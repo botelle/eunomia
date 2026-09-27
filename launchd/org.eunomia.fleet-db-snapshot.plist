@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-db-snapshot — daily consistent copy of fleet.db (plan 0063), so the
+  per-repo model configuration in it has a second copy the offline tier can
+  collect. Uses SQLite's online backup API, never a file copy: fleet-collect
+  writes every 120 seconds and a copied file can be missing rows while still
+  opening fine. Writes fleetdb-<UTC stamp>.db under ~/dev/.fleet/snapshots and
+  keeps the newest seven. Separate from fleet-collect on purpose — the collector
+  is the writer, and a backup inside the writer can block on itself.
+
+  Install (opshost):
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-db-snapshot.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-db-snapshot.plist
+  Verify: run bin/fleet-db-snapshot by hand once and confirm the line it prints
+  names a repo_model row count, then open the file it wrote and check it.
+  Failures land in the log below; this unit does not page.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the shared clone sits on
+  whatever branch a session last left it on (fleet-orphans carries the same
+  note). The pin is a detached worktree of this repo at
+  ~/.local/share/pins/eunomia; fleet-watch reports when it falls behind.
+
+  Collecting the snapshots into the offline tier is a change in operator/infra
+  (backup/dr-snapshot.sh), not here. docs/fleet-db.md names the path.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-db-snapshot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-db-snapshot</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/db-snapshot.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/db-snapshot.log</string>
+</dict>
+</plist>

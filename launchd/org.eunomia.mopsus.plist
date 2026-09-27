@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  mopsus — escalate a failed dispatch with a handle, every 5 minutes (plan 0046).
+
+  A SEPARATE unit from fleet-watch on purpose (D1): the watcher is the fleet's
+  dispatch thread and the one rule that keeps it debuggable is that it checks
+  and moves on. Composing a brief means reading a log file and fleet.db —
+  effort that belongs off that thread entirely, not deferred within it.
+
+  Reads ~/dev/.fleet/fleet.db, which org.eunomia.fleet-collect keeps current
+  on its OWN 120s cadence — this unit does not, and must not, ingest anything
+  itself (docs/fleet-db.md: fleet-collect is the one writer). A host where
+  fleet-collect is not installed, or has fallen behind, simply has no
+  failures visible here yet; mopsus never treats that as an error.
+
+  Install (opshost — the ledger host, alongside fleet-collect):
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.mopsus.plist ~/Library/LaunchAgents/
+    # fill FLEET_ANGELIA_URL/APP/USER + FLEET_ANGELIA_TOKEN_CMD, or
+    # FLEET_NTFY_URL, first — see below
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.mopsus.plist
+  Reload after editing (a frozen job needs bootout+bootstrap, not kickstart):
+    launchctl bootout gui/$(id -u)/org.eunomia.mopsus
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.mopsus.plist
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the same rule
+  fleet-collect and fleet-watch's own plists state, and the same postmortem
+  (ADR-0005): the shared clone sits on whatever branch a session last left it
+  on, and a scheduled job is the worst place to inherit that silently.
+
+  No page channel configured here (both env vars empty) means mopsus still
+  runs, still composes briefs, still writes handles to
+  ~/dev/.fleet/mopsus/briefs/ and still records every attempt in
+  ~/dev/.fleet/pages.jsonl — it just prints instead of reaching a phone
+  (bin/orchestrator's notify() contract, reused rather than restated here).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.eunomia.mopsus</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/mopsus</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- angelia (preferred) -->
+    <key>FLEET_ANGELIA_URL</key><string></string>
+    <key>FLEET_ANGELIA_APP</key><string></string>
+    <key>FLEET_ANGELIA_USER</key><string></string>
+    <key>FLEET_ANGELIA_TOKEN_CMD</key><string></string>
+    <!-- ntfy fallback; empty = print-only -->
+    <key>FLEET_NTFY_URL</key><string></string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- A read-only sweep over fleet.db and a handful of log tails; never on
+       the critical path of anything a login or an active session waits on. -->
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/operator/dev/.fleet/mopsus.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/operator/dev/.fleet/mopsus.log</string>
+</dict>
+</plist>

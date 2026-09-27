@@ -1,0 +1,782 @@
+#!/usr/bin/env python3
+"""fleet-models — which runner serves each agentic position, per repo (plan 0048).
+
+Adds `repo_model` and `repo_model_change` to the fleet history DB (`fleet.db`,
+alongside `review` / `model_price` from `bin/fleet-reviews` — a precedent
+tier, not a new one). This is the ONE writer: a human and the control app's
+API both go through this CLI, so every write lands exactly one
+`repo_model_change` row (ADR-0006 §1 as amended — a configuration change
+replaces a reviewed merge for this class of setting, and the record is the
+audit trail it is traded for).
+
+Positions are exactly ADR-0009 §1's agentic rows — nothing mechanical gets a
+row, because a dropdown that changes nothing is worse than a missing one:
+
+  implementer      exactly 1   default: the 'default' row
+  plan_reviewer    1..n        default: 1
+  code_reviewer    1..n        default: 1
+  tester           1..n        default: 1 (ADR-0006 §3 as amended)
+  mediator         0 or 1      default: none
+  impl_supervisor  0 or 1      default: none (ADR-0009 §2)
+  test_supervisor  0 or 1      default: none (ADR-0009 §2)
+
+The fleet watcher does not appear: it is fleet-scoped, and a per-repo row for
+it would imply the fleet can have more than one dispatcher.
+
+RESOLUTION, per (repo, position, ordinal) slot: the repo's own row where
+`disabled = 0`, then the `'default'` row where `disabled = 0`, then nothing —
+there is no further, built-in fallback. `bin/orchestrator`'s
+`EUNOMIA_IMPL_RUNNER` sits ABOVE this whole table for the `implementer`
+position only; that override is the orchestrator's, not this module's, and is
+applied before this module is ever asked.
+
+REMOVAL IS `disabled = 1`. A row is never deleted and an ordinal is never
+reused — disabling #2 of 3 and adding a new one gives #4, not #2, because the
+change log (and later, review records) name ordinals, and renumbering would
+silently rewrite what an existing record meant.
+
+THE REVIEWER POSITIONS TAKE FABLE RUNNERS ONLY (plan 0065). `plan_reviewer` and
+`code_reviewer` refuse any runner whose `Runner.family` is not "fable" — the
+2026-08-26 ruling, "Fable on every PR, hard stop", previously a comment above
+`MODEL` in ~/agent/dispatch-review.py (operator/talos) and now code that refuses.
+A property of the runner, not a match on its name; enforced at write and at read
+so a row that predates this cannot stay live by surviving. Every other position
+still takes any runner in the registry (ADR-0009 §3).
+
+A RUNNER NAME IS VALIDATED AGAINST `RUNNERS`, in `bin/orchestrator`, both at
+write time (refuse the write) and at read time (a registry entry can be
+retired after the row was written). It cannot be a `CHECK` constraint because
+`RUNNERS` is a Python registry, not a SQL fact.
+
+  fleet-models list                                    every row, as stored
+  fleet-models get <repo>                               resolved runner, per
+                                                         position, with layer
+  fleet-models set <repo> <position> [<ordinal>] <runner>
+  fleet-models disable <repo> <position> [<ordinal>]    ordinal defaults to 1
+  fleet-models enable  <repo> <position> [<ordinal>]
+
+`<ordinal>` omitted on `set`: a singleton position (exactly-1 or 0-or-1) always
+targets ordinal 1; a list position allocates the next never-before-used
+ordinal for that (repo, position).
+
+DURABILITY (plan 0063). `repo_model` is the one piece of fleet state with no
+other home: history is rebuilt from transcripts and the ledger, but a config
+row is a decision. Three things make it survive the loss of `fleet.db`:
+
+  * every write also appends a `repo-model-changed` event to the ledger
+    (`_log_change`), so the table is DERIVABLE from `events.jsonl`;
+  * `reconstruct_repo_model` replays those events into an ABSENT (or empty)
+    table — a restore, never an edit of a table that survived;
+  * `bin/fleet-db-snapshot` keeps dated copies via SQLite's backup API.
+
+The ledger written to is the one BESIDE the database being written — in
+production the same directory, and in a test an isolated one by construction,
+so a `FLEET_DB` override can never append to the real fleet's ledger.
+
+The journal mode is WAL, set here at every open (`connect`), not by a one-off
+pragma on the live file: journal mode is persistent, so a hand-run pragma would
+look fixed and then a copy restored in `delete` mode would have nothing to set
+it again.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+_lib_loader = importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+# `lib.fleet_dir()`, not a hardcoded `~/dev/.fleet` — this module is read from
+# bin/orchestrator on every dispatch (plan 0048 D6), and a default that
+# ignores EUNOMIA_FLEET_DIR would have a test (or an alternate host
+# configuration) reach into the real production fleet.db instead of its own
+# isolated tree, exactly the mistake `fleet_dir()` exists to prevent.
+DB = os.path.expanduser(os.environ.get("FLEET_DB", str(lib.fleet_dir() / "fleet.db")))
+
+# ADR-0009 §1's agentic rows, and nothing else — see the module docstring.
+POSITIONS = ("implementer", "plan_reviewer", "code_reviewer", "tester",
+             "mediator", "impl_supervisor", "test_supervisor")
+
+# Positions whose cardinality is 0-or-1 or exactly-1: `set` with no ordinal
+# always means ordinal 1, never "allocate a new one" (plan 0048 D2).
+SINGLETON = {"implementer", "mediator", "impl_supervisor", "test_supervisor"}
+
+# The positions a review runs in, and the one runner family they accept (plan
+# 0065 D2/D3). `tester`, `mediator` and the supervisors are deliberately absent:
+# the ruling names reviews, and inventing an equivalent for them is not this
+# module's call.
+REVIEWER_POSITIONS = ("plan_reviewer", "code_reviewer")
+REVIEWER_FAMILY = "fable"
+REVIEWER_POLICY = ("'Fable on every PR, hard stop' (the operator, 2026-08-26; "
+                   "~/agent/dispatch-review.py MODEL)")
+
+# The `detail` keys of a `repo-model-changed` event, and nothing else. A runner
+# name and a position are configuration; this file's sibling, `events.jsonl`,
+# carries every other event and is read by `fleet-events`, which does not
+# redact. So a future config key that holds a credential must NOT be added here
+# — that is a decision for a redacting path, not a new entry in a tuple.
+# `tests/test_config_durability.py` pins this set exactly, so growing it fails
+# a test that says why.
+EVENT_DETAIL_KEYS = ("change_id", "source", "position", "ordinal",
+                      "old_runner", "new_runner", "old_disabled", "new_disabled")
+EVENT_TYPE = "repo-model-changed"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS repo_model (
+  repo      TEXT    NOT NULL,            -- 'operator/eunomia', or 'default'
+  position  TEXT    NOT NULL,
+  ordinal   INTEGER NOT NULL DEFAULT 1,  -- 1 for singletons, 1..n for lists
+  runner    TEXT    NOT NULL,            -- a key in the orchestrator's RUNNERS
+  disabled  INTEGER NOT NULL DEFAULT 0,  -- soft delete; rows are never removed
+  PRIMARY KEY (repo, position, ordinal),
+  CHECK (position IN ('implementer','plan_reviewer','code_reviewer',
+                      'tester','mediator','impl_supervisor','test_supervisor')),
+  CHECK (ordinal >= 1),
+  CHECK (disabled IN (0,1))
+);
+
+CREATE TABLE IF NOT EXISTS repo_model_change (
+  id          TEXT    NOT NULL PRIMARY KEY,  -- ULID from the writer, not a sequence
+  ts          TEXT    NOT NULL,              -- ISO-8601 UTC
+  actor       TEXT    NOT NULL,              -- 'user:forgejo:7' | 'cli:operator'
+  source      TEXT    NOT NULL,              -- 'fleet-models' | the control app
+  repo        TEXT    NOT NULL,
+  position    TEXT    NOT NULL,
+  ordinal     INTEGER NOT NULL,
+  old_runner  TEXT,                          -- NULL on create
+  new_runner  TEXT,                          -- NULL on disable
+  old_disabled INTEGER,
+  new_disabled INTEGER
+);
+CREATE INDEX IF NOT EXISTS repo_model_change_repo ON repo_model_change(repo, ts);
+"""
+
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+class UnknownRunner(ValueError):
+    """A runner name that bin/orchestrator's RUNNERS registry does not carry —
+    raised at write time (refuse) and at read time (a registry entry can be
+    retired after the row was written)."""
+
+
+class ReviewerRunnerRefused(UnknownRunner):
+    """A reviewer position offered a runner outside the Fable family. An
+    `UnknownRunner` so every caller that already turns a refused runner into a
+    message or a `Stop` handles this one the same way."""
+
+
+class NotConfigured(LookupError):
+    """repo_model has never been created on this install — distinct from
+    "the table exists and this repo/position resolves to nothing", which
+    plan 0048 D3 requires a Stop for. This one is a fleet that has not
+    adopted the feature yet, and a caller may fall back to its own prior
+    default rather than treat an unopened door as a locked one."""
+
+
+class LedgerAppendFailed(RuntimeError):
+    """The `repo-model-changed` event could not be appended, so the write was
+    rolled back. A config change the ledger cannot record is not made: the event
+    is what makes the table derivable, and a change that exists only in the
+    file this plan exists to protect is the exact gap being closed."""
+
+
+def _ulid():
+    """A real ULID: 48-bit ms timestamp + 80-bit randomness, Crockford base32.
+    Not a sequence — plan 0048 D1 is explicit that this is the writer's job,
+    not the DB's, so two writers can never collide on the next integer."""
+    ts_ms = int(time.time() * 1000)
+    data = ts_ms.to_bytes(6, "big") + os.urandom(10)
+    bits = int.from_bytes(data, "big") << 2  # 128 bits -> 130, base32-aligned
+    return "".join(_CROCKFORD[(bits >> (130 - 5 * (i + 1))) & 0x1F] for i in range(26))
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _load_orchestrator():
+    """RUNNERS lives in bin/orchestrator, not here — a second registry is a
+    second registry to drift. Loaded fresh each call, the same lazy-sibling
+    idiom bin/orchestrator itself uses for fleetforge.py and fleet-emit."""
+    loader = importlib.machinery.SourceFileLoader(
+        "_fleet_models_orchestrator", str(BIN / "orchestrator"))
+    spec = importlib.util.spec_from_loader("_fleet_models_orchestrator", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def known_runners():
+    return sorted(_load_orchestrator().RUNNERS)
+
+
+def validate_runner(name, position=None):
+    """Refuse a name `RUNNERS` does not carry and, given a reviewer `position`,
+    any runner whose `family` is not `REVIEWER_FAMILY` (plan 0065 D2). Called
+    with the position at BOTH write and read: the write refuses, and the read
+    refuses a row that got in some other way."""
+    registry = _load_orchestrator().RUNNERS
+    if name not in registry:
+        raise UnknownRunner(f"{name!r} is not a runner bin/orchestrator's RUNNERS "
+                             f"carries (known: {sorted(registry)})")
+    if position in REVIEWER_POSITIONS and registry[name].family != REVIEWER_FAMILY:
+        accepted = sorted(n for n, r in registry.items() if r.family == REVIEWER_FAMILY)
+        raise ReviewerRunnerRefused(
+            f"{name!r} cannot serve {position}: {REVIEWER_POLICY}. The reviewer "
+            f"positions accept only {REVIEWER_FAMILY!r}-family runners "
+            f"(accepted: {accepted})")
+
+
+def _enable_wal(con):
+    """Put the database in WAL, at open, from every writer. Returns the mode
+    now in force, or None if it could not be switched.
+
+    WAL is what lets the lynceus API read `fleet.db` while `fleet-collect`
+    writes it — in `delete` mode a writer blocks readers, and collect.log has
+    recorded `database is locked` twice. Switching out of `delete` needs a
+    moment with no other connection holding the file, so a refusal is a warning,
+    not a failure: refusing a config write over a journal mode would make the
+    tuning knob the outage. It is retried by the next open."""
+    try:
+        mode = con.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    except sqlite3.OperationalError as e:
+        print(f"fleet-models: could not switch to WAL ({e}) — continuing in the "
+              f"current journal mode", file=sys.stderr)
+        return None
+    if mode != "wal" and mode != "memory":
+        print(f"fleet-models: journal_mode is {mode!r}, not 'wal'", file=sys.stderr)
+    return mode
+
+
+def connect(db_path=None):
+    con = sqlite3.connect(db_path or DB)
+    _enable_wal(con)
+    con.executescript(SCHEMA)
+    return con
+
+
+def _existing(con, repo, position, ordinal):
+    return con.execute(
+        "SELECT runner, disabled FROM repo_model WHERE repo=? AND position=? "
+        "AND ordinal=?", (repo, position, ordinal)).fetchone()
+
+
+def _next_ordinal(con, repo, position):
+    """MAX, not COUNT: a disabled row's ordinal still counts, so disabling #2
+    of 3 and adding a new one allocates #4, never reusing #2 (plan 0048 D2)."""
+    row = con.execute(
+        "SELECT MAX(ordinal) FROM repo_model WHERE repo=? AND position=?",
+        (repo, position)).fetchone()
+    return (row[0] or 0) + 1
+
+
+def _ledger_dir(con):
+    """The directory whose `events.jsonl` describes THIS database: its own.
+    None for an in-memory database, which has no durability to protect and no
+    business appending to any real ledger."""
+    for _seq, name, path in con.execute("PRAGMA database_list"):
+        if name == "main":
+            return Path(path).parent if path else None
+    return None
+
+
+def _emit_event(con, actor, repo, detail):
+    """Append one `repo-model-changed` to the ledger beside `con`'s database.
+
+    bin/fleet-emit is loaded as a sibling (the idiom `_load_orchestrator` and
+    bin/orchestrator use) and pointed at that directory after load, since it
+    reads its location at import. Its own failures are `sys.exit` calls; they
+    are turned into `LedgerAppendFailed` so a caller can catch one type."""
+    fleet_dir = _ledger_dir(con)
+    if fleet_dir is None:
+        return
+    loader = importlib.machinery.SourceFileLoader("_fleet_models_emit",
+                                                  str(BIN / "fleet-emit"))
+    spec = importlib.util.spec_from_loader("_fleet_models_emit", loader)
+    emit_mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(emit_mod)
+    emit_mod.FLEET_DIR = fleet_dir
+    emit_mod.EVENTS = fleet_dir / "events.jsonl"
+    emit_mod.LOCK = fleet_dir / "locks" / "events.lock"
+    try:
+        emit_mod.emit(EVENT_TYPE, actor, repo=repo, detail=detail)
+    except SystemExit as e:
+        raise LedgerAppendFailed(f"{e.code}") from None
+    except OSError as e:
+        raise LedgerAppendFailed(f"{e.__class__.__name__}: {e}") from None
+
+
+def _log_change(con, actor, source, repo, position, ordinal,
+                 old_runner, new_runner, old_disabled, new_disabled):
+    """The audit row AND the ledger event, together — one function so no writer
+    path can do one without the other. The event goes out BEFORE the caller
+    commits: if the append fails the caller rolls back and nothing changed, and
+    a retry is a clean retry. (A retry after "write succeeded, event lost" would
+    find the value already in force, write nothing, and never emit.) The cost
+    is the opposite race — a commit failing after a successful append — which is
+    an I/O error on a transaction that already holds the write lock."""
+    change_id = _ulid()
+    con.execute(
+        "INSERT INTO repo_model_change (id, ts, actor, source, repo, position, "
+        "ordinal, old_runner, new_runner, old_disabled, new_disabled) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (change_id, _now(), actor, source, repo, position, ordinal,
+         old_runner, new_runner, old_disabled, new_disabled))
+    fields = {"change_id": change_id, "source": source, "position": position,
+              "ordinal": ordinal, "old_runner": old_runner,
+              "new_runner": new_runner, "old_disabled": old_disabled,
+              "new_disabled": new_disabled}
+    _emit_event(con, actor, repo, {k: fields[k] for k in EVENT_DETAIL_KEYS})
+
+
+def _check_position(position):
+    if position not in POSITIONS:
+        raise ValueError(f"{position!r} is not an ADR-0009 §1 agentic position "
+                         f"(known: {POSITIONS})")
+
+
+def set_runner(con, repo, position, runner, ordinal=None,
+               actor="cli:unknown", source="fleet-models"):
+    """(ordinal, changed). Refuses an unknown runner before writing anything.
+    A `set` to the value already in force writes no row and no change
+    (plan 0048 DoD)."""
+    _check_position(position)
+    validate_runner(runner, position)
+    if ordinal is None:
+        ordinal = 1 if position in SINGLETON else _next_ordinal(con, repo, position)
+    existing = _existing(con, repo, position, ordinal)
+    if existing is not None and existing[0] == runner:
+        return ordinal, False
+    old_runner = existing[0] if existing else None
+    old_disabled = existing[1] if existing else None
+    disabled_value = existing[1] if existing else 0
+    con.execute(
+        "INSERT INTO repo_model (repo, position, ordinal, runner, disabled) "
+        "VALUES (?,?,?,?,?) "
+        "ON CONFLICT(repo, position, ordinal) DO UPDATE SET runner=excluded.runner",
+        (repo, position, ordinal, runner, disabled_value))
+    # A runner change leaves disabled state untouched — old/new_disabled are
+    # only meaningful on a create, where there is a disabled state to report
+    # for the first time (plan 0048 D1: "new_runner NULL on disable" implies
+    # the symmetric case here).
+    try:
+        _log_change(con, actor, source, repo, position, ordinal,
+                    old_runner, runner,
+                    None if existing else None, 0 if existing is None else None)
+    except Exception:
+        con.rollback()
+        raise
+    con.commit()
+    return ordinal, True
+
+
+def _set_disabled(con, repo, position, ordinal, disabled, actor, source):
+    _check_position(position)
+    existing = _existing(con, repo, position, ordinal)
+    if existing is None:
+        raise LookupError(f"no row for {repo!r} {position}#{ordinal} — nothing to "
+                          f"{'disable' if disabled else 'enable'}")
+    old_runner, old_disabled = existing
+    new_disabled = 1 if disabled else 0
+    if old_disabled == new_disabled:
+        return False
+    con.execute(
+        "UPDATE repo_model SET disabled=? WHERE repo=? AND position=? AND ordinal=?",
+        (new_disabled, repo, position, ordinal))
+    # A disable/enable leaves runner untouched — new_runner is NULL here (only
+    # a `set` reports a new runner), old_runner is filled since the row
+    # already existed (only a create leaves it NULL).
+    try:
+        _log_change(con, actor, source, repo, position, ordinal,
+                    old_runner, None, old_disabled, new_disabled)
+    except Exception:
+        con.rollback()
+        raise
+    con.commit()
+    return True
+
+
+def disable(con, repo, position, ordinal=1, actor="cli:unknown", source="fleet-models"):
+    return _set_disabled(con, repo, position, ordinal, True, actor, source)
+
+
+def enable(con, repo, position, ordinal=1, actor="cli:unknown", source="fleet-models"):
+    return _set_disabled(con, repo, position, ordinal, False, actor, source)
+
+
+def resolve(con, repo, position, ordinal=1):
+    """(runner, layer) for one (position, ordinal) slot — the repo's own
+    enabled row, then 'default's, then (None, None). Raises UnknownRunner if
+    the row that resolved names a runner RUNNERS no longer carries (plan 0048:
+    validated at write AND at read, and a reviewer position also refuses a
+    non-Fable runner — plan 0065; a row written straight into the table never
+    resolves)."""
+    row = con.execute(
+        "SELECT runner FROM repo_model WHERE repo=? AND position=? AND ordinal=? "
+        "AND disabled=0", (repo, position, ordinal)).fetchone()
+    layer = "repo"
+    if row is None:
+        row = con.execute(
+            "SELECT runner FROM repo_model WHERE repo='default' AND position=? "
+            "AND ordinal=? AND disabled=0", (position, ordinal)).fetchone()
+        layer = "default"
+    if row is None:
+        return None, None
+    validate_runner(row[0], position)
+    return row[0], layer
+
+
+def resolve_repo(repo, position, ordinal=1, db_path=None):
+    """`resolve`, opening its own read-only connection — for a caller (the
+    orchestrator) that only ever reads. This CLI is the one writer (plan 0048
+    D5); a reader must not risk creating the schema underneath it, so a
+    missing file or table raises `NotConfigured` rather than writing one.
+
+    Raises `NotConfigured` when repo_model has never been created here at
+    all (no db file, or the table itself is absent) — distinct from a
+    resolved `(None, None)`, which means the table exists but this
+    repo/position has no answer, repo or default."""
+    path = db_path or DB
+    if not os.path.exists(path):
+        raise NotConfigured(f"{path} does not exist")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return resolve(con, repo, position, ordinal)
+    except sqlite3.OperationalError as e:
+        raise NotConfigured(str(e))
+    finally:
+        con.close()
+
+
+def active_ordinals(con, repo, position):
+    """Every ordinal worth resolving for this (repo, position): the union of
+    what the repo's own enabled rows and the default's enabled rows carry."""
+    rows = con.execute(
+        "SELECT DISTINCT ordinal FROM repo_model WHERE position=? AND "
+        "(repo=? OR repo='default') AND disabled=0", (position, repo)).fetchall()
+    return sorted(r[0] for r in rows)
+
+
+# ------------------------------------------------------------- reconstruction
+
+
+def replay_events(rows):
+    """Fold `repo-model-changed` events, in ledger order, into the state they
+    describe. `rows` is an iterable of `(repo, detail_json)`.
+
+    Returns `(state, predates, skipped)`:
+      state     {(repo, position, ordinal): (runner, disabled)}
+      predates  slots whose first ledger event shows they already existed —
+                a write from before this event type did. Their `disabled` flag
+                cannot be known from the ledger and is assumed 0.
+      skipped   events that could not be read as a change (bad JSON, unknown
+                position, no runner to name). Counted, never fatal: one torn
+                or foreign line must not stop a restore of the rest.
+
+    A `set` carries `new_runner`; a disable/enable carries `new_disabled` and
+    the `old_runner` the slot already had — which is what lets a slot be
+    recovered from a disable event alone."""
+    state, predates, skipped = {}, set(), 0
+    for repo, detail_json in rows:
+        try:
+            d = json.loads(detail_json)
+            position, ordinal = d["position"], d["ordinal"]
+            if (position not in POSITIONS or not isinstance(ordinal, int)
+                    or isinstance(ordinal, bool) or ordinal < 1
+                    or not isinstance(repo, str) or not repo):
+                raise ValueError
+            new_runner, old_runner = d.get("new_runner"), d.get("old_runner")
+            new_disabled = d.get("new_disabled")
+            if new_disabled not in (None, 0, 1):
+                raise ValueError
+            for name in (new_runner, old_runner):
+                if name is not None and (not isinstance(name, str) or not name):
+                    raise ValueError
+        except (ValueError, KeyError, TypeError, AttributeError):
+            skipped += 1
+            continue
+        slot = (repo, position, ordinal)
+        known = state.get(slot)
+        if new_runner is not None:                       # a `set`
+            if known is not None:
+                state[slot] = (new_runner, known[1])
+            else:
+                if old_runner is not None:               # slot predates the ledger
+                    predates.add(slot)
+                state[slot] = (new_runner, new_disabled or 0)
+        elif new_disabled is not None:                   # a disable / enable
+            runner = known[0] if known is not None else old_runner
+            if runner is None:
+                skipped += 1
+                continue
+            if known is None:
+                predates.discard(slot)                   # `new_disabled` is certain
+            state[slot] = (runner, new_disabled)
+        else:
+            skipped += 1
+    return state, predates, skipped
+
+
+def _table_rows(con):
+    """{(repo, position, ordinal): (runner, disabled)} — or None if the table
+    does not exist."""
+    try:
+        return {(r[0], r[1], r[2]): (r[3], r[4]) for r in con.execute(
+            "SELECT repo, position, ordinal, runner, disabled FROM repo_model")}
+    except sqlite3.OperationalError:
+        return None
+
+
+def reconstruct_repo_model(con, ledger_complete=True):
+    """Rebuild `repo_model` from the ledger's `repo-model-changed` events, as
+    `fleet-collect` has ingested them into the `event` table of the same `con`.
+
+    RESTORES INTO NOTHING, NEVER EDITS SOMETHING. The table is written only when
+    it is absent or holds no rows. An empty table counts as absent because rows
+    are never deleted (removal is `disabled = 1`), so a table with zero rows has
+    never carried a decision — and `connect()` creates the schema, so a
+    `fleet-models list` run on a wiped database would otherwise turn "absent"
+    into "present and empty" and lock the restore out for good. When the table
+    HAS rows they win, however the ledger reads: a ledger can be incomplete (a
+    write from before the event existed, an events file rotated away), and
+    replaying it over a surviving table would silently revert configuration to
+    an older state. What the ledger would have changed is REPORTED instead.
+
+    `ledger_complete=False` — some events file failed to ingest — refuses the
+    restore: a plausible-looking table built from a partial ledger is worse than
+    no table, because dispatch stops loudly on a missing `default` row and does
+    not stop at all on a wrong one.
+
+    Returns a report dict: `action` is one of "none" (no events; nothing done,
+    and no table created — a fleet that never adopted repo_model must still see
+    NotConfigured), "reconstructed", "refused" (incomplete ledger), or
+    "compared" (table survived). See `describe_reconstruction`."""
+    try:
+        rows = con.execute(
+            "SELECT repo, detail_json FROM event WHERE type=? ORDER BY source, line",
+            (EVENT_TYPE,)).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    report = {"action": "none", "events": len(rows), "rows": 0, "skipped": 0,
+              "predates": [], "differs": [], "ledger_only": [], "table_only": []}
+    if not rows:
+        return report
+    state, predates, skipped = replay_events(rows)
+    report["skipped"] = skipped
+    report["predates"] = sorted(predates)
+    existing = _table_rows(con)
+
+    if not existing:                       # absent, or present with no rows
+        if not ledger_complete:
+            report["action"] = "refused"
+            return report
+        con.executescript(SCHEMA)
+        con.executemany(
+            "INSERT INTO repo_model (repo, position, ordinal, runner, disabled) "
+            "VALUES (?,?,?,?,?)",
+            [(r, p, o, runner, dis) for (r, p, o), (runner, dis) in sorted(state.items())])
+        con.commit()
+        report["action"] = "reconstructed"
+        report["rows"] = len(state)
+        return report
+
+    report["action"] = "compared"
+    for slot, (runner, disabled) in sorted(state.items()):
+        have = existing.get(slot)
+        if have is None:
+            report["ledger_only"].append((slot, runner, disabled))
+        elif have[0] != runner or (slot not in predates and have[1] != disabled):
+            report["differs"].append((slot, have, (runner, disabled)))
+    report["table_only"] = sorted(set(existing) - set(state))
+    return report
+
+
+def describe_reconstruction(report, limit=10):
+    """The lines a caller should print for `reconstruct_repo_model`'s report —
+    empty when there is nothing to say. Kept here, beside the semantics, so the
+    wording a reader sees and the decision the code made cannot drift."""
+    def slot_s(slot):
+        return f"{slot[0]} {slot[1]}#{slot[2]}"
+
+    action = report["action"]
+    if action == "none":
+        return []
+    lines = []
+    if action == "reconstructed":
+        lines.append(f"repo_model: was absent — reconstructed {report['rows']} row(s) from "
+                     f"{report['events']} repo-model-changed event(s)")
+        if report["predates"]:
+            lines.append(f"repo_model: {len(report['predates'])} slot(s) predate the ledger "
+                         f"(disabled state assumed 0): "
+                         + ", ".join(slot_s(s) for s in report["predates"][:limit]))
+        lines.append("repo_model: the ledger only holds writes made since the event "
+                     "existed — check `fleet-models list` against the last snapshot")
+    elif action == "refused":
+        lines.append("repo_model: absent but NOT reconstructed — an events file failed to "
+                     "ingest, so the ledger is incomplete")
+    elif action == "compared":
+        for slot, have, want in report["differs"][:limit]:
+            lines.append(f"repo_model: ledger disagrees on {slot_s(slot)}: table has "
+                         f"{have[0]} (disabled={have[1]}), ledger says {want[0]} "
+                         f"(disabled={want[1]}) — table left unchanged")
+        for slot, runner, disabled in report["ledger_only"][:limit]:
+            lines.append(f"repo_model: ledger names {slot_s(slot)} = {runner} "
+                         f"(disabled={disabled}), table has no such row — table left unchanged")
+        n = len(report["differs"]) + len(report["ledger_only"])
+        if n > limit:
+            lines.append(f"repo_model: ... and {n - limit} more disagreement(s)")
+        if report["table_only"]:
+            lines.append(f"repo_model: {len(report['table_only'])} row(s) have no ledger "
+                         f"event (written before repo-model-changed existed) — covered "
+                         f"by the snapshot only")
+    if report["skipped"]:
+        lines.append(f"repo_model: {report['skipped']} repo-model-changed event(s) "
+                     f"could not be read and were skipped")
+    return lines
+
+
+# --------------------------------------------------------------------- CLI
+
+
+def _actor(args):
+    return args.actor or f"cli:{os.environ.get('USER', 'unknown')}"
+
+
+def cmd_list(con, args):
+    rows = con.execute(
+        "SELECT repo, position, ordinal, runner, disabled FROM repo_model "
+        "ORDER BY repo, position, ordinal").fetchall()
+    if not rows:
+        print("no repo_model rows")
+        return 0
+    for repo, position, ordinal, runner, disabled in rows:
+        flag = " (disabled)" if disabled else ""
+        print(f"{repo:28} {position:16} #{ordinal:<3} {runner}{flag}")
+    return 0
+
+
+def cmd_show(con, args):
+    for position in POSITIONS:
+        ords = active_ordinals(con, args.repo, position)
+        if not ords:
+            print(f"{position:16} —")
+            continue
+        for ordinal in ords:
+            try:
+                name, layer = resolve(con, args.repo, position, ordinal)
+            except UnknownRunner as e:
+                print(f"{position:16} #{ordinal:<3} ERROR: {e}", file=sys.stderr)
+                continue
+            tag = f"#{ordinal}" if position not in SINGLETON else ""
+            print(f"{position:16} {tag:>3} {name}  [{layer}]")
+    return 0
+
+
+def cmd_set(con, args):
+    ordinal, runner = args.ordinal, args.runner
+    try:
+        new_ordinal, changed = set_runner(con, args.repo, args.position, runner,
+                                          ordinal=ordinal, actor=_actor(args),
+                                          source=args.source)
+    except (UnknownRunner, ValueError, LedgerAppendFailed) as e:
+        print(f"fleet-models: {e}", file=sys.stderr)
+        return 1
+    verb = "set" if changed else "unchanged"
+    print(f"{verb}: {args.repo} {args.position}#{new_ordinal} = {runner}")
+    return 0
+
+
+def cmd_disable(con, args):
+    ordinal = args.ordinal if args.ordinal is not None else 1
+    try:
+        changed = disable(con, args.repo, args.position, ordinal,
+                          actor=_actor(args), source=args.source)
+    except (LookupError, ValueError, LedgerAppendFailed) as e:
+        print(f"fleet-models: {e}", file=sys.stderr)
+        return 1
+    print(f"{'disabled' if changed else 'already disabled'}: "
+          f"{args.repo} {args.position}#{ordinal}")
+    return 0
+
+
+def cmd_enable(con, args):
+    ordinal = args.ordinal if args.ordinal is not None else 1
+    try:
+        changed = enable(con, args.repo, args.position, ordinal,
+                         actor=_actor(args), source=args.source)
+    except (LookupError, ValueError, LedgerAppendFailed) as e:
+        print(f"fleet-models: {e}", file=sys.stderr)
+        return 1
+    print(f"{'enabled' if changed else 'already enabled'}: "
+          f"{args.repo} {args.position}#{ordinal}")
+    return 0
+
+
+def _cmd_set_dispatch(con, args):
+    if len(args.rest) == 1:
+        args.ordinal, args.runner = None, args.rest[0]
+    elif len(args.rest) == 2:
+        try:
+            args.ordinal = int(args.rest[0])
+        except ValueError:
+            print(f"fleet-models: {args.rest[0]!r} is not an ordinal", file=sys.stderr)
+            return 1
+        args.runner = args.rest[1]
+    else:
+        print("fleet-models: set takes [<ordinal>] <runner>", file=sys.stderr)
+        return 1
+    return cmd_set(con, args)
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="fleet-models")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("get")
+    p.add_argument("repo")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("set")
+    p.add_argument("repo")
+    p.add_argument("position", choices=POSITIONS)
+    p.add_argument("rest", nargs="+", metavar="[ordinal] runner")
+    p.add_argument("--actor")
+    p.add_argument("--source", default="fleet-models")
+    p.set_defaults(func=_cmd_set_dispatch)
+
+    for name, func in (("disable", cmd_disable), ("enable", cmd_enable)):
+        p = sub.add_parser(name)
+        p.add_argument("repo")
+        p.add_argument("position", choices=POSITIONS)
+        p.add_argument("ordinal", type=int, nargs="?")
+        p.add_argument("--actor")
+        p.add_argument("--source", default="fleet-models")
+        p.set_defaults(func=func)
+
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    con = connect()
+    try:
+        return args.func(con, args)
+    finally:
+        con.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

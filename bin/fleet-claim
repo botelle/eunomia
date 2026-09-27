@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""fleet-claim — grant, activate, pull, or take over a lease (SPEC.md §Grant flow).
+
+  fleet-claim --assign '<resource-json>' [--holder ID] [--ttl MIN] [--note TEXT]
+  fleet-claim --activate LEASE_ID
+  fleet-claim --next TYPE
+  fleet-claim --takeover LEASE_ID
+
+--assign with a holder is the push model: the coordinator names the intended
+worker and bakes the lease id into its launch prompt. Without a holder it writes
+a POOL row, claimed later through --next. --activate is verification, not
+acquisition: it refuses unless EUNOMIA_SESSION matches the assigned holder.
+--takeover is the ONLY path that changes a set holder, and only after re-deriving
+orphanhood under the lease's lock.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+_lib_loader = importlib.machinery.SourceFileLoader(
+    "fleetlib", str(Path(__file__).resolve().parent / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9.-]+")
+
+
+def _slug(resource: dict) -> str:
+    # Must never return "" — an empty slug makes _next_id mint `type----NNN`,
+    # which _ID_RE rejects, so the grant writes but every later op refuses it
+    # forever (1522 L1). A value that strips to empty (e.g. "---") falls through
+    # to the next source, and finally to the (always-valid) resource type.
+    for key in ("branch", "service", "udid", "host", "repo"):
+        v = resource.get(key)
+        if v:
+            s = _SLUG_RE.sub("-", str(v)).strip("-").lower()[:40]
+            if s:
+                return s
+    globs = resource.get("globs")
+    if isinstance(globs, (list, tuple)) and globs:
+        s = _SLUG_RE.sub("-", str(globs[0])).strip("-").lower()[:40]
+        if s:
+            return s
+    return resource.get("type", "lease")
+
+
+def _next_id(rtype: str, slug: str) -> str:
+    taken = set()
+    for p in lib.leases_dir().glob(f"{rtype}--{slug}--*.json"):
+        m = re.search(r"--(\d{3,})\.json\Z", p.name)
+        if m:
+            taken.add(int(m.group(1)))
+    n = 1
+    while n in taken:
+        n += 1
+    return f"{rtype}--{slug}--{n:03d}"
+
+
+def cmd_assign(args) -> int:
+    try:
+        resource = json.loads(args.assign)
+    except json.JSONDecodeError as e:
+        sys.exit(f"fleet-claim: --assign is not valid JSON: {e}")
+    rtype = resource.get("type")
+    if rtype not in lib.RESOURCE_TYPES:
+        sys.exit(f"fleet-claim: resource type {rtype!r} not in {lib.RESOURCE_TYPES}")
+    if "globs" in resource and not isinstance(resource["globs"], list):
+        # a truthy non-list reached globs[0] as a KeyError traceback before
+        # (1522 r10 low 4) — malformed input gets a named refusal here like
+        # everywhere else
+        sys.exit(f"fleet-claim: resource globs must be a list, "
+                 f"got {type(resource['globs']).__name__}")
+    if resource.get("role") not in (None, "integrator"):
+        # the only known role; a typo here would silently fail fleet-cr's
+        # integrator gate weeks later (1522 #11 H1)
+        sys.exit(f"fleet-claim: unknown resource role {resource['role']!r} "
+                 "(only 'integrator' exists)")
+    if resource.get("role") == "integrator":
+        # The gate matches type in (branch, paths) AND repo — a role on any
+        # other shape would silently never pass it, the exact deferred-failure
+        # class the unknown-role check exists for (1522 #11 r2 L1).
+        if rtype not in ("branch", "paths"):
+            sys.exit("fleet-claim: role 'integrator' requires a branch/paths "
+                     "resource — the fleet-cr gate matches only those")
+        if not resource.get("repo"):
+            sys.exit("fleet-claim: role 'integrator' requires a repo field — "
+                     "the fleet-cr gate matches on it")
+        # M2 (1522 #11 r4): SHAPE-validate, not just presence — a trailing
+        # space or a non-string writes a grant the gate's exact string
+        # equality silently never matches, and keys one-per-repo on junk.
+        lib.validate_repo(resource["repo"])
+        if args.holder is None:
+            # M1 (1522 #11 r4): a role-bearing POOL row would be absorbed
+            # by whatever worker next runs --next, silently making it the
+            # integrator. The role is always granted to a named holder.
+            sys.exit("fleet-claim: role 'integrator' requires --holder — "
+                     "a pool row would hand the role to a random puller")
+
+    actor = lib.session_id()
+    if args.holder is not None and not lib._SID_RE.match(args.holder):
+        sys.exit(f"fleet-claim: --holder {args.holder!r} is not a valid session id "
+                 "— holders become heartbeat paths (1522 r9 L1)")
+    lease_id = _next_id(rtype, _slug(resource))
+    # Structural backstop for 1522 L1: never write a grant whose id its own
+    # validators would reject. With the _slug empty-guard this cannot trigger;
+    # if it ever does, fail loud BEFORE the ledger write rather than mint a
+    # permanently-unusable lease.
+    if not lib._ID_RE.match(lease_id):
+        sys.exit(f"fleet-claim: generated id {lease_id!r} is malformed — "
+                 "give the resource a nameable field")
+    record = {
+        "id": lease_id,
+        "resource": resource,
+        "holder": args.holder,          # None => pool row, claimed via --next
+        "granted_by": actor,
+        "state": "assigned",
+        "ttl_minutes": args.ttl,
+        "created": lib.ts(lib.now_utc()),
+        "activated": None,
+        "note": args.note or "",
+    }
+    def _refuse_second_integrator():
+        for rec in lib.all_leases():
+            res = lib.resource_of(rec)
+            if (rec.get("state") in ("assigned", "active")
+                    and res.get("role") == "integrator"
+                    and res.get("repo") == resource["repo"]):
+                sys.exit(f"fleet-claim: {rec.get('id')} already holds the "
+                         f"integrator role for {resource['repo']} — one per "
+                         "repo. Release it, or if its holder is dead, "
+                         "`fleet-claim --takeover` it (docs/takeover.md) — "
+                         "never hand-delete the lease file.")
+
+    def _refuse_conflicting_holder():
+        """A live lease on this exact resource, held by someone else, refuses.
+
+        Until 2026-09-07 --assign refused nothing for a branch: two sessions
+        naming one branch both succeeded and fleet-status showed two rows with
+        different holders. The ledger recorded the collision instead of
+        preventing it, and that is how two actors worked eunomia #96 and #99 at
+        the same time without either noticing.
+
+        Fails CLOSED on an unreadable ledger. `all_leases` deliberately skips a
+        corrupt row with a warning — right for a reader sweep, wrong here, since
+        the row it skipped may be the conflict. Not being able to prove there is
+        no conflict is not the same as there being none; the same rule
+        fleet-watch applies to a truncated dedupe scan.
+
+        Re-assigning as the SAME holder is idempotent rather than an error: a
+        session re-running its launch block should get its lease id back, not a
+        second row or a failure.
+
+        POOL ROWS ARE NOT AFFECTED, and that is deliberate. An --assign with no
+        holder is an offer, claimed later through --next, and several offers on
+        one resource are how capacity is expressed — `sim` rows exist precisely
+        so two pullers can each take one. So this refuses only when BOTH sides
+        name a holder. An earlier revision refused any second row and broke the
+        puller model; the tests for --next caught it.
+
+        Residual, stated rather than hidden: --next can still hand two pool rows
+        for one resource to two sessions. For `sim` that is the intent. For a
+        branch it would be the very collision this closes, so a branch belongs
+        in a held lease, never a pool row.
+
+        An ORPHANED lease does not hold anything either — its holder has stopped
+        heartbeating — so it does not block. That is not a convenience: respawn
+        assigns the successor BEFORE retiring the dead lease, because retiring
+        first "stranded the plan whenever that assign failed"
+        (docs/plan-dispatch.md). Blocking on an orphan would have broken it.
+        """
+        want = json.dumps(resource, sort_keys=True)
+        try:
+            on_disk = len(list(lib.leases_dir().glob("*.json"))) if lib.leases_dir().is_dir() else 0
+        except OSError as e:
+            sys.exit(f"fleet-claim: cannot list the lease ledger ({e.__class__.__name__}) "
+                     "— refusing rather than granting a lease it could not check")
+        rows = lib.all_leases()
+        if len(rows) != on_disk:
+            sys.exit(f"fleet-claim: {on_disk - len(rows)} lease file(s) unreadable — "
+                     "refusing, because the row that could not be read may be the "
+                     "conflict. Fix or remove the bad file, then retry.")
+        for rec in rows:
+            if rec.get("state") not in ("assigned", "active"):
+                continue
+            if lib.is_orphaned(rec):
+                # A lease whose holder has stopped heartbeating does not hold
+                # anything. Blocking on one would break respawn, which
+                # docs/plan-dispatch.md deliberately assigns the SUCCESSOR
+                # before retiring the dead lease — retiring first "stranded the
+                # plan whenever that assign failed". The watcher's own tests
+                # caught this. Orphanhood is derived, never stored, so this
+                # re-derives it here rather than trusting a field.
+                continue
+            if json.dumps(lib.resource_of(rec), sort_keys=True) != want:
+                continue
+            held = rec.get("holder")
+            if not held or not args.holder:
+                continue          # an offer, not a holding — see the docstring
+            if held == args.holder:
+                # already ours — hand back the existing id, emit nothing
+                print(rec.get("id"))
+                sys.stdout.flush()
+                sys.exit(0)
+            sys.exit(
+                f"fleet-claim: {rec.get('id')} already holds this resource "
+                f"(holder={held!r}, state={rec.get('state')}). A lease is one "
+                "per resource. Coordinate with that session, wait for it to "
+                "release, or — if its holder is dead — `fleet-claim --takeover "
+                f"{rec.get('id')}` (docs/takeover.md). Never hand-delete a lease file.")
+
+    def _write_grant():
+        with lib.held_lock(lib.lock_path(lease_id)):
+            if lib.read_lease(lease_id) is not None:
+                sys.exit(f"fleet-claim: {lease_id} already exists — id allocation raced; retry")
+            lib.write_lease(record)
+
+    # Both refusals are scan-then-write and need the scan and the write under one
+    # lock, or two concurrent --assigns each scan a clean ledger and both write.
+    # The integrator rule is per REPO, so it locks the repo; the one-holder rule
+    # is per RESOURCE, so it locks the resource. Lock order is always
+    # outer-lock -> lease-lock; nothing takes them reversed.
+    if resource.get("role") == "integrator":
+        with lib.held_lock(lib.role_lock_path(resource["repo"])):
+            _refuse_second_integrator()
+            _refuse_conflicting_holder()
+            _write_grant()
+    else:
+        with lib.held_lock(lib.resource_lock_path(resource)):
+            _refuse_conflicting_holder()
+            _write_grant()
+    # The ledger write IS the grant, and it has already happened — print the id
+    # before attempting the emit, so a broken event log cannot turn a working
+    # grant into an unusable one (review 1493: the id was lost from stdout).
+    print(lease_id)
+    sys.stdout.flush()
+    lib.emit("lease-assigned", lease_id, actor,
+             detail={"holder": args.holder, "type": rtype})
+    return 0
+
+
+def cmd_activate(args) -> int:
+    sid = lib.session_id()
+    lease_id = lib.validate_lease_id(args.activate)
+    with lib.held_lock(lib.lock_path(lease_id)):
+        rec = lib.read_lease_checked(lease_id)
+        if rec is None:
+            sys.exit(f"fleet-claim: no lease {lease_id}")
+        if rec.get("holder") != sid:
+            sys.exit(f"fleet-claim: {lease_id} is assigned to {rec.get('holder')!r}, "
+                     f"not {sid!r} — activation is verification, not acquisition")
+        if rec.get("state") == "released":
+            sys.exit(f"fleet-claim: {lease_id} is released")
+        rec["state"] = "active"
+        rec["activated"] = lib.ts(lib.now_utc())
+        lib.write_lease(rec)
+        # A late activation (worker blew the activate-timeout, a sweep already
+        # marked+emitted lease-orphaned) resolves that orphaning: clear the marker
+        # under the lock so a FUTURE death re-emits. Without this the stale marker
+        # makes the next genuine orphaning silently emit nothing (1522 M1) — the
+        # same discipline takeover and release already follow.
+        try:
+            lib.marker_path(lease_id).unlink()
+        except FileNotFoundError:
+            pass
+    lib.touch_heartbeat(sid)
+    lib.emit("lease-activated", lease_id, sid, detail=None)
+    print(lease_id)
+    return 0
+
+
+def cmd_next(args) -> int:
+    sid = lib.session_id()
+    rtype = args.next
+    if rtype not in lib.RESOURCE_TYPES:
+        sys.exit(f"fleet-claim: resource type {rtype!r} not in {lib.RESOURCE_TYPES}")
+    # The pool lock makes scan-then-claim atomic against other pullers; the
+    # per-lease write still goes through that lease's own lock underneath.
+    with lib.held_lock(lib.locks_dir() / f"pool-{rtype}.lock"):
+        candidates = [
+            r for r in lib.all_leases()
+            if r.get("state") == "assigned" and r.get("holder") is None
+            and lib.resource_of(r).get("type") == rtype
+            # A hand-edited pool row whose body id is missing/non-string/traversal
+            # is skipped, not pathed (rec["id"] -> lock_path) and not allowed to
+            # block the queue by always sorting first (1522 r5 M1).
+            and isinstance(r.get("id"), str) and lib._ID_RE.match(r["id"])
+            # a role-bearing row is never pool-claimed (1522 #11 r4 M1):
+            # the puller would become the integrator without being told
+            and lib.resource_of(r).get("role") is None
+        ]
+        candidates.sort(key=lambda r: r.get("created") or "")
+        if not candidates:
+            sys.exit(f"fleet-claim: no unclaimed {rtype} pool rows")
+        claimed = None
+        for cand in candidates:
+            lease_id = cand["id"]
+            with lib.held_lock(lib.lock_path(lease_id)):
+                rec = lib.read_lease(lease_id)
+                if (rec is None or rec.get("id") != lease_id
+                        or rec.get("holder") is not None
+                        or rec.get("state") != "assigned"):
+                    # Raced away since the scan — or an aliased pool file whose
+                    # body id names a different lease (the template-copy
+                    # mistake): a deterministic sys.exit here would wedge --next
+                    # forever on the same oldest pick (1522 r9 M3). Warn, try
+                    # the next-oldest.
+                    print(f"fleet: WARN pool row {lease_id} unclaimable "
+                          "(raced or aliased) — trying next", file=sys.stderr)
+                    continue
+                rec["holder"] = sid
+                rec["state"] = "active"
+                rec["activated"] = lib.ts(lib.now_utc())
+                lib.write_lease(rec)
+                claimed = lease_id
+            break
+        if claimed is None:
+            sys.exit(f"fleet-claim: no claimable {rtype} pool rows "
+                     "(all raced away or aliased)")
+    # The ledger write IS the claim, and the caller learns WHICH lease it holds
+    # only from stdout — print before the fallible touch + emit (1493 / r9 M2).
+    print(claimed)
+    sys.stdout.flush()
+    lib.touch_heartbeat(sid)
+    lib.emit("lease-activated", claimed, sid, detail={"via": "pool"})
+    return 0
+
+
+def cmd_takeover(args) -> int:
+    sid = lib.session_id()
+    lease_id = lib.validate_lease_id(args.takeover)
+    with lib.held_lock(lib.lock_path(lease_id)):
+        rec = lib.read_lease_checked(lease_id)
+        if rec is None:
+            sys.exit(f"fleet-claim: no lease {lease_id}")
+        if not rec.get("holder"):
+            sys.exit(f"fleet-claim: {lease_id} is an unclaimed pool row — "
+                     "use --next; takeover would bypass oldest-first fairness")
+        # Re-derive UNDER the lock: two racing claimants serialize here, the
+        # winner rewrites `activated`, so the loser's re-derivation finds fresh
+        # liveness and aborts — even before row 4's heartbeats exist.
+        if not lib.is_orphaned(rec):
+            sys.exit(f"fleet-claim: {lease_id} is not orphaned — holder "
+                     f"{rec.get('holder')!r} is live; takeover refused")
+        prev = rec.get("holder")
+        rec["holder"] = sid
+        rec["state"] = "active"
+        rec["activated"] = lib.ts(lib.now_utc())
+        lib.write_lease(rec)
+        try:
+            lib.marker_path(lease_id).unlink()
+        except FileNotFoundError:
+            pass
+    lib.touch_heartbeat(sid)
+    lib.emit("lease-takeover", lease_id, sid, detail={"from": prev})
+    print(lease_id)
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="fleet-claim", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--assign", metavar="RESOURCE_JSON")
+    g.add_argument("--activate", metavar="LEASE_ID")
+    g.add_argument("--next", metavar="TYPE")
+    g.add_argument("--takeover", metavar="LEASE_ID")
+    ap.add_argument("--holder", default=None,
+                    help="--assign only: intended holder session (omit for a pool row)")
+    ap.add_argument("--ttl", type=int, default=240, help="--assign only: ttl minutes")
+    ap.add_argument("--note", default=None, help="--assign only: short human note (no secrets)")
+    args = ap.parse_args(argv)
+
+    if args.assign:
+        return cmd_assign(args)
+    if args.activate:
+        return cmd_activate(args)
+    if args.next:
+        return cmd_next(args)
+    return cmd_takeover(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

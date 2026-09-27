@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-stalled — daily sweep for a pull request waiting on nobody (plan 0060).
+  Reports four states — unreviewed, stale-review, stale-base, red — dispatches
+  nothing, rebases nothing. Daily, an hour after fleet-orphans so the two
+  reports do not race the same repositories at once.
+
+  Install (opshost): set FLEET_NTFY_URL to the Fleet-ops push URL, then
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-stalled.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-stalled.plist
+  Verify (PROVENANCE §8.3 — see it page before trusting it): run fleet-stalled
+  by hand first in dry run mode (the flag is in bin/fleet-stalled's own
+  help) and confirm the report names a repository count. The first real run
+  baseline-pages once per pre-existing stalled pull request; triage those,
+  then it is quiet until the next head goes stalled.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the shared clone sits on
+  whatever branch a session last left it on (fleet-orphans' own plist carries
+  the same note, and the same postmortem). The pin is a detached worktree of
+  this repo at ~/.local/share/pins/eunomia; fleet-watch reports when it falls
+  behind.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-stalled</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-stalled</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- replace with the real Fleet-ops push URL at install; empty = print-only -->
+    <key>FLEET_NTFY_URL</key><string></string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>8</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/stalled.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/stalled.log</string>
+</dict>
+</plist>

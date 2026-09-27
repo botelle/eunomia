@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-broker-tunnel — put keyvault's forgejo-broker socket on THIS host.
+
+  infra ADR-0003 §2. The watcher no longer holds the owner's Forgejo admin PAT;
+  it asks the broker on vaulthost for the protection verdict. The broker listens on a
+  unix socket (never a TCP port — a LAN port would have to authenticate callers
+  with something they HOLD, which is the copyable-bearer defect ADR-0002 exists
+  to remove, reintroduced in front of the credential ADR-0003 exists to hide).
+  So the socket is forwarded here instead.
+
+  WHY A PERSISTENT FORWARD RATHER THAN ssh-PER-CALL. The retired helper ssh'd to
+  vaulthost ONCE per cycle for a token that was then reused for every repo. Asking the
+  broker is per-REPO, so the naive port of it would ssh ~20 times a cycle — the
+  exact pattern that filled opshost with ~90k TIME_WAIT sockets and broke TCP on
+  2026-08-2x. One long-lived connection, multiplexed by the forward.
+
+  WHAT REPLACES THIS. Nothing in eunomia knows this is ssh: fleet-watch connects
+  to a LOCAL socket path (FLEET_BROKER_SOCKET) and holds no credential. When
+  SPIRE reaches opshost, a Ghostunnel sidecar presents an SVID at the same path and
+  this job goes away. That is the ADR-0002 shape — the app holds nothing, a
+  co-located sidecar terminates — with ssh standing in for the sidecar meanwhile.
+
+  Install (opshost only — the host fleet-watch runs on):
+    mkdir -p ~/run ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-broker-tunnel.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-broker-tunnel.plist
+  Reload after editing (a frozen daemon needs bootout+bootstrap, not kickstart):
+    launchctl bootout gui/$(id -u)/org.eunomia.fleet-broker-tunnel
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-broker-tunnel.plist
+  Verify the postcondition, not the exit code — that the socket ANSWERS.
+  Use the broker's own query script, which defaults to this path:
+    ~/bao/broker/forgejo-broker-query.sh operator/keyvault
+  (or curl with its unix-socket option against ~/run/forgejo-broker.sock;
+  written out rather than shown because a double dash cannot appear inside
+  an XML comment. launchd tolerates one; plistlib and expat do not.)
+
+  If this job is down the watcher pages ONCE and scans nothing. It does not
+  refuse every repo; see broker_verdict() and ADR-0003 §6.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.eunomia.fleet-broker-tunnel</string>
+
+  <!-- -N: no remote command, forwarding only. The LOCAL socket is removed first
+       because ssh refuses to bind an existing path, and an unclean stop leaves
+       one behind — without the rm the job crash-loops on "Address already in
+       use" and the watcher reads the fleet as blind.
+       ExitOnForwardFailure makes ssh exit non-zero if it cannot ESTABLISH the
+       forward, which for -L means the local bind. Be exact about what that does
+       NOT cover: a -L unix forward connects to the REMOTE socket lazily, per
+       connection, so with the broker down on vaulthost ssh stays up and accepts then
+       closes each local connection. That is a live tunnel answering nothing,
+       and this option does not prevent it. It is handled a layer up instead —
+       an accept-then-close renders as status 0 in _broker_get, which is
+       UNDETERMINED, and the message names both the tunnel and the broker. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>rm -f "$HOME/run/forgejo-broker.sock"; exec /usr/bin/ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L "$HOME/run/forgejo-broker.sock:/Users/operator/bao/run/forgejo-broker.sock" vaulthost</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- KeepAlive unconditionally, including on a clean exit: ssh exiting 0 after
+       the far side closes is still an outage of the forward. ThrottleInterval
+       stops a vaulthost reboot turning into a reconnect storm. -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <!-- Absolute on purpose, and inconsistent with the $HOME in
+       ProgramArguments for a reason: launchd does NOT expand $HOME in a
+       path key, only the shell above expands it in the command. A
+       missing StandardOutPath directory silently prevents the job from
+       starting, so this is the one place the literal home has to appear.
+       Replace it if this is ever installed under another account. -->
+  <key>StandardOutPath</key>
+  <string>/Users/operator/dev/.fleet/broker-tunnel.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/operator/dev/.fleet/broker-tunnel.log</string>
+</dict>
+</plist>

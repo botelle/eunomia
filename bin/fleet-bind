@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""fleet-bind — bind this session's id to the OS process serving it. SessionStart-hook safe.
+
+Invoked by the Claude Code SessionStart hook (`startup|resume|clear|compact|fork`).
+Reads the hook's JSON on stdin for `session_id` and `source` (hooks do not inherit a
+session's shell exports — the fleet-heartbeat lesson), resolves the Claude Code
+process by walking up the hook's OWN ancestry, and writes
+`sessions/<sid>/host` — a single file, not a directory — holding that pid and its
+process start time. Nothing else reads `EUNOMIA_SESSION`: a binding recorded under
+an identity the hook did not itself observe on stdin could kill the wrong process
+later on that record's authority (plan 0012 §3).
+
+Contract (plan 0012 §3):
+  * ALWAYS exits 0 — a binding failure is telemetry lost, never a session lost.
+  * Prints NOTHING on stdout — a SessionStart hook's stdout is injected into the
+    session's own context, so a debug line here is a prompt, not a log line.
+    Nothing on stderr either. Failures append to `<fleet>/bind.log`, and — because
+    the failure that matters most is the fleet tree itself being unwritable, which
+    would make a log inside it record nothing — fall back to a file under
+    `~/Library/Logs` when the primary log can't be written.
+  * Writes `sessions/<sid>/host` only. Never `sessions/<sid>/pids/`: that
+    directory is `fleet-pkill`'s registry of pids a session SPAWNED and can
+    prove ownership of: writing the session's own Claude process there would
+    make `fleet-pkill claude` (or `model`, or any substring of its own long
+    command line) a legitimate self-kill target from inside that very
+    session, mid-task, with leases still held.
+  * Never writes leases, never emits events. Binding is not claiming.
+  * HOST-LOCAL only: no ssh fallback. A pid recorded under a different host's
+    process table is not a valid record in a ledger with cross-host writers.
+
+One process serves one session at a time: writing `<sid>/host` first PRUNES
+every OTHER `sessions/*/host` that already names this exact (pid, start time) —
+`/clear` and interactive `/resume` both fire SessionStart with a NEW session id
+inside the SAME process, and an un-pruned old binding is a live-pid,
+stale-heartbeat decoy for `fleet-pkill --session` to mistake for a hung session.
+
+One session is served by one process at a time: a binding whose recorded
+(pid, start time) is STILL LIVE is never overwritten — a blind overwrite here
+would let a hung session's `/resume` from a fresh terminal rebind its sid to the
+new window's pid, leaving the actually-hung process both unbound and invisible.
+The refusal is recorded at `sessions/<sid>/contested` (pid, start time, source)
+so a later reader (plan 0014's `fleet-pkill --session`) can show the
+disagreement instead of a heartbeat that lies. `contested` is cleared the
+moment it stops being true: when the hook writes that sid's `host`, when the
+recorded pair is no longer live, or — on every invocation, for every sid — when
+the contested record names THIS process (the `/clear`-into-a-new-sid case,
+review 2547 M1).
+
+Install (opshost, one entry in ~/.claude/settings.json beside fleet-heartbeat's
+Stop hook). From the SAME detached worktree the secret guard and heartbeat
+use, never from ~/dev/eunomia (ADR-0005):
+  {"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+    "command": "python3 ~/.local/share/pins/eunomia/bin/fleet-bind"}]}]}}
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+_lib_loader = importlib.machinery.SourceFileLoader(
+    "fleetlib", str(Path(__file__).resolve().parent / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+# The CLI engine process, whether launched from a terminal (/opt/homebrew/bin/claude)
+# or embedded inside the desktop app (…/claude.app/Contents/MacOS/claude) — measured
+# 2026-09-06, both wear this exact basename. The desktop app's OWN shell process is
+# `/Applications/Claude.app/Contents/MacOS/Claude` — capital C — a few hops further
+# out; matching it would bind the outer app shell's pid, not the engine actually
+# serving this session (plan 0012 §2).
+_TARGET_BASENAME = "claude"
+
+
+def _log(msg: str) -> None:
+    line = msg.rstrip() + "\n"
+    try:
+        p = lib.fleet_dir() / "bind.log"
+        if p.exists() and p.stat().st_size > 1_000_000:
+            p.write_text("")
+        with open(p, "a") as fh:
+            fh.write(line)
+        return
+    except OSError:
+        pass
+    try:                         # the tree itself may be the thing that's unwritable
+        d = Path.home() / "Library" / "Logs"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "eunomia-fleet-bind.log", "a") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+def _read_stdin():
+    try:
+        if sys.stdin.isatty():
+            return "", ""
+        raw = sys.stdin.read()
+    except OSError:
+        return "", ""
+    if not raw.strip():
+        return "", ""
+    try:
+        d = json.loads(raw)
+    except (json.JSONDecodeError, AttributeError):
+        _log("WARN unparseable hook payload")
+        return "", ""
+    return str(d.get("session_id") or ""), str(d.get("source") or "")
+
+
+def _read_pair(path: Path):
+    try:
+        d = json.loads(path.read_text())
+        return int(d["pid"]), str(d["lstart"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
+def _is_live(pid: int, lstart: str) -> bool:
+    cur = lib._lstart(pid)
+    return cur is not None and cur == lstart
+
+
+def _prune_matching_hosts(root: Path, pid: int, started: str) -> None:
+    if not root.is_dir():
+        return
+    for host_path in root.glob("*/host"):
+        if _read_pair(host_path) == (pid, started):
+            try:
+                host_path.unlink()
+            except OSError:
+                pass
+
+
+def _sweep_contested(root: Path, pid: int, started: str) -> None:
+    """Clear pre-existing `contested` records that are no longer true: their
+    (pid, start time) is no longer live, or they name THIS process — a claim
+    this same process made on some other sid before moving on to serve a
+    different one (review 2547 M1). Runs BEFORE this invocation's own
+    write/refuse decision, so a contested record this call is about to write
+    for its own sid is never the one being swept."""
+    if not root.is_dir():
+        return
+    for cpath in root.glob("*/contested"):
+        pair = _read_pair(cpath)
+        if pair is None:
+            continue
+        if pair == (pid, started) or not _is_live(*pair):
+            try:
+                cpath.unlink()
+            except OSError:
+                pass
+
+
+def main() -> int:
+    sid, source = _read_stdin()
+    if not sid or not lib._SID_RE.match(sid):
+        return 0                # no observed identity, nothing to bind
+
+    table = lib.proc_table()
+    pid = lib.nearest_ancestor_pid(os.getppid(), _TARGET_BASENAME, table=table)
+    if pid is None:
+        _log(f"session {sid}: no '{_TARGET_BASENAME}' ancestor within hop bound")
+        return 0
+    started = lib._lstart(pid)
+    if started is None:
+        _log(f"session {sid}: lstart probe failed for pid {pid}")
+        return 0
+
+    root = lib.sessions_dir()
+    _prune_matching_hosts(root, pid, started)
+    _sweep_contested(root, pid, started)
+
+    host_path = root / sid / "host"
+    contested_path = root / sid / "contested"
+    existing = _read_pair(host_path)
+
+    if existing is not None and existing != (pid, started) and _is_live(*existing):
+        _write_json(contested_path, {"pid": pid, "lstart": started, "source": source})
+        _log(f"session {sid}: refused to rebind — held by live pid {existing[0]}")
+        return 0
+
+    _write_json(host_path, {"pid": pid, "lstart": started})
+    if contested_path.exists():
+        try:
+            contested_path.unlink()
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    # Same structural guarantee as fleet-heartbeat: catch everything, log
+    # best-effort, exit 0. A hook that can refuse to start a session is a hook
+    # that will eventually refuse to start every session.
+    try:
+        rc = main()
+    except BaseException as e:
+        try:
+            _log(f"WARN unexpected {e.__class__.__name__}: {e}")
+        except BaseException:
+            pass
+        rc = 0
+    sys.exit(rc)

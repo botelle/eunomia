@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""fleet-emit — append one event to the fleet ledger's append-only log.
+
+Per SPEC.md ("Event record", "Locking protocol", "CLI surface"): one JSON object
+per line in `events.jsonl`, appended under `flock(EX)` on the stable lockfile
+`locks/events.lock`. The log itself is opened BY PATH only after the lock is held —
+that ordering is what keeps a concurrent rotation from losing an append (a writer
+that opened before the rotator renamed would keep writing into the now-archived
+file; opening under the lock guarantees the writer sees whichever file is current).
+
+Event types are the v0.2 closed set (SPEC.md "Event record"); anything else is
+rejected non-zero rather than silently widening the set.
+
+Secret hygiene (Principle 6 — this tree is rendered by atlas): fleet-emit writes
+exactly the structured fields it is given and never inspects, redacts, or echoes
+`--detail-json` content on success. Producers are trusted per Principle 5
+(cooperative, not adversarial) to keep secrets out of event fields; this CLI's own
+obligation is narrower — never itself become a leak path, e.g. by echoing an
+unparseable --detail-json value back in an error message.
+"""
+import argparse
+import fcntl
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+FLEET_DIR = Path(os.environ.get("EUNOMIA_FLEET_DIR") or Path.home() / "dev" / ".fleet")
+EVENTS = FLEET_DIR / "events.jsonl"
+LOCK = FLEET_DIR / "locks" / "events.lock"
+
+ROTATE_BYTES = 10 * 1024 * 1024
+
+# v0.2 closed set (SPEC.md "Event record"). Additions require a SPEC PR.
+EVENT_TYPES = {
+    "session-spawned", "session-stopped", "session-killed",
+    "lease-assigned", "lease-activated", "lease-released", "lease-orphaned",
+    "lease-takeover",
+    "cr-filed", "cr-applied",
+    "pr-opened", "pr-pushed", "review-posted", "pr-armed", "candidate-testing",
+    "pr-merged", "pr-bounced",
+    "token-minted", "token-revoked",
+    "deploy-started", "deploy-verified",
+    # row 6b (plan 0004): merge-is-ignition dispatch
+    "plan-dispatched", "plan-done", "plan-failed",
+    # plan 0039: a `ready` plan withheld before dispatch because a declared
+    # `depends_on` is unmet — emitted by the watcher ON TRANSITION ONLY (first
+    # blocked, or the reason changes), never once per cycle. No `plan-unblocked`:
+    # a plan that clears its block already produces `plan-dispatched`.
+    "plan-blocked",
+    "budget-checkpoint",
+    # plan 0025: a capability (skill, script, policy, repo) changed under
+    # long-running sessions. Awareness only — never an input to automation.
+    "capability-published",
+    # a pinned worktree drifted from its origin/main: reviewed work is not
+    # reaching sessions. Awareness only -- the watcher never moves a pin.
+    "pin-drift",
+    # plan 0063: a per-repo model choice changed (`bin/fleet-models`, one event per
+    # `repo_model_change` row). This is what makes `repo_model` DERIVABLE from the
+    # ledger after `fleet.db` is lost. `detail` carries runner names, positions and
+    # ordinals ONLY — never a credential; see SPEC.md "repo-model-changed".
+    "repo-model-changed",
+    # plan 0068: a fleet-scoped setting changed (`bin/fleet-config`, one event
+    # per `fleet_setting_change` row) — the same durability shape as
+    # `repo-model-changed`, on a plainer table. `detail` carries the setting's
+    # key and its old/new value ONLY; see SPEC.md "fleet-setting-changed".
+    "fleet-setting-changed",
+    # plan 0078 / ADR-0012: `bin/mopsus` (mechanical mode) released a failed
+    # dispatch lease so the watcher can dispatch the plan again. `detail`:
+    # plan, lease, class, attempt, limit.
+    "plan-requeued",
+}
+
+
+def _rotate_if_needed():
+    """Rotate events.jsonl to a timestamped archive if it has crossed the size
+    threshold. Must be called with locks/events.lock already held."""
+    try:
+        size = EVENTS.stat().st_size
+    except FileNotFoundError:
+        return
+    if size < ROTATE_BYTES:
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    archive = FLEET_DIR / f"events-{stamp}.jsonl"
+    if archive.exists():
+        # SPEC.md notes the timestamp avoids same-day collisions; a same-SECOND
+        # collision would mean two rotations serialized on this very lock within
+        # one second, which is a sign something is wrong. Refuse loudly rather
+        # than silently clobber the earlier archive (postmortem class D).
+        sys.exit(f"fleet-emit: rotation target {archive} already exists — refusing to overwrite")
+    EVENTS.rename(archive)
+
+
+def _repair_tail():
+    """Close a torn final line with a newline. Caller holds locks/events.lock."""
+    try:
+        with open(EVENTS, "ab+") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != b"\n":
+                fh.write(b"\n")
+    except FileNotFoundError:
+        pass
+
+
+def emit(event_type, actor, repo=None, pr=None, sha=None, lease=None, detail=None):
+    if event_type not in EVENT_TYPES:
+        sys.exit(f"fleet-emit: unknown event type {event_type!r} (v0.2 closed set)")
+    if not actor:
+        sys.exit("fleet-emit: no actor — set EUNOMIA_SESSION or pass --session")
+
+    is_lease_event = event_type.startswith("lease-")
+    if is_lease_event and not lease:
+        sys.exit(f"fleet-emit: {event_type} is a lease-* event and requires --lease")
+    # plan-requeued (plan 0078) is the one non-lease-* type that names a lease:
+    # the failed lease mopsus released.
+    if not is_lease_event and lease is not None and event_type != "plan-requeued":
+        sys.exit(f"fleet-emit: {event_type} is not a lease-* event — SPEC requires lease=null")
+
+    record = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "actor": actor,
+        "type": event_type,
+        "repo": repo,
+        "pr": pr,
+        "sha": sha,
+        "lease": lease,
+        "detail": detail if detail is not None else {},
+    }
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        FLEET_DIR.mkdir(parents=True, exist_ok=True)
+        # Tail repair FIRST, then rotate: a writer killed mid-append (or a
+        # disk-full partial flush) leaves the file without a trailing newline.
+        # Repairing before rotation means an archive can never contain a torn
+        # tail — the first version rotated first, which shipped the torn line
+        # into the archive and permanently stalled every --follow reader parked
+        # on it (review 1490 M1). Repairing also stops this event MERGING into
+        # the torn line, which would exit 0 while the event was unreadable
+        # forever. The torn record is the only casualty, never a healthy one.
+        _repair_tail()
+        _rotate_if_needed()
+        # Open BY PATH only now: if a rotation just renamed events.jsonl out from
+        # under us, this open creates/re-opens the fresh file rather than
+        # appending into a handle for the file that just became an archive.
+        with open(EVENTS, "ab") as fh:
+            fh.write(line.encode("utf-8"))
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    return record
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="fleet-emit",
+        description="Append one event to the fleet ledger's append-only log.",
+    )
+    ap.add_argument("type", help="event type (v0.2 closed set — see SPEC.md)")
+    ap.add_argument("--repo", default=None, help="owner/repo")
+    ap.add_argument("--pr", default=None, type=int, help="PR number")
+    ap.add_argument("--sha", default=None, help="head SHA (pr-*) or merge SHA (pr-merged, deploy-*)")
+    ap.add_argument("--lease", default=None, help="lease id — required for lease-* events, forbidden otherwise")
+    ap.add_argument("--detail-json", default=None, help="JSON object, defaults to {}")
+    ap.add_argument("--session", default=None, help="actor override (tests use this instead of EUNOMIA_SESSION)")
+    args = ap.parse_args(argv)
+
+    if args.detail_json is not None:
+        try:
+            detail = json.loads(args.detail_json)
+        except json.JSONDecodeError:
+            # Deliberately not echoing the raw value: it may be a mistyped paste
+            # that partially contains the secret material Principle 6 forbids.
+            sys.exit("fleet-emit: --detail-json is not valid JSON")
+        if not isinstance(detail, dict):
+            sys.exit("fleet-emit: --detail-json must decode to a JSON object")
+    else:
+        detail = {}
+
+    actor = args.session or os.environ.get("EUNOMIA_SESSION")
+
+    record = emit(
+        args.type, actor,
+        repo=args.repo, pr=args.pr, sha=args.sha, lease=args.lease, detail=detail,
+    )
+    print(json.dumps(record, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

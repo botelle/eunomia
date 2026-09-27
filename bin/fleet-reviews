@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""fleet-reviews — the review record: which PR, which round, what it cost.
+
+Adds a `review` table to the fleet history DB and fills it from Forgejo, which
+is the only place that knows a session was a review of a particular pull
+request.
+
+**Why Forgejo and not the DB.** `fleet-collect` stores `first_prompt` redacted
+and capped at 300 characters, and `tool_use.target` keeps only the verb of a
+Bash command. Neither carries the repository or the PR number, so the history
+DB cannot be backfilled from itself — a fact worth stating precisely, because the
+failure is partial rather than total. An anchored parse for the dispatcher's
+template recovers nothing — the template puts `Repository:` past the 300-char
+cap — while a loose repo-and-number parse finds about 30% of the population,
+namely the hand-written prompts. A table built that way looks populated and
+omits exactly the reviews the pipeline produced.
+
+**Tokens are the unit, not dollars.** Rates change, need chasing, and were got
+wrong twice on 2026-09-02 by pricing a single prompt for a multi-turn loop and
+by matching model names with `like`. Token counts are stable month to month and
+comparable without a source to maintain. A `model_price` table exists for
+anyone who wants currency later; nothing here reads it.
+
+  fleet-reviews --backfill        fill from Forgejo (idempotent)
+  fleet-reviews --report [--repo R]   per-PR rounds, turns, tokens
+  fleet-reviews --inflight        leases older than the overdue bound
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+_forge_loader = importlib.machinery.SourceFileLoader(
+    "fleetforge", str(Path(__file__).resolve().parent / "fleetforge.py"))
+_forge_spec = importlib.util.spec_from_loader("fleetforge", _forge_loader)
+fleetforge = importlib.util.module_from_spec(_forge_spec)
+_forge_loader.exec_module(fleetforge)
+
+DB = os.path.expanduser(os.environ.get("FLEET_DB", "~/dev/.fleet/fleet.db"))
+_DEFAULT_FORGEJO_URL = "http://forge.example:3000"
+# The default owner lives here, at this CLI's one edge, not in fleetforge.py
+# (plan 0022 §3, "Don't write operator into fleetforge.py"): the module has to
+# make sense in a repository that is not ours.
+OWNER = os.environ.get("FLEET_FORGE_OWNER", "operator")
+REPOS = os.environ.get("FLEET_REVIEW_REPOS",
+                       "agent-bus,agent-guardrails,ares,bakeoff-ongoing,"
+                       "operator-net,keyvault,eunomia,infra,speakhush").split(",")
+REVIEWER = os.environ.get("FLEET_REVIEWER", "revbot")
+
+
+def _qualify(repo):
+    """A bare repo name is qualified with OWNER; a full owner/repo passes
+    unchanged. All three places that used to hardcode `operator` — the request
+    paths, the stored row, and the `--report --repo` filter — call this, so a
+    non-default OWNER cannot desync them (an unqualified filter under a
+    non-default owner would report "no reviews recorded" against rows the
+    backfill just wrote)."""
+    return repo if "/" in repo else f"{OWNER}/{repo}"
+
+
+def _forgejo_base_url():
+    """FLEET_FORGEJO_URL is the bare origin every other fleet tool reads;
+    fleetforge.Forge appends /api/v1 itself. This tool alone read FORGEJO_API,
+    shaped as <origin>/api/v1 (paths used to be concatenated onto it
+    directly) — kept as a fallback, but normalised: a trailing /api/v1 is
+    stripped before it becomes a base_url, because fed raw it would request
+    /api/v1/api/v1/... and every call would 404, on exactly the host the
+    fallback exists for. FLEET_FORGEJO_URL wins when both are set. A launchd
+    unit is edited by a human after a pull, never before (the 2026-08-27
+    ordering trap), so when only the old knob is set this warns once rather
+    than silently reading it."""
+    new = os.environ.get("FLEET_FORGEJO_URL", "").strip()
+    if new:
+        return new.rstrip("/")
+    old = os.environ.get("FORGEJO_API", "").strip()
+    if old:
+        print("fleet-reviews: reading FORGEJO_API; the other fleet tools "
+              "read FLEET_FORGEJO_URL — set that instead", file=sys.stderr)
+        base = old.rstrip("/")
+        if base.endswith("/api/v1"):
+            base = base[: -len("/api/v1")]
+        return base
+    return _DEFAULT_FORGEJO_URL
+
+# Start generous and tighten with evidence. 30 minutes is above every measured
+# review (the longest observed was 622s) and well above any orchestrator run
+# seen so far — deliberately, because an unbounded "overdue" is a dashboard that
+# is always red and therefore never read. Lower it when the history says what
+# normal is, not before.
+OVERDUE_SECONDS = int(os.environ.get("FLEET_OVERDUE_SECONDS", "1800"))
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS review (
+  forgejo_id   INTEGER PRIMARY KEY,   -- the review id; idempotent by construction
+  repo         TEXT NOT NULL,
+  pr           INTEGER NOT NULL,
+  round        INTEGER,               -- nth review on this PR, by time
+  reviewer     TEXT NOT NULL,
+  model        TEXT,                  -- from the Review-provenance line
+  provenance   TEXT,                  -- same-session-as-author=...
+  verdict      TEXT,                  -- APPROVED | COMMENT | REQUEST_CHANGES
+  head_sha     TEXT,
+  submitted_at TEXT,
+  session_uuid TEXT,                  -- the reviewer's own session, from `session=` in the
+                                      -- provenance line; NULL where the line has none (never
+                                      -- guessed from a time window -- plan 0076)
+  dismissed    INTEGER DEFAULT 0,     -- Forgejo keeps state=APPROVED and sets this
+  stale        INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS review_pr ON review(repo, pr);
+
+-- Secondary and unused by this tool. Present so cost can be computed later
+-- without inventing a schema under time pressure; every row needs a date and a
+-- source, because an unsourced rate is how a $15k-$40k figure ended up in four
+-- governance documents.
+CREATE TABLE IF NOT EXISTS model_price (
+  model      TEXT NOT NULL,
+  as_of      TEXT NOT NULL,
+  source     TEXT NOT NULL,
+  in_per_mtok  REAL,
+  out_per_mtok REAL,
+  cache_write_multiplier REAL,
+  cache_read_multiplier  REAL,
+  PRIMARY KEY (model, as_of)
+);
+"""
+
+_PROV = re.compile(r"Review-provenance:\s*model=([^;\s]+)\s*;?\s*(.*)")
+# `session=<uuid>` rides inside the provenance remainder (talos plan 0007 prints
+# it). It is lifted out into `review.session_uuid`; `provenance` keeps its text
+# exactly as before, so a line with or without the field parses the same.
+# Read from the provenance LINE only: `_PROV`'s `\s*` runs across a newline, so
+# its remainder can swallow the next line of the review's prose.
+_PROV_LINE = re.compile(r"Review-provenance:[^\n]*")
+_PROV_SESSION = re.compile(r"[;:\s]\s*session=([0-9A-Fa-f-]{8,})\s*(?=;|$)")
+
+
+class TokenError(RuntimeError):
+    """A resolver miss, named by role and configuration key.
+
+    Never built from the helper's stdout or stderr (plan 0055 boundary): the
+    helper's own stderr can quote the token, e.g. a curl trace repeating the
+    header it failed to send, and a failure message that formats `{e}` would
+    carry that one level up into whatever prints this exception."""
+
+
+_TOKEN_ROLES = {
+    # This backfill only ever reads; "reading" is the same role
+    # fleet-watch/fleet-orphans/fleet-candidate resolve via FLEET_TOKEN_CMD,
+    # so an operator who already pointed that at a different helper does not
+    # have to configure this tool separately too.
+    "reading": ("FLEET_TOKEN_CMD", "~/bin/fetch-forgejo-token.sh"),
+}
+
+
+def token_for(role):
+    """The Forgejo token for `role`, via a command configurable per role.
+
+    Both the env var and the default are named in `_TOKEN_ROLES`, not inlined
+    at the call site — the thing plan 0055 removed was a `subprocess.run`
+    whose argv held the helper's path directly, which meant no deployment
+    could point this tool anywhere else without editing this file."""
+    try:
+        env_key, default = _TOKEN_ROLES[role]
+    except KeyError:
+        raise TokenError(f"token_for(role={role!r}): no such role")
+    cmd = os.environ.get(env_key, "").strip() or os.path.expanduser(default)
+    try:
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True,
+                           timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise TokenError(f"token_for(role={role!r}) via {env_key}: helper "
+                         f"did not run ({e.__class__.__name__})")
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not lines:
+        raise TokenError(f"token_for(role={role!r}) via {env_key}: helper "
+                         "produced no token")
+    return lines[-1]
+
+
+_FAILURES = []
+
+
+def _paged_all(pages, what):
+    """Drain a fleetforge.paged() iterator into a list, or None on failure.
+
+    A truncated read must not be indistinguishable from a short one: any page
+    that comes back unreadable fails the WHOLE read (mirrors the pre-module
+    `_paged`, whose test pins exactly this) — partial pages already pulled off
+    `pages` are simply not used. `cap=None` (the default `paged()` uses) means
+    this can never itself report cap-hit; it is written to handle that outcome
+    anyway so a future cap does not silently fall through as "exhausted"."""
+    out = []
+    for page in pages:
+        out.extend(page)
+    if pages.outcome != fleetforge.EXHAUSTED:
+        # The pre-module `_get` recorded `-> HTTP 401` / `-> URLError`; a bare
+        # `.outcome` collapses those into one `"failed"` string, making an
+        # expired token indistinguishable from Forgejo being down (review
+        # 2146 M1). `.failed_status` carries the real code back when there is
+        # one — an HTTP status is truthy and non-zero; a transport failure
+        # (status 0, no status at all) falls back to the outcome string,
+        # which is all that survives that case under the module's contract.
+        detail = pages.outcome or "unreadable"
+        if pages.outcome == fleetforge.FAILED and pages.failed_status:
+            detail = f"HTTP {pages.failed_status}"
+        _FAILURES.append(f"{what} -> {detail}")
+        return None
+    return out
+
+
+def backfill(con, forge):
+    seen = added = 0
+    for repo in REPOS:
+        repo = repo.strip()
+        if not repo:
+            continue
+        full = _qualify(repo)
+        prs = _paged_all(fleetforge.paged(forge.list_pulls, full, state="all"),
+                         f"{full} pulls")
+        if prs is None:
+            continue                        # recorded in _FAILURES; never silent
+        for pr in prs:
+            # paged: the reviews endpoint takes page/limit like every other list
+            # here, and the REVIEWER filter runs AFTER the fetch — so an unpaged
+            # read silently dropped this reviewer's later rounds on busy PRs
+            revs = _paged_all(fleetforge.paged(forge.list_reviews, full, pr["number"]),
+                              f"{full}#{pr['number']} reviews")
+            if revs is None:
+                continue
+            mine = sorted((x for x in revs if (x.get("user") or {}).get("login") == REVIEWER),
+                          key=lambda x: x.get("submitted_at") or "")
+            for n, rv in enumerate(mine, 1):
+                seen += 1
+                body = rv.get("body") or ""
+                m = _PROV.search(body)
+                line = _PROV_LINE.search(body) if m else None
+                ms = _PROV_SESSION.search(line.group(0)) if line else None
+                # ON CONFLICT DO UPDATE, not INSERT OR IGNORE: a review's
+                # `dismissed` flag changes AFTER it is written (any push to the
+                # branch dismisses standing approvals), and Forgejo does not
+                # rewrite `state` when it does. Ignoring the conflict froze the
+                # first observation forever, so a dismissed approval kept
+                # counting as an approval and no re-run could ever correct it.
+                cur = con.execute(
+                    "INSERT INTO review (forgejo_id, repo, pr, round, reviewer, "
+                    "model, provenance, verdict, head_sha, submitted_at, "
+                    "dismissed, stale, session_uuid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(forgejo_id) DO UPDATE SET "
+                    "  round=excluded.round, verdict=excluded.verdict, "
+                    "  dismissed=excluded.dismissed, stale=excluded.stale, "
+                    "  model=COALESCE(excluded.model, review.model), "
+                    "  provenance=COALESCE(excluded.provenance, review.provenance), "
+                    # A backfill fills a NULL and never replaces a value: the
+                    # column is the reviewer's own session id, and a later read
+                    # of the same review must not move it.
+                    "  session_uuid=COALESCE(review.session_uuid, excluded.session_uuid)",
+                    (rv.get("id"), full, pr["number"], n, REVIEWER,
+                     m.group(1) if m else None, m.group(2).strip() if m else None,
+                     rv.get("state"), rv.get("commit_id"), rv.get("submitted_at"),
+                     1 if rv.get("dismissed") else 0, 1 if rv.get("stale") else 0,
+                     ms.group(1) if ms else None))
+                added += cur.rowcount
+    con.commit()
+    print(f"backfill: {seen} reviews seen, {added} rows written")
+    if _FAILURES:
+        print(f"backfill: {len(_FAILURES)} request(s) FAILED — this record is "
+              f"incomplete and must not be read as a census:", file=sys.stderr)
+        for f in _FAILURES[:10]:
+            print(f"  {f}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def report(con, repo_filter=None):
+    # rows are stored fully qualified, so a bare `--repo eunomia` matched
+    # nothing and printed "0 pull requests" — a wrong answer that looks like a
+    # finding. Accept either spelling, and say so when the filter matches
+    # nothing rather than reporting an empty census.
+    if repo_filter:
+        repo_filter = _qualify(repo_filter)
+    q = """
+      SELECT r.repo, r.pr, COUNT(*) AS rounds,
+             SUM(CASE WHEN r.verdict='APPROVED' AND NOT r.dismissed
+                      THEN 1 ELSE 0 END) AS approvals,
+             MIN(r.submitted_at) AS first_seen, MAX(r.submitted_at) AS last_seen,
+             GROUP_CONCAT(DISTINCT r.model)
+        FROM review r {where}
+       GROUP BY r.repo, r.pr
+       ORDER BY rounds DESC, r.repo, r.pr
+    """.format(where="WHERE r.repo = ?" if repo_filter else "")
+    rows = con.execute(q, (repo_filter,) if repo_filter else ()).fetchall()
+    if repo_filter and not rows:
+        known = [r[0] for r in con.execute("SELECT DISTINCT repo FROM review ORDER BY 1")]
+        print(f"no reviews recorded for {repo_filter!r}. known repos: "
+              f"{', '.join(known) or '(none)'}", file=sys.stderr)
+        return
+    _model_coverage_warning(con)
+    print(f"{'repo':24} {'pr':>5} {'rounds':>7} {'appr':>5}  span")
+    for repo, pr, rounds, appr, a, b, models in rows:
+        span = f"{(a or '')[:16]} → {(b or '')[:16]}"
+        print(f"{repo:24} {pr:>5} {rounds:>7} {appr:>5}  {span}")
+    print(f"\n{len(rows)} pull requests, {sum(r[2] for r in rows)} reviews")
+
+
+def _model_coverage_warning(con):
+    """Refuse to let anyone group outcomes by model without seeing the bias.
+
+    `post-review.py` REQUIRES a `Review-provenance` line on an APPROVED review
+    and accepts a COMMENT without one. So the model is recorded far more often
+    when the verdict was an approval, and any "approval rate by model" computed
+    from this table is conditioning on the outcome — it measures the reporting
+    rule, not the reviewer. Backfilled rows showed 65% of approvals carrying a
+    model against 22% of comments, which renders every model at or near 100%.
+
+    Stated at the bottom of every report rather than in a comment, because the
+    number looks like a finding and reads as one.
+    """
+    rows = dict(con.execute(
+        "SELECT verdict, COUNT(*) FROM review GROUP BY verdict").fetchall())
+    withm = dict(con.execute(
+        "SELECT verdict, SUM(model IS NOT NULL) FROM review GROUP BY verdict").fetchall())
+    ap, co = rows.get("APPROVED", 0), rows.get("COMMENT", 0)
+    if not (ap and co):
+        return
+    ra = (withm.get("APPROVED") or 0) / ap
+    rc = (withm.get("COMMENT") or 0) / co
+    if abs(ra - rc) > 0.15:
+        print(f"\nNOTE: model is recorded on {ra:.0%} of approvals but only {rc:.0%} of "
+              f"comments,\n      because post-review.py requires a provenance line only "
+              f"on approvals.\n      Do NOT compute approval rate by model from this "
+              f"table — it conditions\n      on the outcome and returns ~100% for "
+              f"everything.")
+
+
+def _migrate(con):
+    """CREATE TABLE IF NOT EXISTS adds no columns to a table that already
+    exists, so a DB written before `dismissed` landed would read NULL there and
+    `NOT r.dismissed` would drop every one of its rows from the approval count.
+    Add what is missing, defaulted to 0."""
+    have = {r[1] for r in con.execute("PRAGMA table_info(review)")}
+    for col in ("dismissed", "stale"):
+        if col not in have:
+            con.execute(f"ALTER TABLE review ADD COLUMN {col} INTEGER DEFAULT 0")
+    con.commit()
+
+
+def _enable_wal(con):
+    """Plan 0063 D3: WAL at every open by every writer (see bin/fleet-models).
+    A refusal is a warning, not a failure; the next open retries."""
+    try:
+        con.execute("PRAGMA journal_mode=WAL").fetchone()
+    except sqlite3.OperationalError as e:
+        print(f"fleet-reviews: could not switch to WAL ({e}) — continuing", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--backfill", action="store_true")
+    ap.add_argument("--report", action="store_true")
+    ap.add_argument("--repo")
+    a = ap.parse_args()
+    if not os.path.exists(DB):
+        sys.exit(f"FATAL: no history DB at {DB}")
+    con = sqlite3.connect(DB)
+    _enable_wal(con)
+    con.executescript(SCHEMA)
+    _migrate(con)
+    rc = 0
+    if a.backfill:
+        try:
+            token = token_for("reading")
+        except TokenError as e:
+            sys.exit(f"FATAL: {e}")
+        # timeout=30, not the module's 20s default: this backfill's own
+        # pre-migration HTTP request ran at 30s, and a single hardcoded value
+        # in fleetforge would have silently shortened it (review 2146 LOW).
+        forge = fleetforge.Forge(_forgejo_base_url(), token, timeout=30)
+        rc = backfill(con, forge)
+    if a.report or not a.backfill:
+        report(con, a.repo)
+    con.close()
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

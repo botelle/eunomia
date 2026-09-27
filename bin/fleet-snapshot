@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""fleet-snapshot — consistent point-in-time copy of fleet.db for the backup set.
+
+`VACUUM INTO` is the supported way to snapshot a live SQLite database: it takes a
+read lock, writes a defragmented copy, and cannot observe a half-committed
+transaction. Copying the file with `cp` while the collector is mid-write can
+capture a torn page plus a stale -wal, which restores as a corrupt database — the
+failure you only discover when you need the restore.
+
+The snapshot is a MEMBER OF THE CROWN-JEWELS BACKUP SET (infra `runbooks/dr-plan.md`
+item 2, "service DBs"). Encryption at rest is restic's job (dr-plan item 3, engine
+decided 2026-08-07: restic over raw tar+age) — this script deliberately does NOT
+roll its own crypto or ship a parallel age pipeline that would be torn out when
+item 3 lands.
+
+Until then the snapshot lives on opshost only (FileVault at rest) and this script
+says so rather than pretending it is backed up: `--verify` reports whether a
+restic repo has been configured yet.
+
+Usage:
+  fleet-snapshot [--db PATH] [--out DIR] [--keep N] [--verify]
+"""
+import argparse
+import os
+import shutil
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_DB = Path.home() / "dev" / ".fleet" / "fleet.db"
+DEFAULT_OUT = Path.home() / "dev" / ".fleet" / "snapshots"
+
+
+def snapshot(db: Path, out_dir: Path, keep: int) -> Path:
+    if not db.exists():
+        sys.exit(f"fleet-snapshot: no database at {db} — run fleet-collect first")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = out_dir / f"fleet-{stamp}.db"
+    if dest.exists():
+        sys.exit(f"fleet-snapshot: {dest} already exists — refusing to overwrite")
+
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        # VACUUM INTO refuses to overwrite, so dest must not exist (checked above).
+        con.execute("VACUUM INTO ?", (str(dest),))
+    finally:
+        con.close()
+
+    # Integrity-check the SNAPSHOT, not the source: a snapshot that cannot be
+    # opened is worse than no snapshot, because it looks like one.
+    chk = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+    try:
+        result = chk.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        chk.close()
+    if result != "ok":
+        dest.unlink(missing_ok=True)
+        sys.exit(f"fleet-snapshot: integrity_check failed ({result}) — snapshot discarded")
+
+    sessions = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+    try:
+        n = sessions.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+    finally:
+        sessions.close()
+
+    print(f"snapshot: {dest} ({dest.stat().st_size/1e6:.1f} MB, {n} sessions, integrity ok)")
+
+    snaps = sorted(out_dir.glob("fleet-*.db"))
+    for old in snaps[:-keep] if keep > 0 else []:
+        old.unlink()
+        print(f"  pruned {old.name}")
+    return dest
+
+
+def verify_backup_coverage(out_dir: Path) -> int:
+    """Say plainly whether these snapshots are actually backed up yet."""
+    have_restic = shutil.which("restic") is not None
+    repo = os.environ.get("RESTIC_REPOSITORY")
+    print()
+    print("backup coverage:")
+    print(f"  snapshots dir     : {out_dir}")
+    print(f"  restic installed  : {'yes' if have_restic else 'NO'}")
+    print(f"  RESTIC_REPOSITORY : {repo or 'unset'}")
+    if have_restic and repo:
+        print("  status            : covered by the restic set (verify with `restic snapshots`)")
+        return 0
+    print("  status            : NOT BACKED UP — opshost-local only (FileVault at rest).")
+    print("                      Encryption at rest + offsite arrive with dr-plan item 3")
+    print("                      (encrypted restic repo on nashost). Add this directory to")
+    print("                      the crown-jewels set (dr-plan item 2, 'service DBs').")
+    return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", type=Path, default=DEFAULT_DB)
+    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--keep", type=int, default=7, help="snapshots to retain (0 = keep all)")
+    ap.add_argument("--verify", action="store_true",
+                    help="report whether snapshots are covered by a backup set")
+    args = ap.parse_args()
+
+    snapshot(args.db, args.out, args.keep)
+    if args.verify:
+        return verify_backup_coverage(args.out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

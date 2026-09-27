@@ -1,0 +1,3195 @@
+#!/usr/bin/env python3
+"""fleet-watch — merge is ignition (plan 0004, roadmap row 6b).
+
+One poll cycle: scan allowlisted, branch-protected repos ON MAIN ONLY for
+feature plans that are `status: ready` and carry no implbot-authored PR (in
+ANY state) marked `Plan: <id>`, then spawn one orchestrator per such plan, up
+to the concurrency cap.
+
+The watcher is MECHANICAL: it never edits a repo, never talks to a model, and
+never acts on staleness. It spawns, it emits, it notifies. Everything
+judgment-shaped lives in bin/orchestrator.
+
+Why main-only: reachability on `main` IS the authorisation. `fleet-plan lint`
+is a validity check, not an authorisation check — only a human's reviewed merge
+produces reachability, so merging a plan file is the ignition and no separate
+arm step exists. "Human" is enforced, not assumed (r6 M2, revised by ADR-0004 2026-09-09):
+main_is_protected refuses any repo where an agent account could PUSH or MERGE
+main, because either writes it outright. Approving is a THRESHOLD, not a write,
+so agents may hold approval rights provided they cannot reach
+`required_approvals` between them — one agent against two required means a human
+approval is structurally mandatory, which Forgejo's scheduled auto-merge cannot
+route around. A `ready` plan on an unmerged branch is invisible here by design.
+
+Config (env; the allowlist has NO default — an unconfigured watcher dispatches
+nothing):
+  FLEET_WATCH_REPOS     comma list, e.g. "operator/sniff,operator/ares"
+  FLEET_WATCH_CAP       max concurrent orchestrators (default 1)
+  FLEET_OPERATOR_UID     numeric Forgejo user id whose `respawn` comment counts
+  FLEET_IMPLEMENTER_UIDS  comma list of numeric uids whose work PRs mark a plan
+                        as dispatched. Preferred over logins: dedupe gates
+                        SPEND, and a rename must not silently re-ignite every
+                        merged plan (r7 M2).
+  FLEET_IMPLEMENTER_LOGINS  comma list, fallback when no uid is configured
+                        (default "implbot")
+  FLEET_AGENT_ACCOUNTS  *** SET THIS ON THE BROKER, NOT HERE. *** Comma list of
+                        ADDITIONAL automated accounts that must never be able to
+                        push or merge main, and that count toward the approvals
+                        SUFFICIENCY test rather than being banned from it
+                        (ADR-0004, revised), merged with the built-in
+                        author/reviewer accounts (r7 L5). Since ADR-0003 §2 it is
+                        read by main_is_protected, which runs in the BROKER's
+                        process on vaulthost — setting it here is a silent no-op and
+                        fails OPEN: a repo whose merge whitelist holds the extra
+                        account comes back ok:true and gets vouched for. It
+                        belongs on keyvault's
+                        net.operator.keyvault-forgejo-broker.plist.
+  FLEET_AUTHOR_ACCOUNT / FLEET_REVIEWER_ACCOUNT / FLEET_MERGER_ACCOUNT
+                        rename the three positions (plan 0056) for a deployment
+                        whose forge accounts are not called implbot,
+                        revbot and operator. Defaults are this fleet's own
+                        accounts; see fleetlib.agent_roles() and
+                        docs/operating.md's mapping. The three POSITIONS
+                        (author/reviewer/merger) are not configurable, only
+                        the names filling them.
+  FLEET_FORGEJO_URL     READ IN BOTH PLACES, and they are not the same read.
+                        Default http://forge.example:3000. THIS host's value
+                        is what every call the watcher still makes uses —
+                        plans/ listings, plan bodies, the dedupe PR scan,
+                        respawn comments — so keep it set here. The BROKER's
+                        own copy decides which Forgejo the protection VERDICT
+                        comes from, because main_is_protected runs in its
+                        process. Only the verdict moved. Set both, and set them
+                        to the same instance.
+  FLEET_VERDICT_SOURCE  "broker" (default) or "direct" — which implementation
+                        answers "is main protected" (plan 0054). Broker is the
+                        default for a reason: this fleet is multi-host, and an
+                        unconfigured watcher must not silently gain a stronger
+                        credential than it is handed. "direct" is for a
+                        deployment where the watcher, the forge credential and
+                        the repository already share one trust boundary; see
+                        docs/plan-dispatch.md for what it costs. Selection is
+                        never a runtime fallback — an unreachable broker stays
+                        "could not determine" and does not fall through.
+  FLEET_DIRECT_TOKEN_CMD  command printing an ADMIN-scoped Forgejo token, read
+                        only when FLEET_VERDICT_SOURCE=direct. No default:
+                        FLEET_TOKEN_CMD's own default helper is write-scoped
+                        and 403s on branch_protections, and this fleet does
+                        not hand out an admin-scoped helper by default.
+  FLEET_BROKER_SOCKET   local unix socket reaching keyvault's forgejo-broker
+                        (default ~/run/forgejo-broker.sock). An ssh forward puts
+                        vaulthost's socket there today; a SPIFFE sidecar will later.
+                        Read only when FLEET_VERDICT_SOURCE=broker (the default).
+  FLEET_BROKER_TIMEOUT  seconds to wait for a verdict (default 90 — the broker's
+                        cold-cache worst case, not the expectation)
+  FLEET_TOKEN_CMD       command printing a Forgejo token (default
+                        ~/bin/fetch-forgejo-token.sh — the sanctioned helper;
+                        the token is never logged, echoed, or spooled)
+  FLEET_ORCHESTRATOR    orchestrator path (default: sibling bin/orchestrator)
+  FLEET_NTFY_URL        push endpoint for surfaced conditions
+  FLEET_PR_PAGE_CAP     list-scan bound (default 20 pages x 50)
+  FLEET_PINS            comma list of DETACHED worktree paths whose HEAD should
+                        equal their own origin/main, e.g.
+                        "~/.local/share/pins/eunomia,~/.local/share/pins/techne".
+                        No default: an unconfigured watcher checks no pins, the
+                        same rule FLEET_WATCH_REPOS follows. Reported only --
+                        the watcher never moves a pin (see check_pins).
+  FLEET_PIN_ADVANCE_PLIST  path to the INSTALLED fleet-pin-advance plist (plan
+                        0059), read once per process for its `StartInterval` --
+                        the window a self-healing stale pin is given before
+                        `check_pins` pages on it. Default
+                        ~/Library/LaunchAgents/org.eunomia.fleet-pin-advance.plist,
+                        the installed copy, not this repo's launchd/ one: the
+                        installed one is what actually runs and the two can
+                        differ. Overridable so a result never depends on
+                        whether the machine running the suite happens to have
+                        the unit installed -- the suite always sets this.
+  FLEET_PIN_PAGE_MARGIN  extra seconds added to that window before paging
+                        (plan 0059; default 600) -- must exceed the watcher's
+                        own poll jitter, or a sample taken moments before the
+                        advancer's next run would misread a healthy pin as
+                        overdue.
+"""
+import datetime as _dt
+import argparse
+import fnmatch
+import http.client
+import importlib.machinery
+import importlib.util
+import json
+import hashlib
+import os
+import plistlib
+import re
+import socket
+import signal
+import subprocess
+import time
+import sys
+import urllib.request
+import uuid
+from pathlib import Path
+
+_lib_loader = importlib.machinery.SourceFileLoader(
+    "fleetlib", str(Path(__file__).resolve().parent / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+# NOT `import fleetforge` (plan 0051 boundary): this file is SourceFileLoader'd
+# from two directories that are not on sys.path — ~/.local/share/pins/eunomia/bin
+# and keyvault's forgejo-broker deployment on vaulthost — and a plain import passes
+# every test here while failing only on vaulthost, where every repo silently reads
+# "could not determine". Same loader shape as fleetlib above.
+_forge_loader = importlib.machinery.SourceFileLoader(
+    "fleetforge", str(Path(__file__).resolve().parent / "fleetforge.py"))
+_forge_spec = importlib.util.spec_from_loader("fleetforge", _forge_loader)
+fleetforge = importlib.util.module_from_spec(_forge_spec)
+_forge_loader.exec_module(fleetforge)
+
+# NOT `import fleetjob` (plan 0053 boundary, the same reason as fleetforge
+# above): this file is SourceFileLoader'd from directories not on sys.path,
+# and a plain import would pass every test here while failing only where it
+# is actually deployed. Same loader shape as fleetlib/fleetforge above.
+_job_loader = importlib.machinery.SourceFileLoader(
+    "fleetjob", str(Path(__file__).resolve().parent / "fleetjob.py"))
+_job_spec = importlib.util.spec_from_loader("fleetjob", _job_loader)
+fleetjob = importlib.util.module_from_spec(_job_spec)
+_job_loader.exec_module(fleetjob)
+
+# bin/fleet-config, by path, same reason as fleetlib/fleetforge/fleetjob above.
+# Loaded once at import so cycle()'s own reads never re-open the module, but
+# the CAP VALUE it resolves is never cached (plan 0068 boundary: not read at
+# import) — only the module object is.
+_config_loader = importlib.machinery.SourceFileLoader(
+    "fleetconfig", str(Path(__file__).resolve().parent / "fleet-config"))
+_config_spec = importlib.util.spec_from_loader("fleetconfig", _config_loader)
+fleetconfig = importlib.util.module_from_spec(_config_spec)
+_config_loader.exec_module(fleetconfig)
+
+BIN = Path(__file__).resolve().parent
+FORGEJO_URL = os.environ.get("FLEET_FORGEJO_URL", "http://forge.example:3000")
+TOKEN_CMD = os.environ.get("FLEET_TOKEN_CMD",
+                           str(Path.home() / "bin" / "fetch-forgejo-token.sh"))
+# The protection verdict comes from keyvault's forgejo-broker, NOT from a token
+# this process holds (infra ADR-0003 §2). `FLEET_ADMIN_TOKEN_CMD` — a recipe for
+# minting the OWNER's admin PAT — is retired: the watcher now asks a question and
+# receives an answer, holding nothing it could leak.
+#
+# A LOCAL unix socket on purpose, and the transport is deliberately not this
+# module's business. Today an ssh forward puts vaulthost's broker socket here
+# (launchd/org.eunomia.fleet-broker-tunnel.plist); under ADR-0002 a Ghostunnel
+# sidecar presents an SVID at the same path. Either way this process connects to
+# a local socket and holds no credential — which is the ADR-0002 shape, not a
+# workaround for it.
+BROKER_SOCKET = os.environ.get(
+    "FLEET_BROKER_SOCKET", str(Path.home() / "run" / "forgejo-broker.sock"))
+def _int_env(key, default):
+    """int() at import raised ValueError on a typo (`CAP=one`, or a comment
+    pasted into a plist) — an unhandled crash-loop under launchd, the class
+    r7 L1 and r8 M3 were fixed for. warn() is not defined yet at import."""
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"fleet-watch: WARN {key}={raw!r} is not an integer — "
+              f"using {default}", file=sys.stderr)
+        return default
+
+
+# The broker's worst case is a cold PAT cache — an AppRole login, a kv read and
+# a revoke at 10s each — then a 20s Forgejo call, and a rejected cached token
+# buys a second round of the same. 25s covered the Forgejo call alone and would
+# have reported that path as UNREACHABLE, which is the opposite of what the
+# comment claimed. Both services answer in milliseconds in practice; this is
+# the ceiling, not the expectation.
+BROKER_TIMEOUT = _int_env("FLEET_BROKER_TIMEOUT", 90)
+# plan 0068: the fallback `cycle()` passes to `fleetconfig.resolve_setting`
+# every cycle — never the resolved cap itself, which is read live from
+# `fleet_setting.dispatch_cap` when a database configures it (D3). Kept as a
+# module attribute, not inlined, because the existing cap tests configure it
+# via `FLEET_WATCH_CAP` at load time and a database-backed test wants the
+# SAME fallback a database-less one gets — this is that one value, read once.
+CAP = _int_env("FLEET_WATCH_CAP", 1)
+CAP_SOURCE = "env" if os.environ.get("FLEET_WATCH_CAP", "").strip() else "default"
+# The (value, source) last printed, so cycle() logs the resolved cap only ON
+# TRANSITION — the same discipline `pin-drift`/`plan-blocked` already follow —
+# rather than once per cycle forever.
+_last_cap_logged = None
+# 20 pages x 50 = 1000 PRs. The scan is oldest-first for stability (r2 M2),
+# but a new plan's marked PR is among the NEWEST — so once a repo's lifetime PR
+# count exceeds the bound, every new plan reads as "unreadable" and dispatch
+# stalls PERMANENTLY (r3 M2). 200 was months away for an active repo; 1000 is
+# years, and hitting it now pages instead of whispering to stderr.
+PAGE_CAP = _int_env("FLEET_PR_PAGE_CAP", 20)
+NOTE_PREFIX = "plan:"          # marks a lease as an orchestrator dispatch slot
+MARKER = "Plan: "              # reserved for author work PRs (the merger never emits it)
+# The respawn instruction is a whole LINE reading `respawn` (optionally in
+# backticks), anywhere in the comment — the orchestrator's `_UNFREEZE_RE`
+# shape. It was a whole-BODY equality until 2026-09-23, and the owner's first
+# real respawn (eunomia#487) never fired: Minos appends
+# `_via minos (<id>.access)_` to every comment it posts, so the body was never
+# equal to the word. A line match survives any client's signature and still
+# refuses "please respawn it": the instruction must stand alone on its line.
+_RESPAWN_RE = re.compile(r"(?im)^\s*`?respawn`?\s*$")
+# This file runs under TWO launchd labels (plan 0058) — a dispatch cycle
+# (`--resident`, `org.eunomia.fleet-watch`) and a pin check
+# (`--pins-only`, `org.eunomia.fleet-pin-watch`) — and `notify()`/
+# `_notify_once()` are shared by both, plus a third caller in
+# bin/fleet-pin-advance. Each caller states which identity it is, as one of
+# these two constants passed explicitly; NOT read from `XPC_SERVICE_NAME`,
+# the only variable launchd sets, because `_child_env` forwards it to every
+# orchestrator this file spawns (so an orchestrator's own page would inherit
+# `org.eunomia.fleet-watch`) and a hand run from Terminal reads "0" either way.
+LABEL_WATCH = "org.eunomia.fleet-watch"
+LABEL_PIN_WATCH = "org.eunomia.fleet-pin-watch"
+# accounts that must never be able to push main directly: one that can would
+# push its own `status: ready` plan and self-ignite (r5 M3)
+#
+# ROLES is fleetlib's one role table (plan 0056): author, reviewer, merger ->
+# account/logins/commit_identity, extending plan 0055's per-role configuration
+# from credentials to identity. This fleet's own accounts (implbot,
+# revbot, operator) are ROLES's documented defaults; docs/operating.md
+# carries the mapping.
+ROLES = lib.agent_roles()
+
+# WHERE THIS IS READ MATTERS NOW (ADR-0003 §2). It is consulted only inside
+# `main_is_protected`, which since the broker exists runs in the BROKER's
+# process on vaulthost — so the value that decides a verdict is the one in the
+# BROKER's environment, not this host's. Setting FLEET_AGENT_ACCOUNTS on the
+# watcher host changes nothing and fails SILENTLY OPEN: a repo whose merge
+# whitelist holds the extra account would come back ok:true and be vouched for.
+# The knob lives on keyvault's forgejo-broker plist; see docs/plan-dispatch.md.
+# Deliberately NOT carried in the request: the set of accounts that count as
+# agents is policy, and a caller that could supply it could send an empty one
+# and be vouched for — "authorize on something the caller controls", which §3
+# forbids. Never the merger's account (ROLES["merger"]) — that is this fleet's
+# one human position, the account the merge whitelist exists for.
+AGENT_ACCOUNTS = lib.agent_accounts(ROLES)
+# r7 M2: dedupe gates SPEND, and it was bound to the literal login
+# `implbot` — the very thing FLEET_OPERATOR_UID exists to avoid on the
+# respawn side. A rename (or a second implementer account, which this fleet's
+# bakeoff practice makes likely) made every historical marked PR invisible and
+# re-dispatched every merged plan, silently. uids are rename-proof; the login
+# set remains as the configured fallback so existing deployments still work.
+# ROLES["author"] guarantees its own account is always a member (lib._role
+# refuses construction otherwise), which is the property this comment used to
+# ask each caller to remember by hand.
+IMPLEMENTER_UIDS = {x.strip() for x in
+                    os.environ.get("FLEET_IMPLEMENTER_UIDS", "").split(",")
+                    if x.strip().isdigit()}
+IMPLEMENTER_LOGINS = ROLES["author"].logins
+PLAN_DIR = "plans/"                # the ignition namespace
+PLAN_NAME_RE = re.compile(r"\d{4}-.*\.md$")
+
+
+def repos():
+    return [r.strip() for r in os.environ.get("FLEET_WATCH_REPOS", "").split(",")
+            if r.strip()]
+
+
+def _ts_utc(value):
+    """RFC3339 -> aware UTC datetime, or None.
+
+    Forgejo serialises API timestamps in the SERVER's offset (the swagger
+    examples show `2015-10-24T19:32:49-04:00`). Truncating to 19 chars and
+    stamping `Z` — the r1 implementation — silently shifted every comment by
+    that offset: on a US/Eastern server a `respawn` posted a minute after
+    orphaning reads ~5h OLD and the documented recovery does nothing, and on a
+    positive offset a just-consumed comment stays "fresh" long enough to
+    re-arm the unbounded retry the time bound exists to stop (r2 M1)."""
+    if not value:
+        return None
+    v = value.strip()
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    try:
+        d = _dt.datetime.fromisoformat(v)
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_dt.timezone.utc)
+    return d.astimezone(_dt.timezone.utc)
+
+
+def _single_instance():
+    """Exclusive, or refuse to run (r3 M4).
+
+    The doc claimed "the cap's authority is this process plus its service
+    lease" — but no service lease was ever assigned, so two watchers (a
+    launchd overlap, or a manual run beside the daemon) could each compute
+    `inflight` before either assigned and both dispatch the same plan. A
+    non-blocking flock on the fleet tree IS the mechanism; it is also what
+    makes retire-after-assign safe below (r3 M3)."""
+    import fcntl
+    lock = lib.locks_dir()
+    lock.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock / "fleet-watch.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd                              # held for the process's lifetime
+
+
+def _watch_sid():
+    """SPEC defines `actor` as a session id — use ours, not a program name."""
+    return os.environ.get("EUNOMIA_SESSION", "").strip() or "fleet-watch"
+
+
+def warn(msg):
+    print(f"fleet-watch: WARN {msg}", file=sys.stderr)
+
+
+def _token():
+    """The general token (reads, and anything the implbot PAT may do)."""
+    return _run_token_helper(TOKEN_CMD)
+
+
+def _run_token_helper(cmd):
+    """The token, via the sanctioned helper. Never logged, never in argv."""
+    try:
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True,
+                           text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"token helper failed ({e.__class__.__name__})"
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, "token helper produced no token"
+    # last non-empty LINE (r3 low): a helper that ever prints a banner would
+    # otherwise yield a value with an interior newline, and urllib's
+    # header-injection guard raises ValueError. fleetforge.Forge catches that
+    # (a superset of what the hand-rolled _api this replaced caught), but the
+    # defensiveness stays here too — same reasoning fleet-claim's stdout gets.
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    return (lines[-1].strip(), "") if lines else (None, "token helper produced no token")
+
+
+# --- the protection broker (infra ADR-0003) --------------------------------
+
+PROT_OK, PROT_REFUSED, PROT_UNKNOWN = 0, 1, 2   # same three as fleet-repo's exits
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """http.client over AF_UNIX. Fourteen lines of stdlib beats a dependency in
+    a control-plane binary that has to run when things are already broken."""
+
+    def __init__(self, socket_path, timeout=BROKER_TIMEOUT):
+        super().__init__("localhost", timeout=timeout)
+        self._socket_path = socket_path
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(self._socket_path)
+        self.sock = s
+
+
+def _broker_get(path):
+    """(status, parsed-json-or-None). Never raises — status 0 means the broker
+    could not be reached at all, which the caller must read as "could not
+    determine" and never as a refusal."""
+    conn = None
+    try:
+        conn = _UnixHTTPConnection(BROKER_SOCKET)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", "replace")
+        try:
+            return resp.status, json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            return resp.status, None
+    except (OSError, http.client.HTTPException):
+        return 0, None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def broker_reachable():
+    """(bool, detail) — the once-per-cycle pre-flight.
+
+    Mirrors what `_admin_token()` did before it: page once and scan NOTHING,
+    rather than making N futile calls and refusing every repo for a reason that
+    has nothing to do with any repo. /health answers 503 when the broker is up
+    but cannot load eunomia's rule, which is equally a reason not to scan.
+    """
+    st, body = _broker_get("/health")
+    if st == 200:
+        return True, ""
+    if st == 0:
+        return False, (f"forgejo-broker unreachable on {BROKER_SOCKET} — is the "
+                       "tunnel up (launchd org.eunomia.fleet-broker-tunnel) and "
+                       "the broker running on vaulthost?")
+    detail = (body or {}).get("detail") or (body or {}).get("rule_error")
+    return False, f"forgejo-broker unhealthy (HTTP {st}): {detail}"
+
+
+def verdict_source(env=None):
+    """'broker' (default) or 'direct' — which verdict implementation this
+    deployment is configured to use (`FLEET_VERDICT_SOURCE`, plan 0054).
+
+    Read live rather than cached at import, the same as `forge_timeout()` and
+    `watch_interval()` below: every caller here re-reads it fresh each cycle,
+    and a bad value stops the run the same way theirs do rather than silently
+    picking a default a deployment did not choose.
+
+    Broker is the default (D3): this fleet is multi-host, and an unconfigured
+    watcher must not silently gain a stronger credential than the one it is
+    handed — see `docs/plan-dispatch.md` for what `direct` costs instead."""
+    env = os.environ if env is None else env
+    raw = (env.get("FLEET_VERDICT_SOURCE") or "broker").strip().lower()
+    if raw not in ("broker", "direct"):
+        sys.exit(f"fleet-watch: FLEET_VERDICT_SOURCE={raw!r} is not "
+                 "'broker' or 'direct'")
+    return raw
+
+
+def verdict(repo):
+    """(code, detail, lane) — the ignition verdict for `repo`, from whichever
+    source this deployment is configured to use.
+
+    This is the ONLY place the two implementations meet, and selection is
+    configuration decided ahead of time — never a runtime fallback. An
+    unreachable broker must never silently fall through to `_direct_verdict`:
+    that would put an admin-scoped credential into this process on every
+    broker outage, exactly the condition ADR-0003 §2 removed, arriving at the
+    moment nobody is watching (plan 0054 D3).
+
+    `broker_verdict` keeps its name rather than being renamed alongside
+    `_direct_verdict`: `bin/fleet-pin-advance` calls it directly, by that
+    name, and is outside this plan's lease — renaming it here would silently
+    break that caller in production while its own stub-based test kept
+    passing (the stub sets whatever name the test writes, so it would not
+    catch a caller reading a name that no longer exists)."""
+    if verdict_source() == "direct":
+        return _direct_verdict(repo)
+    return broker_verdict(repo)
+
+
+def _direct_token_cmd():
+    return os.environ.get("FLEET_DIRECT_TOKEN_CMD", "").strip()
+
+
+def _direct_token():
+    """The credential `_direct_verdict` calls `main_is_protected` with, or
+    `(None, detail)`.
+
+    Deliberately NOT `FLEET_TOKEN_CMD`'s default: `branch_protections` sits
+    behind Forgejo's `reqAdmin()`, and the implbot helper `FLEET_TOKEN_CMD`
+    defaults to is write-scoped, not admin — it 403s on every repo (see
+    `main_is_protected`'s r10 M1 comment). No default is supplied here on
+    purpose: a deployment that wants the direct source has to say explicitly
+    which command mints an admin-scoped token. See the D2 handoff in
+    `plans/0054-the-verdict-has-more-than-one-source.md` and
+    `docs/plan-dispatch.md` for what that credential costs."""
+    cmd = _direct_token_cmd()
+    if not cmd:
+        return None, ("FLEET_DIRECT_TOKEN_CMD is not set — the direct "
+                      "verdict source needs an admin-scoped credential and "
+                      "none is configured")
+    return _run_token_helper(cmd)
+
+
+def _fleet_repo():
+    """`bin/fleet-repo`, `SourceFileLoader`'d rather than imported — the same
+    reason fleetlib/fleetforge/fleetjob are above: this file is loaded from
+    directories that do not necessarily carry the rest of `bin/` on
+    `sys.path`. Loaded lazily, on the first call that actually needs
+    `classify()` — not at import — because `fleet-repo`'s own `_watch()`
+    loads THIS file the same way, and loading both eagerly at module scope
+    would try to run one before the other exists."""
+    ldr = importlib.machinery.SourceFileLoader(
+        "fleet_repo", str(BIN / "fleet-repo"))
+    mod = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("fleet_repo", ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+def _direct_verdict(repo):
+    """(code, detail, lane) — is `main` protected, read straight from Forgejo
+    IN THIS PROCESS (D2, plan 0054) rather than through keyvault's broker.
+
+    Calls the very `main_is_protected` this module already defines — never a
+    second copy of the eight-lane rule — with a credential from
+    `_direct_token()`, then passes the result through `bin/fleet-repo`'s
+    `classify()`: the SAME function the broker calls (it is
+    `SourceFileLoader`'d from a different repository), so both verdict
+    sources share one mapping from evidence to exit code.
+
+    `lane` has no wire format to carry it here — there is no broker response
+    to read one off. So this recognises only the one lane value the watcher's
+    own `cycle()` actually branches on, `token_rejected`, by the same message
+    prefix `classify()` itself keys on; every other case reports `lane=None`,
+    same as `broker_verdict` does for anything the broker did not label."""
+    token, err = _direct_token()
+    if token is None:
+        return PROT_UNKNOWN, err, None
+    ok, why = main_is_protected(repo, token)
+    repo_mod = _fleet_repo()
+    code, detail = repo_mod.classify(ok, why)
+    mapped = {repo_mod.EXIT_OK: PROT_OK, repo_mod.EXIT_REFUSED: PROT_REFUSED,
+             repo_mod.EXIT_UNKNOWN: PROT_UNKNOWN}[code]
+    if mapped == PROT_OK:
+        return PROT_OK, "", None
+    lane = ("token_rejected"
+            if detail.startswith("branch protections rejected the token")
+            else None)
+    return mapped, detail, lane
+
+
+def broker_verdict(repo):
+    """(code, detail, lane) — is `main` protected, per keyvault's broker.
+
+    `lane` is the broker's own label and may be None. It is returned because
+    the watcher keeps TWO separate alarm chains — "the broker's token was
+    rejected" and "the watcher is blind" — and only the lane distinguishes
+    them. Reading it out of the message text is what the r6 low was about.
+
+    THE CONTRACT, and the thing that must not collapse (ADR-0003 §6): HTTP 200
+    means a determination was made and `ok` can be trusted; ANYTHING else —
+    including no connection at all — is "could not determine". A broker that is
+    down is NOT a refusal of every repo. Two codes cannot carry three answers,
+    which is why fleet-repo has three exits and why this returns a code rather
+    than the bool `main_is_protected` returns.
+
+    Note what is NOT here: a fallback to calling `main_is_protected` locally.
+    That would need the admin PAT back in this process, which is the whole
+    point of ADR-0003. Degrading to "cannot tell" is the correct degradation.
+    """
+    owner_repo = repo.strip("/")
+    st, body = _broker_get(f"/forgejo/protection/{owner_repo}")
+    # `body or {}` was not enough: a JSON ARRAY is truthy and `.get` on a list
+    # raises AttributeError, which under launchd is the crash-loop class r7 L1
+    # and r8 M3 were fixed for. The broker never sends one today; "never
+    # raises" should not depend on that staying true.
+    if not isinstance(body, dict):
+        body = {}
+    detail = body.get("detail") or ""
+    lane = body.get("lane")
+    if st == 200 and body.get("ok") is True:
+        return PROT_OK, "", lane
+    if st == 200 and body.get("ok") is False:
+        return PROT_REFUSED, detail, lane
+    if st == 0:
+        return PROT_UNKNOWN, (f"forgejo-broker unreachable on {BROKER_SOCKET} "
+                              "— protection could not be determined"), None
+    return PROT_UNKNOWN, (f"forgejo-broker could not determine (HTTP {st}"
+                          + (f", lane {lane}" if lane else "") + ")"
+                          + (f": {detail}" if detail else "")), lane
+
+
+def forge_timeout(env=None):
+    """Seconds to allow one forge request. MEASURED, not guessed.
+
+    20s was the value here, and it is BELOW what this fleet's own pull-request
+    listing costs. Measured 2026-09-09 against operator/eunomia (247 PRs):
+    `pulls?state=all&limit=50` took **22.6s** for a single page — Forgejo does
+    roughly 0.45s of work per pull request on that endpoint — with curl and
+    urllib agreeing at 23.7s and 22.7s.
+
+    The consequence was not a slow scan but a silent refusal to work. The dedupe
+    read is a pull listing, so on the very first armed cycle the watcher reported
+
+        operator/eunomia: dedupe unreadable for 0029-service-lease — not spawning
+
+    and dispatched nothing. Failing closed there is correct — an unreadable
+    dedupe cannot be told from "no marked PR exists", and guessing would
+    re-dispatch merged work. The timeout was what made it unreadable.
+
+    bin/orchestrator got this fix first (its own forge_timeout, 60s). This file
+    kept a hardcoded 20 and was missed, which is why the fix has to be applied
+    twice — the two modules each open their own door to the forge.
+
+    NOTE, and it is the same note FLEET_AGENT_ACCOUNTS carries: since ADR-0003
+    §2 `main_is_protected` runs in the BROKER's process on vaulthost, so this value
+    governs the protection read THERE. Setting it in the watcher's plist does
+    not change what the broker allows itself; the broker needs redeploying."""
+    env = os.environ if env is None else env
+    raw = (env.get("FLEET_FORGE_TIMEOUT") or "").strip()
+    if not raw:
+        return 60
+    try:
+        n = int(raw)
+    except ValueError:
+        sys.exit(f"fleet-watch: FLEET_FORGE_TIMEOUT={raw!r} is not an integer")
+    if n < 1:
+        sys.exit(f"fleet-watch: FLEET_FORGE_TIMEOUT={n} — a forge read needs "
+                 "some patience")
+    return n
+
+
+def _forge(token):
+    """The one door to the forge (plan 0051). `timeout=forge_timeout()` is
+    passed explicitly — `Forge`'s own default is 20s, and forge_timeout()'s
+    docstring records the 22.6s pull listing that failed at that default every
+    time. Built fresh per call: `token` is fetched once per cycle (see
+    `_token()`'s caller) and threaded down as a plain value exactly as it was
+    before this module owned a `Forge` client, so no call site here holds a
+    token longer than it used to."""
+    return fleetforge.Forge(FORGEJO_URL, token, timeout=forge_timeout())
+
+
+def _expand_braces(pattern, depth=0):
+    """Every literal alternative of a gobwas brace pattern, or None if it
+    cannot be expanded (unbalanced, or nested past a sane depth).
+
+    One-level expansion was fail-OPEN (r7 M3): `{plans,docs}/{0001,0002}*.md`
+    kept a literal `{` that fnmatch never matches, so the pattern covered the
+    ignition file while the guard saw nothing. Groups nest, so this recurses.
+    """
+    if depth > 8:
+        return None
+    i = pattern.find("{")
+    if i < 0:
+        return None if "}" in pattern else [pattern]
+    level = 0
+    for j in range(i, len(pattern)):
+        if pattern[j] == "{":
+            level += 1
+        elif pattern[j] == "}":
+            level -= 1
+            if level == 0:
+                break
+    else:
+        return None                       # unbalanced
+    head, body_, tail = pattern[:i], pattern[i + 1:j], pattern[j + 1:]
+    alts, level, cur = [], 0, ""
+    for ch in body_:                      # split on TOP-LEVEL commas only
+        if ch == "{":
+            level += 1
+        elif ch == "}":
+            level -= 1
+        if ch == "," and level == 0:
+            alts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    alts.append(cur)
+    out = []
+    for alt in alts:
+        sub_ = _expand_braces(f"{head}{alt.strip()}{tail}", depth + 1)
+        if sub_ is None:
+            return None
+        out.extend(sub_)
+    return out
+
+
+def _may_touch_plans(pattern):
+    """Could this exemption glob match ANYTHING under plans/?
+
+    r8 M1: probing one representative filename checked a strictly weaker
+    property than the doc claimed — `**/README.md` and `plans/1*.md` both miss
+    `plans/0001-probe.md` while exempting a real ignition file. Instead of
+    sampling, prove the pattern is confined elsewhere: compare its static
+    prefix (everything before the first wildcard) with plans/. If neither is a
+    prefix of the other the glob can never reach the namespace; anything else,
+    including an unparseable pattern, refuses.
+    """
+    # r10 M2: Forgejo lower-cases the pattern (`getFilePatterns`) AND the path
+    # (`IsUnprotectedFile`) before matching, so `Plans/**` and `PLANS/*.md`
+    # exempt plans/ just as `plans/**` does — and a case-sensitive comparison
+    # here vouched for exactly the rule that opens the r6 M1 self-ignition path.
+    pattern = pattern.lower()
+    if "\\" in pattern:
+        # r9 low: gobwas reads `\p` as a literal `p`, so `\plans/*.md` covers
+        # the ignition file while a static-prefix comparison sees `\plans/`
+        # and matches nothing. Escapes join the cannot-parse bucket.
+        return True
+    alts = _expand_braces(pattern)
+    if alts is None:
+        return True                       # cannot parse -> cannot vouch
+    for pat in alts:
+        head = re.split(r"[*?\[]", pat, 1)[0]
+        if head.startswith(PLAN_DIR) or PLAN_DIR.startswith(head):
+            return True
+    return False
+
+
+def _glob_hits(pattern, path):
+    """Does this Forgejo glob cover `path`?
+
+    Forgejo matches with gobwas/glob; fnmatch is the stdlib approximation.
+    fnmatch's `*` crosses `/`; Forgejo compiles these with separators
+    (`glob.Compile(expr, '.', '/')`), so its `*` crosses neither `/` nor `.`
+    (r10 M2 corrected an earlier comment here that claimed otherwise). The
+    difference makes this guard OVER-refuse — `*.md` is treated as reaching
+    `plans/x.md` when Forgejo would not — which is the safe direction and is
+    left deliberately. A pattern this cannot parse answers TRUE
+    — at both call sites that is the fail-CLOSED direction (a
+    protection rule gets evaluated rather than skipped; an exemption refuses
+    the repo rather than passing unseen), which is what the old one-level
+    expansion got backwards (r7 M3).
+    """
+    if not pattern:
+        return False
+    pats = _expand_braces(pattern)
+    if pats is None:
+        return True                       # cannot parse -> cannot vouch
+    return any(fnmatch.fnmatch(path, pat) for pat in pats)
+
+
+def _unprotected_patterns(bp):
+    """`unprotected_file_patterns` as a list, or None if its shape is unknown.
+
+    Forgejo sends a semicolon-separated STRING, not a list."""
+    raw = bp.get("unprotected_file_patterns")
+    if raw in (None, "", []):
+        return []
+    if isinstance(raw, str):
+        return [x.strip() for x in re.split(r"[;\n]", raw) if x.strip()]
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    return None
+
+
+def _agents_cannot_satisfy(bp, approvals, name):
+    """Refuse unless an agent approval is INSUFFICIENT on its own.
+
+    The rule this replaces was "no agent may be on the approvals whitelist",
+    and it was too blunt. Approving is not writing: an approval satisfies a
+    COUNTER that something else must then consume. What makes an agent approval
+    dangerous is not its presence but its SUFFICIENCY — whether agents alone can
+    reach `required_approvals` and let a merge proceed with no human in the
+    chain.
+
+        safe  <=>  agents_on_whitelist < required_approvals
+
+    With `required_approvals: 2` and a whitelist of one agent and one human —
+    exactly what `forgejo-create-repo.sh` installs on every repo — a human
+    approval is STRUCTURALLY mandatory. Forgejo's scheduled auto-merge (this
+    instance is 15.0.2 and its merge endpoint accepts
+    `merge_when_checks_succeed`) cannot get around that: it fires when the
+    conditions are met, and they cannot be met without the human.
+
+    The old rule refused precisely that configuration, so it refused the whole
+    fleet — and the remedy proposed for it was to drop `required_approvals` to 1
+    and take the reviewer off the whitelist, which is strictly weaker than what
+    the fleet already had. ADR-0004 is revised accordingly.
+
+    The MERGE lane keeps the absolute rule and does not come through here: a
+    merge is not counted, so one whitelisted account writes main by itself."""
+    if not bp.get("enable_approvals_whitelist"):
+        return False, (f"rule {name!r} does not restrict who may approve — any "
+                       "write user counts, agent accounts included, so nothing "
+                       "bounds them and nothing makes them insufficient")
+    users = bp.get("approvals_whitelist_username")
+    if not isinstance(users, list):
+        return False, (f"rule {name!r} restricts who may approve but its "
+                       "membership is unreadable — cannot vouch")
+    if bp.get("approvals_whitelist_teams"):
+        return False, (f"rule {name!r} lets a team approve and team membership "
+                       "is not visible here — cannot vouch")
+    named = {u.lower() for u in users}
+    agents = sorted(named & AGENT_ACCOUNTS)
+    humans = sorted(named - AGENT_ACCOUNTS)
+    if len(agents) >= approvals:
+        return False, (f"rule {name!r} requires {approvals} approval(s) and "
+                       f"whitelists {len(agents)} agent account(s) {agents} — "
+                       "agents alone could satisfy it and ignition would be "
+                       "self-forgeable")
+    if len(humans) < approvals - len(agents):
+        # Not a safety refusal: nothing can satisfy this rule, so nothing will
+        # ever merge, and vouching would promise a dispatch that cannot happen.
+        return False, (f"rule {name!r} requires {approvals} approval(s) but "
+                       f"only {len(humans)} non-agent account(s) are "
+                       "whitelisted — the rule is unsatisfiable")
+    return True, ""
+
+
+def _no_agents_on(bp, enable_key, users_key, teams_key, label, name):
+    """Refuse unless only non-agent accounts can `label`.
+
+    Since ADR-0004's 2026-09-09 revision this is the MERGE lane only. The
+    approvals lane is a threshold and goes through _agents_cannot_satisfy;
+    routing it here refused every repo on the fleet.
+
+    r6 M2: `required_approvals >= 1` said an approval was REQUIRED, never who
+    could give one. With the corresponding whitelist off, Forgejo counts an
+    approval — and permits a merge — from ANY user with write access, which is
+    exactly what implbot and revbot hold. A work PR that also adds a
+    `status: ready` plan, approved by one agent and merged by the queue, then
+    reaches main with no human in the chain, and this function vouches for it.
+    """
+    if not bp.get(enable_key):
+        return False, (f"rule {name!r} does not restrict who may {label} — "
+                       "any write user counts, agent accounts included, so "
+                       "ignition would not require a human")
+    users = bp.get(users_key)
+    if not isinstance(users, list):
+        return False, (f"rule {name!r} restricts who may {label} but its "
+                       "membership is unreadable — cannot vouch")
+    agents = sorted(set(u.lower() for u in users) & AGENT_ACCOUNTS)
+    if agents:
+        return False, (f"rule {name!r} lets agent account(s) {agents} "
+                       f"{label} — ignition would be self-forgeable")
+    if bp.get(teams_key):
+        return False, (f"rule {name!r} lets a team {label} and team "
+                       "membership is not visible here — cannot vouch")
+    return True, ""
+
+
+def main_is_protected(repo, token):
+    """True only on POSITIVE evidence of a protection rule covering main.
+
+    *** DO NOT DELETE AS DEAD CODE. *** Since infra ADR-0003 §2, BY DEFAULT
+    nothing in this module calls it: the watcher asks keyvault's forgejo-broker
+    for the verdict (`broker_verdict`) rather than holding an admin PAT. The
+    broker imports this function — `SourceFileLoader` on this very file,
+    deployed beside it — precisely so the rule has ONE definition. Since plan
+    0054, `_direct_verdict` is a SECOND caller inside this module — the direct
+    verdict source, opt-in via `FLEET_VERDICT_SOURCE=direct` — but it is still
+    not the common case: a grep for callers finds one opt-in caller and the
+    tests, and removing this on the strength of "the broker is the only real
+    caller" would break either the fleet's protection check from a repo that
+    never mentions it, or any deployment running the direct source.
+    `tests/test_fleet_watch.py::test_the_broker_imports_this_rule` guards it.
+
+    The plan's boundary: an unprotected repo is REFUSED at scan time. Merge is
+    ignition, so if anything but a reviewed merge can write main, ignition is
+    forgeable. Unknown (unreadable protections) is refusal too — this is the
+    one place the fleet does NOT degrade open, because the degradation would
+    be 'run code from an unauthenticated source'.
+    """
+    st, body = _forge(token).get_branch_protections(repo)
+    if st in (401, 403):
+        # r10 M1: this endpoint is behind reqAdmin(), so a write-collaborator
+        # PAT — what the default FLEET_TOKEN_CMD helper mints — 403s on every
+        # repo. That used to fire the "Watcher blind … LAN privacy" page and
+        # send the operator after a network fault that does not exist.
+        #
+        # r11 M1: but making it quiet was the wrong correction. 401 and 403
+        # are different faults and both must PAGE — a rotated or expired PAT
+        # stalls every plan, and the runbook tells the operator that silence
+        # means the watcher is not running. The caller pages once on this
+        # prefix and clears on a 200; it is still not counted as blindness.
+        # This function runs in the BROKER's process on vaulthost (ADR-0003 §2), and
+        # this string travels back to the caller verbatim as `detail`. So it
+        # must name the credential that actually failed and the host holding
+        # it — an operator sent to FLEET_ADMIN_TOKEN_CMD would be looking for a
+        # variable this repo no longer sets, on the wrong machine.
+        # The PREFIX is load-bearing: keyvault's LANES table and classify()
+        # both match "branch protections rejected the token". Only the
+        # parenthetical may change.
+        detail = ("HTTP 401 — unauthenticated: the PAT is invalid, expired, or "
+                  "was rotated out from under the broker"
+                  if st == 401 else
+                  "HTTP 403 — insufficient scope: this endpoint needs ADMIN and "
+                  "the stored PAT does not have it")
+        return False, (f"branch protections rejected the token ({detail}) — the "
+                       "PAT is the one keyvault holds on vaulthost at kv/forgejo/admin; "
+                       "fix it there, not on the calling host")
+    if st != 200 or not isinstance(body, list):
+        return False, f"branch protections unreadable (HTTP {st})"
+    matching = [bp for bp in body
+                if _rule_matches_main(bp.get("branch_name")
+                                      or bp.get("rule_name") or "")]
+    if not matching:
+        return False, "main is not branch-protected"
+    # EVERY matching rule must pass (r2 M4): Forgejo resolves overlapping rules
+    # by its own precedence (an exact `main` beats a glob), so judging the
+    # first list-ordered match could accept a strong glob while a weak exact
+    # rule is what actually governs main — a fail-OPEN acceptance of a
+    # directly-writable main. Requiring all of them stays fail-closed under
+    # any precedence order. fnmatch also recognises `mai*`/`m*`, which the
+    # literal name list missed.
+    for bp in matching:
+        name = bp.get("branch_name") or bp.get("rule_name") or ""
+        # A rule EXISTING is not the property we need (r1 M1): a rule that only
+        # blocks force-pushes, or allows direct pushes to everyone, leaves main
+        # directly writable — exactly the "something other than a reviewed
+        # merge can write main" condition this check exists to refuse. Require
+        # positive evidence of BOTH halves.
+        approvals = bp.get("required_approvals") or 0
+        push_open = bool(bp.get("enable_push")) and not bp.get("enable_push_whitelist")
+        # r6 M1: `unprotected_file_patterns` exempts matching paths from the
+        # push restrictions entirely — that is the field's whole purpose. A
+        # plausible "don't gate docs" rule (`**/*.md`) therefore exempts
+        # plans/*.md, which IS the ignition file: an agent pushes a
+        # `status: ready` plan straight to main and self-ignites, while this
+        # function vouches. The field is in the body already parsed.
+        pats = _unprotected_patterns(bp)
+        if pats is None:
+            return False, (f"rule {name!r} has an unreadable "
+                           "`unprotected_file_patterns` — cannot vouch")
+        exempt = [x for x in pats if _may_touch_plans(x)]
+        if exempt:
+            return False, (f"rule {name!r} exempts {exempt} from its push "
+                           f"restrictions and cannot be shown to miss "
+                           f"{PLAN_DIR} — a plan could reach main unreviewed")
+        if bool(bp.get("enable_push")) and bp.get("enable_push_whitelist"):
+            # a whitelist is only "fine" if no AGENT is on it (r5 M3): an
+            # agent that can push main can push a `status: ready` plan and
+            # SELF-IGNITE, while this very function vouches for the repo.
+            wl = bp.get("push_whitelist_usernames")
+            if not isinstance(wl, list):
+                return False, (f"rule {name!r} whitelists pushes but its "
+                               "membership is unreadable — cannot vouch")
+            agents = sorted(set(a.lower() for a in wl) & AGENT_ACCOUNTS)
+            if agents:
+                return False, (f"rule {name!r} lets agent account(s) "
+                               f"{agents} push main directly — ignition "
+                               "would be self-forgeable")
+            # r6 M3: usernames were the only lane read. A write-scoped deploy
+            # key held by agent tooling pushes main just as directly, and team
+            # membership is not visible from this response.
+            if bp.get("push_whitelist_deploy_keys"):
+                return False, (f"rule {name!r} lets deploy keys push main "
+                               "directly — a key held by agent tooling is a "
+                               "self-ignition credential")
+            if bp.get("push_whitelist_teams"):
+                return False, (f"rule {name!r} whitelists team pushes and team "
+                               "membership is not visible here — cannot vouch")
+        if approvals < 1:
+            return False, (f"rule {name!r} requires {approvals} approvals — "
+                           "merge-is-ignition needs at least 1")
+        if push_open:
+            return False, (f"rule {name!r} allows unrestricted direct pushes — "
+                           "main must be writable only by a reviewed merge")
+        # r8 M1... and r9 M1: `apply_to_admins` is the eighth. When it is
+        # false — the Forgejo DEFAULT — repository admins bypass the entire
+        # rule: push restrictions, approvals, whitelists, stale dismissal, all
+        # of it. Admin membership is no more visible from this response than
+        # team membership, which this function already refuses to vouch for,
+        # so a rule that does not apply to admins cannot be vouched for either.
+        if not bp.get("apply_to_admins"):
+            return False, (f"rule {name!r} does not apply to admins — a repo "
+                           "admin bypasses every lane above, and admin "
+                           "membership is not visible here")
+        # r7 M1: an approval that survives a later push is the seventh lane.
+        # Both fields default FALSE in Forgejo, so the common configuration is
+        # the unsafe one: operator approves a work PR, implbot then pushes a
+        # commit adding a `status: ready` plan, and the stale approval still
+        # satisfies required_approvals. The approval is genuinely human — of a
+        # different tree. This fleet already codifies the hazard for its own
+        # PRs; the watcher must not vouch for a repo that does not.
+        stale_ok = (bp.get("dismiss_stale_approvals"),
+                    bp.get("ignore_stale_approvals"))
+        if any(v is None for v in stale_ok):
+            return False, (f"rule {name!r} does not report its stale-approval "
+                           "handling — cannot vouch")
+        if not any(stale_ok):
+            return False, (f"rule {name!r} lets an approval survive a later "
+                           "push — a plan added after the approval would "
+                           "ignite on a human's approval of a different tree")
+        # r6 M2, REVISED: the two remaining lanes onto main, which are not the
+        # same kind of lane. Checked last because their refusals are
+        # configuration advice, not alarm.
+        #
+        # MERGE is absolute. A merge is not counted, so one whitelisted agent
+        # writes main by itself.
+        ok, why = _no_agents_on(bp, "enable_merge_whitelist",
+                                "merge_whitelist_usernames",
+                                "merge_whitelist_teams", "merge", name)
+        if not ok:
+            return False, why
+        # APPROVE is a THRESHOLD, so the question is sufficiency, not presence.
+        ok, why = _agents_cannot_satisfy(bp, approvals, name)
+        if not ok:
+            return False, why
+    return True, ""
+
+
+def _rule_matches_main(pattern):
+    """Does this protection rule govern `main`?
+
+    Forgejo matches with gobwas/glob, which supports brace alternation that
+    fnmatch does not (r5 low): a weak `{main,master}` rule was invisible here,
+    so a coexisting strong rule could vouch alone while the brace rule
+    actually governed main. _glob_hits expands braces recursively and answers
+    True for anything it cannot parse, so an unreadable rule name is treated
+    as governing main and must then pass on its merits (r7 M3)."""
+    return _glob_hits(pattern, "main")
+
+
+def _parse_depends_on(fm_block):
+    """`depends_on` as a list of strings, from the RAW front-matter block (the
+    text between the `---` fences).
+
+    Two shapes appear across plans/: inline (`depends_on: [a, b]`) and block
+    (`depends_on:` then `- a` / `- b`). The scalar loop in `front_matter()`
+    below reads `depends_on:` as one more `key: value` line — for the inline
+    form that captures the bracketed text; for the block form the value on
+    that line is empty and the `- a` continuations carry no `:`, so they are
+    skipped and the field reads as an empty list. A block-style `depends_on`
+    would then dispatch with its dependencies silently IGNORED — the same
+    defect review 2573 found for `paths` — so this is a dedicated reader
+    rather than one more branch in a one-line-per-key loop. Kept identical to
+    `bin/fleet-plan`'s copy on purpose (standalone-scripts convention, same as
+    `EVENT_TYPES` in fleet-emit/fleet-events): both readers must agree on this
+    shape, and a shared import between two CLIs this file's own comments treat
+    as intentionally standalone would be a bigger change than the field justifies.
+    """
+    lines = fm_block.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("#"):
+            continue
+        m = re.match(r"^depends_on\s*:\s*(.*)$", line)
+        if not m:
+            continue
+        rest = m.group(1).strip()
+        if rest.startswith("["):
+            buf, j = rest, i
+            while "]" not in buf and j + 1 < len(lines):
+                j += 1
+                buf += " " + lines[j].strip()
+            inner = buf[buf.find("[") + 1: buf.rfind("]")]
+            return [x.strip().strip('"').strip("'")
+                    for x in inner.split(",") if x.strip()]
+        if rest:
+            return [rest.strip('"').strip("'")]
+        items = []
+        key_indent = len(line) - len(line.lstrip())
+        for j in range(i + 1, len(lines)):
+            nxt = lines[j]
+            if not nxt.strip():
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= key_indent:
+                break
+            stripped = nxt.strip()
+            if not stripped.startswith("-"):
+                break
+            items.append(stripped[1:].strip().strip('"').strip("'"))
+        return items
+    return []
+
+
+def front_matter(text):
+    """The plan's YAML-ish front matter as a dict of scalars, plus a parsed
+    `depends_on` list. Deliberately not a YAML parser (stdlib-only, and the
+    format is fixed by docs/feature-plans)."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    fm_block = text[3:end]
+    out = {}
+    for line in fm_block.splitlines():
+        if ":" not in line or line.strip().startswith("#"):
+            continue
+        k, _, v = line.partition(":")
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    out["depends_on"] = _parse_depends_on(fm_block)
+    return out
+
+
+def plan_files(repo, token):
+    """[(path, front_matter)] for plans/*.md on MAIN. Templates skipped."""
+    st, body = _forge(token).list_contents(repo, "plans", ref="main")
+    if st != 200 or not isinstance(body, list):
+        return None                      # unreadable: caller skips the repo
+    out = []
+    for entry in body:
+        name = entry.get("name") or ""
+        # r8 M1: "any .md" made plans/README.md ignitable if someone gave it
+        # front matter, and made the exemption guard's probe unrepresentative
+        # of the namespace it guards. Plans are `dddd-slug.md`; 0000- is the
+        # template.
+        if not PLAN_NAME_RE.match(name) or name.startswith("0000-"):
+            continue
+        # r7 low: an unquoted non-ASCII name raised UnicodeEncodeError inside
+        # urlopen, a ValueError the hand-rolled _api this replaced did not
+        # catch, crash-looping the cycle under launchd. fleetforge.Forge
+        # percent-encodes every path segment itself (get_contents), which is
+        # the same fix kept by construction rather than by a local quote().
+        st2, f = _forge(token).get_contents(repo, f"plans/{name}", ref="main")
+        if st2 != 200 or not isinstance(f, dict):
+            warn(f"{repo}: plans/{name} unreadable (HTTP {st2}) — skipped")
+            continue
+        try:
+            import base64
+            text = base64.b64decode(f.get("content") or "").decode("utf-8", "replace")
+        except Exception:
+            warn(f"{repo}: plans/{name} undecodable — skipped")
+            continue
+        fm = front_matter(text)
+        if fm.get("id"):
+            out.append((f"plans/{name}", fm))
+    return out
+
+
+def marked_pr(repo, plan_id, token, dry_run=False):
+    """The FIRST implbot-authored PR in ANY state whose body carries
+    `Plan: <id>`, else None. Any state: a closed work PR does NOT re-arm the
+    plan — rejection is a human decision, not an automatic retry."""
+    # LINE-anchored (r1 M2): a substring match made plan `0009-auth` look
+    # permanently done because `0009-auth-v2`'s PR body contains its text —
+    # silent loss of a merged, ready plan.
+    needle = re.compile(rf"^{re.escape(MARKER)}{re.escape(plan_id)}\s*$", re.M)
+    first_match = None
+    for page in range(1, PAGE_CAP + 1):
+        # `sort="oldest"` (created asc), NOT recentupdate (r2 M2): any update
+        # bumps a PR toward page 1, so a PR on page 3 updated while page 2 is
+        # read slides into the scanned region and is never seen — and a
+        # MISSED marked PR dispatches a duplicate orchestrator for done work.
+        st, body = _forge(token).list_pulls(repo, state="all", page=page,
+                                            limit=50, sort="oldest")
+        if st != 200 or not isinstance(body, list):
+            return "unreadable"
+        for pr in body:
+            if not _is_implementer(pr.get("user") or {}):
+                continue
+            if not needle.search(pr.get("body") or ""):
+                continue
+            # r12: prefer an OPEN marked PR over an older closed one.
+            # `sort=oldest` means the FIRST match wins, and dedupe only needs
+            # "any marked PR exists" — but `orphan_sweep` asks this same
+            # function for the PR to comment the respawn instruction on, and
+            # then requires it to be open. With an older closed marked PR in
+            # front of a live one, the sweep pages "no open marked PR" forever
+            # and the documented `respawn` recovery is unreachable while a
+            # perfectly good PR sits open. Keep scanning; fall back to the
+            # first match only if no open one turns up.
+            if (pr.get("state") or "").lower() == "open":
+                return pr
+            if first_match is None:
+                first_match = pr
+        if not body:
+            if not dry_run:
+                _clear_notified(f"pagecap-{repo.replace('/', '-')}-{PAGE_CAP}")
+            return first_match           # empty page: unambiguously the end
+        # NOT `len(body) < 50` (r1 low): an instance whose MAX_RESPONSE_ITEMS
+        # is below 50 returns short FULL pages, and treating those as the end
+        # would call a truncated scan definitive — the very thing this
+        # function refuses to do.
+    warn(f"{repo}: dedupe scan hit the {PAGE_CAP}-page bound for {plan_id} — "
+         "treating as UNREADABLE (never spawn on a truncated scan)")
+    # PERMANENT once the repo outgrows the bound: every future plan stalls, and
+    # the runbook tells the operator that silence means "the watcher is not
+    # running" — actively wrong here. Page once per repo (r3 M2).
+    # keyed on the CAP VALUE (r4 low): after the operator raises the bound and
+    # the repo later outgrows the NEW one, the stall must page again rather
+    # than be silenced by a marker from the old bound.
+    if not dry_run:
+        _notify_once(f"pagecap-{repo.replace('/', '-')}-{PAGE_CAP}",
+                     "Dispatch stalled",
+                     f"{repo}: >{PAGE_CAP * 50} PRs — dedupe cannot prove a "
+                     "plan undispatched, so NO new plan will dispatch. Raise "
+                     "FLEET_PR_PAGE_CAP.")
+    return "unreadable"
+
+
+def pins():
+    """Configured pins as (path, ref). No default, deliberately: an
+    unconfigured watcher checks nothing, exactly as FLEET_WATCH_REPOS does.
+
+    Entry syntax is `path` or `path=ref` (r1 L6): `origin/main` was hard-coded,
+    which is wrong for any pin whose repo names its trunk differently or that is
+    deliberately held to a release ref.
+    """
+    raw = os.environ.get("FLEET_PINS", "")
+    out = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        path, _, ref = item.partition("=")
+        out.append((os.path.expanduser(path.strip()), ref.strip() or "origin/main"))
+    return out
+
+
+def _git(path, *args):
+    """(ok, stdout). Never raises; a missing git is a finding, not a crash."""
+    try:
+        r = subprocess.run(("git", "-C", path) + args, capture_output=True,
+                           text=True, timeout=60)
+        return r.returncode == 0, r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+
+
+def pin_status(path, ref="origin/main"):
+    """(state, detail, facts) for one pinned worktree. READ ONLY.
+
+    States, and why each is separate:
+      missing     the path is gone -- whatever symlinks into it is dangling
+      not-a-repo  it exists but is not a worktree ROOTED HERE. `git -C` walks
+                  upward (r1 L4), so a plain directory inside any repo was
+                  classified by its parent -- a deleted-and-recreated pin under
+                  a home that is itself a repo reported the parent's branch.
+                  --show-toplevel must equal the pin path.
+      attached    it is ON A BRANCH. Then it is not a pin at all: someone
+                  else's checkout can move what every session loads, which is
+                  the whole condition pinning removed.
+      dirty       HEAD matches, but the tree does not (r1 L5). Someone patched
+                  the pin in place, so sessions load unreviewed code. Reported
+                  separately because `current` would otherwise mean "sessions
+                  run what is on the trunk" while they do not -- the more
+                  dangerous direction for a secret guard.
+      unfetchable the remote could not be reached. Its own state, NOT folded
+                  into `current`: answering "in sync" from a ref that could not
+                  be refreshed is the fail-open this fleet keeps rediscovering.
+      stale       HEAD != ref. The pin is doing its job; a human re-points.
+      current     HEAD == ref, tree clean, verified after a successful fetch.
+    """
+    facts = {"path": path, "ref": ref}
+    if not os.path.isdir(path):
+        return "missing", f"{path} does not exist", facts
+    ok, top = _git(path, "rev-parse", "--show-toplevel")
+    if not ok or os.path.realpath(top) != os.path.realpath(path):
+        return ("not-a-repo",
+                f"{path} is not a git worktree rooted here", facts)
+    on_branch, branch = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if on_branch:
+        facts["branch"] = branch
+        return ("attached",
+                f"{path} is on branch '{branch}', not detached — another "
+                "checkout can move what sessions load", facts)
+    fetched, _ = _git(path, "fetch", "origin", "--quiet")
+    ok_head, head = _git(path, "rev-parse", "HEAD")
+    ok_target, target = _git(path, "rev-parse", ref)
+    facts["head"] = head or None
+    facts["target"] = target or None
+    if not ok_head or not ok_target:
+        return "unfetchable", f"{path}: cannot resolve HEAD or {ref}", facts
+    if not fetched:
+        return ("unfetchable",
+                f"{path}: fetch failed, so {ref} may be stale — refusing to "
+                f"call this current (HEAD {head[:7]})", facts)
+    if head != target:
+        return ("stale",
+                f"{path}: HEAD {head[:7]} != {ref} {target[:7]} — merged work "
+                "is not reaching sessions", facts)
+    ok_st, porcelain = _git(path, "status", "--porcelain")
+    if ok_st and porcelain:
+        facts["dirty_entries"] = len(porcelain.splitlines())
+        return ("dirty",
+                f"{path}: at {head[:7]} but the tree has local changes — "
+                "sessions are loading unreviewed edits", facts)
+    return "current", f"{path}: {head[:7]}", facts
+
+
+# --- the resident watcher's own self-restart (plan 0040) --------------------
+#
+# A resident process holds the code it imported at start. `fleet-pin-advance`
+# fast-forwards the pin fleet-watch runs from, but nothing else tells this
+# already-running process to look again -- so after plan 0034 started moving
+# pins on a timer, the watcher kept dispatching without whatever the newest
+# merge changed until a human restarted it by hand. `fleet-svc restart` cannot
+# do this FOR it: fleet-watch holds its own service lease, and fleet-svc
+# refuses every caller but the holder (plan 0029). It is the only process
+# entitled to end its own loop.
+
+
+def _watcher_worktree():
+    """(path, head) for the git worktree this code was loaded from -- the
+    repository containing BIN -- or (None, None) if it cannot be resolved.
+    `head` is fixed here at the commit this process's imported code actually
+    is, and is compared against that same worktree's HEAD every cycle after:
+    however far the worktree moves, what is already imported cannot change
+    without a restart."""
+    ok, top = _git(str(BIN), "rev-parse", "--show-toplevel")
+    if not ok or not top:
+        return None, None
+    ok, head = _git(top, "rev-parse", "HEAD")
+    if not ok or not head:
+        return None, None
+    return top, head
+
+
+def _head_is_behind(path, ref="origin/main"):
+    """True if HEAD is a strict ancestor of `ref` -- behind and ONLY behind,
+    never diverged and never ahead. Reads what `pin_status` already fetched
+    moments ago in the same check; it does not fetch again."""
+    ok, _out = _git(path, "merge-base", "--is-ancestor", "HEAD", ref)
+    return ok
+
+
+def _launched_still_running():
+    """True if anything this process Popen'd (FLEET_SPAWN=popen) is still
+    alive. No in-memory list of what was spawned: the module holds no fleet
+    state in memory and this must not add any (plan 0040 boundary), so this
+    asks the OS which processes have THIS process as their parent -- the same
+    thing a resident process that had just crashed and restarted would have to
+    do, since it would remember nothing either.
+
+    A reaped-but-unwaited child is a ZOMBIE and can open no pull request, so it
+    does not count; neither does the `ps` this function spawns to ask the
+    question, which is itself briefly this process's child while it runs.
+    Never raises; a `ps` that cannot answer is read as "assume something is
+    still running" -- the direction that never cuts off a live orchestrator."""
+    try:
+        r = subprocess.run(["ps", "-axo", "pid=,ppid=,stat=,comm="],
+                           capture_output=True, text=True, errors="replace",
+                           timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return True
+    if r.returncode != 0:
+        return True
+    me = os.getpid()
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        state, comm = parts[2], parts[3]
+        if ppid != me or state.startswith("Z"):
+            continue
+        if os.path.basename(comm) == "ps":
+            continue                      # the probe itself, not a launch
+        return True
+    return False
+
+
+def _restart_check(worktree, head, dry_run=False):
+    """(decision, message) once HEAD has moved from the commit this process's
+    code was loaded from -- decision is one of "restart", "dry-run" or
+    "declined". Called only when resident()'s own cheap, local
+    `git rev-parse HEAD` has already shown a move: `pin_status` below fetches,
+    and the boundary is to not pay that cost every cycle for a watcher that
+    never advances.
+
+    Reuses `pin_status` rather than re-deriving its states (boundary): a
+    `dirty`, `attached`, `not-a-repo`, `missing` or `unfetchable` worktree is
+    not a reviewed trunk commit and must never be restarted onto."""
+    state, detail, _facts = pin_status(worktree)
+    clean = state == "current" or (state == "stale" and _head_is_behind(worktree))
+    if not clean:
+        return ("declined",
+                f"HEAD moved to {head[:7]} but not restarting: {state} ({detail})")
+    if spawn_mode() == "popen" and _launched_still_running():
+        return ("declined",
+                f"HEAD moved to {head[:7]} ({state}) but not restarting: an "
+                "orchestrator this watcher launched is still running")
+    if dry_run:
+        return "dry-run", f"HEAD moved to {head[:7]} ({state})"
+    return "restart", f"HEAD moved to {head[:7]} ({state})"
+
+
+def _pin_state_file(path):
+    return lib.fleet_dir() / "pins" / (hashlib.sha256(
+        path.encode()).hexdigest()[:16] + ".state")
+
+
+def _now():
+    """A seam, nothing more: plan 0059's delayed paging compares `_now()`
+    against a recorded first-seen timestamp, and a test needs to move that
+    clock without faking the whole interpreter's idea of time."""
+    return lib.now_utc()
+
+
+_PIN_ADVANCE_WINDOW = {}   # {} until read once; then {"seconds": int | None}
+
+
+def pin_advance_plist_path():
+    return Path(os.environ.get(
+        "FLEET_PIN_ADVANCE_PLIST",
+        str(Path.home() / "Library" / "LaunchAgents" /
+            "org.eunomia.fleet-pin-advance.plist")))
+
+
+def pin_advance_window():
+    """fleet-pin-advance's own `StartInterval`, in seconds -- the time it is
+    given to heal a stale pin unaided -- or None if the unit is not
+    installed (plan 0059: "if the advancer is not installed, page on today's
+    schedule").
+
+    Read from the INSTALLED copy (`pin_advance_plist_path`, overridable for
+    tests -- the suite always overrides it, so a result never depends on
+    whether the machine running it happens to have the unit), not this
+    repo's `launchd/` copy: the installed one is what actually runs and the
+    two can differ.
+
+    `plistlib` reads the file directly -- zero subprocesses -- and the
+    answer is cached for the LIFE OF THIS PROCESS (Boundaries: "do not shell
+    out to launchctl every cycle" applies just as much to re-reading a file
+    that cannot change without a reinstall)."""
+    if not _PIN_ADVANCE_WINDOW:
+        window = None
+        try:
+            with open(pin_advance_plist_path(), "rb") as fh:
+                data = plistlib.load(fh)
+            raw = data.get("StartInterval")
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+                window = raw
+        except (OSError, plistlib.InvalidFileException, ValueError, TypeError):
+            window = None
+        _PIN_ADVANCE_WINDOW["seconds"] = window
+    return _PIN_ADVANCE_WINDOW["seconds"]
+
+
+def pin_page_margin(env=None):
+    """Extra seconds beyond the advance window before a self-healing stale
+    pin pages (plan 0059) -- must exceed the watcher's own poll jitter, or a
+    sample taken moments before the advancer's next scheduled run would
+    misread a pin that is about to heal on schedule as overdue. Default
+    600s, well past ordinary launchd StartInterval slop."""
+    env = os.environ if env is None else env
+    raw = (env.get("FLEET_PIN_PAGE_MARGIN") or "").strip()
+    if not raw:
+        return 600
+    try:
+        n = int(raw)
+    except ValueError:
+        sys.exit(f"fleet-watch: FLEET_PIN_PAGE_MARGIN={raw!r} is not an integer")
+    if n < 0:
+        sys.exit(f"fleet-watch: FLEET_PIN_PAGE_MARGIN={n} must be >= 0")
+    return n
+
+
+def _pin_heal_category(path, head, target):
+    """(category, reason) -- would `fleet-pin-advance` heal this STALE pin
+    unaided? Reads fleetlib's shared predicate (plan 0059) rather than
+    re-deriving fleet-pin-advance's own refusal list here, which is exactly
+    the drift the plan calls out ("mirroring the list leaves two
+    implementations to drift"). This resolves the origin repo and asks the
+    broker itself -- the same two doors `pin_origin_repo`/`broker_verdict`
+    already open for fleet-pin-advance and this file's own dispatch cycle --
+    but only when the checks before them do not already settle it."""
+    def _broker(repo):
+        code, why, _lane = broker_verdict(repo)
+        result = {PROT_OK: "ok", PROT_REFUSED: "refused",
+                 PROT_UNKNOWN: "unknown"}[code]
+        return result, why
+    return lib.pin_advance_category(path, head, target, lib.pin_origin_repo, _broker)
+
+
+def _read_pin_record(f):
+    """(record, is_legacy). `record` is None if this pin has never been
+    recorded. `is_legacy` marks a plan-0058-era one-line file -- the bare
+    state name, with no head/first-seen/paged -- for the caller to upgrade
+    in place exactly once (plan 0059 Boundaries)."""
+    try:
+        text = f.read_text().strip()
+    except OSError:
+        return None, False
+    if not text:
+        return None, False
+    try:
+        rec = json.loads(text)
+    except json.JSONDecodeError:
+        return {"state": text}, True
+    if isinstance(rec, dict) and isinstance(rec.get("state"), str):
+        return rec, False
+    return {"state": text}, True          # unreadable shape: same safe path
+
+
+def _pin_deliver_now(path, state, head, target, new_episode, paged, first_seen):
+    """Would THIS cycle actually PAGE for a pin already known to be in
+    `state` -- as opposed to merely emitting `pin-drift`? Isolated from
+    check_pins's file/emit bookkeeping so the delay math plan 0059 adds
+    reads as one small function.
+
+    `current` never pages. Every other non-`stale` state pages exactly on
+    its own transition, unchanged from before this plan. A `stale` pin
+    delays only when something is actually positioned to heal it: the
+    advancer is installed (`pin_advance_window` is not None) AND
+    `_pin_heal_category` says HEALS rather than STANDING. A diverged head, a
+    dirty tree, an unparseable origin, or a broker that actively refuses are
+    all STANDING and page on their own transition too, exactly like any
+    other bad state, because delaying them buys nothing."""
+    if state == "current":
+        return False
+    if state != "stale":
+        return new_episode
+    window = pin_advance_window()
+    if window is None:
+        return new_episode
+    category, _why = _pin_heal_category(path, head, target)
+    if category == lib.PIN_ADVANCE_STANDING:
+        return new_episode
+    if paged:
+        return False
+    seen_at = lib.parse_ts(first_seen)
+    elapsed = (_now() - seen_at).total_seconds() if seen_at else 0
+    return elapsed >= window + pin_page_margin()
+
+
+def check_pins(dry_run=False, label=LABEL_WATCH):
+    """Report pin drift ON TRANSITION. Emits and pages; never moves a pin.
+
+    `label` (plan 0058) is which launchd identity is running this check: the
+    caller under `--pins-only` passes LABEL_PIN_WATCH; the dispatch cycle
+    (plain invocation and `--resident`) passes the default, LABEL_WATCH. This
+    function cannot tell the two apart itself — both run the identical check
+    — so the caller states it.
+
+    Moving a pin is a deployment decision with a security surface -- these paths
+    are how fleet-secret-guard and the skill corpus reach every session -- and
+    the watcher's contract is that it spawns, emits and notifies, never acts on
+    staleness.
+
+    Transition-gated, not marker-gated (r1 M1, L1, L2). The first version keyed
+    a one-shot on path+state and never cleared it, so a pin paged ONCE per
+    install: the everyday cycle is merge -> stale -> re-point -> merge -> stale,
+    and the plist's own verification step spent the only page. It also emitted
+    every cycle (48 rows per stale pin per day) and wrote events under
+    --dry-run. Recording last-seen state fixes all three: an unchanged state is
+    silent, a changed one warns, emits and pages once, and returning to
+    `current` re-arms by construction.
+
+    Delivery still consumes the transition, mirroring _notify_once: the new
+    state is recorded only if the page was delivered, so a five-second ntfy
+    outage does not swallow the signal permanently.
+
+    PLAN 0059, beyond pure transition-gating: `pin-drift` still emits on
+    every transition (staleness is never silenced, only the page), but a
+    STALE transition that the advancer is positioned to heal unaided does
+    NOT page on sight — it pages once, from an otherwise UNCHANGED state,
+    once `pin_advance_window() + pin_page_margin()` has passed since the pin
+    was first seen at its current (stale) head with no page yet sent. Per
+    the plan's Boundaries, a legacy one-line state file is upgraded in place
+    as "state known, first-seen unknown, ALREADY PAGED" — the safer
+    direction is one possible missed page, never a replay of a page someone
+    may already have been woken for.
+    """
+    bad = []
+    for path, ref in pins():
+        state, detail, facts = pin_status(path, ref)
+        head = facts.get("head")
+        f = _pin_state_file(path)
+        prev, is_legacy = _read_pin_record(f)
+        if state != "current":
+            bad.append((path, state, detail))
+
+        if is_legacy:
+            prev = {"state": prev["state"], "head": head,
+                    "first_seen": lib.ts(_now()), "paged": True}
+
+        prev_state = prev.get("state") if prev else None
+        prev_head = prev.get("head") if prev else None
+        # per-HEAD, not per stale episode (plan 0059): several merges healed
+        # in quick succession must not accumulate into a page on the last
+        # one, so a `stale` pin re-arms the clock on a HEAD change even
+        # though its state name never stopped being "stale".
+        new_episode = (prev is None or state != prev_state or
+                      (state == "stale" and head != prev_head))
+        first_seen = (lib.ts(_now()) if new_episode
+                     else (prev.get("first_seen") or lib.ts(_now())))
+        paged = False if new_episode else bool(prev.get("paged"))
+
+        deliver_now = _pin_deliver_now(path, state, head, facts.get("target"),
+                                       new_episode, paged, first_seen)
+
+        if not (new_episode or is_legacy or deliver_now):
+            continue                       # true steady state: say nothing
+
+        if dry_run:
+            if new_episode or deliver_now:
+                warn(f"pin {state}: {detail}")
+            continue                       # r1 L1: report, write nothing
+
+        if new_episode:
+            warn(f"pin {state}: {detail}")
+            emit("pin-drift", None, dict(facts, state=state, previous=prev_state))
+
+        delivered = True
+        if deliver_now:
+            delivered = notify(f"Pin {state}", detail, label) is not False
+        if deliver_now and not delivered:
+            # Boundaries: a delayed (or immediate) page that fails to
+            # deliver must not set the paged flag, and first-seen must
+            # survive so the next cycle retries rather than re-arming.
+            continue
+
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(
+                {"state": state, "head": head, "first_seen": first_seen,
+                 "paged": paged or deliver_now}, sort_keys=True) + "\n")
+        except OSError:
+            pass                           # unrecordable: re-report next cycle
+    return bad
+
+
+def dispatch_leases():
+    """Active/assigned dispatch leases, keyed (repo, plan_id).
+
+    NOT by bare plan id (r3 M1): ids are per-repo sequential, so two repos
+    both carrying `0001-initial-setup` collided — and a collision silently
+    HID one lease from both the cap count and the orphan sweep, so its
+    orchestrator's death would never page and the plan would stall with zero
+    signal. The repo comes from the lease's own resource."""
+    out = {}
+    for rec in lib.all_leases():
+        note = rec.get("note") or ""
+        if not note.startswith(NOTE_PREFIX):
+            continue
+        if rec.get("state") not in ("assigned", "active"):
+            continue
+        repo = lib.resource_of(rec).get("repo") or ""
+        out[(repo, note[len(NOTE_PREFIX):])] = rec
+    return out
+
+
+# Plan 0067. The steward's own log lines that mean "nothing is being spent right
+# now": it is polling the forge for a human merge, or it has just seen a comment
+# it has not yet acted on. Pinned as a LITERAL set, never a `steward-*` glob —
+# the orchestrator owns that namespace and will grow it, and a glob would let a
+# line written by someone who never heard of this rule un-count a spending
+# session. tests/test_fleet_watch.py greps bin/orchestrator for every
+# `steward-` emitter and fails on one that is in neither this set nor its own
+# "spends or has ended" list, so a new line is classified on purpose.
+STEWARD_WAITING_PHASES = frozenset({
+    "steward-start",
+    "steward-foreign",
+    "steward-unfreeze",
+    "steward-followup",
+    "steward-instruction",
+    "steward-refused",
+})
+_LOG_TAIL_BYTES = 8192
+
+
+def _last_phase(path):
+    """The phase word of the LAST line of a run log, or None when unreadable.
+
+    Lines are `<ts> <phase> k=v ...` (`RunLog.note`). Only the tail is read: the
+    log is append-only and this runs every cycle for every live lease. None for
+    a missing or empty file, for an unreadable one, and for a tail that holds
+    no complete line — every caller reads None as "unknown", which counts."""
+    try:
+        with open(path, "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            start = max(0, size - _LOG_TAIL_BYTES)
+            fh.seek(start)
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    lines = [l for l in tail.split("\n") if l.strip()]
+    if not lines or (start and len(lines) == 1):
+        return None          # empty, or one line longer than the tail we read
+    parts = lines[-1].split()
+    return parts[1] if len(parts) >= 2 else None
+
+
+def is_waiting_on_a_human(rec, orch=None):
+    """True when this lease's orchestrator has finished spending and is only
+    polling for a human merge (plan 0067), so it must not hold a dispatch slot.
+
+    Read from the orchestrator's own run log, at the path
+    `orchestrator.run_log_path` names — not from `dispatch_phase` in fleet.db,
+    which `fleet-collect` fills on its own cadence and so lags the log by
+    minutes, exactly the window in which a steward unfreezes and starts
+    spending again. The log line is written synchronously by the process the
+    lease belongs to.
+
+    UNKNOWN IS LIVE. The cap is a spend throttle, so a lease whose state cannot
+    be read is assumed to be spending: no lease id, an orchestrator that will
+    not load (the broker deployment does not ship it), no log, an empty or
+    unreadable log, or a last line outside `STEWARD_WAITING_PHASES`. Only a
+    positive reading of a waiting line returns True. A steward that resumes
+    spending writes `implementer-start`, which is not in the set, so it counts
+    again with no state kept here.
+
+    Callers consult this only for leases that are not orphaned
+    (`lib.is_orphaned`), so the two rules cannot disagree about one lease."""
+    lease_id = rec.get("id") or ""
+    if not lease_id:
+        return False
+    try:
+        orch = orch or _orchestrator_module()
+        path = orch.run_log_path(orch.lease_key(lease_id))
+    except Exception:                        # noqa: BLE001 — unknown is live
+        return False
+    return _last_phase(path) in STEWARD_WAITING_PHASES
+
+
+def count_live(inflight):
+    """(live, waiting) over the dispatch leases: `live` counts against
+    FLEET_WATCH_CAP, `waiting` is the non-orphaned leases excluded from it
+    because they are only waiting on a human merge (plan 0067). An orphan is
+    neither — it is the respawn path's, and a dead steward is an orphan first."""
+    live = waiting = 0
+    orch = None
+    for rec in inflight.values():
+        if lib.is_orphaned(rec):
+            continue
+        if orch is None:
+            try:
+                orch = _orchestrator_module()
+            except Exception:                # noqa: BLE001 — unknown is live
+                orch = False
+        if orch and is_waiting_on_a_human(rec, orch):
+            waiting += 1
+        else:
+            live += 1
+    return live, waiting
+
+
+def cap_excluded(waiting):
+    """The summary line's form of `cap_note`: `, waiting-on-human N excluded`
+    inside `(cap M...)`, empty at zero."""
+    return f", waiting-on-human {waiting} excluded" if waiting else ""
+
+
+def cap_note(live, waiting):
+    """What the cap message says was left out of the count; empty when nothing
+    was, so a reader that predates plan 0067 sees the line it always saw."""
+    if not waiting:
+        return ""
+    return f" (live {live}, waiting-on-human {waiting} excluded)"
+
+
+# What the last cycle() excluded, for the one-line summary its callers print.
+# cycle() returns the dispatch count and tests pin that, so the exclusion
+# travels beside it rather than in it.
+_cycle_waiting = 0
+
+# The cap cycle() last RESOLVED (plan 0068) — same travel-beside-the-return
+# reason as _cycle_waiting above: cycle()'s callers print it, but cycle()
+# itself owns resolving it fresh every call, never cached beyond one cycle.
+_cycle_cap = CAP
+
+
+def _resolve_cap():
+    """The concurrency cap for this cycle: `fleet_setting.dispatch_cap` when a
+    database configures it, else the module's own `CAP`/`CAP_SOURCE` fallback
+    (plan 0068 D3) — a `fleet.db` that is absent, locked, or lacks the table
+    is the second source, not a refusal. Logs the resolved value ON
+    TRANSITION ONLY, so `dispatch_cap = 0` prints `cap 0 (paused)` once per
+    change, never once per plan (nothing here runs inside the per-plan loop)
+    and never once per cycle forever."""
+    global _last_cap_logged, _cycle_cap
+    value, source, _changed_at = fleetconfig.resolve_setting(
+        "dispatch_cap", CAP, CAP_SOURCE)
+    _cycle_cap = value
+    state = (value, source)
+    if state != _last_cap_logged:
+        _last_cap_logged = state
+        if value == 0:
+            print(f"fleet-watch: cap 0 (paused) — source={source}")
+        else:
+            print(f"fleet-watch: dispatch cap {value} (source={source})")
+    return value
+
+
+def _orchestrator_module():
+    """`bin/orchestrator`, loaded on demand and NEVER at import.
+
+    The one place this file loads it. The reasons in `_record_page` below apply
+    to every caller: this file is loaded from directories that may not carry the
+    rest of `bin/`, so a module-level load would make merely importing it fail
+    there. Raises whatever the load raises — each caller decides what an
+    unloadable orchestrator means for it."""
+    loader = importlib.machinery.SourceFileLoader(
+        "orchestrator", str(BIN / "orchestrator"))
+    orch_mod = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("orchestrator", loader))
+    loader.exec_module(orch_mod)
+    return orch_mod
+
+
+def _record_page(title, body, delivered, detail, label):
+    """bin/orchestrator's `record_page`, reused rather than restated so every
+    page this fleet sends lands in the one pages.jsonl (plan 0058; bin/mopsus
+    loads it the same way, for the same reason).
+
+    Loaded LAZILY, inside the call, NOT at module import: `bin/fleet-watch` is
+    `SourceFileLoader`'d from two directories that do not contain the rest of
+    `bin/` — `~/.local/share/pins/eunomia/bin` (which does), and keyvault's
+    forgejo-broker deployment on vaulthost, which does NOT ship `bin/orchestrator`
+    at all (tests/test_forge_call_sites.py's COMPANIONS is the declared,
+    tested set, and orchestrator is not in it). A module-level load made
+    merely IMPORTING this file fail on the broker, whether or not it ever
+    pages — this file has to keep loading there even if every call below
+    never fires.
+
+    Also guards on top of record_page's own promise (plan 0058 Boundaries): "a
+    failed record must not fail the page" — logging must not take down the
+    thing it logs, twice over."""
+    try:
+        orch_mod = _orchestrator_module()
+        orch_mod.record_page(title, body, delivered, detail, extra={"unit": label})
+    except Exception:
+        pass
+
+
+def notify(title, body, label=LABEL_WATCH):
+    """True when the page was delivered (or stderr is the configured channel).
+    False on a delivery failure — callers must not consume a one-shot on it.
+
+    `label` is which of this file's launchd identities is paging (LABEL_WATCH
+    or LABEL_PIN_WATCH, or a caller's own constant — bin/fleet-pin-advance
+    passes its own name). It is recorded, never used to change behaviour.
+    Defaults to LABEL_WATCH: every call site inside this file that does not
+    pass one explicitly sits in the dispatch cycle, which never runs under
+    `--pins-only`, so there is nothing for it to disambiguate.
+
+    Records the attempt AFTER it is made, via bin/orchestrator's own
+    `record_page` (plan 0058) — reused, not restated, so this page lands in
+    the same pages.jsonl every other pager writes. The stderr-only case below
+    still returns True (unchanged: a print-only channel must keep consuming
+    its one-shot the way it always has, so an unconfigured watcher does not
+    spam every cycle) but the RECORD reflects the truth — nobody was actually
+    paged — the same reading `bin/orchestrator`'s own notify() gives a blank
+    channel."""
+    url = os.environ.get("FLEET_NTFY_URL", "")
+    if not url:
+        print(f"fleet-watch: NOTIFY {title} — {body}", file=sys.stderr)
+        _record_page(title, body, False, "no channel configured", label)
+        return True
+    try:
+        req = urllib.request.Request(url, data=f"{title}: {body}".encode(),
+                                     method="POST")
+        urllib.request.urlopen(req, timeout=5).read()
+        _record_page(title, body, True, "", label)
+        return True
+    except Exception as e:
+        # r8 M3: a schemeless FLEET_NTFY_URL ("ntfy.sh/topic" — an easy paste)
+        # raises ValueError from urlopen, which is none of URLError/OSError/
+        # HTTPException. It escaped notify(), propagated through _notify_once
+        # and crash-looped the cycle under launchd — and because the O_EXCL
+        # marker is written BEFORE delivery and unlinked only on a False
+        # RETURN, the exception path left the marker with the page undelivered:
+        # the swallowed one-shot r4 M3 fixed, reintroduced. Returning False
+        # inherits that unlink. Nothing a notifier does is worth the cycle.
+        #
+        # The exception CLASS NAME only (plan 0058) — never str(e): that ValueError
+        # echoes the malformed URL, and other transport errors can echo a host
+        # or a token-bearing query string into this durable file.
+        print(f"fleet-watch: NOTIFY(failed) {title} — {body}", file=sys.stderr)
+        _record_page(title, body, False, e.__class__.__name__, label)
+        return False
+
+
+def emit(event_type, repo, detail, pr=None):
+    """Emit through fleet-emit so the append rides the same lock/rotation path
+    every producer uses. Awareness, not authority — a failed emit never gates
+    a dispatch decision."""
+    try:
+        src = BIN / "fleet-emit"
+        loader = importlib.machinery.SourceFileLoader("_fleet_emit", str(src))
+        spec = importlib.util.spec_from_loader("_fleet_emit", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        mod.FLEET_DIR = lib.fleet_dir()
+        mod.EVENTS = lib.fleet_dir() / "events.jsonl"
+        mod.LOCK = lib.fleet_dir() / "locks" / "events.lock"
+        # lease=None ALWAYS: plan-* are not lease-* events, and SPEC (enforced
+        # by fleet-emit) requires a null lease on those — the lease id rides
+        # in detail, exactly as budget-checkpoint carries its lease.
+        mod.emit(event_type, _watch_sid(), repo=repo, pr=pr, lease=None,
+                 detail=detail)
+    except (Exception, SystemExit) as e:
+        # not BaseException: a KeyboardInterrupt mid-emit must still interrupt
+        warn(f"emit {event_type} failed ({e.__class__.__name__}) — "
+             "the log is awareness, not authority; continuing")
+
+
+def slug_of(plan_id):
+    return re.sub(r"[^a-z0-9-]+", "-", plan_id.lower()).strip("-")[:40] or "plan"
+
+
+def _child_env():
+    """The environment the orchestrator gets — without the token helper (r12).
+
+    `spawn` passed `os.environ` straight through, which handed the child
+    `FLEET_TOKEN_CMD`.
+
+    WHAT THIS DOCSTRING USED TO CLAIM, AND WHY IT WAS WRONG (review 2369 L4). It
+    said "on this fleet that points at the admin-token helper", and then that an
+    admin token can PATCH the branch-protection rule, push a `status: ready`
+    plan, and restore it — forging the ignition this module exists to make
+    unforgeable. That is true of an admin token and false of this variable.
+
+    CHECKED, twice, most recently 2026-09-10: `FLEET_TOKEN_CMD` is set in no
+    launchd unit and in no shell profile, so it holds its default — line 104,
+    `~/bin/fetch-forgejo-token.sh`, the IMPLBOT helper. The admin one is
+    `fetch-forgejo-admin-token.sh`, reached through `FLEET_ADMIN_TOKEN_CMD`,
+    which ADR-0003 §2 retired.
+
+    Withholding it is still right, for the smaller true reason: a future
+    repointing of this variable must not be inherited by a child. Leaving the
+    larger false reason in place is worse than saying nothing, because a
+    security claim nobody re-checks is one everybody builds on.
+
+    The token VALUE was never here — it exists only as a local in `_token()` and
+    only as a header. This closes the recipe for minting a new one.
+    """
+    env = dict(os.environ, EUNOMIA_SESSION=_watch_sid())
+    env.pop("FLEET_TOKEN_CMD", None)
+    # FLEET_ADMIN_TOKEN_CMD was the same hazard with a sharper edge: the recipe
+    # for the OWNER's admin PAT. ADR-0003 §2 retired it, so there is normally
+    # nothing to pop — but it is still popped, because a host that ran the old
+    # configuration can have it set in a plist or a login shell, and inheriting
+    # a stale recipe is exactly r12.
+    env.pop("FLEET_ADMIN_TOKEN_CMD", None)
+    # FLEET_DIRECT_TOKEN_CMD is the same shape of hazard for the direct
+    # verdict source (plan 0054): a recipe for an admin-scoped credential,
+    # and a child inheriting it could mint one of its own.
+    env.pop("FLEET_DIRECT_TOKEN_CMD", None)
+    # FLEET_BROKER_SOCKET is deliberately NOT popped. It is a path, not a
+    # credential, and a child on this host reaches the socket with or without
+    # the variable — what it can no longer do is mint a PAT, which is the point
+    # of brokering a verdict.
+    #
+    # Not overclaiming, though: a same-uid child could unlink the socket and
+    # bind its own listener answering `ok: true`, and popping the variable would
+    # not stop that. Same-uid non-separation is the state ADR-0003 §3 concedes
+    # in writing; it closes when these callers get a distinct service uid and an
+    # SVID, not here.
+    return env
+
+
+# Every child gets its environment from _child_env(). Adding a subprocess that
+# builds one from os.environ directly reopens r12, which is how r12 shipped
+# half-applied: the fix was written for the orchestrator and landed on
+# fleet-claim, and nothing caught the difference because both calls looked alike.
+
+
+def spawn(repo, plan_path, fm, dry_run=False):
+    """Assign the lane lease, then start one detached orchestrator holding it.
+
+    The lease is a real `branch` lease on the branch the orchestrator will
+    create — so row 6's pre-push hook enforces the lane for free, and row 4's
+    heartbeat makes a dead orchestrator DERIVE orphaned (which this watcher
+    surfaces but never acts on: Principle 4)."""
+    plan_id = fm["id"]
+    sid = f"orch-{slug_of(plan_id)}-{uuid.uuid4().hex[:8]}"
+    branch = f"feat/{slug_of(plan_id)}"
+    resource = json.dumps({"type": "branch", "repo": repo, "branch": branch})
+    # the collision check runs BEFORE the dry-run return (r6 low): reporting
+    # "would dispatch" for a plan an armed run refuses misleads exactly the
+    # operator who reached for --dry-run to find out what would happen.
+    for rec in lib.all_leases():
+        res = lib.resource_of(rec)
+        if (rec.get("state") in ("assigned", "active")
+                and res.get("repo") == repo and res.get("branch") == branch
+                and (rec.get("note") or "") != f"{NOTE_PREFIX}{plan_id}"):
+            warn(f"{repo}: branch {branch} is already leased for a different "
+                 f"plan ({rec.get('note')}) — distinct ids normalising to one "
+                 "slug would put two orchestrators on one branch (r4 low)")
+            return None
+    if dry_run:
+        print(f"DRY-RUN would dispatch {repo} {plan_path} as {sid}")
+        return sid
+    r = subprocess.run(
+        # --ttl explicitly: the default is 240 minutes, and once the
+        # orchestrator activates this lease is_orphaned switches from the
+        # 10-minute activate timeout to ttl-minutes of heartbeat silence. Left
+        # unset, a SIGKILLed orchestrator would be invisible for four hours.
+        [sys.executable, str(BIN / "fleet-claim"), "--assign", resource,
+         "--holder", sid, "--note", f"{NOTE_PREFIX}{plan_id}",
+         "--ttl", str(lib.lease_ttl_minutes())],
+        capture_output=True, text=True,
+        # r7 low: a set-but-EMPTY EUNOMIA_SESSION (trivial in a launchd
+        # plist) propagated straight through, and fleet-claim exits "no
+        # session identity" — every dispatch then failed as "lease assign
+        # failed", pointing the operator at the ledger instead of the plist.
+        env=_child_env())
+    lease_id = (r.stdout or "").strip().splitlines()[0] if r.stdout.strip() else ""
+    if r.returncode != 0 or not lease_id:
+        detail = r.stderr.strip()[:120]
+        warn(f"{repo}: lease assign failed for {plan_id} ({detail}) — NOT spawning")
+        # the doc promises plan-failed + a push here (r2 M3): a persistently
+        # failing fleet-claim would otherwise stall ALL dispatch with the
+        # evidence only in stderr, while the runbook's own diagnostic says
+        # silence means "the watcher is not running" — actively wrong.
+        emit("plan-failed", repo, {"plan": plan_id, "reason": "lease assign failed"})
+        _notify_once(_marker_key("fail-assign", repo, plan_id),
+                     "Plan dispatch failed",
+                     f"{repo} {plan_id}: could not assign a lease")
+        return None
+    orch = os.environ.get("FLEET_ORCHESTRATOR", str(BIN / "orchestrator"))
+    # r12 fixed the WRONG subprocess. Its commit said "the orchestrator inherited
+    # FLEET_TOKEN_CMD ... one line" and changed the fleet-claim call above, not
+    # this one — so the child the mitigation was written for kept receiving the
+    # admin-token recipe, and _child_env's own docstring asserted a protection
+    # this line did not have. Both spawn modes below go through _child_env.
+    child = dict(_child_env(), EUNOMIA_SESSION=sid,
+                 EUNOMIA_PLAN_ID=plan_id, EUNOMIA_PLAN_ZONE=fm.get("zone", ""),
+                 EUNOMIA_PLAN_TIER=fm.get("tier", ""))
+    argv = [orch, repo, plan_path, lease_id]
+    try:
+        if spawn_mode() == "launchd":
+            label = job_label(lease_id)
+            if label is None:
+                raise OSError(f"lease id {lease_id!r} is not label-safe")
+            # Which supervisor actually runs this is a host property, not a
+            # per-dispatch choice (plan 0053 D4) — fleetjob.select_impl()
+            # decides once here so the log line below and the spawn agree.
+            spawn_impl = fleetjob.select_impl()
+            fleetjob.start(label, argv, job_env(child), impl=spawn_impl)
+        else:
+            subprocess.Popen(
+                argv, env=child,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            spawn_impl = "popen"
+    except OSError as e:
+        warn(f"{repo}: orchestrator spawn failed for {plan_id} ({e}) — "
+             "releasing the lease so the next cycle can retry")
+        if not _retire(lease_id):
+            notify("Dangling dispatch lease",
+                   f"{repo} {plan_id}: spawn failed AND the lease would not "
+                   f"release ({lease_id}) — this plan is blocked until it is")
+        emit("plan-failed", repo, {"plan": plan_id, "reason": "spawn failed"})
+        _notify_once(_marker_key("fail-spawn", repo, plan_id),
+                     "Plan dispatch failed",
+                     f"{repo} {plan_id}: orchestrator would not start")
+        return None
+    # r6 low: these synthetic keys are excluded from _sweep_markers by design,
+    # so without an explicit clear a SECOND failure after an intervening
+    # recovery (orchestrator installed, later broken again) would page never.
+    # A completed dispatch is that recovery.
+    _clear_notified(_marker_key("fail-assign", repo, plan_id))
+    _clear_notified(_marker_key("fail-spawn", repo, plan_id))
+    _clear_notified(_marker_key("fail-respawn", repo, plan_id))
+    # spawn_impl is the choice fleetjob.select_impl() made above ("launchd" or
+    # "systemd"), or the literal "popen" fallback — logged once per start
+    # (plan 0053 D4) through the same structured-event channel every other
+    # dispatch fact rides, per `bin/fleet-events --type plan-dispatched`.
+    emit("plan-dispatched", repo, {"plan": plan_id, "session": sid,
+                                   "branch": branch, "lease": lease_id,
+                                   "spawn": spawn_impl})
+    print(f"dispatched {repo} {plan_id} -> {sid} (lease {lease_id}, "
+         f"spawn={spawn_impl})")
+    return sid
+
+
+# The only environment a job inherits is what its record carries, so the
+# variables have to be named. Named rather than copied WHOLESALE on purpose:
+# os.environ would be written verbatim to a file on disk, and the day something
+# secret enters the watcher's environment that file silently becomes a leak.
+# These prefixes are configuration — urls, uids, socket paths, repo lists — and
+# a reviewer can see at a glance that none of them is a credential.
+JOB_ENV_PREFIXES = ("FLEET_", "EUNOMIA_")
+# HOME and PATH are not FLEET_-shaped and the orchestrator needs both: git reads
+# HOME for its config and ssh for known_hosts, and PATH is how `claude` is found.
+JOB_ENV_EXTRA = ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SSH_AUTH_SOCK")
+
+
+def job_label(lease_id):
+    """The supervised-job label for a dispatch — a launchd label verbatim, and
+    (see fleetjob.py's module docstring) also a legal systemd unit name with no
+    remapping. Lease ids are `type--slug--NNN`, which is already label-safe,
+    but this refuses anything else rather than handing a supervisor a string a
+    lease body could have chosen."""
+    if not lib._ID_RE.match(lease_id or ""):
+        return None
+    return f"org.eunomia.fleet-orch.{lease_id}"
+
+
+def spawn_mode(env=None):
+    """`launchd` (default) or `popen`.
+
+    WHY THE DEFAULT MOVED. `popen` is the v0 shape: Popen(start_new_session=True)
+    and the watcher exits, which reparents the orchestrator to launchd as an
+    ORPHAN — a process whose responsible process is gone. On macOS such a process
+    cannot open a local-network connection from a newly-launched binary, so every
+    dispatch died at its first `git fetch`. Six for six, and a shape matrix on
+    2026-09-10 separated it over 15 samples with no overlap; both ssh and HTTP
+    fail identically while raw sockets from the same orphan succeed.
+
+    A supervised JOB also reports ppid 1, and this is the distinction that
+    matters: the supervisor is its parent rather than the reaper it fell back
+    to, and its git calls succeed (measured, same matrix, 3/3). The name
+    stayed `launchd` rather than becoming a third value: on every host this
+    fleet runs the watcher on today it still IS launchd, and `fleetjob.
+    select_impl()` — not this flag — is what picks systemd on a host that
+    has it instead (plan 0053 D4).
+
+    `popen` is kept because it is correct again the moment the watcher is
+    RESIDENT — the orphaning is what breaks it, not the Popen — and because a
+    knob that cannot be turned back is not a knob."""
+    env = os.environ if env is None else env
+    mode = (env.get("FLEET_SPAWN") or "launchd").strip().lower()
+    if mode not in ("launchd", "popen"):
+        sys.exit(f"fleet-watch: FLEET_SPAWN={mode!r} is not 'launchd' or 'popen'")
+    return mode
+
+
+def job_env(child_env):
+    """The subset of `child_env` a job definition carries. See JOB_ENV_*.
+
+    EUNOMIA_FLEET_DIR is stamped EXPLICITLY rather than passed through. It is
+    what `reap_jobs` reads to decide "did I mint this?", and on a default fleet
+    dir the variable is simply unset in the environment — so relying on the
+    prefix filter to carry it would leave every production job unattributable
+    and therefore never reaped, which is the failure the attribution check was
+    added to prevent, arriving from the other side."""
+    out = {k: v for k, v in child_env.items()
+           if k.startswith(JOB_ENV_PREFIXES) or k in JOB_ENV_EXTRA}
+    out["EUNOMIA_FLEET_DIR"] = str(lib.fleet_dir())
+    return out
+
+
+def reap_jobs(dry_run=False):
+    """Stop and forget job records whose dispatch is over.
+
+    A one-shot job's record (see fleetjob.py) stays LISTED with its last exit
+    status after it finishes, so without this fleetjob.JOB_DIR accumulates one
+    file per plan ever dispatched.
+
+    Reaps ONLY jobs this fleet dir minted — see the comment at the check. The
+    lease is the authority on "over", not the job's exit status: an
+    orchestrator that exits 0 having opened a PR is done, and so is one that
+    died — what says the dispatch is finished is that nothing holds its lease
+    any more. Asking the supervisor for that would be reading the log for
+    authority, which principle 3 refuses."""
+    live = {rec.get("id") for rec in lib.all_leases()
+            if rec.get("state") in ("assigned", "active")}
+    reaped = 0
+    mine = str(lib.fleet_dir())
+    for label in fleetjob.list_labels(prefix="org.eunomia.fleet-orch."):
+        lease_id = label.rsplit(".", 1)[-1]
+        # ONLY reap what this fleet dir minted (r1 H1). fleetjob.JOB_DIR is
+        # uid-global and fixed from HOME at import, while `live` comes from
+        # EUNOMIA_FLEET_DIR — so a watcher pointed at a different ledger finds
+        # every OTHER watcher's job records, decides their leases do not
+        # exist, and stops them. On a running job that stop is a SIGTERM, so
+        # that is not a tidy-up, it is killing an orchestrator mid-implement
+        # and deleting the evidence.
+        #
+        # The test suite is exactly such a watcher: `_load` redirects the fleet
+        # dir to tmp_path and dozens of tests reach an armed cycle(), so on the
+        # dispatch host `pytest tests/test_fleet_watch.py` would SIGTERM whatever
+        # the fleet was working on and still pass. Found by review of this PR,
+        # reproduced by execution. It is the same class of miss as the commit
+        # above it, which fixed the SPAWN side reaching the real domain and left
+        # the REAP side reaching it.
+        #
+        # Unreadable is NOT ours: a record we cannot attribute is one we must
+        # not destroy.
+        env = fleetjob.job_environment(label)
+        owner = (env or {}).get("EUNOMIA_FLEET_DIR")
+        if owner != mine:
+            continue
+        if lease_id in live:
+            continue                     # still dispatched
+        if dry_run:
+            reaped += 1
+            continue
+        fleetjob.stop(label)
+        fleetjob.remove_record(label)
+        reaped += 1
+    return reaped
+
+
+def _safe_lease_key(lease_id):
+    """A lease id that is safe as a FILENAME (r10 L2).
+
+    `orphan_sweep` takes the id from the lease BODY, and a hand-edited body id
+    like `../x` reaches `leases/../x.watch-notified` through
+    `mkdir(parents=True)` + `O_CREAT`. The r9 fix sanitised PLAN ids for the
+    synthetic keys and left this path — which is the one carrying attacker- or
+    typo-controlled text from a file — untouched. `fleetlib._ID_RE` already
+    defines the shape a real lease id has.
+
+    r12 L3: the sanitising branch used `slug_of`, whose 40-character cap exists
+    for BRANCH names and has no business truncating a filename. It collided
+    siblings: `fail-respawn-operator-eunomia-0004-plan-dispatcher` and its `-v2`
+    sibling cut to the same key — and the runbook's own recovery advice
+    ("re-file under a new id") produces exactly that pair. The damage runs both
+    ways: the second plan's failure page is swallowed while the first plan's
+    marker exists, and either plan's success clears the other's marker. The
+    digest is of the ORIGINAL string, so two ids that slug alike still differ.
+    """
+    lease_id = str(lease_id or "")
+    if lib._ID_RE.match(lease_id):
+        return lease_id
+    slug = re.sub(r"[^a-z0-9-]+", "-", lease_id.lower()).strip("-")[:80] or "lease"
+    return f"{slug}-{hashlib.sha256(lease_id.encode()).hexdigest()[:8]}"
+
+
+def _marker_key(prefix, repo, plan_id):
+    """A one-shot key that is safe as a FILENAME (r9 low).
+
+    These keys become `leases/<key>.watch-notified`. Built from a raw
+    front-matter `id`, a `/` silently nested the marker in a subdirectory the
+    top-level sweep glob never sees (leaking forever, in a tree atlas
+    renders), and `..` let mkdir(parents=True) and unlink touch paths outside
+    leases/. slug_of() already exists to sanitise this value for branch names.
+
+    r12 L3: sanitising alone was not enough, because every key built here is
+    then run through `_safe_lease_key`, which caps at 40 characters and so
+    COLLIDED siblings. The uniqueness fix lives there, at the single point
+    where a key becomes a filename, rather than here — an earlier attempt
+    added a digest at this end and watched the cap downstream truncate it away.
+    """
+    return f"{prefix}-{slug_of(repo)}-{slug_of(plan_id)}"
+
+
+def _clear_notified(lease_id):
+    """Recovered orchestrators re-arm their page — SPEC removes `.orphaned` on
+    takeover/release for exactly this reason (r2 L2): orphan -> heartbeat
+    recovers -> orphans again must page again."""
+    # Sanitised HERE rather than at each call site (r10 L2): six callers pass
+    # an id, one of them straight out of a lease body, and a rule applied per
+    # call site is a rule the seventh caller will miss.
+    key = _safe_lease_key(lease_id)
+    try:
+        os.unlink(str(lib.leases_dir() / f"{key}.watch-notified"))
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _is_implementer(user):
+    """Did an implementer account open this PR? (r7 M2)
+
+    A configured numeric uid wins — it survives a rename, which is exactly the
+    argument this module already makes for FLEET_OPERATOR_UID. The login set is
+    the fallback when no uid is configured."""
+    # UNION, not precedence (r8 low): giving uids total precedence meant an
+    # operator adding a second implementer's uid — and forgetting implbot's —
+    # made every historical login-authored marked PR invisible, re-dispatching
+    # every merged plan. That is the r7 M2 failure this check exists to stop,
+    # re-entered through its own configuration step.
+    return (str(user.get("id")) in IMPLEMENTER_UIDS
+            or (user.get("login") or "").lower() in IMPLEMENTER_LOGINS)
+
+
+def _comments_since(repo, num, token, since):
+    """Comments on a PR at or after `since`, or None if unreadable.
+
+    ONE request, no paging (r10 H1). Forgejo's per-issue handler
+    `ListIssueComments` declares only owner/repo/index/since/before and builds
+    its query with no ListOptions, so `page` is ignored and every call returns
+    the entire comment list, oldest-first. The previous loop therefore fetched
+    the identical full list PAGE_CAP times, never saw the empty page it waited
+    for, and returned None — meaning the documented `respawn` recovery could
+    not succeed against a real Forgejo on any PR that had a comment to find,
+    while burning PAGE_CAP identical API calls per orphaned lease per cycle.
+    (The repo-level `ListRepoIssueComments` is the paginated one; that is
+    almost certainly where the r4 "30 oldest" premise came from. It is a
+    different endpoint.)
+
+    Both tests that covered the old loop passed only because the stub
+    implemented paging the API does not have — the fixture, not the system,
+    was under test.
+
+    `since` IS supported by this endpoint, so the authorisation time bound is
+    applied server-side rather than by scanning the whole thread. The caller
+    still re-checks freshness locally: the server bound is an optimisation,
+    not the guarantee.
+
+    `fleetforge.Forge.list_issue_comments` always sends `page`/`limit` too —
+    plan 0051's migration note: this endpoint has no ListOptions (see above),
+    so it ignores both rather than erroring on them, exactly as it already
+    ignored the `page` the old paging loop sent before r10 H1 removed it.
+    """
+    st, body = _forge(token).list_issue_comments(repo, num, since=since)
+    if st != 200 or not isinstance(body, list):
+        return None
+    return body
+
+
+def _notify_once(lease_id, title, body):
+    """O_CREAT|O_EXCL marker beside the lease — the fleet-status precedent
+    (r1 low): nothing releases an orphaned dispatch lease, so an unguarded
+    notify would page on EVERY cycle, forever.
+
+    Takes no `label` of its own (plan 0058): every call site here sits in the
+    dispatch cycle (marked_pr, spawn, orphan_sweep, cycle), which never runs
+    under `--pins-only` — the one other identity this file can page as — so
+    `notify()`'s own default (LABEL_WATCH) is always the right one and there
+    is nothing here for a caller to disambiguate."""
+    marker = lib.leases_dir() / f"{_safe_lease_key(lease_id)}.watch-notified"
+    try:
+        # the tree may not exist yet on a fresh fleet dir — without this the
+        # O_EXCL write ENOENTs and "once" silently becomes EVERY cycle, which
+        # is precisely the paging storm the marker exists to prevent
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.close(fd)
+    except FileExistsError:
+        return False
+    except OSError:
+        pass                              # unmarkable: notify anyway, once-ish
+    # marker created BUT delivery is what consumes the one-shot (r4 M3): a
+    # 5-second ntfy outage would otherwise permanently swallow the most
+    # important page in the system — and nothing re-arms it, because a dead
+    # orchestrator's lease never recovers. A rare double-page on a
+    # crash-between is strictly the better failure.
+    if notify(title, body) is False:
+        try:
+            os.unlink(str(marker))
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _plan_by_id(repo, plan_id, token):
+    """(path, front_matter) re-read from main — NEVER reconstructed from the id
+    (r1 M3): nothing binds front-matter `id` to the filename, and a respawn
+    that fabricates `plans/<id>.md` hands the successor a nonexistent path and
+    blank zone/tier, where blank reads as 'unconstrained' rather than 'refuse'."""
+    plans = plan_files(repo, token)
+    if plans is None:
+        # r6 low: `or []` made a transient Forgejo 500 indistinguishable from
+        # a deleted plan, and the caller's warn then sent the operator looking
+        # for a missing file. Refusal either way; the message must differ.
+        return "unreadable", None
+    for path, fm in plans:
+        if fm.get("id") == plan_id:
+            return path, fm
+    return None, None
+
+
+def _path_exists_on_main(repo, path, token):
+    """True only on POSITIVE evidence that `path` exists on `repo`@main — read
+    straight off the forge (Boundaries: read main, never a working tree, and
+    never a local `origin/main` ref, which can be absent or stale). Any
+    non-200, including a transient failure, reads as "not proven to exist":
+    the same fail-closed direction every other ambiguous read in this module
+    takes — dispatching on a guess is worse than one extra blocked cycle."""
+    st, _ = _forge(token).get_contents(repo, path, ref="main")
+    return st == 200
+
+
+def _plan_dependency_block(repo, depends_on, plans_by_id, token):
+    """The first unmet entry in `depends_on`, as (spec, form, reason, detail) —
+    or None once every entry is satisfied.
+
+    Checked in DECLARED ORDER and only the first blocker is returned: SPEC
+    asks for "blocked, and on what" — one legible cause — and a plan with
+    several unmet dependencies then reports the same one across cycles until
+    it clears, which is what keeps the `plan-blocked` transition gate (D3b)
+    meaningful: what transitions is the first blocker, not the whole set.
+
+    Never infers a dependency (Boundaries): only what `depends_on` declares.
+    """
+    for dep in depends_on:
+        if dep.startswith("external:"):
+            return dep, "external", "external", (
+                "a human attestation, never auto-satisfied — satisfied only "
+                "by a reviewed commit deleting this entry")
+        if dep.startswith("path:"):
+            p = dep[len("path:"):]
+            if _path_exists_on_main(repo, p, token):
+                continue
+            return dep, "path", "unmet", f"{p!r} does not exist on {repo}@main"
+        dep_fm = plans_by_id.get(dep)
+        if dep_fm is None:
+            return dep, "plan", "dangling", (
+                f"no plan {dep!r} found in {repo}'s plans/ on main")
+        dep_status = dep_fm.get("status")
+        if dep_status == "done":
+            continue
+        if dep_status == "abandoned":
+            return dep, "plan", "abandoned", f"{dep} is abandoned — unsatisfiable"
+        return dep, "plan", "unmet", f"{dep} is status={dep_status!r}, not done"
+    return None
+
+
+def _blocked_state_file(repo, plan_id):
+    key = _safe_lease_key(_marker_key("blocked", repo, plan_id))
+    return lib.leases_dir() / f"{key}.blocked-state"
+
+
+def _report_blocked(repo, plan_id, dep, form, reason, detail):
+    """`plan-blocked` on TRANSITION ONLY (D3b), plus a one-shot page per plan
+    through the existing `_notify_once` discipline (D3).
+
+    Two different one-shots, deliberately, because they answer different
+    questions. The EVENT asks "did the reason change" — a state file records
+    the current blocker, and an unchanged blocker across cycles writes nothing
+    further to a ledger that rotates at 10 MB. The PAGE asks "has a human
+    already been told at all" — one page per plan, cleared only when the plan
+    actually dispatches (same clearing as the fail-assign/fail-spawn markers),
+    so a plan stuck for ten cycles pages once, not ten times, and swapping
+    from one unmet dependency to another does not re-page over a plan that is
+    already known to be blocked.
+    """
+    state_key = f"{dep}|{reason}"
+    state_file = _blocked_state_file(repo, plan_id)
+    try:
+        previous = state_file.read_text().strip()
+    except OSError:
+        previous = ""
+    if state_key != previous:
+        emit("plan-blocked", repo, {"plan": plan_id, "dependency": dep,
+                                    "form": form, "reason": reason,
+                                    "detail": detail})
+        try:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(state_key + "\n")
+        except OSError:
+            pass                          # unrecordable: re-emit next cycle
+    _notify_once(_marker_key("blocked", repo, plan_id), "Plan blocked",
+                f"{repo} {plan_id}: blocked on {dep} ({reason}) — {detail}")
+
+
+def _clear_blocked(repo, plan_id):
+    """A plan no longer blocked: re-arm both one-shots (r2 L2's precedent —
+    recovered conditions re-arm their page) so a FUTURE block is reported
+    again rather than reading as the same one still open."""
+    _clear_notified(_marker_key("blocked", repo, plan_id))
+    try:
+        _blocked_state_file(repo, plan_id).unlink()
+    except OSError:
+        pass
+
+
+def _orchestrator_ready(orch):
+    """(ready, detail). Ask the orchestrator whether it can carry a plan.
+
+    A non-zero exit, a timeout, or an unrunnable file all mean NOT ready: the
+    watcher must fail closed here, because the cost of arming a half-built
+    wrapper is a page per plan per cycle, while the cost of refusing is one
+    page total. An orchestrator that does not understand --ready is by
+    definition older than this contract, so it is not ready either."""
+    try:
+        r = subprocess.run([orch, "--ready"], capture_output=True, text=True,
+                           timeout=30, env=_child_env())
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"--ready did not run ({e.__class__.__name__})"
+    if r.returncode == 0:
+        return True, ""
+    return False, ((r.stderr or r.stdout).strip().splitlines() or ["exit "
+                   f"{r.returncode}"])[-1][:120]
+
+
+def _retire(lease_id):
+    """Release a dead dispatch lease.
+
+    Called immediately AFTER a successor is assigned (r3 M3 — retiring first
+    stranded the plan when the assign failed). The window with two live leases
+    is intra-process and safe only because _single_instance() guarantees one
+    watcher; if this release FAILS the caller must page, because two leases
+    sharing (repo, plan_id) collapse in dispatch_leases() and two `branch`
+    leases on one branch make the pre-push hook refuse the successor's own
+    pushes (r1 H1)."""
+    r = subprocess.run(
+        [sys.executable, str(BIN / "fleet-release"), lease_id, "--force"],
+        capture_output=True, text=True,
+        env=_child_env())
+    if r.returncode != 0:
+        warn(f"could not retire dead lease {lease_id} "
+             f"({r.stderr.strip()[:120]}) — NOT spawning a successor onto a "
+             "lane the dead lease still holds")
+        return False
+    return True
+
+
+def orphan_sweep(token, live, dry_run=False, waiting=0, cap=None):
+    """Surface dead orchestrators; spawn a successor ONLY on an explicit human
+    `respawn` newer than the dispatch it replaces (Principle 4).
+
+    `cap` is the value `cycle()` resolved THIS cycle (plan 0068) — passed in,
+    never re-resolved here, so the sweep and the primary dispatch loop always
+    agree within one cycle even if `fleet_setting.dispatch_cap` changes
+    between them. Defaults to the module's own `CAP` for a caller with no
+    cycle of its own."""
+    if cap is None:
+        cap = CAP
+    spawned = 0
+    uid_raw = os.environ.get("FLEET_OPERATOR_UID", "").strip()
+    allow = set(repos())
+    for (repo, plan_id), rec in sorted(dispatch_leases().items()):
+        lease_id = rec.get("id") or ""
+        if repo not in allow:
+            # r2 H1: the repo here comes from a lease FILE, never from the
+            # allowlist — a delisted repo kept getting API reads every cycle
+            # and could still receive a successor spawn. "Never read at all"
+            # has to hold on BOTH dispatch paths.
+            continue
+        if not lib.is_orphaned(rec):
+            if not dry_run:               # r6 low: dry-run mutates NOTHING
+                _clear_notified(lease_id)  # recovered: re-arm the page (r2 L2)
+            continue
+        # r7 low: what actually stopped a dead lease from re-firing its
+        # consumed `respawn` was all_leases() iterating a SORTED glob, so the
+        # successor won the (repo, plan_id) slot and the dead lease became
+        # invisible — a fleetlib implementation detail nothing pins, and the
+        # r4 M2 comment credited the marker, which only guards the page.
+        # Check the property directly instead of inheriting it.
+        if any(o.get("id") != lease_id
+               and (o.get("note") or "") == (rec.get("note") or "")
+               and lib.resource_of(o).get("repo") == repo
+               and not lib.is_orphaned(o)
+               for o in lib.all_leases()
+               if o.get("state") in ("assigned", "active")):
+            warn(f"{repo}: {plan_id} already has a live successor — leaving "
+                 f"the dead lease {lease_id} for release, not respawning")
+            continue
+        pr = marked_pr(repo, plan_id, token, dry_run=dry_run)
+        if pr == "unreadable":
+            # a transient 500 must NOT consume the one-shot page with the
+            # wrong message — the actionable "comment respawn on PR #N" could
+            # then never fire for this lease (r2 L2)
+            warn(f"{repo}: dedupe unreadable while sweeping {plan_id} — "
+                 "not paging on a guess")
+            continue
+        if pr is None or (pr or {}).get("state") != "open":
+            if not dry_run:
+                _notify_once(lease_id, "Orchestrator dead",
+                             f"{repo} {plan_id}: no open marked PR")
+            continue
+        num = pr.get("number")
+        if dry_run:
+            print(f"DRY-RUN orphaned {repo} {plan_id} (PR #{num}, lease "
+                  f"{lease_id}) — no page, no marker, no spawn")
+            continue
+        if uid_raw.isdigit():
+            _notify_once(lease_id, "Orchestrator dead",
+                         f"{repo} {plan_id}: PR #{num} open — post "
+                         "`respawn` as a TOP-LEVEL comment to continue "
+                         "(a reply inside a review thread is not read)")
+        else:
+            # never instruct an action that is disabled (r4 low)
+            _notify_once(lease_id, "Orchestrator dead",
+                         f"{repo} {plan_id}: PR #{num} open — respawn is "
+                         "DISABLED (FLEET_OPERATOR_UID unset); restart it "
+                         "by hand")
+            warn("FLEET_OPERATOR_UID unset/non-numeric — respawn is disabled "
+                 "(authorisation binds to a numeric id, never a display name)")
+            continue
+        if live + spawned >= cap:
+            warn(f"{repo}: respawn for {plan_id} deferred — at cap {cap}"
+                 f"{cap_note(live + spawned, waiting)}")
+            continue
+        # TIME-BOUND authorisation (r1 H1): a `respawn` comment is consumed by
+        # the dispatch it triggers, not a standing grant. The lease's `created`
+        # IS the dispatch instant, so only a comment newer than it counts —
+        # otherwise one old comment would auto-respawn every future orphaning,
+        # an unbounded automatic retry loop.
+        #
+        # Computed BEFORE the fetch (r10 H1) so it can be pushed to the server
+        # as `since=`.
+        dispatched_at = _ts_utc(rec.get("created"))
+        if dispatched_at is None:
+            # fails CLOSED (r2 L1): without a dispatch instant there is no
+            # time bound, and "no bound" would silently mean "standing grant"
+            warn(f"{repo}: lease {lease_id} has an unparsable `created` — "
+                 "refusing to respawn without a time bound")
+            continue
+        comments = _comments_since(repo, num, token, rec.get("created"))
+        if comments is None:
+            warn(f"{repo}: comments unreadable for PR #{num} — cannot check "
+                 "respawn authorisation this cycle")
+            continue
+        fresh = False
+        for c in comments:
+            if (c.get("user") or {}).get("id") != int(uid_raw):
+                continue
+            if not _RESPAWN_RE.search(c.get("body") or ""):
+                continue
+            made = _ts_utc(c.get("created_at"))
+            if made and made > dispatched_at:
+                fresh = True
+        if not fresh:
+            continue
+        code, why, _lane = verdict(repo)
+        if code != PROT_OK:
+            # protection can LAPSE between dispatch and respawn, and the
+            # successor reads its plan (path, zone, tier) from that main —
+            # verbatim the degradation the refusal exists to prevent (r2 H1).
+            # "Could not determine" must NOT read as "refused" here either: the
+            # respawn simply does not happen this cycle, and the wording says
+            # which of the two it was.
+            warn(f"{repo}: {'REFUSED' if code == PROT_REFUSED else 'UNDETERMINED'}"
+                 f" at respawn — {why}")
+            continue
+        path, fm = _plan_by_id(repo, plan_id, token)
+        if path == "unreadable":
+            warn(f"{repo}: plans/ unreadable — cannot check respawn "
+                 f"authorisation for {plan_id} this cycle")
+            continue
+        if not path:
+            warn(f"{repo}: no plan on main with id {plan_id} — cannot respawn")
+            continue
+        # the SAME gates the primary path enforces (r5 M1): a fresh `respawn`
+        # can outlive the human's kill gesture — comment, then defer at cap,
+        # then `status: abandoned` on main — and a successor would launch
+        # against work whose last human act said STOP.
+        if fm.get("status") != "ready":
+            warn(f"{repo}: {plan_id} is status={fm.get('status')!r}, not "
+                 "ready — refusing to respawn (a human changed it)")
+            continue
+        if fm.get("repo", repo) != repo:
+            warn(f"{repo}: {plan_id} declares repo {fm.get('repo')!r} — "
+                 "refusing to respawn")
+            continue
+        # D1, the same gate the primary path enforces: a dependency can go
+        # unmet between the original dispatch and a `respawn` (a plan-id
+        # dependency's plan can be abandoned in the meantime, say). Skipped
+        # entirely when depends_on is empty, which is the common case, so this
+        # never costs the primary path's callers an extra forge read.
+        deps = fm.get("depends_on") or []
+        if deps:
+            dep_plans = plan_files(repo, token)
+            if dep_plans is None:
+                warn(f"{repo}: plans/ unreadable — cannot check {plan_id}'s "
+                     "dependencies this cycle")
+                continue
+            dep_index = {f.get("id", ""): f for _, f in dep_plans}
+            block = _plan_dependency_block(repo, deps, dep_index, token)
+            if block is not None:
+                dep, _form, reason, detail = block
+                warn(f"{repo}: {plan_id} blocked on {dep} ({reason}) — {detail} "
+                     "— refusing to respawn")
+                continue
+        # assign-then-retire (r3 M3): retiring first meant a failed successor
+        # assign left NO lease and an open marked PR — the sweep never saw the
+        # plan again and the documented `respawn` gesture was permanently
+        # inert, silently. Ordering is safe because _single_instance()
+        # guarantees one watcher, so the two-lease window is intra-process.
+        new_sid = spawn(repo, path, fm)
+        if not new_sid:
+            # r9 M2: this was the module's only NON-one-shot failure page. A
+            # `respawn` comment is consumed by a SUCCESSFUL dispatch only, so
+            # while spawn fails persistently the comment stays fresh against
+            # the dead lease's `created` and every cycle re-attempts and pages
+            # — the "hundreds of pages a day" shape r5 M2 fixed, re-entered
+            # through the sweep. (FLEET_ORCHESTRATOR pointing at a DIRECTORY
+            # gets there: os.access(dir, X_OK) is true, so the arm gate passes
+            # and Popen raises every cycle.) The prose said "retry it" while
+            # the code retried automatically; now the human really is the one
+            # who retries, and the page clears on a successful dispatch.
+            _notify_once(_marker_key("fail-respawn", repo, plan_id),
+                         "Respawn failed",
+                         f"{repo} {plan_id}: could not start a successor — "
+                         "the old lease is intact, so `respawn` still works; "
+                         "retry it once the cause is fixed")
+            continue
+        if _retire(lease_id):
+            _clear_notified(lease_id)
+        else:
+            # two live leases keyed (repo, plan_id) collide in
+            # dispatch_leases (winner ordering-dependent) and two `branch`
+            # leases on one branch make the pre-push hook refuse the
+            # SUCCESSOR's own pushes — the state r1 H1 called worst. The
+            # spawn-internal path already pages for this; r3's reorder
+            # dropped it here (r4 M2). The marker stops the dead lease
+            # re-PAGING; the same-note guard at the top of this loop is what
+            # stops it inviting a second successor (r7 low corrected the
+            # attribution — the marker was never consulted on the spawn path).
+            notify("Dangling dispatch lease",
+                   f"{repo} {plan_id}: successor started but the dead lease "
+                   f"{lease_id} would not release — release it by hand before "
+                   "the successor pushes")
+        spawned += 1
+    return spawned
+
+
+def _sweep_markers():
+    """Drop `.watch-notified` markers whose lease is gone or released (r3 low):
+    _clear_notified only covers live-and-recovered leases, and this tree is
+    rendered by atlas."""
+    live = {r.get("id") for r in lib.all_leases()
+            if r.get("state") in ("assigned", "active")}
+    try:
+        for f in lib.leases_dir().glob("*.watch-notified"):
+            stem = f.name[:-len(".watch-notified")]
+            # ONLY lease-shaped stems (r5, found by the all-repos-unreadable
+            # test): the earlier prefix-exclusion swept every SYNTHETIC
+            # one-shot key too — `all-repos-unreadable`, `no-orchestrator-*`,
+            # `fail-assign-*` — so each degraded straight back to paging every
+            # cycle, the very storm these markers exist to prevent.
+            if lib._ID_RE.match(stem) and stem not in live:
+                f.unlink()
+    except OSError:
+        pass
+
+
+def cycle(dry_run=False):
+    global _cycle_waiting
+    _cycle_waiting = 0
+    # Resolved fresh EVERY cycle (plan 0068 D3), before anything else — never
+    # cached beyond this one call, so a `fleet-config set dispatch_cap N`
+    # between cycles takes effect on the very next one, no restart.
+    effective_cap = _resolve_cap()
+    allow = repos()
+    if not allow:
+        warn("FLEET_WATCH_REPOS is empty — nothing to scan")
+        return 0
+    if not dry_run and not os.environ.get("FLEET_NTFY_URL", "").strip():
+        # the runbook calls pushes THE failure channel; without a URL every
+        # one-shot is consumed into a launchd log nobody reads (r5 low)
+        warn("FLEET_NTFY_URL is unset — failures will only reach stderr, and "
+             "one-shot pages are consumed there")
+    orch = os.environ.get("FLEET_ORCHESTRATOR", str(BIN / "orchestrator"))
+    if not os.access(orch, os.X_OK):
+        # part-1-only deployments hit this on day one (r5 M2): every Popen
+        # would FileNotFoundError, and each cycle would assign a lease,
+        # force-release it, emit plan-failed and page — hundreds of pages a
+        # day. Refuse to arm instead, once.
+        # r7 low: this gate used to be skipped in dry-run, so on a
+        # part-1-only box --dry-run promised dispatches an armed run refuses
+        # to even arm for — the exact deployment state this PR anticipates.
+        warn(f"orchestrator {orch} is not executable — refusing to arm "
+             "(part 2 ships it)")
+        if not dry_run:
+            _notify_once(f"no-orchestrator-{os.path.basename(orch)}",
+                         "Watcher cannot arm",
+                         f"{orch} is missing or not executable — no plan will "
+                         "dispatch until it exists")
+        return 0
+    # Executable is not the same as FINISHED. A part-built orchestrator that
+    # exits at its own boundary satisfies os.access and defeats the refusal
+    # above: every cycle would assign a lease, fail, release and page — the
+    # exact storm r5 M2 added that gate to stop, arriving by a different door.
+    # So readiness is asked, not inferred. `--ready` is the orchestrator's own
+    # answer about whether it can carry a plan end to end.
+    ready = _orchestrator_ready(orch)
+    if not ready[0]:
+        warn(f"orchestrator {orch} reports not ready ({ready[1]}) — refusing to arm")
+        if not dry_run:
+            _notify_once(f"orchestrator-unready-{os.path.basename(orch)}",
+                         "Watcher cannot arm",
+                         f"{orch} is not ready: {ready[1]} — no plan will dispatch")
+        return 0
+    if not dry_run:
+        # the orchestrator is back: re-arm the page (r6 low), same reason a
+        # recovered lease clears its marker.
+        _clear_notified(f"no-orchestrator-{os.path.basename(orch)}")
+        _clear_notified(f"orchestrator-unready-{os.path.basename(orch)}")
+    # The broker pre-flight is only meaningful for the broker source: it asks
+    # a question ("is the socket answering") that has no direct-source
+    # analogue — the direct source has no broker to be unreachable, so
+    # per-repo `verdict()` calls below carry the whole story for it (plan
+    # 0054 D3: selection is configuration, never a runtime fallback between
+    # sources, and that includes this pre-flight).
+    if verdict_source() == "broker":
+        healthy, herr = broker_reachable()
+        if not healthy:
+            # The protections verdict is what makes "only a human's reviewed
+            # merge can write main" checkable. Without it every repo is
+            # undeterminable, which is the blind signature — page once and
+            # scan nothing, rather than refusing each repo for a reason that
+            # has nothing to do with the repo. Same shape as the admin-token
+            # pre-flight this replaced; the dependency moved from a helper on
+            # this host to a service on vaulthost, and ADR-0003 made that explicit
+            # rather than an ssh timeout.
+            warn(f"forgejo-broker: {herr}")
+            # dry_run guards BOTH, per the suite's rule that --dry-run
+            # mutates nothing (r5, r6 low): _notify_once pages AND writes a
+            # marker file, and _clear_notified deletes one. Inherited
+            # un-guarded from the admin-token block this replaced; rewriting
+            # the lines is the moment to fix it rather than carry it.
+            if not dry_run:
+                _notify_once("broker-unreachable", "Watcher cannot scan",
+                             f"{herr} — branch protections cannot be "
+                             "determined, so no plan dispatches until the "
+                             "broker answers")
+            return 0
+        if not dry_run:
+            _clear_notified("broker-unreachable")
+
+    token, err = _token()
+    if not token:
+        # r8 M2: every other stall on this path pages, on the same argument —
+        # the runbook says silence means "the watcher is not running", which
+        # is actively wrong here. keyvault going down (sealed, disk-full) is a
+        # documented shape on this fleet, and it stalls EVERY plan. Note a
+        # garbage token already paged (401 -> blind); only the empty-output
+        # shape was silent, i.e. the least legible one.
+        warn(f"{err} — cannot scan (never spawn blind)")
+        if not dry_run:
+            _notify_once("token-helper-failed", "Watcher cannot scan",
+                         f"{err} — no plan dispatches until the Forgejo token "
+                         "helper works (is keyvault sealed or down?)")
+        return 0
+    if not dry_run:
+        _clear_notified("token-helper-failed")   # recovered: re-arm the page
+    if not dry_run:
+        _sweep_markers()                  # r5 low: dry-run mutates NOTHING
+    inflight = dispatch_leases()
+    # A steward that has finished spending and is only polling for a human
+    # merge is not counted (plan 0067); unknown is counted. See count_live.
+    live, waiting = count_live(inflight)
+    _cycle_waiting = waiting
+    # Housekeeping BEFORE dispatching, and unconditional. A one-shot launchd job
+    # stays listed with its exit status once it finishes, so the domain would
+    # otherwise grow one label per plan ever dispatched. Run even under
+    # FLEET_SPAWN=popen: switching modes must not strand the labels the other
+    # mode created, and the glob costs nothing when there are none.
+    reaped = reap_jobs(dry_run=dry_run)
+    if reaped:
+        print(f"fleet-watch: reaped {reaped} finished dispatch job(s)")
+    # the sweep respects the cap too (r1 M4) and honours --dry-run (r1 H2 —
+    # the operator most likely to run --dry-run is debugging the very
+    # condition that arms the respawn path)
+    spawned = orphan_sweep(token, live, dry_run=dry_run, waiting=waiting,
+                           cap=effective_cap)
+    live += spawned
+    unreadable = 0
+    scanned = 0
+    rejected = 0
+    # r8 low: a dry-run "spawn" writes no lease, so the collision check and the
+    # refreshed inflight dict both saw nothing and two id/slug-colliding plans
+    # each printed "would dispatch" where an armed run does one and skips.
+    dry_lanes = set()
+    for repo in allow:
+        if live >= effective_cap:
+            break
+        scanned += 1
+        code, why, lane = verdict(repo)
+        # The broker states determinability explicitly, so the old message
+        # sniffing is gone (r6 low: substring "unreadable" used to match the
+        # whitelist-membership REFUSALS too, counting a reachable but oddly
+        # configured repo toward "the watcher is blind"). A structured code and
+        # a lane cannot make that mistake.
+        if code == PROT_UNKNOWN:
+            # TWO chains, still. A rejected token stalls every plan and needs
+            # its own page; only a transport failure means blind. Collapsing
+            # them sends the operator after a network fault that does not
+            # exist — r10 M1 — so the split is preserved verbatim across the
+            # move to the broker, keyed on the lane instead of a message prefix.
+            if lane == "token_rejected":
+                rejected += 1
+            else:
+                unreadable += 1
+            warn(f"{repo}: UNDETERMINED — {why}. Not a refusal: nothing is "
+                 "dispatched for this repo this cycle, and nothing is vouched "
+                 "for either.")
+            continue
+        if code == PROT_REFUSED:
+            warn(f"{repo}: REFUSED — {why}. Merge is ignition; an unprotected "
+                 "main makes ignition forgeable.")
+            continue
+        plans = plan_files(repo, token)
+        if plans is None:
+            warn(f"{repo}: plans/ unreadable — skipped this cycle")
+            continue
+        plans_by_id = {fm.get("id", ""): fm for _, fm in plans}
+        for path, fm in sorted(plans):
+            if live >= effective_cap:
+                break
+            plan_id = fm.get("id", "")
+            if fm.get("status") != "ready" or fm.get("repo", repo) != repo:
+                continue
+            if (repo, plan_id) in inflight:
+                continue                 # already dispatched and alive
+            # D1: a plan does not dispatch until what it declares it needs
+            # actually exists. Checked before the dedupe scan below, which
+            # pages through up to PAGE_CAP*50 pull requests — no point paying
+            # for that read on a plan that cannot dispatch this cycle anyway.
+            block = _plan_dependency_block(repo, fm.get("depends_on") or [],
+                                           plans_by_id, token)
+            if block is not None:
+                dep, form, reason, detail = block
+                # D3: reported every cycle it is skipped.
+                warn(f"{repo}: {plan_id} blocked on {dep} ({reason}) — {detail}")
+                if dry_run:
+                    print(f"DRY-RUN blocked {repo} {plan_id} on {dep} "
+                         f"({reason}) — {detail}")
+                else:
+                    _report_blocked(repo, plan_id, dep, form, reason, detail)
+                continue
+            if not dry_run:
+                _clear_blocked(repo, plan_id)
+            if dry_run and (repo, slug_of(plan_id)) in dry_lanes:
+                warn(f"{repo}: {plan_id} shares a branch lane with a plan "
+                     "already counted this dry-run — an armed run dispatches "
+                     "one of them")
+                continue
+            pr = marked_pr(repo, plan_id, token, dry_run=dry_run)
+            if pr == "unreadable":
+                warn(f"{repo}: dedupe unreadable for {plan_id} — not spawning")
+                continue
+            if pr is not None:
+                continue                 # marked PR exists in ANY state: done
+            if spawn(repo, path, fm, dry_run=dry_run):
+                live += 1
+                spawned += 1
+                if dry_run:
+                    dry_lanes.add((repo, slug_of(plan_id)))
+                else:
+                    inflight = dispatch_leases()   # r3 M1: a stale dict let a
+                                                   # colliding id spawn twice
+    if unreadable and unreadable == len(allow) and not dry_run:
+        # Without a page this stalls behind stderr warns while the runbook
+        # tells the operator "the watcher is not running" (r5 low).
+        #
+        # This counter is BROKER-shaped, not network-shaped: since ADR-0003 it
+        # is incremented only by PROT_UNKNOWN, which arrives over the local unix
+        # socket. The comment here used to call it "the macOS Local Network
+        # Privacy shape" — it is not, and it cannot be: an LNP block kills the
+        # forge reads, and those warn and `continue` without touching this count.
+        # See docs/plan-dispatch.md; that hazard is real and still unpaged.
+        _notify_once("all-repos-unreadable", "Watcher blind",
+                     f"all {unreadable} allowlisted repo(s) undeterminable — "
+                     "the forgejo-broker could not answer (vaulthost down, keyvault "
+                     "sealed, tunnel down, or its Forgejo call failing). This "
+                     "is NOT a refusal of those repos: nothing was vouched for "
+                     "and nothing was dispatched.")
+    elif scanned and not unreadable and not dry_run:
+        # r6 low: clearing on a cycle that scanned ZERO repos (cap reached on
+        # entry) re-armed the page while the blind condition still held, so a
+        # persistent outage double-paged across cap churn.
+        _clear_notified("all-repos-unreadable")
+
+    # A SEPARATE chain, deliberately. Folding this into the one above put the
+    # blind-page clear behind a token condition and made it unreachable — a
+    # tangle the first cut of this fix actually shipped for a minute.
+    if rejected and not dry_run:
+        # r11 M1: one page, cleared on the next clean scan. A stale credential
+        # stalls EVERY plan, and the previous cut reported it only to stderr —
+        # the exact silence r3 M2, r5 low and r8 M2 each removed once already.
+        _notify_once("token-rejected", "Watcher token rejected",
+                     f"{rejected} of {scanned} repo(s) came back lane "
+                     "token_rejected — the PAT the BROKER holds on vaulthost is "
+                     "invalid, expired or under-scoped. Fix it there (this "
+                     "host no longer holds one); no plan dispatches until then")
+    elif scanned and not dry_run:
+        _clear_notified("token-rejected")
+    return spawned
+
+
+def watch_interval(env=None):
+    """Seconds between cycles in resident mode. Default 120 — the StartInterval
+    the launchd job used, so going resident changes the process model and not
+    the cadence. One variable at a time."""
+    env = os.environ if env is None else env
+    raw = (env.get("FLEET_WATCH_INTERVAL") or "").strip()
+    if not raw:
+        return 120
+    try:
+        n = int(raw)
+    except ValueError:
+        sys.exit(f"fleet-watch: FLEET_WATCH_INTERVAL={raw!r} is not an integer")
+    if not 5 <= n <= 3600:
+        sys.exit(f"fleet-watch: FLEET_WATCH_INTERVAL={n} is outside 5..3600")
+    return n
+
+
+def _service_resource():
+    """This watcher, as a `service` lease resource (plan 0029).
+
+    Keyed on the fleet-chosen `<host>:fleet-watch`, never the launchd label —
+    that is the whole point of 0029, whose incident was one runner registered
+    under two labels and therefore two accepted 'leases'."""
+    host = socket.gethostname().split(".")[0]
+    return {"type": "service", "host": host, "service": f"{host}:fleet-watch"}
+
+
+def _foreign_service_holder(sid):
+    """An ACTIVE service lease on this watcher held by someone else, or None.
+
+    Regardless of orphanhood, matching fleet-svc's step 4 and for its reason:
+    past a lease's ttl fleet-claim's own orphan-skip will grant a SECOND
+    --assign, so two active rows on one unit is reachable and both holders pass
+    an 'is it mine' check. This is the step that turns that into a refusal
+    instead of a second scheduler."""
+    want = json.dumps(_service_resource(), sort_keys=True)
+    for rec in lib.all_leases():
+        if rec.get("state") != "active":
+            continue
+        if json.dumps(lib.resource_of(rec), sort_keys=True) != want:
+            continue
+        if (rec.get("holder") or "") != sid:
+            return rec
+    return None
+
+
+def acquire_service_lease(sid):
+    """Assign and activate this watcher's own `service` lease. id, or None.
+
+    SPEC principle 2 (revised 2026-09-10) permits a resident scheduler only
+    where it holds this lease — the fleet's own supervisor being subject to the
+    rule the 2026-09-07 cihost double-runner incident produced.
+
+    `_single_instance()` already stops two watchers on THIS host by flock. The
+    lease is the other half and is not redundant with it: a flock is invisible
+    to `fleet-status`, says nothing to another host, and dies silently with the
+    process. The lease is how the rest of the fleet can see who the scheduler
+    is."""
+    foreign = _foreign_service_holder(sid)
+    if foreign is not None:
+        warn(f"another session holds this watcher's service lease "
+             f"({foreign.get('holder')}, lease {foreign.get('id')}) — refusing "
+             "to start a second scheduler")
+        return None
+    claim = [sys.executable, str(BIN / "fleet-claim"), "--assign",
+             json.dumps(_service_resource(), sort_keys=True),
+             "--holder", sid, "--note", "watch:resident",
+             "--ttl", str(lib.lease_ttl_minutes())]
+    r = subprocess.run(claim, capture_output=True, text=True, env=_child_env())
+    lease_id = (r.stdout or "").strip().splitlines()[0] if r.stdout.strip() else ""
+    if r.returncode != 0 or not lease_id:
+        warn(f"service lease assign failed ({(r.stderr or '').strip()[:120]})")
+        return None
+    env = dict(os.environ, EUNOMIA_SESSION=sid)
+    a = subprocess.run([sys.executable, str(BIN / "fleet-claim"),
+                        "--activate", lease_id],
+                       capture_output=True, text=True, env=env)
+    if a.returncode != 0:
+        warn(f"service lease {lease_id} would not activate "
+             f"({(a.stderr or '').strip()[:120]}) — releasing it rather than "
+             "running behind a lease nothing heartbeats")
+        _retire(lease_id)
+        return None
+    return lease_id
+
+
+def resident(dry_run=False):
+    """Run cycles forever. Returns an exit code when asked to stop.
+
+    WHY RESIDENT AT ALL. As a StartInterval job the watcher exits every cycle,
+    which reparents every orchestrator it spawned to launchd as an ORPHAN — and
+    an orphan cannot open a local-network connection from a newly-launched
+    binary. Six of six autonomous dispatches died at their first git call. A
+    matrix on 2026-09-10 separated it over 15 samples: the same Popen with the
+    parent STILL ALIVE succeeded 3/3.
+
+    WHAT MAKES THIS SAFE. Nothing in this module holds fleet state in memory —
+    there is not one module-level dict or set — so a cycle leaves nothing behind
+    for the next one to inherit, and killing this process at any instant loses
+    nothing. That is not luck; it is principle 2 having been obeyed while the
+    process happened to be short-lived. It is also exactly the condition the
+    revised principle attaches to being resident.
+
+    A cycle that raises does NOT kill the scheduler. Under launchd KeepAlive a
+    crash would be restarted, but restarting is the loudest possible way to lose
+    every in-flight orchestrator: they are this process's children, and the
+    restart orphans all of them — the very fault this mode exists to remove.
+
+    SELF-RESTART (plan 0040). `fleet-pin-advance` fast-forwards the pin this
+    code was loaded from without telling this already-running process, so a
+    resident watcher used to keep dispatching on stale code until a human
+    restarted it by hand. Once a cycle's cheap, local `git rev-parse HEAD`
+    shows the loaded worktree has moved, `_restart_check` decides whether that
+    move is onto a clean, reviewed commit and whether anything this watcher
+    launched (FLEET_SPAWN=popen) is still running; only then does this loop
+    end through the same `stopping` path a signal uses, so `KeepAlive`
+    relaunches the watcher on the new code with the lease already released."""
+    sid = _watch_sid()
+    lease_id = None
+    if not dry_run:
+        lease_id = acquire_service_lease(sid)
+        if lease_id is None:
+            return 1
+    stopping = {"now": False}
+
+    def _stop(signum, _frame):
+        # Set a flag; do not exit from the handler. Exiting here would drop the
+        # release below AND kill in-flight orchestrators mid-git.
+        stopping["now"] = True
+        warn(f"signal {signum} — finishing this cycle, then releasing")
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _stop)
+        except (ValueError, OSError):
+            pass                       # not the main thread, or no such signal
+
+    interval = watch_interval()
+    print(f"fleet-watch: resident, cycle every {interval}s"
+          + (f", service lease {lease_id}" if lease_id else " (dry-run)"))
+    worktree, loaded_commit = _watcher_worktree()
+    if worktree is None:
+        warn("could not resolve the git worktree this code was loaded from "
+             "— self-restart on merge is disabled this run")
+    restart_backoff = 1            # cycles to skip between pin_status checks
+    since_restart_check = 0        # while HEAD stays moved and declined
+    try:
+        while not stopping["now"]:
+            started = time.time()
+            try:
+                if not dry_run:
+                    lib.touch_heartbeat(sid)
+                drift = check_pins(dry_run=dry_run)
+                n = cycle(dry_run=dry_run)
+                verb = "would dispatch" if dry_run else "dispatched"
+                pins = f", {len(drift)} pin(s) drifted" if drift else ""
+                print(f"fleet-watch: {n} {verb} "
+                      f"(cap {_cycle_cap}{cap_excluded(_cycle_waiting)}){pins}",
+                      flush=True)
+            except Exception as e:                # noqa: BLE001 — see docstring
+                warn(f"cycle raised {e.__class__.__name__}: {str(e)[:160]} — "
+                     "continuing; the scheduler outliving one bad cycle is the "
+                     "point of being resident")
+            if worktree and loaded_commit and not stopping["now"]:
+                ok, head = _git(worktree, "rev-parse", "HEAD")
+                if ok and head and head != loaded_commit:
+                    since_restart_check += 1
+                    if since_restart_check >= restart_backoff:
+                        since_restart_check = 0
+                        decision, message = _restart_check(worktree, head, dry_run)
+                        if decision == "restart":
+                            print(f"fleet-watch: restarting — {message}")
+                            stopping["now"] = True
+                        else:
+                            if decision == "dry-run":
+                                print(f"fleet-watch: --dry-run — would "
+                                     f"restart — {message}")
+                            else:
+                                warn(message)
+                            # a simple backoff: do not pay pin_status's fetch
+                            # every cycle for a restart that keeps declining
+                            restart_backoff = min(restart_backoff * 2, 8)
+                else:
+                    since_restart_check = 0
+                    restart_backoff = 1
+            # Sleep the REMAINDER, so a slow cycle does not push the cadence out
+            # and a very slow one does not queue up back-to-back scans.
+            slept = 0.0
+            while slept < max(0.0, interval - (time.time() - started)):
+                if stopping["now"]:
+                    break
+                time.sleep(1)
+                slept += 1
+    finally:
+        if lease_id and not _retire(lease_id):
+            warn(f"service lease {lease_id} would not release — a restart will "
+                 "refuse until it expires or is released by hand")
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    # argparse, not `in argv` (r4 M4): `--dryrun`/`--dry_run`/`-n` silently ran
+    # a fully ARMED cycle — real leases, real spawns, real spend — and the
+    # operator reaching for dry-run is usually debugging the scariest state.
+    ap = argparse.ArgumentParser(prog="fleet-watch", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="scan and report; assign nothing, spawn nothing, "
+                         "page nothing")
+    ap.add_argument("--resident", action="store_true",
+                    help="stay running and cycle internally, instead of one "
+                         "cycle per launchd StartInterval (SPEC principle 2, "
+                         "revised 2026-09-10)")
+    ap.add_argument("--pins-only", action="store_true",
+                    help="check FLEET_PINS and exit; take no cycle lock and "
+                         "dispatch nothing")
+    args = ap.parse_args(argv)
+    dry = args.dry_run
+    if args.pins_only:
+        # Deliberately OUTSIDE _single_instance() (r1 L3). Sharing the dispatch
+        # watcher's lock had three effects, all wrong: this unit held it across
+        # up to two 60s fetches so a dispatch cycle exited blaming "another
+        # fleet-watch"; a running dispatch cycle silently skipped the pin check
+        # for 30 minutes with the same misleading line; and if the dispatch
+        # watcher runs as the root LaunchDaemon the runbook suggests, the
+        # lockfile is root-owned 0644 and this agent's os.open(O_RDWR) raises
+        # PermissionError that _single_instance does not catch — a traceback
+        # every 30 minutes and no pin check, ever.
+        #
+        # No lock of its own: the check is read-only plus a last-writer-wins
+        # state file, so two concurrent runs cost at worst a duplicate page.
+        drift = check_pins(dry_run=dry, label=LABEL_PIN_WATCH)
+        print(f"fleet-watch: {len(drift)} pin(s) drifted")
+        return 0
+    held = _single_instance()
+    if held is None:
+        warn("another fleet-watch holds the cycle lock — exiting (one watcher, "
+             "one cap, no second scheduler)")
+        return 0
+    if args.resident:
+        # The lock is held for the life of the process, which is a STRONGER
+        # singleton than re-taking it each cycle: there is no window between
+        # cycles for a second scheduler to slip into.
+        return resident(dry_run=dry)
+    # Before cycle(), deliberately. cycle() returns early on an empty
+    # allowlist, a missing orchestrator or an unready one -- and pin drift is
+    # not a property of plan dispatch. A watcher that cannot arm is exactly
+    # when you still want to know the skill corpus or the secret-guard stopped
+    # receiving merged work.
+    drift = check_pins(dry_run=dry)
+    n = cycle(dry_run=dry)
+    # r7 low: dry-run "spawns" count too, so the armed wording was a lie on a
+    # run that dispatched nothing.
+    verb = "would dispatch" if dry else "dispatched"
+    pins_note = f", {len(drift)} pin(s) drifted" if drift else ""
+    print(f"fleet-watch: {n} {verb} "
+          f"(cap {_cycle_cap}{cap_excluded(_cycle_waiting)}){pins_note}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

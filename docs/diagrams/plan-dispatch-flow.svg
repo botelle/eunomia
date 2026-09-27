@@ -1,0 +1,273 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1900 2150" width="1900" height="2150" font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+<style>
+ .t{font-size:27px;font-weight:700;fill:#1c1c1c}
+ .sub{font-size:14px;fill:#5c6670}
+ .h{font-size:15px;font-weight:700;fill:#1c1c1c}
+ .b{font-size:13px;fill:#222}
+ .n{font-size:11.5px;fill:#5c6670;font-style:italic}
+ .badge{font-size:9.5px;font-weight:700;letter-spacing:.06em}
+ .shipb{fill:#1a7f47}.partb{fill:#a86a00}.todob{fill:#1d4ed8}.gateb{fill:#6b21a8}.testb{fill:#9a3412}
+ .zone{fill:#f4f2ee;stroke:#ddd8cf;stroke-width:1.5}
+ .ship{fill:#eaf7ef;stroke:#1a7f47;stroke-width:2}
+ .part{fill:#fdf3e0;stroke:#a86a00;stroke-width:2}
+ .todo{fill:#eaf0ff;stroke:#1d4ed8;stroke-width:2}
+ .test{fill:#fdeee6;stroke:#9a3412;stroke-width:2}
+ .gate{fill:#f5ecfd;stroke:#6b21a8;stroke-width:2}
+ .plain{fill:#ffffff;stroke:#9aa0a6;stroke-width:1.5}
+ .panel{fill:#f7f7f9;stroke:#cccccc;stroke-width:1.5}
+ .fl{fill:none;stroke:#444;stroke-width:2.2;marker-end:url(#a)}
+ .ret{fill:none;stroke:#1d4ed8;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#ab)}
+ .bus{fill:none;stroke:#444;stroke-width:2.2}
+ .fail{fill:none;stroke:#b91c1c;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#af)}
+ .actA{font-size:9.5px;letter-spacing:.09em;font-weight:700;fill:#7c3aed}
+ .actM{font-size:9.5px;letter-spacing:.09em;font-weight:700;fill:#6b7280}
+ .actH{font-size:9.5px;letter-spacing:.09em;font-weight:700;fill:#a21caf}
+</style>
+<defs>
+ <marker id="a" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+  <path d="M0,0 L10,4 L0,8 z" fill="#444"/></marker>
+ <marker id="ab" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+  <path d="M0,0 L10,4 L0,8 z" fill="#1d4ed8"/></marker>
+ <marker id="af" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+  <path d="M0,0 L10,4 L0,8 z" fill="#b91c1c"/></marker>
+</defs>
+<rect class="bg" x="0" y="0" width="1900" height="2150" fill="#ffffff"/>
+<text class="t" x="950" y="52" text-anchor="middle">Plan dispatch — the gate, the lane, and black-box tests</text>
+<text class="sub" x="950" y="76" text-anchor="middle">Version 1.10 — 2026-09-13 by Fleet Operator</text>
+<text class="n" x="60" y="46" text-anchor="start">Tracing: one feature plan, from draft to merge.</text>
+<text class="n" x="60" y="62" text-anchor="start">Test lanes are opt-in per repo, default off. Setting the flag is a configuration change.</text>
+<text class="n" x="60" y="78" text-anchor="start">The implementation lane is built; the test lanes are not.</text>
+<rect class="panel" x="1560" y="96" width="300" height="322" rx="8"/>
+<text class="h" x="1578" y="124" text-anchor="start">Legend</text>
+<rect class="ship" x="1578" y="144" width="26" height="15" rx="3"/>
+<text class="b" x="1614" y="156" text-anchor="start">shipped</text>
+<rect class="part" x="1578" y="168" width="26" height="15" rx="3"/>
+<text class="b" x="1614" y="180" text-anchor="start">partly built</text>
+<rect class="todo" x="1578" y="192" width="26" height="15" rx="3"/>
+<text class="b" x="1614" y="204" text-anchor="start">specified, not built</text>
+<rect class="test" x="1578" y="216" width="26" height="15" rx="3"/>
+<text class="b" x="1614" y="228" text-anchor="start">third-party model</text>
+<rect class="gate" x="1578" y="240" width="26" height="15" rx="3"/>
+<text class="b" x="1614" y="252" text-anchor="start">human gate (Minos)</text>
+<path class="fl" d="M1578,272 L1604,272"/>
+<text class="b" x="1614" y="276" text-anchor="start">flow</text>
+<path class="ret" d="M1578,296 L1604,296"/>
+<text class="b" x="1614" y="300" text-anchor="start">return path</text>
+<path class="fail" d="M1578,320 L1604,320"/>
+<text class="b" x="1614" y="324" text-anchor="start">a run that failed</text>
+<text class="b" x="1578" y="350" text-anchor="start">AGENT</text>
+<text class="b" x="1640" y="350" text-anchor="start">a model runs here</text>
+<text class="b" x="1578" y="368" text-anchor="start">MECHANICAL</text>
+<text class="b" x="1660" y="368" text-anchor="start">code; no model</text>
+<text class="b" x="1578" y="386" text-anchor="start">HUMAN</text>
+<text class="b" x="1640" y="386" text-anchor="start">a person decides</text>
+<rect class="ship" x="140" y="150" width="360" height="156" rx="8"/>
+<text class="actA" x="484" y="174" text-anchor="end">AGENT</text>
+<text class="badge shipb" x="156" y="174">SHIPPED</text>
+<text class="h" x="156" y="196">① Planning session</text>
+<text class="b" x="156" y="217">A prompt from any stakeholder. Opus turns</text>
+<text class="b" x="156" y="234">it into one plan file per feature, opened</text>
+<text class="b" x="156" y="251">as a plan PR.</text>
+<text class="n" x="156" y="271">Via intakebot it also routes the architecture,</text>
+<text class="n" x="156" y="286">security and privacy questions to a human</text>
+<text class="n" x="156" y="301">BEFORE there is a plan to review.</text>
+<rect class="ship" x="140" y="360" width="360" height="150" rx="8"/>
+<text class="actM" x="484" y="384" text-anchor="end">MECHANICAL</text>
+<text class="badge shipb" x="156" y="384">SHIPPED</text>
+<text class="h" x="156" y="406">mopsus — a failure gets a handle</text>
+<text class="b" x="156" y="427">Composes a brief from the failed run and</text>
+<text class="b" x="156" y="444">pages it with a handle. Opens a session</text>
+<text class="b" x="156" y="461">holding the plan, the reason and the log.</text>
+<text class="n" x="156" y="481">Per repo: escalate (built) | mechanical | triage.</text>
+<text class="n" x="156" y="496">It decides nothing and acts on nothing.</text>
+<path class="fail" d="M140,1470 L80,1470 L80,435 L136,435"/>
+<text class="n" x="88" y="1430" text-anchor="start">failures</text>
+<path class="ret" d="M320,360 L320,314"/>
+<text class="n" x="330" y="336" text-anchor="start">a handle, via intakebot or a page</text>
+<rect class="zone" x="580" y="150" width="420" height="180" rx="8"/>
+<text class="h" x="596" y="174" text-anchor="start">plans/ on a branch</text>
+<rect class="plain" x="596" y="186" width="388" height="30" rx="4"/>
+<text class="b" x="608" y="206" text-anchor="start">plan.md</text>
+<text class="n" x="976" y="206" text-anchor="end">umbrella — never ignites</text>
+<rect class="plain" x="596" y="220" width="388" height="30" rx="4" stroke="#1a7f47" stroke-width="2"/>
+<text class="b" x="608" y="240" text-anchor="start">0015-feat-a.md</text>
+<text class="n" x="976" y="240" text-anchor="end">status: ready</text>
+<rect class="plain" x="596" y="254" width="388" height="30" rx="4" stroke="#1a7f47" stroke-width="2"/>
+<text class="b" x="608" y="274" text-anchor="start">0016-feat-b.md</text>
+<text class="n" x="976" y="274" text-anchor="end">status: ready</text>
+<rect class="plain" x="596" y="288" width="388" height="30" rx="4"/>
+<text class="b" x="608" y="308" text-anchor="start">0017-feat-c.md</text>
+<text class="n" x="976" y="308" text-anchor="end">status: draft</text>
+<path class="fl" d="M500,216 L576,216"/>
+<rect class="gate" x="1080" y="176" width="360" height="96" rx="8"/>
+<text class="actH" x="1424" y="200" text-anchor="end">HUMAN</text>
+<text class="h" x="1096" y="200">② Minos: merge plan.md</text>
+<text class="b" x="1096" y="221">Documentation only.</text>
+<text class="b" x="1096" y="238">Nothing ignites.</text>
+<path class="fl" d="M1000,224 L1076,224"/>
+<path class="fl" d="M790,330 L790,376"/>
+<rect class="ship" x="580" y="380" width="420" height="120" rx="8"/>
+<text class="actA" x="984" y="404" text-anchor="end">AGENT</text>
+<text class="h" x="596" y="404">revbot reviews the plan PR</text>
+<text class="b" x="596" y="425">APPROVE, or a blocking question a human</text>
+<text class="b" x="596" y="442">must answer before anything ignites.</text>
+<path class="fl" d="M790,500 L790,546"/>
+<rect class="gate" x="580" y="550" width="420" height="90" rx="8"/>
+<text class="actH" x="984" y="574" text-anchor="end">HUMAN</text>
+<text class="h" x="596" y="574">③ Minos: merge the feature plan</text>
+<text class="b" x="596" y="595">Necessary, and no longer sufficient.</text>
+<path class="fl" d="M790,640 L790,686"/>
+<rect class="todo" x="580" y="690" width="420" height="168" rx="8"/>
+<text class="actM" x="984" y="714" text-anchor="end">MECHANICAL</text>
+<text class="badge todob" x="596" y="714">TO BUILD</text>
+<text class="h" x="596" y="736">Ignition gate — fleet-watch</text>
+<text class="b" x="596" y="757">a. APPROVED at the MERGED PR's head SHA</text>
+<text class="b" x="596" y="774">b. no blocking question left unanswered</text>
+<text class="b" x="596" y="791">c. spec_impact covered by the plan's paths</text>
+<text class="n" x="596" y="811">Three checks at once, one message on failure.</text>
+<text class="n" x="596" y="826">Could-not-tell is never rendered as refused.</text>
+<path class="bus" d="M790,858 L790,906"/>
+<path class="bus" d="M350,906 L1230,906"/>
+<path class="fl" d="M350,906 L350,942"/>
+<path class="fl" d="M1230,906 L1230,942"/>
+<text class="n" x="800" y="898" text-anchor="start">one plan, two lanes</text>
+<rect class="ship" x="140" y="946" width="420" height="116" rx="8"/>
+<text class="actM" x="544" y="970" text-anchor="end">MECHANICAL</text>
+<text class="badge shipb" x="156" y="970">SHIPPED</text>
+<text class="h" x="156" y="992">④ Implementation lane</text>
+<text class="b" x="156" y="1013">The plan, the repo, a lease, a worktree.</text>
+<text class="b" x="156" y="1030">Opens its own branch and PR.</text>
+<path class="fl" d="M350,1062 L350,1108"/>
+<rect class="ship" x="140" y="1112" width="420" height="104" rx="8"/>
+<text class="actA" x="544" y="1136" text-anchor="end">AGENT</text>
+<text class="h" x="156" y="1136">⑤ Implementation session</text>
+<text class="b" x="156" y="1157">Runner per run, default sub-sonnet. Same</text>
+<text class="b" x="156" y="1174">plan, other runner = a bakeoff arm.</text>
+<path class="fl" d="M350,1216 L350,1262"/>
+<rect class="ship" x="140" y="1266" width="420" height="104" rx="8"/>
+<text class="actA" x="544" y="1290" text-anchor="end">AGENT</text>
+<text class="h" x="156" y="1290">⑥ Review — bounded</text>
+<text class="b" x="156" y="1311">Per-repo passes, default 5. Exhausted is</text>
+<text class="b" x="156" y="1328">a hard stop that pages a human.</text>
+<path class="ret" d="M140,1318 L100,1318 L100,1164 L136,1164"/>
+<text class="n" x="62" y="1247" text-anchor="start">fix</text>
+<path class="fl" d="M350,1370 L350,1416"/>
+<rect class="gate" x="140" y="1420" width="420" height="100" rx="8"/>
+<text class="actH" x="544" y="1444" text-anchor="end">HUMAN</text>
+<text class="h" x="156" y="1444">Minos: you merge the code PR</text>
+<text class="b" x="156" y="1465">Records which test lanes ran — a PR that</text>
+<text class="b" x="156" y="1482">silently lost them is a false green.</text>
+<rect class="todo" x="1020" y="946" width="420" height="136" rx="8"/>
+<text class="actM" x="1424" y="970" text-anchor="end">MECHANICAL</text>
+<text class="badge todob" x="1036" y="970">TO BUILD</text>
+<text class="h" x="1036" y="992">Repo opted in?</text>
+<text class="b" x="1036" y="1013">config/repos.conf, default off — an untouched</text>
+<text class="b" x="1036" y="1030">repo discloses nothing.</text>
+<text class="b" x="1036" y="1047">Setting it either way is a configuration</text>
+<text class="b" x="1036" y="1064">change, not a reviewed merge.</text>
+<path class="fl" d="M1230,1082 L1230,1108"/>
+<rect class="ship" x="1020" y="1112" width="420" height="130" rx="8"/>
+<text class="actM" x="1424" y="1136" text-anchor="end">MECHANICAL</text>
+<text class="badge shipb" x="1036" y="1136">SHIPPED</text>
+<text class="h" x="1036" y="1158">Bundle builder — first party</text>
+<text class="b" x="1036" y="1179">Generated contract only: OpenAPI or --help,</text>
+<text class="b" x="1036" y="1196">event names, config keys, harness entry.</text>
+<text class="n" x="1036" y="1216">No source. Nothing is present unless code put it there.</text>
+<path class="bus" d="M1230,1242 L1230,1276"/>
+<path class="bus" d="M1120,1276 L1340,1276"/>
+<path class="fl" d="M1120,1276 L1120,1312"/>
+<path class="fl" d="M1340,1276 L1340,1312"/>
+<rect class="test" x="1020" y="1316" width="200" height="96" rx="8"/>
+<text class="actA" x="1204" y="1340" text-anchor="end">AGENT</text>
+<text class="h" x="1036" y="1340">Antigravity</text>
+<text class="b" x="1036" y="1361">black-box.</text>
+<text class="b" x="1036" y="1378">Sees the bundle,</text>
+<text class="b" x="1036" y="1395">never the code.</text>
+<rect class="test" x="1240" y="1316" width="200" height="96" rx="8"/>
+<text class="actA" x="1424" y="1340" text-anchor="end">AGENT</text>
+<text class="h" x="1256" y="1340">Codex</text>
+<text class="b" x="1256" y="1361">black-box.</text>
+<text class="b" x="1256" y="1378">Same bundle,</text>
+<text class="b" x="1256" y="1395">same question.</text>
+<path class="bus" d="M1120,1412 L1120,1444"/>
+<path class="bus" d="M1340,1412 L1340,1444"/>
+<path class="bus" d="M1120,1444 L1340,1444"/>
+<path class="fl" d="M1230,1444 L1230,1480"/>
+<rect class="todo" x="1020" y="1484" width="420" height="130" rx="8"/>
+<text class="actM" x="1424" y="1508" text-anchor="end">MECHANICAL</text>
+<text class="badge todob" x="1036" y="1508">TO BUILD</text>
+<text class="h" x="1036" y="1530">Wrapper opens ONE test PR</text>
+<text class="b" x="1036" y="1551">Both suites, plus where the two vendors</text>
+<text class="b" x="1036" y="1568">disagreed — and any spec gaps they hit.</text>
+<text class="n" x="1036" y="1588">The models hold no token and write nothing.</text>
+<path class="fl" d="M1230,1614 L1230,1660"/>
+<rect class="gate" x="1020" y="1664" width="420" height="100" rx="8"/>
+<text class="actH" x="1424" y="1688" text-anchor="end">HUMAN</text>
+<text class="h" x="1036" y="1688">Minos: a second human approves</text>
+<text class="b" x="1036" y="1709">A second human, who reads the spec and</text>
+<text class="b" x="1036" y="1726">the tests and never the implementation.</text>
+<path class="fl" d="M350,1520 L350,1860 L616,1860"/>
+<path class="fl" d="M1230,1764 L1230,1860 L984,1860"/>
+<rect class="todo" x="620" y="1800" width="360" height="120" rx="8"/>
+<text class="actM" x="964" y="1824" text-anchor="end">MECHANICAL</text>
+<text class="h" x="636" y="1824">They meet exactly once</text>
+<text class="b" x="636" y="1845">The tests run against the code in a</text>
+<text class="b" x="636" y="1862">scratch worktree.</text>
+<text class="n" x="636" y="1882">A failure names both SHAs. Neither side</text>
+<text class="n" x="636" y="1897">adjudicates it alone.</text>
+<path class="fl" d="M800,1920 L800,1966"/>
+<rect class="todo" x="620" y="1970" width="360" height="130" rx="8"/>
+<text class="actA" x="964" y="1994" text-anchor="end">AGENT</text>
+<text class="h" x="636" y="1994">Mediator — adjudicates</text>
+<text class="b" x="636" y="2015">Reads the ADR and returns content:</text>
+<text class="b" x="636" y="2032">which side is wrong, and a draft plan.</text>
+<text class="n" x="636" y="2052">Holds no token. The wrapper posts and opens.</text>
+<path class="fl" d="M616,2035 L564,2035"/>
+<rect class="todo" x="140" y="1970" width="420" height="130" rx="8"/>
+<text class="actM" x="544" y="1994" text-anchor="end">MECHANICAL</text>
+<text class="h" x="156" y="1994">Follow-up plan PR (draft)</text>
+<text class="b" x="156" y="2015">Spec gaps and non-blocking findings.</text>
+<text class="b" x="156" y="2032">Nothing arms until a human merges it.</text>
+<text class="n" x="156" y="2052">The ADR is the referee: the only artefact both</text>
+<text class="n" x="156" y="2067">sides read and neither wrote.</text>
+<path class="ret" d="M140,2035 L60,2035 L60,595 L576,595"/>
+<text class="n" x="72" y="2026" text-anchor="start">re-enters at ③ — the fleet never arms itself</text>
+<rect class="panel" x="1560" y="460" width="300" height="304" rx="8"/>
+<text class="h" x="1578" y="488" text-anchor="start">Why they never see the code</text>
+<text class="b" x="1578" y="514" text-anchor="start">A tester who reads the source writes</text>
+<text class="b" x="1578" y="532" text-anchor="start">tests shaped by it. QA works from the</text>
+<text class="b" x="1578" y="550" text-anchor="start">requirement and the interface.</text>
+<text class="b" x="1578" y="568" text-anchor="start"></text>
+<text class="b" x="1578" y="586" text-anchor="start">So the bundle is an allowlist of</text>
+<text class="b" x="1578" y="604" text-anchor="start">generated artifacts, not the tree with</text>
+<text class="b" x="1578" y="622" text-anchor="start">things removed. Filtering means</text>
+<text class="b" x="1578" y="640" text-anchor="start">deciding what to strip and being</text>
+<text class="b" x="1578" y="658" text-anchor="start">wrong once; generating means nothing</text>
+<text class="b" x="1578" y="676" text-anchor="start">is there unless code put it there.</text>
+<text class="b" x="1578" y="694" text-anchor="start"></text>
+<text class="b" x="1578" y="712" text-anchor="start">Two vendors on one bundle: where they</text>
+<text class="b" x="1578" y="730" text-anchor="start">disagree, the spec was ambiguous.</text>
+<rect class="panel" x="1560" y="798" width="300" height="250" rx="8"/>
+<text class="h" x="1578" y="826" text-anchor="start">Where the decision lives</text>
+<text class="b" x="1578" y="852" text-anchor="start">Mechanism and default-off: an ADR</text>
+<text class="b" x="1578" y="870" text-anchor="start">in eunomia.</text>
+<text class="b" x="1578" y="888" text-anchor="start"></text>
+<text class="b" x="1578" y="906" text-anchor="start">Per-repo answer: config/repos.conf,</text>
+<text class="b" x="1578" y="924" text-anchor="start">read from main. Setting it is a</text>
+<text class="b" x="1578" y="942" text-anchor="start">configuration change, not a merge.</text>
+<text class="b" x="1578" y="960" text-anchor="start"></text>
+<text class="b" x="1578" y="978" text-anchor="start">A refusal: an ADR in the repo</text>
+<text class="b" x="1578" y="996" text-anchor="start">that refused, so the absence reads</text>
+<text class="b" x="1578" y="1014" text-anchor="start">as decided, not overlooked.</text>
+<rect class="panel" x="1560" y="1082" width="300" height="214" rx="8"/>
+<text class="h" x="1578" y="1110" text-anchor="start">What is actually built</text>
+<text class="b" x="1578" y="1136" text-anchor="start">fleet-watch, the plan format,</text>
+<text class="b" x="1578" y="1154" text-anchor="start">repo enrollment, plan review,</text>
+<text class="b" x="1578" y="1172" text-anchor="start">bin/fleet-bundle and mopsus:</text>
+<text class="b" x="1578" y="1190" text-anchor="start">shipped. Orchestrator: the whole</text>
+<text class="b" x="1578" y="1208" text-anchor="start">wrapper — lease, session, review</text>
+<text class="b" x="1578" y="1226" text-anchor="start">loop, steward, freeze.</text>
+<text class="b" x="1578" y="1244" text-anchor="start"></text>
+<text class="b" x="1578" y="1262" text-anchor="start">The IGNITION GATE and the test</text>
+<text class="b" x="1578" y="1280" text-anchor="start">lane are specified and not built.</text>
+</svg>

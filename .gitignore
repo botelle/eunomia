@@ -1,0 +1,8 @@
+# The permanent flock target beside the enrolment record (bin/fleet-repo
+# write_conf). It is created on first write, holds no content, and must never
+# be committed — a lock is host state, not part of the record.
+config/repos.conf.lock
+
+# Written into a pin by fleet-watch loading fleetlib through SourceFileLoader.
+# Host state, and an untracked file here makes `git worktree remove` refuse.
+__pycache__/

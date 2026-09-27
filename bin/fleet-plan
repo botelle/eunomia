@@ -1,0 +1,1485 @@
+#!/usr/bin/env python3
+"""fleet-plan — validate and list feature plans.
+
+The check that matters is §3 Boundaries. A plan with an empty or placeholder
+Boundaries section is refused for dispatch, because that section is the only thing
+standing between a fresh session and the plausible wrong thing (docs/feature-plans.md).
+
+  fleet-plan lint [path ...]     validate; non-zero if any plan is invalid
+  fleet-plan list [--status S]   one line per plan
+  fleet-plan show <id>           print a plan
+  fleet-plan audit [path ...]    dead-end drafts, graded on path evidence, never guessed
+  fleet-plan ledger [path ...]   each plan beside its dispatches, marked PR and review rounds,
+                                 and what each run and round cost (--cost)
+"""
+import argparse
+import fnmatch
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+PLANS = Path(__file__).resolve().parent.parent / "plans"
+REPO_ROOT = PLANS.parent
+TEMPLATE = PLANS / "0000-template.md"
+REQUIRED_FM = ("id", "status", "repo", "zone", "tier", "paths")
+STATUSES = {"draft", "ready", "done", "abandoned"}   # "in flight" is derived, never stored
+ZONES = {"public", "private"}
+SECTIONS = ["1. Goal", "2. Deliverables", "3. Boundaries",
+            "4. Definition of done", "5. Handoff", "6. Resources"]
+# A bullet that is still the template's angle-bracket prompt. Kept as a cheap
+# first pass, but it is NOT the real check — see _is_unfilled(): comparing against
+# the template is what catches a multi-line prose placeholder, which is the shape a
+# copied template actually has.
+PLACEHOLDER = re.compile(r"^\s*[-*]\s*<[^<>]*>\s*$", re.M)
+
+
+def _norm(text: str) -> str:
+    """Collapse whitespace so formatting drift doesn't defeat the comparison."""
+    return re.sub(r"\s+", " ", text or "").strip().lower()
+
+
+def _template_sections() -> dict:
+    """Each section's body as the template ships it."""
+    try:
+        _, body, _ = parse(TEMPLATE)
+    except Exception:
+        return {}
+    return {name: _norm(section(body, name)) for name in SECTIONS}
+
+
+def _is_unfilled(body: str, name: str, tmpl: dict) -> bool:
+    """True when a section is empty, still the template's text, or only placeholders.
+
+    The template's own prompts are multi-line prose, so a line-oriented regex never
+    matched them — a verbatim copy of the template linted clean. Comparing the
+    normalised section against the template is the check that actually holds.
+    """
+    raw = section(body, name)
+    if _norm(raw) == "":
+        return True
+    if tmpl.get(name) and _norm(raw) == tmpl[name]:
+        return True
+    return PLACEHOLDER.sub("", raw).strip() == ""
+
+
+def parse_list_field(fm_raw: str, key: str):
+    """`key`'s value as a list of strings, from the RAW front-matter block (the
+    text between the `---` fences), or None if `key` has no line there at all
+    — distinct from an empty list, which means the key is present and empty.
+
+    Two shapes appear across plans/: inline (`key: [a, b]`) and block (`key:`
+    then `- a` / `- b`). The naive scalar reader in parse() below treats
+    `key:` as just another `key: value` line — for the inline form that
+    captures the bracketed text, which is usable; for the block form the
+    value is empty and the `- a` continuation lines carry no `:`, so they are
+    skipped entirely. A block-style list would then read as an empty list —
+    entries silently DROPPED, not merely unenforced (review 2573 M1, for
+    `paths`; the same shape recurs for `depends_on`). One reader for both
+    fields, because a scalar loop cannot be taught either shape without
+    stopping being a one-line-per-key reader, and two copies of this reader
+    disagreeing about a shape would be worse than either alone.
+    """
+    lines = fm_raw.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("#"):
+            continue
+        m = re.match(rf"^{re.escape(key)}\s*:\s*(.*)$", line)
+        if not m:
+            continue
+        rest = m.group(1).strip()
+        if rest.startswith("["):
+            # the list may itself wrap onto later lines before its closing ]
+            buf, j = rest, i
+            while "]" not in buf and j + 1 < len(lines):
+                j += 1
+                buf += " " + lines[j].strip()
+            inner = buf[buf.find("[") + 1: buf.rfind("]")]
+            return [x.strip().strip('"').strip("'")
+                    for x in inner.split(",") if x.strip()]
+        if rest:
+            return [rest.strip('"').strip("'")]
+        # block style: `- item` lines indented deeper than the key, until one
+        # that isn't (a dedent, a blank line, or a non-`-` line ends the list)
+        items = []
+        key_indent = len(line) - len(line.lstrip())
+        for j in range(i + 1, len(lines)):
+            nxt = lines[j]
+            if not nxt.strip():
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= key_indent:
+                break
+            stripped = nxt.strip()
+            if not stripped.startswith("-"):
+                break
+            items.append(stripped[1:].strip().strip('"').strip("'"))
+        return items
+    return None
+
+
+def parse_depends_on(fm_raw: str) -> list:
+    """`depends_on` as a list, defaulting to `[]` when absent — unlike `paths`,
+    an absent `depends_on` is a real, valid "no dependencies", not a missing
+    required field, so callers never need to tell "absent" from "empty" here."""
+    return parse_list_field(fm_raw, "depends_on") or []
+
+
+def parse(path: Path):
+    """(front_matter, body, errors). Never raises on malformed input — a half-written
+    draft in plans/ must not make the whole tool unusable."""
+    try:
+        text = path.read_text()
+    except OSError as e:
+        return None, "", [f"{e.strerror or e}"]
+    if not text.startswith("---"):
+        return None, text, ["no front matter"]
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None, text, ["front matter is not terminated by a closing ---"]
+    _, fm_raw, body = parts
+    fm, errs = {}, []
+    for line in fm_raw.strip().splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        fm[k.strip()] = v.strip()
+    fm["depends_on"] = parse_depends_on(fm_raw)
+    # Overwrite the scalar loop's raw text for `paths` with the real list, in
+    # both shapes — but ONLY when `paths:` actually has a line (parse_list_field
+    # returns None then), so a plan that omits `paths` entirely still fails the
+    # REQUIRED_FM check in lint() rather than getting a synthesized `[]`.
+    paths = parse_list_field(fm_raw, "paths")
+    if paths is not None:
+        fm["paths"] = paths
+    return fm, body, errs
+
+
+def _mask_fences(body: str) -> str:
+    """Blank fenced code blocks so a '##' inside one can't end a section.
+
+    LENGTH-PRESERVING on purpose: section() finds offsets in the masked text and
+    slices the ORIGINAL body with them, so every character must keep its position.
+    Replacing fenced lines with "" shifts everything after the first fence and the
+    slice lands on the wrong text — which silently both false-refused valid plans and
+    let an empty Boundaries section pass.
+    """
+    out, fenced = [], False
+    for line in body.split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            out.append(" " * len(line))
+            continue
+        out.append(" " * len(line) if fenced else line)
+    return "\n".join(out)
+
+
+def section(body: str, name: str) -> str:
+    """The body of one '## <name>' section, ignoring headings inside code fences."""
+    masked = _mask_fences(body)
+    m = re.search(rf"^##\s+{re.escape(name)}\s*$", masked, re.M)
+    if not m:
+        return ""
+    nxt = re.search(r"^##\s", masked[m.end():], re.M)
+    end = m.end() + (nxt.start() if nxt else len(masked) - m.end())
+    return body[m.end():end].strip()
+
+
+_ID_PREFIX = re.compile(r"\d{4}")
+
+
+def _prefix(path: Path):
+    """The id `show` would resolve this file under, or None.
+
+    Deliberately derived with `show`'s own rule (`stem.split("-", 1)[0]`, line
+    ~229) rather than a dashed-prefix regex. An earlier version required the
+    dash, so `plans/0025.md` had no prefix and was exempt from the duplicate
+    check — while `fleet-plan show 0025` still matched it, because its stem
+    splits to "0025", and returned whichever of the two files sorted first.
+    A uniqueness check that resolves ids differently from the command that
+    looks them up is not checking uniqueness of anything.
+    """
+    head = path.stem.split("-", 1)[0]
+    return head if _ID_PREFIX.fullmatch(head) else None
+
+
+def _same_id_siblings(path: Path) -> list:
+    """Other plan files beside `path` claiming its numeric id.
+
+    Directory-scoped and deliberately git-free. CI checks out at depth 1
+    (actions/checkout@v4's default), so `origin/main` does not exist there and a
+    check against it would fail every run — and it is not needed: a branch cut
+    from main already carries main's plans, so a new plan reusing a merged id
+    appears as two files in this very directory.
+
+    What it therefore cannot catch, stated rather than implied: two branches that
+    have never seen each other. On 2026-09-07 eunomia#93 and #95 both claimed
+    0025 that way, and neither tree held the other's file. That is the in-flight
+    visibility gap; no lint over a single working tree can close it.
+    """
+    pfx = _prefix(path)
+    if pfx is None:
+        return []
+    try:
+        return sorted(q for q in path.parent.glob("*.md")
+                      if q.name != path.name and _prefix(q) == pfx)
+    except OSError:
+        return []
+
+
+def _repo_plan_index(path: Path) -> dict:
+    """id -> (file, front_matter) for every plan beside `path`, `path` itself
+    included. Directory-scoped and git-free, mirroring `_same_id_siblings`
+    above — for the same reason: it must work the same inside a shallow CI
+    checkout as on a full clone, and a branch cut from main already carries
+    main's plans in this directory."""
+    idx = {}
+    try:
+        files = sorted(path.parent.glob("*.md"))
+    except OSError:
+        files = [path] if path.exists() else []
+    for f in files:
+        fm, _, errs = parse(f)
+        if fm is None or errs:
+            continue
+        pid = fm.get("id")
+        if pid:
+            idx[pid] = (f, fm)
+    return idx
+
+
+def _plan_id_deps(fm: dict) -> list:
+    """The subset of `depends_on` that names another PLAN — never a `path:` or
+    `external:` entry, neither of which is a node in the dependency graph."""
+    return [d for d in fm.get("depends_on", [])
+            if not d.startswith("path:") and not d.startswith("external:")]
+
+
+def _resolved_deps(fm: dict, index: dict) -> list:
+    """[(dep, dep_front_matter_or_None)] for each plan-id entry in
+    `depends_on` — None means the id resolves nowhere in this repo."""
+    out = []
+    for dep in _plan_id_deps(fm):
+        entry = index.get(dep)
+        out.append((dep, entry[1] if entry else None))
+    return out
+
+
+def _dependency_cycle(plan_id: str, index: dict):
+    """A cycle reachable from `plan_id` through plan-id-typed `depends_on`
+    edges, as a list of ids from `plan_id` back to itself, or None."""
+    def dfs(node, path):
+        if node in path:
+            return path[path.index(node):] + [node]
+        entry = index.get(node)
+        if entry is None:
+            return None
+        for dep in _plan_id_deps(entry[1]):
+            found = dfs(dep, path + [node])
+            if found:
+                return found
+        return None
+
+    return dfs(plan_id, [])
+
+
+def dependency_warnings(path: Path) -> list:
+    """Non-fatal notices for `path`'s `depends_on`: an edge onto a plan that is
+    now ABANDONED, reported from a dependent that is itself `done` or
+    `abandoned`. `lint()` FAILS this same shape when the dependent can still
+    dispatch (`ready`/`draft`) — D4d's distinction: there the edge is a live
+    hazard (an implementer would read `depends_on` as a promise that never
+    resolves); here it is history a `done` plan carries from before its
+    dependency was abandoned, and failing the committed-plans lint test on
+    history would break it on day one without protecting anything.
+    """
+    fm, _, errs = parse(path)
+    if fm is None or errs or fm.get("status") not in ("done", "abandoned"):
+        return []
+    index = _repo_plan_index(path)
+    return [f"{path.name}: depends_on {dep!r}, which is abandoned — the edge "
+            "is history, not a live hazard"
+            for dep, dep_fm in _resolved_deps(fm, index)
+            if dep_fm is not None and dep_fm.get("status") == "abandoned"]
+
+
+def lint(path: Path) -> list:
+    fm, body, errs = parse(path)
+    if fm is None:
+        return [f"{path.name}: {e}" for e in (errs or ["unparseable"])]
+    errs = [f"{path.name}: {e}" for e in errs]
+    for k in REQUIRED_FM:
+        if k not in fm:
+            errs.append(f"{path.name}: front matter missing '{k}'")
+    if fm.get("status") not in STATUSES:
+        errs.append(f"{path.name}: status '{fm.get('status')}' not in {sorted(STATUSES)}")
+    if fm.get("zone") not in ZONES:
+        errs.append(f"{path.name}: zone '{fm.get('zone')}' not in {sorted(ZONES)}")
+    for s in SECTIONS:
+        if not re.search(rf"^##\s+{re.escape(s)}\s*$", body, re.M):
+            errs.append(f"{path.name}: missing section '## {s}'")
+
+    # `if fm.get("id")` would exempt an EMPTY value: the key is present so
+    # REQUIRED_FM is satisfied, and "" != stem never fires. A blanked id then
+    # lints clean and fleet-watch ignites it as plan_id "" on branch feat/plan.
+    if "id" in fm and fm["id"] != path.stem:
+        errs.append(f"{path.name}: front matter id '{fm['id']}' does not match the "
+                    f"filename stem '{path.stem}'. `fleet-plan show` resolves by stem "
+                    "and by numeric prefix, so a mismatch makes a plan findable under "
+                    "an id it does not claim — and makes the uniqueness check below, "
+                    "which reads filenames, insufficient on its own")
+    dupes = _same_id_siblings(path)
+    if dupes:
+        errs.append(f"{path.name}: plan id {_prefix(path)} is also claimed by "
+                    + ", ".join(q.name for q in dupes)
+                    + ". The id is the handle a plan is referenced by, and "
+                      "`fleet-plan show <id>` returns whichever file it finds first, "
+                      "so a duplicate resolves silently to the wrong plan")
+
+    if fm.get("id"):
+        index = _repo_plan_index(path)
+        cyc = _dependency_cycle(fm["id"], index)
+        if cyc:
+            errs.append(f"{path.name}: depends_on cycle: " + " -> ".join(cyc))
+        for dep, dep_fm in _resolved_deps(fm, index):
+            if dep_fm is None:
+                errs.append(f"{path.name}: depends_on references {dep!r}, "
+                            "which is not the id of any plan in this repo")
+            elif dep_fm.get("status") == "abandoned" and fm.get("status") in ("ready", "draft"):
+                errs.append(f"{path.name}: depends_on {dep!r}, which is "
+                            "abandoned and will never be done — edit the edge")
+
+    if path.stem == "0000-template":
+        return errs  # the template is meant to be placeholders
+
+    # The point of the whole format.
+    tmpl = _template_sections()
+    b = section(body, "3. Boundaries")
+    if _is_unfilled(body, "3. Boundaries", tmpl):
+        errs.append(f"{path.name}: §3 Boundaries is empty, unchanged from the template, "
+                    "or still placeholder text — a plan without boundaries has not been "
+                    "interrogated (docs/feature-plans.md)")
+    elif fm.get("status") == "ready" and not re.search(
+            r"\bbecause\b|\bsince\b|\bwhy it matters\b|—", b, re.I):
+        # A proxy, not a proof: it catches the honest omission, not a determined
+        # author writing "because reasons". Per SPEC.md Principle 5 this tooling is
+        # cooperative — plan review is what catches a bad-faith boundary.
+        #
+        # `why it matters` is here because the proxy also fails the OTHER way.
+        # operator/lynceus 0002 carries an explicit "*Why it matters:*" paragraph
+        # on every one of its five boundaries and was refused at `ready` on
+        # 2026-09-12, having used none of `because`, `since` or an em-dash. That
+        # phrase is this repo's own convention — docs/feature-plans.md asks for
+        # "a claim plus its reasoning", and the template and most plans here
+        # spell it exactly that way — so not recognising it refused the format
+        # the format asks for. Case-insensitive, because the heading is written
+        # capitalised in prose.
+        errs.append(f"{path.name}: §3 Boundaries states what not to do but not why; "
+                    "the reasoning is the part that transfers")
+    if fm.get("status") == "ready":
+        for name in ("2. Deliverables", "4. Definition of done", "6. Resources"):
+            if _is_unfilled(body, name, tmpl):
+                errs.append(f"{path.name}: status 'ready' with §{name} empty or "
+                            "unchanged from the template")
+    return errs
+
+
+# ------------------------------------------------------------------ audit
+#
+# docs/plan-triage.md is the record of why this is small and refuses often:
+# three probes were tried (path existence alone, grep-for-the-name, a
+# `Plan: <id>` marker commit) and all three produce false "built"s. This
+# command reports only what path *timing* can support, and says so plainly
+# when it can't.
+
+def _run_git(repo: Path, *args) -> "str | None":
+    """stdout of `git -C repo <args>`, or None on ANY failure — never raises.
+
+    None must mean something different from "": a failed call has to read as
+    absent data to every caller, not as an empty (and misleadingly zero-like)
+    result. Boundary: "a git call that fails is reported as itself."
+    """
+    try:
+        out = subprocess.run(["git", "-C", str(repo), *args],
+                              capture_output=True, text=True, timeout=30)
+    except OSError:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _is_shallow(repo: Path) -> bool:
+    """True for an actual shallow clone AND for "could not tell" — the git call
+    failing must not be read as the safe "false". `--diff-filter=A` on a
+    shallow history silently finds no adding commit, which renders as
+    "nothing pre-dated the plan", the most favourable possible reading,
+    produced by missing data (2556 M4). Refuse rather than risk it."""
+    out = _run_git(repo, "rev-parse", "--is-shallow-repository")
+    return out is None or out.strip() != "false"
+
+
+def _tree_files(repo: Path, rev: str):
+    """Frozenset of every path in `rev`'s tree, or None if the git call failed."""
+    out = _run_git(repo, "ls-tree", "-r", "--name-only", rev)
+    return None if out is None else frozenset(l for l in out.splitlines() if l)
+
+
+def _filing_commit(repo: Path, ref: str, relpath: str) -> "str | None":
+    """The SHA that first added `relpath` on `ref`, or None if the call failed
+    or nothing on `ref` ever added it. Either way there is no baseline to
+    grade the plan against, so callers treat both alike: refuse that plan."""
+    out = _run_git(repo, "log", ref, "--diff-filter=A", "--format=%H", "--", relpath)
+    if out is None:
+        return None
+    hits = [l for l in out.splitlines() if l.strip()]
+    return hits[-1] if hits else None  # `git log` is newest-first; want the first add
+
+
+def _classify_path(entry: str, tree_now: frozenset, tree_at_filing: frozenset):
+    """(state, matches) for one declared entry against the current tree and the
+    filing commit's tree. `entry` is a glob — `paths` entries are matched
+    against the tree, never compared as a literal (2556 M3) — matched
+    case-sensitively (`fnmatchcase`) so the result does not depend on the
+    filesystem this happens to run on.
+
+    state is one of:
+      "missing"       — matches nothing now: evidence AGAINST the plan (D2)
+      "pre_existing"  — matches now, and every match already existed at the
+                         filing commit: evidence of NOTHING (D3)
+      "touched_after" — matches now, and at least one match did not exist at
+                         the filing commit: something landed after filing (D3b)
+    """
+    matches_now = sorted(f for f in tree_now if fnmatch.fnmatchcase(f, entry))
+    if not matches_now:
+        return "missing", []
+    if any(f not in tree_at_filing for f in matches_now):
+        return "touched_after", matches_now
+    return "pre_existing", matches_now
+
+
+def _audit_plan(path: Path, fm: dict, repo: Path, ref: str, tree_now: frozenset) -> dict:
+    """The plan-level verdict for one `status: draft` plan, from path evidence
+    alone. Never "built" — that state does not exist here (§3 Boundaries)."""
+    pid = fm.get("id")
+    empty = {"missing": [], "pre_existing": [], "touched_after": []}
+
+    # D2/review 2556 M2: the plan's own file is created BY the filing commit,
+    # so it can never pre-date it — counting it would make D3/D4 unreachable
+    # for every plan in the repo.
+    own = f"plans/{path.name}"
+    declared = [p for p in fm.get("paths", []) if p != own]
+
+    filing = _filing_commit(repo, ref, own)
+    if filing is None:
+        return {"id": pid, "file": path.name, "state": "error", "filing_commit": None,
+                "detail": f"could not find the filing commit for {own!r} on {ref!r} "
+                          "— refusing to grade rather than guessing a baseline",
+                **empty}
+
+    tree_at_filing = _tree_files(repo, filing)
+    if tree_at_filing is None:
+        return {"id": pid, "file": path.name, "state": "error", "filing_commit": filing,
+                "detail": f"could not read the tree at the filing commit {filing}",
+                **empty}
+
+    buckets = {"missing": [], "pre_existing": [], "touched_after": []}
+    for entry in declared:
+        state, _ = _classify_path(entry, tree_now, tree_at_filing)
+        buckets[state].append(entry)
+
+    if buckets["missing"]:
+        state = "not_built"
+        detail = "NOT BUILT — missing: " + ", ".join(buckets["missing"])
+    elif buckets["touched_after"]:
+        state = "touched_after_filing"
+        detail = ("TOUCHED AFTER FILING — added after the plan was filed: "
+                   + ", ".join(buckets["touched_after"]))
+    else:
+        state = "undecidable"
+        paths_repr = ", ".join(declared) if declared else "(none declared)"
+        detail = f"UNDECIDABLE — this method cannot tell (paths: {paths_repr})"
+
+    return {"id": pid, "file": path.name, "state": state, "filing_commit": filing,
+            "detail": detail, **buckets}
+
+
+def audit(files, repo: Path = REPO_ROOT, ref: str = "origin/main") -> dict:
+    """{"refused": <reason>} or {"refused": None, "plans": [...]}.
+
+    Scope is `status: draft` plans only (§3 Boundaries: never grade `done` or
+    `abandoned` — those are human statements about outcome). A plan that fails
+    to parse is reported as an error regardless of status, because its status
+    is exactly the thing that failed to parse — dropping it would be the
+    silence this command exists to refuse ("absent must not look like zero").
+    Read-only throughout: no plan file, index, or working tree is written.
+
+    Defaults to `origin/main`, not the local `main`, because the two drift: a
+    long-lived worktree's local `main` can sit behind `origin/main` (this repo's
+    own worktree did, while this plan was being built), and a plan filed since
+    the last local fetch would then read as "filing commit not found" instead
+    of being graded. `origin/main` is what a fresh checkout and CI both have.
+    """
+    if _is_shallow(repo):
+        return {"refused": (
+            "this is a shallow clone (or its shallowness could not be confirmed) — "
+            "`git log --diff-filter=A` on a shallow history silently finds no adding "
+            "commit, which reads as \"nothing pre-dated the plan\": the most "
+            "favourable possible answer, produced by missing data")}
+
+    tree_now = _tree_files(repo, ref)
+    if tree_now is None:
+        return {"refused": f"could not read the tree at {ref!r} — refusing rather "
+                            "than reporting zero declared paths"}
+
+    plans = []
+    for f in files:
+        fm, _body, errs = parse(f)
+        if fm is None or errs:
+            plans.append({"id": (fm or {}).get("id"), "file": f.name, "state": "error",
+                          "filing_commit": None,
+                          "detail": "; ".join(errs or ["unparseable"]),
+                          "missing": [], "pre_existing": [], "touched_after": []})
+            continue
+        if fm.get("status") != "draft":
+            continue
+        plans.append(_audit_plan(f, fm, repo, ref, tree_now))
+    return {"refused": None, "plans": plans}
+
+
+# ------------------------------------------------------------------- graph
+#
+# Extends `audit` rather than racing it (plan 0047 Boundaries): same parser,
+# same front-matter reader, same `main` reads. A second binary would be a
+# second answer to "what does this front matter mean", and the two would
+# eventually disagree.
+
+_REPO_URL_RE = re.compile(r"[:/]([a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*?)(?:\.git)?/?\s*$")
+
+
+def _own_repo(repo: Path) -> "str | None":
+    """`owner/name` this checkout's `origin` points at, lowercased — or None
+    if it can't be told. Mirrors `fleet-prepush`'s own URL parsing so the two
+    tools never disagree about what repo a checkout is."""
+    url = _run_git(repo, "remote", "get-url", "origin")
+    if url is None:
+        return None
+    m = _REPO_URL_RE.search(url.strip().lower())
+    return m.group(1) if m else None
+
+
+def _dep_edges(fm: dict, index: dict, tree_now: "frozenset | None",
+               own_repo: "str | None") -> list:
+    """One dict per `depends_on` entry of `fm`, in declared order.
+
+    Each carries `form` (`plan` / `path` / `external`), `to` (the entry's
+    target), `satisfied` (bool for `plan`/`path`, always None for `external`
+    — D2: it never auto-satisfies), and `reason` when unsatisfied, using the
+    vocabulary `docs/plan-dependencies.md` already defines (`unmet`,
+    `abandoned`, `dangling`, `external`, and `cross_repo` below it).
+
+    Never infers a dependency (plan 0047 Boundaries): only what `depends_on`
+    literally declares, read once, here.
+    """
+    edges = []
+    for dep in fm.get("depends_on", []):
+        if dep.startswith("external:"):
+            edges.append({"to": dep[len("external:"):], "form": "external",
+                          "satisfied": None, "reason": "external"})
+            continue
+        if dep.startswith("path:"):
+            p = dep[len("path:"):]
+            plan_repo = fm.get("repo")
+            # `_plan_dependency_block` (fleet-watch) resolves `path:` against
+            # the DEPENDENT plan's own repo, never the repo this graph is run
+            # in. When the two differ, this checkout cannot resolve the path
+            # at all — reporting True or False would be a guess dressed as an
+            # answer (Boundaries: "the graph must say so").
+            if own_repo and plan_repo and plan_repo != own_repo:
+                edges.append({"to": p, "form": "path", "satisfied": None,
+                              "reason": "cross_repo",
+                              "detail": f"declared against {plan_repo!r}; "
+                                        f"unresolvable from {own_repo!r}"})
+                continue
+            exists = None if tree_now is None else p in tree_now
+            edges.append({"to": p, "form": "path", "satisfied": exists,
+                          "reason": None if exists else "unmet"})
+            continue
+        dep_fm = index.get(dep)
+        if dep_fm is None:
+            edges.append({"to": dep, "form": "plan", "satisfied": False,
+                          "reason": "dangling"})
+            continue
+        status = dep_fm.get("status")
+        if status == "done":
+            edges.append({"to": dep, "form": "plan", "satisfied": True,
+                          "reason": None})
+        elif status == "abandoned":
+            edges.append({"to": dep, "form": "plan", "satisfied": False,
+                          "reason": "abandoned"})
+        else:
+            edges.append({"to": dep, "form": "plan", "satisfied": False,
+                          "reason": "unmet"})
+    return edges
+
+
+def _plan_layers(index: dict) -> dict:
+    """{id: layer}, layer 0 for a plan with no plan-id `depends_on`, else
+    1 + the longest chain of plan-id dependencies below it.
+
+    Iterative — an explicit stack, no recursion — because the front matter
+    this reads is hand-written and nothing rejects a cycle in it (Boundaries:
+    "the tempting implementation recurses and blows the stack"). A dependency
+    already on the current DFS stack (a cycle back-edge) contributes nothing
+    further to its own layer rather than being followed again: the edge is
+    still drawn everywhere else in this module, only its contribution to
+    vertical rank is capped so this terminates.
+    """
+    layer, color = {}, {pid: 0 for pid in index}   # 0=white 1=gray 2=black
+    for start in index:
+        if color[start]:
+            continue
+        stack = [(start, iter(_plan_id_deps(index[start])))]
+        color[start] = 1
+        while stack:
+            node, it = stack[-1]
+            pushed = False
+            for dep in it:
+                if dep not in index or color.get(dep) != 0:
+                    continue
+                color[dep] = 1
+                stack.append((dep, iter(_plan_id_deps(index[dep]))))
+                pushed = True
+                break
+            if pushed:
+                continue
+            deps = [d for d in _plan_id_deps(index[node]) if d in index]
+            layer[node] = 1 + max((layer.get(d, 0) for d in deps), default=-1)
+            color[node] = 2
+            stack.pop()
+    return layer
+
+
+def _find_cycles(index: dict) -> list:
+    """Every distinct cycle in the plan-id dependency graph, each as a list
+    of ids from its earliest-visited member back to itself.
+
+    Iterative for the same reason as `_plan_layers`. Distinct cycles are
+    deduped by their member SET, not their starting point, so a cycle found
+    while walking from any of its own members is reported once.
+    """
+    cycles, seen = [], set()
+    color = {pid: 0 for pid in index}
+    for start in index:
+        if color[start]:
+            continue
+        stack = [(start, iter(_plan_id_deps(index[start])))]
+        path = [start]
+        color[start] = 1
+        while stack:
+            node, it = stack[-1]
+            pushed = False
+            for dep in it:
+                if dep not in index:
+                    continue
+                if color[dep] == 0:
+                    color[dep] = 1
+                    stack.append((dep, iter(_plan_id_deps(index[dep]))))
+                    path.append(dep)
+                    pushed = True
+                    break
+                if color[dep] == 1:
+                    i = path.index(dep)
+                    cyc = path[i:] + [dep]
+                    key = frozenset(cyc)
+                    if key not in seen:
+                        seen.add(key)
+                        cycles.append(cyc)
+            if pushed:
+                continue
+            color[node] = 2
+            stack.pop()
+            path.pop()
+    return cycles
+
+
+def _unreachable_ids(index: dict) -> set:
+    """ids whose `depends_on` chain — their own entries, or a plan-id
+    dependency's, transitively — contains an `external:` entry or a plan-id
+    dependency on an `abandoned` plan (D5): the two things nothing automatic,
+    or nothing at all, can ever clear. A missing `path:` or an `unmet` but
+    still-live plan dependency does NOT make a node unreachable — those can
+    still land.
+
+    Iterative and memoized for the same reason as `_plan_layers`; a cycle
+    encountered mid-walk is not itself treated as a D5 blocker (that is what
+    `_find_cycles` reports on).
+
+    A blocker discovered while walking a freshly-pushed child cannot be
+    picked up by the parent re-scanning its own `depends_on` iterator: the
+    iterator already consumed that entry before the child was recursed into,
+    so the parent's `for dep in it` loop never sees it again. That miss is
+    input-order dependent — it only bites when the child is reached by
+    recursion rather than already `color == 2` from an earlier top-level
+    `start` — so the fix is to also propagate a finished node's `blocked`
+    status to its stack parent at pop time, not only when an iterator
+    happens to walk over an already-finished node.
+    """
+    blocked, color = {}, {pid: 0 for pid in index}
+    for start in index:
+        if color[start]:
+            continue
+        stack = [(start, iter(index[start].get("depends_on", [])))]
+        color[start] = 1
+        blocked.setdefault(start, False)
+        while stack:
+            node, it = stack[-1]
+            pushed = False
+            for dep in it:
+                if dep.startswith("external:"):
+                    blocked[node] = True
+                    continue
+                if dep.startswith("path:"):
+                    continue
+                dep_fm = index.get(dep)
+                if dep_fm is None:
+                    continue                         # dangling: not a D5 blocker
+                if dep_fm.get("status") == "abandoned":
+                    blocked[node] = True
+                    continue
+                if color.get(dep) == 0:
+                    color[dep] = 1
+                    blocked.setdefault(dep, False)
+                    stack.append((dep, iter(dep_fm.get("depends_on", []))))
+                    pushed = True
+                    break
+                if color.get(dep) == 2 and blocked.get(dep):
+                    blocked[node] = True
+            if pushed:
+                continue
+            color[node] = 2
+            stack.pop()
+            if stack and blocked.get(node):
+                blocked[stack[-1][0]] = True
+    return {pid for pid, v in blocked.items() if v}
+
+
+def graph(files, repo: Path = REPO_ROOT, ref: str = "origin/main") -> dict:
+    """{"nodes": [...], "edges": [...], "cycles": [...], "errors": [...]}.
+
+    One node per parseable plan (`id`, `status`, `repo`, `paths`, `unreachable`
+    — D2, D5); one edge per `depends_on` entry, tagged with its form (D2/D3).
+    A plan that fails to parse is reported in `errors`, never silently
+    dropped (matching `audit`'s own rule). Read-only: no plan file, index, or
+    working tree is written (Boundaries: "report, never write").
+    """
+    own_repo = _own_repo(repo)
+    tree_now = _tree_files(repo, ref)
+
+    index, errors = {}, []
+    for f in files:
+        fm, _body, errs = parse(f)
+        if fm is None or errs or not fm.get("id"):
+            errors.append({"file": f.name, "detail": "; ".join(errs or ["unparseable"])})
+            continue
+        index[fm["id"]] = fm
+
+    layers = _plan_layers(index)
+    unreachable = _unreachable_ids(index)
+
+    nodes, edges = [], []
+    for pid, fm in index.items():
+        nodes.append({"id": pid, "status": fm.get("status"), "repo": fm.get("repo"),
+                      "paths": fm.get("paths", []), "layer": layers.get(pid, 0),
+                      "unreachable": pid in unreachable})
+        for e in _dep_edges(fm, index, tree_now, own_repo):
+            edges.append({"from": pid, **e})
+
+    return {"nodes": nodes, "edges": edges,
+            "cycles": _find_cycles(index), "errors": errors}
+
+
+def _mermaid(data: dict) -> str:
+    """A `graph TD` Mermaid flowchart — the cheap surface (D3): one fenced
+    block, renders in a Forgejo pull request body or a page under `docs/`.
+
+    The three `depends_on` forms stay visually distinct (Boundaries: "never
+    flatten them") — a plain arrow for a satisfied plan-id edge, a dashed one
+    for an unmet plan-id or missing/cross-repo path, and a thick one into a
+    diamond for `external:`, which nothing but a human deleting the line ever
+    clears.
+    """
+    def nid(s: str) -> str:
+        return "n_" + re.sub(r"[^A-Za-z0-9_]", "_", s)
+
+    def esc(s: str) -> str:
+        return s.replace('"', "'")
+
+    lines = ["graph TD"]
+    for n in sorted(data["nodes"], key=lambda n: n["id"]):
+        label = f"{n['id']} ({n['status']})"
+        if n["unreachable"]:
+            label += " [unreachable]"
+        lines.append(f'  {nid(n["id"])}["{esc(label)}"]')
+
+    counter = 0
+    for e in data["edges"]:
+        src = nid(e["from"])
+        if e["form"] == "plan":
+            arrow = "-->" if e["satisfied"] else "-.->"
+            lines.append(f'  {src} {arrow} {nid(e["to"])}')
+            continue
+        counter += 1
+        if e["form"] == "path":
+            tag = nid(f"path_{counter}")
+            note = e["reason"] or "ok"
+            lines.append(f'  {tag}(["path: {esc(e["to"])}"])')
+            lines.append(f'  {src} -.->|{note}| {tag}')
+        else:
+            tag = nid(f"ext_{counter}")
+            lines.append(f'  {tag}{{"external: {esc(e["to"])}"}}')
+            lines.append(f'  {src} ==>|external| {tag}')
+    return "\n".join(lines) + "\n"
+
+
+def _svg(data: dict) -> str:
+    """A layered SVG (D4): one box per plan, rows are `_plan_layers`. Fixed
+    box size and pure grid placement make non-overlap a property of the
+    arithmetic, not something drawn and hoped for — `tests/test_plan_graph.py`
+    still asserts it geometrically (plan 0047 D.o.D), the way
+    `tests/test_svg_layout.py` does for the house-style diagrams.
+    """
+    BOX_W, BOX_H, GAP_X, GAP_Y, MARGIN, HEAD = 240, 64, 30, 30, 30, 50
+
+    by_layer = {}
+    for n in sorted(data["nodes"], key=lambda n: n["id"]):
+        by_layer.setdefault(n["layer"], []).append(n)
+    ext_counts, unmet_counts = {}, {}
+    for e in data["edges"]:
+        if e["form"] == "external":
+            ext_counts[e["from"]] = ext_counts.get(e["from"], 0) + 1
+        elif not e["satisfied"]:
+            unmet_counts[e["from"]] = unmet_counts.get(e["from"], 0) + 1
+
+    max_cols = max((len(row) for row in by_layer.values()), default=1)
+    n_layers = (max(by_layer) + 1) if by_layer else 1
+    width = MARGIN * 2 + max_cols * (BOX_W + GAP_X) - GAP_X
+    height = MARGIN * 2 + HEAD + n_layers * (BOX_H + GAP_Y) - GAP_Y
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+             f'width="{width}" height="{height}">',
+             f'<rect class="bg" x="0" y="0" width="{width}" height="{height}" fill="white"/>',
+             f'<text x="{MARGIN}" y="20">fleet-plan graph</text>',
+             f'<text x="{MARGIN}" y="36">Legend: solid=satisfied plan-id dep, '
+             'dashed=unmet, red outline=unreachable (D5)</text>']
+
+    pos = {}
+    for li in sorted(by_layer):
+        for ci, n in enumerate(by_layer[li]):
+            x = MARGIN + ci * (BOX_W + GAP_X)
+            y = MARGIN + HEAD + li * (BOX_H + GAP_Y)
+            pos[n["id"]] = (x, y)
+            stroke = "#c00" if n["unreachable"] else "#333"
+            parts.append(f'<rect class="node" x="{x}" y="{y}" width="{BOX_W}" '
+                         f'height="{BOX_H}" fill="white" stroke="{stroke}"/>')
+            parts.append(f'<text x="{x + 8}" y="{y + 18}">{n["id"]}</text>')
+            parts.append(f'<text x="{x + 8}" y="{y + 34}">{n["status"]}</text>')
+            extra = f'ext:{ext_counts.get(n["id"], 0)} unmet:{unmet_counts.get(n["id"], 0)}'
+            parts.append(f'<text x="{x + 8}" y="{y + 50}">{extra}</text>')
+
+    for e in data["edges"]:
+        if e["form"] != "plan" or e["from"] not in pos or e["to"] not in pos:
+            continue
+        x0, y0 = pos[e["from"]]
+        x1, y1 = pos[e["to"]]
+        dash = '' if e["satisfied"] else ' stroke-dasharray="5,4"'
+        parts.append(f'<path class="edge" d="M{x0 + BOX_W / 2},{y0} '
+                     f'L{x1 + BOX_W / 2},{y1 + BOX_H}" stroke="#333" fill="none"{dash}/>')
+
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
+
+
+# ------------------------------------------------------------------ ledger
+#
+# Plan 0061. The provenance of a plan — who ran it, what merged, at what cost —
+# and NOT a verdict on whether it was built. That question belongs to `audit`,
+# which asks the work rather than a record of the work (docs/plan-triage.md).
+#
+# Everything between this banner and the `end ledger` one is read-only by
+# construction: a sqlite3 connection opened `mode=ro`, no file writes, no
+# git writes. tests/test_plan_ledger.py greps this span for both.
+
+LEDGER_SUCCESS = ("merged", "done")      # a dispatch outcome that is not a failure
+
+# What `fleet-plan ledger` prints, in the table and in the JSON, so a reader
+# cannot take the column for something it is not.
+LEDGER_NOTES = (
+    "`claimed`: status is done and the fleet has no dispatch record. It answers "
+    "\"did someone decide this was finished\", which is not \"did the fleet build "
+    "it\": most of these predate the dispatcher and were done by hand because "
+    "there was nothing to dispatch them. It is a place to look, not an accusation.",
+    "`stalled`: a failed dispatch and no successful one, whatever the file says. "
+    "Also a place to look. The pull request it names is only named: whether that "
+    "pull request is waiting on a review is `fleet-stalled`'s finding, not this one's.",
+    "This is provenance, not a verdict. Whether a plan's work exists is "
+    "`fleet-plan audit`'s question; `--verdict` runs that probe for the two "
+    "classes and prints its answer in its own column.",
+    "fleet.db indexes the forge and does not poll it: a pull request state with "
+    "source `fleet.db` is as of `pr_as_of`. Only source `forge` was read just now.",
+)
+
+LEDGER_COLUMNS = ("id", "status", "runs", "outcome", "pr", "pr_state", "pr_source",
+                  "pr_as_of", "rounds", "impl_seconds", "class", "reason")
+
+
+def _ledger_db_path(explicit: "str | None") -> Path:
+    """`--db`, else `$FLEET_DB`, else `<fleet dir>/fleet.db` — the same order
+    every other fleet.db reader in this repo uses."""
+    if explicit:
+        return Path(explicit).expanduser()
+    if os.environ.get("FLEET_DB"):
+        return Path(os.environ["FLEET_DB"]).expanduser()
+    fleet = os.environ.get("EUNOMIA_FLEET_DIR") or str(Path.home() / "dev" / ".fleet")
+    return Path(fleet) / "fleet.db"
+
+
+_LEDGER_RUNS = """
+SELECT d.lease, d.plan_id, d.started_ts, d.current_phase_ts, d.pr, d.outcome,
+       d.failure_reason,
+       (SELECT COUNT(*) FROM dispatch_phase p
+         WHERE p.lease = d.lease AND p.phase = 'review-round') AS rounds,
+       (SELECT SUM(p.seconds) FROM dispatch_phase p
+         WHERE p.lease = d.lease AND p.phase = 'implementer-exit') AS impl_seconds
+FROM dispatch d
+WHERE lower(d.repo) = ? AND d.plan_id IS NOT NULL
+"""
+
+
+def _load_collect():
+    """bin/fleet-collect, by path — it owns the slug rule, the pair fragment and
+    the two views, so the ledger reads them rather than restating them."""
+    loader = importlib.machinery.SourceFileLoader(
+        "fleet_collect_for_cost", str(Path(__file__).resolve().parent / "fleet-collect"))
+    spec = importlib.util.spec_from_loader("fleet_collect_for_cost", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+_COST_SESSIONS = """
+SELECT lease, COUNT(*) AS sessions, SUM(processed) AS processed, SUM(output) AS output,
+       SUM(turns) AS turns, ROUND(SUM(minutes), 1) AS minutes
+FROM dispatch_cost WHERE kind = 'implementer' GROUP BY lease
+"""
+
+_COST_ROUNDS = """
+SELECT r.pr AS pr, r.round AS round, r.verdict AS verdict, c.session_uuid AS session_uuid,
+       c.processed AS processed, c.output AS output, c.turns AS turns, c.minutes AS minutes
+FROM review r
+LEFT JOIN dispatch_cost c ON c.kind = 'review' AND c.repo = r.repo
+                         AND c.pr = r.pr AND c.round = r.round
+WHERE lower(r.repo) = ?
+ORDER BY r.pr, r.round
+"""
+
+
+def _read_costs(con, repo: str) -> dict:
+    """Plan 0076: what the linked sessions cost, read on the ledger's own
+    read-only connection. `state` is `ok` or `unavailable` — a database the
+    collector has not yet given the two views (or a `review` table) is not an
+    error in the ledger, it is a cost block that says so."""
+    try:
+        collect = _load_collect()
+        collect.register_functions(con)
+        pairs = dict(con.execute(
+            f"SELECT lease, COUNT(*) FROM ({collect.DISPATCH_PAIRS_SQL}) GROUP BY lease"))
+        sessions = {r["lease"]: dict(r) for r in con.execute(_COST_SESSIONS)}
+        rounds = {}
+        for r in con.execute(_COST_ROUNDS, (repo.lower(),)):
+            rounds.setdefault(r["pr"], []).append(dict(r))
+    except Exception as e:           # a diagnostic read must not take the ledger down
+        return {"state": "unavailable", "detail": f"{e.__class__.__name__}: {e}",
+                "pairs": {}, "sessions": {}, "rounds": {}}
+    return {"state": "ok", "detail": "", "pairs": pairs, "sessions": sessions,
+            "rounds": rounds}
+
+
+def _read_dispatches(db: Path, repo: str) -> "tuple[dict, dict | None, int, dict | None]":
+    """(db_status, {plan_id: [run, ...]} or None, unattributed, costs).
+
+    None for the runs means "no dispatch data" — the database is absent, not
+    yet built, or unreadable — and every caller must carry that as `unknown`.
+    An empty dict is a different thing: the database was read and this repo has
+    no runs in it. Collapsing the two is the error this function exists to
+    prevent: the absence of a record is not evidence that nothing ran.
+
+    Opened `mode=ro` and `query_only`: the database is derived, can be
+    mid-rebuild, and is not this tool's to touch. `unattributed` counts leases
+    the view could not tie to a repo or plan; they are counted, never joined.
+    """
+    status = {"state": "absent", "path": str(db), "detail": "no such file"}
+    if not db.is_file():
+        return status, None, 0, None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as e:
+        return {**status, "state": "unreadable", "detail": str(e)}, None, 0, None
+    costs = None
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only = ON")
+        rows = con.execute(_LEDGER_RUNS, (repo.lower(),)).fetchall()
+        unattributed = con.execute(
+            "SELECT COUNT(*) FROM dispatch WHERE repo IS NULL OR plan_id IS NULL"
+        ).fetchone()[0]
+        costs = _read_costs(con, repo)
+    except sqlite3.Error as e:
+        return {**status, "state": "unreadable", "detail": str(e)}, None, 0, None
+    finally:
+        con.close()
+    runs = {}
+    for r in rows:
+        runs.setdefault(r["plan_id"], []).append(dict(r))
+    for lst in runs.values():
+        lst.sort(key=lambda r: (r["started_ts"] or "", r["lease"]))
+    return {"state": "ok", "path": str(db), "detail": ""}, runs, unattributed, costs
+
+
+def _ledger_row(pid: str, fm: dict, runs: "list | None") -> dict:
+    """One plan's row. `runs` is None when there is no dispatch data at all."""
+    row = {"id": pid, "status": fm.get("status"), "runs": None, "outcome": "unknown",
+           "pr": None, "pr_state": None, "pr_source": None, "pr_as_of": None,
+           "rounds": None, "impl_seconds": None, "class": None, "reason": None,
+           "probe": None, "dispatches": None, "review_rounds": None, "total": None}
+    if runs is None:
+        return row
+    row["runs"] = len(runs)
+    if not runs:
+        row["outcome"] = "none"
+        if fm.get("status") == "done":
+            row["class"] = "claimed"
+        return row
+
+    latest = runs[-1]
+    # A lease with no terminal record may be running or may have died without
+    # writing one (the dispatch view's own `terminal` caveat) — so it is named
+    # for what is known and not called "running".
+    row["outcome"] = latest["outcome"] or "not-terminal"
+    row["rounds"] = sum(r["rounds"] or 0 for r in runs)
+    secs = [r["impl_seconds"] for r in runs if r["impl_seconds"] is not None]
+    row["impl_seconds"] = int(round(sum(secs))) if secs else None
+
+    for r in reversed(runs):                 # the newest run that reached a PR
+        if r["pr"] is not None:
+            row["pr"] = r["pr"]
+            if r["outcome"] in ("merged", "closed"):
+                row["pr_state"] = r["outcome"]
+            row["pr_source"] = "fleet.db"
+            row["pr_as_of"] = r["current_phase_ts"]
+            break
+
+    failed = [r for r in runs if r["outcome"] == "failed"]
+    if failed and not any(r["outcome"] in LEDGER_SUCCESS for r in runs):
+        row["class"] = "stalled"
+    if row["outcome"] == "failed" or row["class"] == "stalled":
+        row["reason"] = failed[-1]["failure_reason"] if failed else None
+    return row
+
+
+_COST_KEYS = ("processed", "output", "turns", "minutes")
+
+
+def _sum_cost(parts: list) -> "dict | None":
+    """Sum cost dicts; None when there is nothing to sum. A missing turn count is
+    skipped, not read as zero."""
+    if not parts:
+        return None
+    out = {}
+    for k in _COST_KEYS:
+        vals = [p[k] for p in parts if p.get(k) is not None]
+        out[k] = round(sum(vals), 1) if k == "minutes" else int(sum(vals))
+    return out
+
+
+def _ledger_cost(runs: list, costs: dict) -> dict:
+    """One plan's cost block, from its runs and the linked sessions. A run's
+    numbers are summed over ITS linked sessions only, and `unlinked` counts the
+    pairs the collector could not tie to exactly one — a sum is complete only
+    when that is zero, so the total says `partial` otherwise. The rounds are the
+    reviews of each run's pull request, the first run to name a PR taking them."""
+    dispatches, rounds, taken = [], [], set()
+    for run in runs:
+        s = costs["sessions"].get(run["lease"])
+        n = s["sessions"] if s else 0
+        dispatches.append({
+            "lease": run["lease"], "started": run["started_ts"], "outcome": run["outcome"],
+            "pr": run["pr"], "sessions": n,
+            "unlinked": max(costs["pairs"].get(run["lease"], 0) - n, 0),
+            "cost": {k: s[k] for k in _COST_KEYS} if s else None})
+        pr = run["pr"]
+        if pr is not None and pr not in taken:
+            taken.add(pr)
+            for r in costs["rounds"].get(pr, []):
+                linked = r["session_uuid"] is not None and r["processed"] is not None
+                rounds.append({"pr": pr, "round": r["round"], "verdict": r["verdict"],
+                               "cost": {k: r[k] for k in _COST_KEYS} if linked else None})
+    parts = [d["cost"] for d in dispatches if d["cost"]] + [r["cost"] for r in rounds
+                                                            if r["cost"]]
+    total = _sum_cost(parts) or {"processed": 0, "output": 0}
+    return {"dispatches": dispatches, "rounds": rounds,
+            "total": {"processed": total["processed"], "output": total["output"],
+                      "partial": any(d["unlinked"] for d in dispatches)
+                                 or any(r["cost"] is None for r in rounds)}}
+
+
+def _forge_state(pr: dict) -> str:
+    """The forge's own word for a pull request: merged, open or closed."""
+    if pr.get("merged") or pr.get("merged_at"):
+        return "merged"
+    return (pr.get("state") or "unknown").lower()
+
+
+def _marker_lookup(watch, token):
+    """`lookup(repo, plan_id, stored_pr=None)` — the pull request carrying
+    `Plan: <id>`, the fleet's own identifier and never the branch name (which is
+    truncated and collides).
+
+    Two steps, cheapest first. The run recorded a pull request number, so read
+    THAT one and accept it only if its body carries the marker on a line of its
+    own and an implementer opened it — the same two tests `marked_pr` applies,
+    from the same `MARKER` and `_is_implementer`. One request instead of a scan
+    of every pull request in the repository, which took over ten minutes for a
+    ledger's worth of plans. Anything else — no stored number, unreadable, or a
+    body without the marker — falls through to `marked_pr` itself, unchanged.
+    `dry_run=True` because `marked_pr` otherwise clears a page-suppression marker
+    on disk, and this tool writes nothing."""
+    def lookup(repo, pid, stored_pr=None):
+        if stored_pr is not None:
+            st, body = watch._forge(token).get_pull(repo, stored_pr)
+            needle = re.compile(rf"^{re.escape(watch.MARKER)}{re.escape(pid)}\s*$", re.M)
+            if (st == 200 and isinstance(body, dict)
+                    and watch._is_implementer(body.get("user") or {})
+                    and needle.search(body.get("body") or "")):
+                return body
+        return watch.marked_pr(repo, pid, token, dry_run=True)
+    return lookup
+
+
+def _forge_pr_lookup() -> "tuple[object | None, str]":
+    """(lookup, error) from the real fleet-watch and the sanctioned token
+    helper. fleet-watch is imported here, not at the top, so a host that never
+    asks for `--verdict` never loads it."""
+    try:
+        loader = importlib.machinery.SourceFileLoader(
+            "fleet_watch", str(Path(__file__).resolve().parent / "fleet-watch"))
+        spec = importlib.util.spec_from_loader("fleet_watch", loader)
+        watch = importlib.util.module_from_spec(spec)
+        loader.exec_module(watch)
+        token, err = watch._token()
+    except Exception as e:           # a diagnostic tool must not die on its probe
+        return None, f"could not load fleet-watch: {e.__class__.__name__}: {e}"
+    if not token:
+        return None, err or "no forge token"
+    return _marker_lookup(watch, token), ""
+
+
+def _probe_lookup(index: dict, repo: Path, ref: str):
+    """`probe(plan_id)` -> {"state", "detail"} from `audit`'s own capability
+    probe. `audit` refuses to grade a `done` plan, and this is the one place that
+    is overridden — plan 0061 D2b asks for it by name, opt-in. The answer is
+    quoted from `_audit_plan` in its own vocabulary and put in its own column;
+    the ledger's columns never carry it."""
+    refusal, tree_now = None, None
+    if _is_shallow(repo):
+        refusal = "shallow clone — path timing cannot be read"
+    else:
+        tree_now = _tree_files(repo, ref)
+        if tree_now is None:
+            refusal = f"could not read the tree at {ref!r}"
+
+    def probe(pid: str) -> dict:
+        if refusal:
+            return {"state": "refused", "detail": refusal}
+        path, fm = index[pid]
+        res = _audit_plan(path, fm, repo, ref, tree_now)
+        return {"state": res["state"], "detail": res["detail"]}
+    return probe
+
+
+def ledger(files, db: "Path | None" = None, repo: "str | None" = None,
+           verdict: bool = False, cost: bool = False, pr_lookup=None, probe=None,
+           repo_root: Path = REPO_ROOT, ref: str = "origin/main") -> dict:
+    """One row per plan of `repo`, joined to its dispatches. Never raises for a
+    missing database, never writes.
+
+    `pr_lookup` and `probe` are the two `--verdict` seams; either left None is
+    built from the real forge / `audit` when `verdict` is set.
+    """
+    repo = (repo or _own_repo(repo_root) or "").lower()
+    db_status, runs_by_plan, unattributed, costs = _read_dispatches(
+        _ledger_db_path(db), repo)
+
+    index, errors, out_of_scope = {}, [], 0
+    for f in files:
+        fm, _body, errs = parse(f)
+        if fm is None or errs or not fm.get("id"):
+            errors.append({"file": f.name, "detail": "; ".join(errs or ["unparseable"])})
+            continue
+        if (fm.get("repo") or "").lower() != repo:
+            out_of_scope += 1                # another repo's plan, not a missing one
+            continue
+        index[fm["id"]] = (f, fm)
+
+    rows = [_ledger_row(pid, fm, None if runs_by_plan is None
+                        else runs_by_plan.get(pid, []))
+            for pid, (_f, fm) in sorted(index.items())]
+
+    if costs is not None and costs["state"] == "ok":
+        for row in rows:
+            if row["runs"]:
+                block = _ledger_cost(runs_by_plan[row["id"]], costs)
+                row.update(dispatches=block["dispatches"],
+                           review_rounds=block["rounds"], total=block["total"])
+
+    forge = {"asked": False, "unreadable": 0, "error": ""}
+    if verdict:
+        forge["asked"] = True
+        if pr_lookup is None:
+            pr_lookup, forge["error"] = _forge_pr_lookup()
+        if probe is None:
+            probe = _probe_lookup(index, repo_root, ref)
+        for row in rows:
+            if row["pr"] is not None and pr_lookup is not None:
+                found = pr_lookup(repo, row["id"], row["pr"])
+                if found == "unreadable":
+                    forge["unreadable"] += 1
+                elif found is None:
+                    row.update(pr_state="no-marked-pr", pr_source="forge", pr_as_of=None)
+                else:
+                    row.update(pr=found.get("number", row["pr"]),
+                               pr_state=_forge_state(found),
+                               pr_source="forge", pr_as_of=None)
+            if row["class"]:
+                row["probe"] = probe(row["id"])
+
+    # Same-repo dispatches whose plan is not among these files: named, so a
+    # plan that was renamed or removed does not vanish from the join.
+    unmatched = sorted(set(runs_by_plan or {}) - set(index))
+    counts = {"plans": len(rows),
+              "claimed": sum(r["class"] == "claimed" for r in rows),
+              "stalled": sum(r["class"] == "stalled" for r in rows),
+              "unknown": sum(r["outcome"] == "unknown" for r in rows)}
+    cost_status = {"asked": cost, "state": "unavailable" if costs is None else costs["state"],
+                   "detail": "no dispatch data" if costs is None else costs["detail"]}
+    return {"scope": repo, "db": db_status, "verdict": verdict, "cost": cost_status,
+            "forge": forge,
+            "rows": rows, "counts": counts, "unmatched": unmatched,
+            "unattributed": unattributed, "out_of_scope": out_of_scope,
+            "errors": errors, "notes": list(LEDGER_NOTES)}
+
+
+def _ledger_cell(row: dict, col: str) -> str:
+    v = row.get(col)
+    if col == "probe":
+        v = (v or {}).get("state")
+    return "-" if v is None else str(v)
+
+
+def _fmt_tok(n: "int | None") -> str:
+    """`2.2M` / `30k` / `812`; a cost that was not measured is `—`, never 0."""
+    if n is None:
+        return "—"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def _fmt_cost(c: "dict | None", keys: tuple) -> str:
+    fmt = {"processed": _fmt_tok, "output": _fmt_tok,
+           "turns": lambda v: "—" if v is None else str(v),
+           "minutes": lambda v: "—" if v is None else f"{v:.1f}"}
+    return "  ".join(f"{k} {fmt[k]((c or {}).get(k))}" for k in keys)
+
+
+def _cost_block(row: dict) -> "list[str]":
+    """The indented lines under a plan's summary row: a line per dispatch, a
+    line per review round of its pull request, then the total. A sum over a
+    lease with an unlinked pair is printed only with `partial` after it."""
+    out = []
+    rounds_by_pr = {}
+    for r in row["review_rounds"]:
+        rounds_by_pr.setdefault(r["pr"], []).append(r)
+    for d in row["dispatches"]:
+        line = (f"    {d['lease']}  {d['started'] or '-'}  {d['outcome'] or '-'}  "
+                + _fmt_cost(d["cost"], ("processed", "output", "turns", "minutes"))
+                + f"  sessions {d['sessions']}")
+        if d["sessions"] and d["unlinked"]:
+            line += "  partial"
+        out.append(line)
+        for r in rounds_by_pr.pop(d["pr"], []):
+            out.append(f"      round {r['round']}  {r['verdict'] or '-'}  "
+                       + _fmt_cost(r["cost"], ("processed", "output", "minutes")))
+    t = row["total"]
+    out.append(f"    total  processed {_fmt_tok(t['processed'])}  "
+               f"output {_fmt_tok(t['output'])}" + ("  partial" if t["partial"] else ""))
+    return out
+
+
+def _has_linked(row: dict) -> bool:
+    return bool(row["dispatches"]) and (
+        any(d["sessions"] for d in row["dispatches"])
+        or any(r["cost"] for r in row["review_rounds"]))
+
+
+def _ledger_table(data: dict) -> str:
+    cols = LEDGER_COLUMNS + (("probe",) if data["verdict"] else ())
+    db = data["db"]
+    out = [f"ledger — {data['scope']} — {data['counts']['plans']} plan(s), "
+           f"{data['out_of_scope']} other-repo plan(s) not listed"]
+    if db["state"] == "ok":
+        out.append(f"fleet.db: {db['path']}")
+    else:
+        out.append(f"fleet.db: {db['state']} ({db['path']}: {db['detail']}) — "
+                   "no dispatch data, so every plan is reported unknown")
+    if data["cost"]["asked"] and data["cost"]["state"] != "ok":
+        out.append(f"cost: {data['cost']['state']} ({data['cost']['detail']})")
+    out.append("")
+
+    table = [[_ledger_cell(r, c) for c in cols] for r in data["rows"]]
+    widths = [max(len(c), *(len(t[i]) for t in table)) if table else len(c)
+              for i, c in enumerate(cols)]
+    out.append(" | ".join(c.ljust(w) for c, w in zip(cols, widths)).rstrip())
+    out.append("-+-".join("-" * w for w in widths))
+    for t, row in zip(table, data["rows"]):
+        out.append(" | ".join(v.ljust(w) for v, w in zip(t, widths)).rstrip())
+        if row["dispatches"] and (data["cost"]["asked"] or _has_linked(row)):
+            out += _cost_block(row)
+
+    c = data["counts"]
+    out += ["", f"{c['claimed']} claimed, {c['stalled']} stalled, {c['unknown']} unknown"]
+    if data["unmatched"]:
+        out.append(f"{len(data['unmatched'])} plan id(s) in this repo's dispatches with no "
+                   "plan file here: " + ", ".join(data["unmatched"]))
+    if data["unattributed"]:
+        out.append(f"{data['unattributed']} lease(s) carry no repo or plan id and are not joined")
+    for e in data["errors"]:
+        out.append(f"unparseable: {e['file']}: {e['detail']}")
+    if data["forge"]["error"]:
+        out.append(f"forge not read: {data['forge']['error']}")
+    if data["forge"]["unreadable"]:
+        out.append(f"forge unreadable for {data['forge']['unreadable']} pull request(s); "
+                   "their state stays as-of the dispatch record")
+    out.append("")
+    out += [f"* {n}" for n in data["notes"]]
+    return "\n".join(out) + "\n"
+
+
+def cmd_ledger(files, fmt: str, db: "str | None", repo: "str | None",
+               verdict: bool, cost: bool = False) -> int:
+    scope = (repo or _own_repo(REPO_ROOT) or "").lower()
+    if not scope:
+        print("ledger: cannot tell which repository this checkout is — pass --repo "
+              "owner/name. A ledger over every repository's plan ids would list other "
+              "repositories' plans as this one's.", file=sys.stderr)
+        return 2
+    data = ledger(files, db=db, repo=scope, verdict=verdict, cost=cost)
+    sys.stdout.write(json.dumps(data, indent=2) + "\n" if fmt == "json"
+                     else _ledger_table(data))
+    return 0                    # a missing database is not a finding about plans
+
+
+# ------------------------------------------------------------------ end ledger
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p_lint = sub.add_parser("lint"); p_lint.add_argument("paths", nargs="*")
+    p_list = sub.add_parser("list"); p_list.add_argument("--status")
+    p_show = sub.add_parser("show"); p_show.add_argument("id")
+    p_audit = sub.add_parser("audit"); p_audit.add_argument("paths", nargs="*")
+    p_audit.add_argument("--json", action="store_true")
+    p_graph = sub.add_parser("graph"); p_graph.add_argument("paths", nargs="*")
+    p_graph.add_argument("--format", choices=["json", "mermaid", "svg"], default="json")
+    p_graph.add_argument("--out")
+    p_ledger = sub.add_parser("ledger"); p_ledger.add_argument("paths", nargs="*")
+    p_ledger.add_argument("--format", choices=["table", "json"], default="table")
+    p_ledger.add_argument("--db", help="fleet.db (default $FLEET_DB or <fleet dir>/fleet.db)")
+    p_ledger.add_argument("--repo", help="owner/name to scope to (default: this checkout's origin)")
+    p_ledger.add_argument("--cost", action="store_true",
+                          help="print the cost block under every plan that has dispatches, "
+                               "not only those with a linked session")
+    p_ledger.add_argument("--verdict", action="store_true",
+                          help="read the forge for each PR's current state and run audit's "
+                               "path probe for claimed/stalled rows (costs forge reads)")
+    a = ap.parse_args()
+
+    files = ([Path(p) for p in a.paths] if getattr(a, "paths", None)
+             else sorted(PLANS.glob("*.md")))
+    if a.cmd == "lint":
+        errs = [e for f in files for e in lint(f)]
+        warns = [w for f in files for w in dependency_warnings(f)]
+        for w in warns:
+            print(f"WARN {w}", file=sys.stderr)
+        for e in errs:
+            print(e, file=sys.stderr)
+        print(f"{len(files)} plan(s), {len(warns)} warning(s), {len(errs)} problem(s)")
+        return 1 if errs else 0
+    if a.cmd == "list":
+        for f in files:
+            fm, body, _ = parse(f)
+            if not fm or (a.status and fm.get("status") != a.status):
+                continue
+            goal = section(body, "1. Goal").splitlines()
+            print(f"{fm.get('status','?'):9} t{fm.get('tier','?')} {fm.get('zone','?'):7} "
+                  f"{fm.get('id','?'):28} {goal[0][:60] if goal else ''}")
+        return 0
+    if a.cmd == "show":
+        for f in files:
+            if f.stem == a.id or f.stem.split("-", 1)[0] == a.id:
+                print(f.read_text()); return 0
+        print(f"no plan matching {a.id}", file=sys.stderr); return 1
+    if a.cmd == "audit":
+        result = audit(files)
+        if a.json:
+            print(json.dumps(result, indent=2))
+            return 1 if result.get("refused") else 0
+        if result["refused"]:
+            print(f"REFUSED: {result['refused']}", file=sys.stderr)
+            return 1
+        plans = result["plans"]
+        print(f"{len(plans)} draft plan(s) on main")
+        for p in sorted(plans, key=lambda p: p["file"]):
+            print(f"{p.get('id') or p['file']:32} {p['detail']}")
+        counts = {s: sum(1 for p in plans if p["state"] == s)
+                  for s in ("not_built", "undecidable", "touched_after_filing", "error")}
+        print(f"\n{counts['undecidable']} undecidable, {counts['not_built']} not built, "
+              f"{counts['touched_after_filing']} touched after filing, "
+              f"{counts['error']} error")
+        return 0
+    if a.cmd == "graph":
+        data = graph(files)
+        if a.format == "json":
+            out = json.dumps(data, indent=2) + "\n"
+        elif a.format == "mermaid":
+            out = _mermaid(data)
+        else:
+            out = _svg(data)
+        if a.out:
+            Path(a.out).write_text(out)
+        else:
+            sys.stdout.write(out)
+        return 1 if data["cycles"] else 0
+    if a.cmd == "ledger":
+        return cmd_ledger(files, a.format, a.db, a.repo, a.verdict, a.cost)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

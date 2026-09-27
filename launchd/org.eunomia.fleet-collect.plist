@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-collect — ingest Claude Code transcripts into ~/dev/.fleet/fleet.db every 2 min.
+
+  Install (opshost only — the ledger host). The log directory must exist first:
+  launchd does not create it, and a missing StandardOutPath silently prevents the
+  job from starting.
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-collect.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-collect.plist
+  Reload after editing (a frozen daemon needs bootout+bootstrap, not just kickstart):
+    launchctl bootout gui/$(id -u)/org.eunomia.fleet-collect
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-collect.plist
+
+  ProgramArguments uses an absolute path because launchd does not read a login shell.
+  Replace /Users/operator with the real home if this is ever installed elsewhere.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia. Until 2026-09-07 this unit
+  executed the shared clone, so every 120 seconds it ran whatever branch a
+  session had last left checked out there. That clone was observed on three
+  different branches in one afternoon. It is the same defect fleet-secret-guard
+  had (fixed by pinning) and the same one fleet-watch now reports as `pin-drift`.
+  A scheduled job is the worst place for it: nobody is watching when it fires.
+
+  The pin is a detached worktree of this repo at ~/.local/share/pins/eunomia. It
+  is the pinned eunomia deployment, shared by several units and the PreToolUse
+  hook. It was called fleet-guard until 2026-09-07, when both pins were
+  collected under ~/.local/share/pins/<repo>.
+  Updating it is deliberate: fetch, then checkout with the detach flag onto
+  origin/main. (MOVING it to another path is a different operation with its
+  own procedure — see bin/fleet-secret-guard.) fleet-watch reports when it falls behind.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.eunomia.fleet-collect</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-collect</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>120</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Collection is a read-only sweep of transcripts; it must never delay a login
+       or contend with an active session. Background QoS keeps it off the critical path. -->
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/operator/dev/.fleet/collect.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/operator/dev/.fleet/collect.log</string>
+</dict>
+</plist>

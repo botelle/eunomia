@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""fleet-config — fleet-scoped settings, one writer, one change-log, one event
+(plan 0068). `bin/fleet-models` (plan 0048/0063) is the shape being copied:
+a CLI is the one writer, every write appends a row to a change-log table AND
+an event to the ledger BEFORE commit, and the table is derivable from those
+events if `fleet.db` is lost.
+
+THE KEY SET IS CLOSED AND HELD IN CODE (`SETTINGS`). Each key is a spend or
+safety decision with its own validation and its own reader; a plan per key —
+do not add a second one here "while you are there" (plan 0068 boundary).
+
+  fleet-config get <key> [--json]     resolved value, with its source
+  fleet-config set <key> <value>      refused before any write if invalid
+  fleet-config list                   every row fleet_setting holds, as stored
+
+RESOLUTION (`resolve_setting`), in this order: the `fleet_setting` row in an
+existing, readable database, then the caller's fallback — a database that is
+absent, locked, or lacks the table is the SECOND SOURCE, not a refusal: a
+setting like `dispatch_cap` is a throttle, and a throttle's failure mode is
+the old value, not a stop. `get`'s own fallback is `$<SETTINGS[key]["env"]>`
+then `SETTINGS[key]["default"]` — the exact order `bin/fleet-watch`'s
+`cycle()` performs for `dispatch_cap`, in this one place, so a caller that is
+a program (lynceus) reads back what the watcher actually resolved to.
+
+`dispatch_cap` is an integer >= 0. `0` means *dispatch nothing* — the
+operator's pause switch — and is not an error.
+
+DURABILITY (plan 0068 D4, following plan 0063's `repo_model` precedent):
+every `set` appends one `fleet-setting-changed` event to the ledger beside
+the database being written, before the transaction commits — if the append
+fails the write rolls back, so `fleet_setting`/`fleet_setting_change` can
+never hold a change the ledger does not also carry. `reconstruct_fleet_setting`
+replays those events into an ABSENT (or empty) `fleet_setting` table — a
+restore, never an edit of a table that survived.
+
+The journal mode is WAL, set at every open (`connect`), not by a one-off
+pragma on the live file, for the same reason `bin/fleet-models` sets it: the
+lynceus API reads the same file this CLI writes.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+_lib_loader = importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+# Same override fleet-models honours — a `FLEET_DB` test or alternate-host
+# override must never reach the real fleet's database.
+DB = os.path.expanduser(os.environ.get("FLEET_DB", str(lib.fleet_dir() / "fleet.db")))
+
+
+def _validate_dispatch_cap(raw):
+    """An integer >= 0, from a str or an int. Raises ValueError, never coerces
+    a float or a signed float string ('1.0') — an accidental non-integer cap
+    must refuse, not silently truncate."""
+    if isinstance(raw, bool):
+        raise ValueError("dispatch_cap must be an integer, not a bool")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        s = str(raw).strip()
+        if not s or not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            raise ValueError(f"{raw!r} is not an integer")
+        value = int(s)
+    if value < 0:
+        raise ValueError(f"dispatch_cap must be >= 0, got {value}")
+    return value
+
+
+def _validate_retry_limit(raw):
+    """An integer 0..5, from a str or an int (plan 0078). `0` turns automated
+    requeue off. Same refusals as `dispatch_cap`: a bool, a float string or
+    anything out of range is refused before any write — each requeue can buy
+    one more session, so the bound is spend."""
+    if isinstance(raw, bool):
+        raise ValueError("retry_limit must be an integer, not a bool")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        s = str(raw).strip()
+        if not s or not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            raise ValueError(f"{raw!r} is not an integer")
+        value = int(s)
+    if not 0 <= value <= 5:
+        raise ValueError(f"retry_limit must be between 0 and 5, got {value}")
+    return value
+
+
+# The closed key set (plan 0068 boundary: one key per plan). Each entry names
+# its validator, the env var `get`'s own fallback reads (the SAME one
+# `bin/fleet-watch` falls back to), and the default below that.
+SETTINGS = {
+    "dispatch_cap": {
+        "validate": _validate_dispatch_cap,
+        "env": "FLEET_WATCH_CAP",
+        "default": 1,
+    },
+    # plan 0078 / ADR-0012: how many times `bin/mopsus` (mechanical mode) may
+    # release one plan's failed lease before it escalates instead.
+    "retry_limit": {
+        "validate": _validate_retry_limit,
+        "env": "FLEET_RETRY_LIMIT",
+        "default": 2,
+    },
+}
+
+# The `detail` keys of a `fleet-setting-changed` event, and nothing else —
+# pinned by a test the way `repo-model-changed`'s EVENT_DETAIL_KEYS are.
+# `events.jsonl` is read by `fleet-events`, which does not redact, so a future
+# setting that holds a credential must NOT ride this event.
+EVENT_DETAIL_KEYS = ("key", "old", "new")
+EVENT_TYPE = "fleet-setting-changed"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS fleet_setting (
+  key         TEXT NOT NULL PRIMARY KEY,
+  value       TEXT NOT NULL,
+  changed_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fleet_setting_change (
+  id          TEXT NOT NULL PRIMARY KEY,  -- ULID from the writer, not a sequence
+  ts          TEXT NOT NULL,              -- ISO-8601 UTC
+  actor       TEXT NOT NULL,              -- 'cli:<user>' | a control-app identity
+  source      TEXT NOT NULL,              -- 'fleet-config' | the control app
+  key         TEXT NOT NULL,
+  old_value   TEXT,                       -- NULL on first write
+  new_value   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fleet_setting_change_key ON fleet_setting_change(key, ts);
+"""
+
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+class UnknownSetting(ValueError):
+    """A key outside SETTINGS — the closed set is enforced here, not by a
+    CHECK constraint, because it is a Python registry, not a SQL fact."""
+
+
+class LedgerAppendFailed(RuntimeError):
+    """The `fleet-setting-changed` event could not be appended, so the write
+    was rolled back. A config change the ledger cannot record is not made —
+    the event is what makes the table derivable, and a change that exists
+    only in the file this plan exists to protect is the exact gap being
+    closed (bin/fleet-models' `_log_change` rule, copied verbatim)."""
+
+
+def _ulid():
+    ts_ms = int(time.time() * 1000)
+    data = ts_ms.to_bytes(6, "big") + os.urandom(10)
+    bits = int.from_bytes(data, "big") << 2
+    return "".join(_CROCKFORD[(bits >> (130 - 5 * (i + 1))) & 0x1F] for i in range(26))
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _enable_wal(con):
+    """See bin/fleet-models' `_enable_wal` — same reasoning, same fallback: a
+    refusal here is a warning, not a failure, because refusing a config write
+    over a journal mode would make the tuning knob the outage."""
+    try:
+        mode = con.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    except sqlite3.OperationalError as e:
+        print(f"fleet-config: could not switch to WAL ({e}) — continuing in "
+              f"the current journal mode", file=sys.stderr)
+        return None
+    if mode != "wal" and mode != "memory":
+        print(f"fleet-config: journal_mode is {mode!r}, not 'wal'", file=sys.stderr)
+    return mode
+
+
+def connect(db_path=None):
+    con = sqlite3.connect(db_path or DB)
+    _enable_wal(con)
+    con.executescript(SCHEMA)
+    return con
+
+
+def _check_key(key):
+    if key not in SETTINGS:
+        raise UnknownSetting(
+            f"{key!r} is not a known setting (known: {sorted(SETTINGS)})")
+
+
+def _ledger_dir(con):
+    """The directory whose `events.jsonl` describes THIS database — the same
+    idiom bin/fleet-models uses, for the same reason: a `FLEET_DB` override
+    must never append to a stranger's ledger."""
+    for _seq, name, path in con.execute("PRAGMA database_list"):
+        if name == "main":
+            return Path(path).parent if path else None
+    return None
+
+
+def _emit_event(con, actor, detail):
+    fleet_dir = _ledger_dir(con)
+    if fleet_dir is None:               # in-memory database: no ledger to protect
+        return
+    loader = importlib.machinery.SourceFileLoader("_fleet_config_emit",
+                                                  str(BIN / "fleet-emit"))
+    spec = importlib.util.spec_from_loader("_fleet_config_emit", loader)
+    emit_mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(emit_mod)
+    emit_mod.FLEET_DIR = fleet_dir
+    emit_mod.EVENTS = fleet_dir / "events.jsonl"
+    emit_mod.LOCK = fleet_dir / "locks" / "events.lock"
+    try:
+        emit_mod.emit(EVENT_TYPE, actor, detail=detail)
+    except SystemExit as e:
+        raise LedgerAppendFailed(f"{e.code}") from None
+    except OSError as e:
+        raise LedgerAppendFailed(f"{e.__class__.__name__}: {e}") from None
+
+
+def set_value(con, key, raw_value, actor="cli:unknown", source="fleet-config"):
+    """(changed: bool, new_value). Refuses an unknown key or an invalid value
+    before writing anything. A `set` to the value already in force writes no
+    row and emits no event — matching `fleet-models.set_runner`'s no-op rule."""
+    _check_key(key)
+    new_value = SETTINGS[key]["validate"](raw_value)
+    row = con.execute("SELECT value FROM fleet_setting WHERE key=?", (key,)).fetchone()
+    old_value = row[0] if row else None
+    if row is not None and old_value == str(new_value):
+        return False, new_value
+    now = _now()
+    con.execute(
+        "INSERT INTO fleet_setting (key, value, changed_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, changed_at=excluded.changed_at",
+        (key, str(new_value), now))
+    change_id = _ulid()
+    con.execute(
+        "INSERT INTO fleet_setting_change (id, ts, actor, source, key, "
+        "old_value, new_value) VALUES (?,?,?,?,?,?,?)",
+        (change_id, now, actor, source, key, old_value, str(new_value)))
+    try:
+        _emit_event(con, actor, {"key": key, "old": old_value, "new": str(new_value)})
+    except Exception:
+        con.rollback()
+        raise
+    con.commit()
+    return True, new_value
+
+
+def resolve_setting(key, fallback, fallback_source, db_path=None):
+    """(value, source, changed_at). Tier 1: the `fleet_setting` row in an
+    existing, readable database, opened READ-ONLY (this CLI is the one
+    writer — a reader must never create the schema underneath it, or a
+    'fleet-config get' on a fleet that never adopted this file would leave
+    behind an empty table, indistinguishable from one wiped after use). Tier
+    2/3: the caller's fallback, verbatim — a database that is absent, locked,
+    or lacks the table is the second source, not a refusal (plan 0068 D3)."""
+    path = db_path or DB
+    if os.path.exists(path):
+        try:
+            # A short timeout: this is read every dispatch cycle, and a
+            # throttle's own read must never be what stalls the watcher — a
+            # lock that outlives it just means this cycle takes the fallback
+            # (same rule fleet-models' own reader path leans on).
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+            try:
+                row = con.execute(
+                    "SELECT value, changed_at FROM fleet_setting WHERE key=?",
+                    (key,)).fetchone()
+            finally:
+                con.close()
+        except sqlite3.OperationalError:
+            row = None
+        if row is not None:
+            try:
+                value = SETTINGS[key]["validate"](row[0])
+            except ValueError:
+                row = None
+            else:
+                return value, "fleet_setting", row[1]
+    return fallback, fallback_source, None
+
+
+def _env_fallback(key):
+    spec = SETTINGS[key]
+    raw = os.environ.get(spec["env"], "").strip()
+    if raw:
+        try:
+            return spec["validate"](raw), "env"
+        except ValueError:
+            pass
+    return spec["default"], "default"
+
+
+# ------------------------------------------------------- reconstruction (D4)
+
+
+def replay_events(rows):
+    """Fold `fleet-setting-changed` events, in ledger order, into the state
+    they describe. `rows` is an iterable of `detail_json` strings.
+
+    Returns `(state, skipped)`: `state` is `{key: new_value}`; `skipped`
+    counts events that could not be read as a change (bad JSON, unknown key,
+    no `new` to name) — never fatal, so one torn or foreign line does not
+    stop a restore of the rest."""
+    state, skipped = {}, 0
+    for detail_json in rows:
+        try:
+            d = json.loads(detail_json)
+            key, new = d["key"], d.get("new")
+            if key not in SETTINGS or not isinstance(new, str) or not new:
+                raise ValueError
+            SETTINGS[key]["validate"](new)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            skipped += 1
+            continue
+        state[key] = new
+    return state, skipped
+
+
+def _table_rows(con):
+    try:
+        return {r[0]: r[1] for r in con.execute("SELECT key, value FROM fleet_setting")}
+    except sqlite3.OperationalError:
+        return None
+
+
+def reconstruct_fleet_setting(con, ledger_complete=True):
+    """Rebuild `fleet_setting` from the ledger's `fleet-setting-changed`
+    events, as `fleet-collect` has ingested them into the `event` table of
+    the same `con`. See `bin/fleet-models.reconstruct_repo_model` — this is
+    the same restore, on a plainer table (one key column, no ordinals).
+
+    RESTORES INTO NOTHING, NEVER EDITS SOMETHING. Written only when the table
+    is absent or holds no rows — an empty table has never carried a decision,
+    since a `set` to the value already in force writes no row. When the table
+    HAS rows they win however the ledger reads, and any key the ledger would
+    have changed is REPORTED, never applied over a surviving table.
+
+    `ledger_complete=False` refuses the restore outright: a plausible-looking
+    table built from a partial ledger is worse than none.
+
+    Returns a report dict: `action` is "none" (no events — a fleet that never
+    adopted this file must still fall through to the CLI's own env/default
+    fallback, not read an empty table as 'configured to nothing'),
+    "reconstructed", "refused", or "compared"."""
+    try:
+        rows = con.execute(
+            "SELECT detail_json FROM event WHERE type=? ORDER BY source, line",
+            (EVENT_TYPE,)).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    report = {"action": "none", "events": len(rows), "rows": 0, "skipped": 0,
+              "differs": [], "ledger_only": [], "table_only": []}
+    if not rows:
+        return report
+    state, skipped = replay_events(r[0] for r in rows)
+    report["skipped"] = skipped
+    existing = _table_rows(con)
+
+    if not existing:                       # absent, or present with no rows
+        if not ledger_complete:
+            report["action"] = "refused"
+            return report
+        con.executescript(SCHEMA)
+        now = _now()
+        con.executemany(
+            "INSERT INTO fleet_setting (key, value, changed_at) VALUES (?,?,?)",
+            [(k, v, now) for k, v in sorted(state.items())])
+        con.commit()
+        report["action"] = "reconstructed"
+        report["rows"] = len(state)
+        return report
+
+    report["action"] = "compared"
+    for key, value in sorted(state.items()):
+        have = existing.get(key)
+        if have is None:
+            report["ledger_only"].append((key, value))
+        elif have != value:
+            report["differs"].append((key, have, value))
+    report["table_only"] = sorted(set(existing) - set(state))
+    return report
+
+
+def describe_reconstruction(report, limit=10):
+    action = report["action"]
+    if action == "none":
+        return []
+    lines = []
+    if action == "reconstructed":
+        lines.append(f"fleet_setting: was absent — reconstructed {report['rows']} "
+                     f"row(s) from {report['events']} fleet-setting-changed event(s)")
+    elif action == "refused":
+        lines.append("fleet_setting: absent but NOT reconstructed — an events "
+                     "file failed to ingest, so the ledger is incomplete")
+    elif action == "compared":
+        for key, have, want in report["differs"][:limit]:
+            lines.append(f"fleet_setting: ledger disagrees on {key}: table has "
+                         f"{have!r}, ledger says {want!r} — table left unchanged")
+        for key, value in report["ledger_only"][:limit]:
+            lines.append(f"fleet_setting: ledger names {key} = {value!r}, table "
+                         f"has no such row — table left unchanged")
+        n = len(report["differs"]) + len(report["ledger_only"])
+        if n > limit:
+            lines.append(f"fleet_setting: ... and {n - limit} more disagreement(s)")
+        if report["table_only"]:
+            lines.append(f"fleet_setting: {len(report['table_only'])} row(s) have "
+                         f"no ledger event (written before fleet-setting-changed "
+                         f"existed) — covered by the snapshot only")
+    if report["skipped"]:
+        lines.append(f"fleet_setting: {report['skipped']} fleet-setting-changed "
+                     f"event(s) could not be read and were skipped")
+    return lines
+
+
+# --------------------------------------------------------------------- CLI
+
+
+def _actor(args):
+    return args.actor or f"cli:{os.environ.get('USER', 'unknown')}"
+
+
+def cmd_list(con, args):
+    rows = con.execute(
+        "SELECT key, value, changed_at FROM fleet_setting ORDER BY key").fetchall()
+    if not rows:
+        print("no fleet_setting rows")
+        return 0
+    for key, value, changed_at in rows:
+        print(f"{key:16} {value:8} changed {changed_at}")
+    return 0
+
+
+def cmd_show(args):
+    if args.key not in SETTINGS:
+        print(f"fleet-config: {args.key!r} is not a known setting "
+             f"(known: {sorted(SETTINGS)})", file=sys.stderr)
+        return 1
+    fallback, fallback_source = _env_fallback(args.key)
+    value, source, changed_at = resolve_setting(args.key, fallback, fallback_source)
+    if args.json:
+        print(json.dumps({"key": args.key, "value": value, "source": source,
+                          "changed_at": changed_at}))
+    else:
+        suffix = f" (changed {changed_at})" if changed_at else ""
+        print(f"{args.key} = {value}  [{source}]{suffix}")
+    return 0
+
+
+def cmd_set(con, args):
+    try:
+        changed, value = set_value(con, args.key, args.value, actor=_actor(args),
+                                   source=args.source)
+    except (UnknownSetting, ValueError, LedgerAppendFailed) as e:
+        print(f"fleet-config: {e}", file=sys.stderr)
+        return 1
+    verb = "set" if changed else "unchanged"
+    print(f"{verb}: {args.key} = {value}")
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="fleet-config")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list")
+    p.set_defaults(func=cmd_list, needs_con=True)
+
+    p = sub.add_parser("get")
+    p.add_argument("key")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_show, needs_con=False)
+
+    p = sub.add_parser("set")
+    p.add_argument("key")
+    p.add_argument("value")
+    p.add_argument("--actor")
+    p.add_argument("--source", default="fleet-config")
+    p.set_defaults(func=cmd_set, needs_con=True)
+
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if not args.needs_con:
+        return args.func(args)
+    con = connect()
+    try:
+        return args.func(con, args)
+    finally:
+        con.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""fleet-pkill — kill matching processes ONLY if they are provably YOURS.
+
+  fleet-pkill --register <pid>     # at spawn time, while it is your descendant
+  fleet-pkill <substring>          # later, from any shell of the same session
+
+"Yours" is the union of two proofs (1522 #12 M1 — live parentage alone cannot
+reach the fleet's real targets: each agent Bash call is a fresh shell, and a
+dev server backgrounded earlier has reparented to launchd; environment marking
+via `ps -E` is empty on modern macOS — probed, not assumed):
+
+  1. live descendants of the invoking shell — children just spawned, and
+     humans with no session variable;
+  2. pids REGISTERED by your session while they were still provably yours:
+     `--register` verifies the pid is currently your descendant, then records
+     it under `sessions/<EUNOMIA_SESSION>/pids/` with its process START TIME
+     (the robust identity: it survives setproctitle retitling — gunicorn,
+     postgres, nginx — that broke a command-line hash, still catches pid
+     reuse, and puts nothing secret in the atlas-rendered tree). At kill time
+     a registered pid counts only while its start time matches.
+
+A match outside both sets is reported by pid and spared — ownership beats
+matching. Simulator processes are CoreSimulatorService's children, never
+registrable this way: `fleet-sim shutdown` is the verb for sims.
+
+The ownership proof is COOPERATIVE-strength, not adversarial (1522 #12 r10
+L3): the descendant walk parses ps-table text, and a same-user process can
+spoof rows by embedding newlines in its own argv. That crosses no privilege
+boundary — everything reachable is same-UID, and a hostile same-user process
+could call kill() directly — but "provably yours" means proof against
+accidents, not against a peer that wants to lie.
+
+SIGTERM only. A matched process already gone counts as success. Exits 1 when
+no kill succeeded (nothing of yours matched, or every attempt was refused by
+the kernel).
+
+  fleet-pkill --session <sid> --reason "<text>"   # cross-session, human-triggered
+
+A SEPARATE verb (plan 0014) for the case the two proofs above cannot reach: a
+session that has stopped responding cannot register a pid, release a lease, or
+run this itself, because its own shell is the thing that is stuck. This mode
+proves ownership from the ledger's `sessions/<sid>/host` binding (`fleet-bind`,
+plan 0012) instead of a live process tree — see docs/enforcement.md for the
+full refusal list. Still SIGTERM only; still never touches leases.
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+# same rule as fleetlib._SID_RE — the sid becomes a path segment (r2 M2)
+_SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def _fleet_dir() -> Path:
+    return Path(os.environ.get("EUNOMIA_FLEET_DIR",
+                               str(Path.home() / "dev" / ".fleet")))
+
+
+def _reg_dir(sid: str) -> Path:
+    return _fleet_dir() / "sessions" / sid / "pids"
+
+
+def _lstart(pid: int):
+    """Process start time — the standard robust identity (1522 #12 r4 M2: a
+    command-line hash self-destructed for every setproctitle server: gunicorn,
+    postgres, nginx rewrite argv, so the recorded hash never matched again and
+    the destructive prune erased the registration). lstart survives retitling
+    and still catches pid reuse. Carries nothing secret at all."""
+    try:
+        # LC_ALL=C (1522 #12 r5 M2): lstart is a LOCALE-FORMATTED string; a
+        # registration recorded from a Terminal locale and checked from a
+        # POSIX launchd shell would mismatch and read as pid reuse.
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                           capture_output=True, text=True,
+                           errors="replace", timeout=10,
+                           env={**os.environ, "LC_ALL": "C"})
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and out else None
+
+
+def _proc_table():
+    res = subprocess.run(["ps", "-axo", "pid=,ppid=,command="],
+                         capture_output=True, text=True,
+                         errors="replace", timeout=15)
+    if res.returncode != 0:
+        sys.exit("fleet-pkill: cannot read the process table")
+    out = []
+    for line in res.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2:
+            try:
+                out.append((int(parts[0]), int(parts[1]),
+                            parts[2] if len(parts) > 2 else ""))
+            except ValueError:
+                continue
+    return out
+
+
+def _descendants(root: int, table) -> set:
+    kids = {}
+    for pid, ppid, _ in table:
+        kids.setdefault(ppid, []).append(pid)
+    seen, stack = set(), [root]
+    while stack:
+        p = stack.pop()
+        for c in kids.get(p, []):
+            if c not in seen:
+                seen.add(c)
+                stack.append(c)
+    return seen
+
+
+def _registered(sid: str, table) -> set:
+    """Registered pids whose current START TIME matches the recorded one (the
+    pid-reuse guard). Dead pids and positively-mismatched ones are pruned;
+    ambiguous probes are left alone."""
+    if not _SID_RE.match(sid or ""):
+        return set()
+    d = _reg_dir(sid)
+    if not d.is_dir():
+        return set()
+    alive = {pid for pid, _pp, _c in table}
+    mine = set()
+    for f in list(d.iterdir()):
+        try:
+            pid = int(f.name)
+            recorded = f.read_text(errors="replace").strip()
+        except (ValueError, OSError):
+            continue
+        if pid not in alive:
+            try:
+                f.unlink()                # dead — prune
+            except OSError:
+                pass
+            continue
+        cur = _lstart(pid)
+        if cur == recorded:
+            mine.add(pid)
+        elif cur is not None:
+            try:
+                f.unlink()                # alive but a DIFFERENT process wears
+            except OSError:               # the pid (start time differs)
+                pass
+        # cur is None: the pid is alive (table just said so) but the probe
+        # flaked — ambiguous evidence never takes the destructive branch
+        # (1522 #12 r5 M3); the entry self-heals on the next run.
+    return mine
+
+
+def cmd_register(pid_arg: str) -> int:
+    sid = os.environ.get("EUNOMIA_SESSION", "").strip()
+    if not _SID_RE.match(sid):
+        sys.exit("fleet-pkill: EUNOMIA_SESSION is missing or not a valid "
+                 "session id — it becomes a registry path (r2 M2)")
+    try:
+        pid = int(pid_arg)
+    except ValueError:
+        sys.exit(f"fleet-pkill: {pid_arg!r} is not a pid")
+    if os.getppid() <= 1:
+        sys.exit("fleet-pkill: cannot register from an orphaned shell — "
+                 "launchd is not an ownership root (r6 H1); register from the "
+                 "shell that spawned the process")
+    table = _proc_table()
+    tree = _descendants(os.getppid(), table)
+    if pid not in tree:
+        sys.exit(f"fleet-pkill: {pid} is not currently a descendant of your "
+                 "shell — register at spawn time, while ownership is provable")
+    started = _lstart(pid)
+    if started is None:
+        sys.exit(f"fleet-pkill: {pid} vanished before registration")
+    d = _reg_dir(sid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / str(pid)).write_text(started + "\n")
+    print(f"registered {pid} to session {sid}")
+    return 0
+
+
+def cmd_kill(pattern: str) -> int:
+    me, shell = os.getpid(), os.getppid()
+    sid = os.environ.get("EUNOMIA_SESSION", "").strip()
+    table = _proc_table()
+    if shell <= 1:
+        # 1522 #12 r6 H1: an orphaned invocation (parent exited, launchd
+        # adopted us) would make "descendants of my shell" = descendants of
+        # pid 1 = EVERY process on the machine — the ownership proof
+        # collapsing to a machine-wide TERM. launchd is not an ownership
+        # root; only the registry can prove ownership here.
+        print("fleet-pkill: WARN invoking shell already exited — launchd is "
+              "not an ownership root; using the registry only",
+              file=sys.stderr)
+        mine = _registered(sid, table)
+    else:
+        mine = _descendants(shell, table) | _registered(sid, table)
+    mine.discard(me)
+    mine.discard(shell)
+
+    in_set, out_of_set = [], []
+    for pid, _ppid, cmd in table:
+        if pattern not in cmd or pid in (me, shell):
+            continue
+        (in_set if pid in mine else out_of_set).append((pid, cmd))
+
+    for pid, cmd in out_of_set:
+        # binary name ONLY (r2 M1): a raw argv can carry --password=/Bearer
+        # tokens, and stderr lands in the same transcript/atlas sink the
+        # registry's hash was designed to keep command lines out of.
+        name = os.path.basename((cmd.split() or ["?"])[0])
+        print(f"fleet-pkill: NOT killing {pid} ({name}) — not provably yours "
+              "(not registered, not a live descendant); another session may "
+              "own it", file=sys.stderr)
+    ok = 0
+    for pid, cmd in in_set:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            name = os.path.basename((cmd.split() or ["?"])[0])
+            print(f"fleet-pkill: TERM {pid} ({name})")
+            ok += 1
+        except ProcessLookupError:
+            print(f"fleet-pkill: {pid} already gone")
+            ok += 1                       # the goal state, however reached
+        except PermissionError:
+            print(f"fleet-pkill: no permission for {pid}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- --session (plan 0014)
+# A cross-session kill: the ownership proof above is a LIVE process tree /
+# spawn registry, which is exactly what a hung session cannot offer about
+# itself. This mode proves ownership from fleet-bind's (plan 0012) recorded
+# (pid, start time) instead, and is human-triggered rather than a session's
+# own cleanup — hence the required --reason and the loud refusal for every
+# unproven case, rather than the default verb's "spare and report" stance.
+
+_REASON_CAP_BYTES = 512      # same field-size discipline as fleetlib.validate_cr's
+                              # `target` cap — a short operator-typed field that
+                              # rides events.jsonl detail (Principle 6)
+
+
+def _load_fleetlib():
+    """Imported as a sibling module, same idiom as fleet-bind and fleetlib.emit
+    itself use for fleet-emit — these are standalone scripts by convention,
+    not an importable package (bin/fleet-events' own comment on EVENT_TYPES)."""
+    import importlib.machinery
+    import importlib.util
+    src = Path(__file__).resolve().parent / "fleetlib.py"
+    loader = importlib.machinery.SourceFileLoader("_fleetlib_for_pkill", str(src))
+    spec = importlib.util.spec_from_loader("_fleetlib_for_pkill", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _scan_reason(reason: str, lib) -> None:
+    """Scanned and capped BEFORE ANYTHING IS SIGNALLED (plan 0014 Boundaries),
+    at argument-parse time — not before the reason is emitted. The kill runs
+    before the emit (see cmd_kill_session), so a scan sitting there would
+    reject a reason only once the target session is already dead, leaving a
+    cross-session kill with no record — the exact outcome this verb exists to
+    prevent. Same `_content_rules()` fleetlib.validate_cr already scans the
+    CR queue's `intent`/`patch`/`target` fields against (Principle 6 — atlas
+    renders this tree too).
+
+    Names the matched RULE, never the matched text (review 2554 M2): a
+    message that quoted the span would reprint the credential into a
+    terminal, a scrollback, and very likely a transcript — the exact leak
+    the scan exists to stop, moved three lines later."""
+    if len(reason.encode("utf-8")) > _REASON_CAP_BYTES:
+        sys.exit(f"fleet-pkill: --reason exceeds {_REASON_CAP_BYTES} bytes — trim it")
+    for name, rx in lib._content_rules():
+        if rx.search(reason):
+            sys.exit(f"fleet-pkill: --reason matches secret rule {name!r} — "
+                     "refusing before signalling anything; secrets never ride "
+                     "the event log")
+
+
+def _parse_session_kill_args(argv):
+    """Plain parsing, deliberately not argparse `type=` (see _scan_reason's
+    docstring and plan 0014 Boundaries): argparse would format a ValueError
+    from a `type=` validator as `invalid ... value: '<the string>'`, echoing
+    the whole reason — including any matched secret — before this code ever
+    sees it. Parse first, scan after."""
+    sid = reason = killer = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--session" and i + 1 < len(argv):
+            sid, i = argv[i + 1], i + 2
+        elif a == "--reason" and i + 1 < len(argv):
+            reason, i = argv[i + 1], i + 2
+        elif a == "--killer" and i + 1 < len(argv):
+            killer, i = argv[i + 1], i + 2
+        else:
+            sys.exit(f"fleet-pkill: unrecognized argument {a!r} in --session mode")
+    if sid is None or reason is None:
+        sys.exit('usage: fleet-pkill --session <sid> --reason "<text>" [--killer <value>]')
+    return sid, reason, killer
+
+
+def _read_pair(path: Path):
+    """(pid, lstart) out of a `host` or `contested` file, or None if it is
+    missing or malformed — the caller distinguishes those two cases itself,
+    since a missing and a malformed binding are separate, named refusals."""
+    try:
+        d = json.loads(path.read_text())
+        return int(d["pid"]), str(d["lstart"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _sids_bound_to(fleet: Path, pid: int, lstart: str):
+    """Every session id whose `host` names this EXACT (pid, start time) pair.
+    More than one is the /clear decoy plan 0014 exists to close: a pid a
+    failed prune left recorded under a dead sid AND its live successor."""
+    root = fleet / "sessions"
+    if not root.is_dir():
+        return []
+    return sorted(h.parent.name for h in root.glob("*/host") if _read_pair(h) == (pid, lstart))
+
+
+def _ppid_map(table):
+    return {pid: ppid for pid, ppid, _ in table}
+
+
+def _is_ancestor(target_pid: int, start_pid: int, ppid_map: dict, max_hops: int = 64) -> bool:
+    """Whether target_pid sits anywhere in start_pid's ppid chain — the
+    self-target proof. Bounded and cycle-safe like fleetlib.nearest_ancestor_pid;
+    an unresolved or exhausted walk answers False, never a guess."""
+    pid, seen, hops = start_pid, set(), 0
+    while pid is not None and pid > 1 and pid not in seen and hops < max_hops:
+        if pid == target_pid:
+            return True
+        seen.add(pid)
+        pid = ppid_map.get(pid)
+        hops += 1
+    return False
+
+
+def _format_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, s = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{s:02d}s"
+    hours, m = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{m:02d}m"
+    days, h = divmod(hours, 24)
+    return f"{days}d{h:02d}h"
+
+
+def _hb_age_str(fleet: Path, sid: str) -> str:
+    """Never throws and never implies a zero age: no `hb` file at all — true
+    of every session on this host today, the Stop hook not being installed —
+    reads as 'no heartbeat recorded', not '0s ago'."""
+    try:
+        mtime = (fleet / "sessions" / sid / "hb").stat().st_mtime
+    except OSError:
+        return "no heartbeat recorded"
+    return _format_age(time.time() - mtime) + " ago"
+
+
+def _attribute_killer(lib, fleet: Path, explicit):
+    """Reuses fleetlib's ancestry walk (0012) on the CALLER's own process —
+    never defaults to `human`: an agent invoking this from a Bash tool call
+    carries no EUNOMIA_* variables (measured 2026-09-06), so that default
+    would name the wrong who for the one record this verb exists to create.
+    A Claude ancestor names that session when it is itself bound, else names
+    its bare pid; no Claude ancestor at all is `unattributed` — a positive
+    claim about a PERSON the mechanism cannot support."""
+    if explicit:
+        return explicit, "explicit"
+    table = lib.proc_table()
+    ancestor = lib.nearest_ancestor_pid(os.getppid(), "claude", table=table)
+    if ancestor is None:
+        return "unattributed", "ancestry"
+    started = lib._lstart(ancestor)
+    if started is not None:
+        sids = _sids_bound_to(fleet, ancestor, started)
+        if sids:
+            return f"session:{sids[0]}", "ancestry"
+    return f"session-pid:{ancestor}", "ancestry"
+
+
+def cmd_kill_session(sid: str, reason: str, killer_override) -> int:
+    lib = _load_fleetlib()
+    _scan_reason(reason, lib)                 # BEFORE anything else is even read
+
+    if not _SID_RE.match(sid or ""):
+        sys.exit(f"fleet-pkill: {sid!r} is not a valid session id")
+
+    fleet = _fleet_dir()
+    sess_dir = fleet / "sessions" / sid
+    if not sess_dir.is_dir():
+        sys.exit(f"fleet-pkill: unknown session {sid!r} — no record of it in the ledger")
+
+    host_path = sess_dir / "host"
+    if not host_path.is_file():
+        sys.exit(f"fleet-pkill: session {sid!r} has no host binding — nothing to kill")
+
+    pair = _read_pair(host_path)
+    if pair is None:
+        sys.exit(f"fleet-pkill: session {sid!r}'s host file is malformed — refusing")
+    pid, recorded = pair
+
+    if _is_ancestor(pid, os.getppid(), _ppid_map(_proc_table())):
+        sys.exit("fleet-pkill: target is the caller's own session — "
+                 "this verb is cross-session only")
+
+    cur = lib._lstart(pid)
+    if cur is None:
+        sys.exit(f"fleet-pkill: session {sid!r}'s pid {pid} is not alive")
+    if cur != recorded:
+        sys.exit(f"fleet-pkill: session {sid!r}'s pid {pid} is alive but its start "
+                 "time no longer matches the ledger — the pid was reused")
+
+    bound = _sids_bound_to(fleet, pid, recorded)
+    if len(bound) > 1:
+        sys.exit(f"fleet-pkill: pid {pid} is bound to more than one session "
+                 f"({', '.join(bound)}) — refusing; the ledger cannot tell "
+                 "which name is current")
+
+    contested_path = sess_dir / "contested"
+    contested = None
+    if contested_path.exists():
+        c = _read_pair(contested_path)
+        contested = f"pid {c[0]}" if c is not None else "present but unreadable"
+
+    msg = (f"fleet-pkill: targeting session {sid} pid {pid} "
+          f"(last heartbeat {_hb_age_str(fleet, sid)})")
+    if contested is not None:
+        msg += f" — CONTESTED: {contested}"
+    print(msg)
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"fleet-pkill: TERM {pid} (session {sid})")
+    except ProcessLookupError:
+        print(f"fleet-pkill: {pid} already gone")
+    except PermissionError:
+        sys.exit(f"fleet-pkill: no permission to signal pid {pid}")
+
+    killer, basis = _attribute_killer(lib, fleet, killer_override)
+    detail = {"session": sid, "pid": pid, "reason": reason,
+             "killer": killer, "killer-basis": basis}
+    try:
+        lib.emit("session-killed", None, killer, detail)
+    except (SystemExit, OSError) as e:
+        print(f"fleet-pkill: kill succeeded but the event could not be recorded "
+             f"({e}) — the ledger has no record of this kill", file=sys.stderr)
+        return 3
+    return 0
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) == 2 and argv[0] == "--register":
+        return cmd_register(argv[1])
+    if argv[:1] == ["--session"]:
+        sid, reason, killer = _parse_session_kill_args(argv)
+        return cmd_kill_session(sid, reason, killer)
+    if len(argv) == 2 and argv[0] == "--" and argv[1].strip():
+        return cmd_kill(argv[1])          # dash-leading patterns: -- '--port 8793'
+        # (blank patterns refused here too, r6 M1 — an empty pattern matches
+        # every row of the process table)
+    if len(argv) == 1 and argv[0].strip() and not argv[0].startswith("-"):
+        return cmd_kill(argv[0])
+    sys.exit('usage: fleet-pkill [--] <substring> | fleet-pkill --register <pid> | '
+             'fleet-pkill --session <sid> --reason "<text>"')
+
+
+if __name__ == "__main__":
+    sys.exit(main())

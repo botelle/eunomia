@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""fleet-pin-advance — fast-forward a stale pin without a human typing
+`git checkout` (plan 0034, SPEC.md Revisions 2026-09-10).
+
+Every scheduled unit runs from a PIN (`~/.local/share/pins/<repo>`), never from
+a session's own checkout. `fleet-watch --pins-only` (`bin/fleet-pin-watch`
+unit) already REPORTS when a pin falls behind its origin/main; this is the
+narrow, deliberately-boundaried mover that closes the gap it reports on.
+
+WHY THIS IS SAFE TO AUTOMATE AT ALL. SPEC Principle 4 forbids anything
+automated acting on staleness, for leases: takeover is always an explicit
+human-spawned claim. A pin is not a lease, and the argument here is
+merge-is-ignition, the same argument `fleet-watch` itself runs on: on a repo
+whose main the Forgejo protection broker vouches for, reaching that commit
+already required a reviewed human merge, so fast-forwarding a pin onto it adds
+no authority nobody already exercised. See SPEC.md Revisions for the exact
+amendment to Principle 4 this reasons from.
+
+WHAT THIS REFUSES, every one of them named by `pin_status` (bin/fleet-watch)
+or by this tool itself, never collapsed into a truthiness check:
+  - anything but `stale` (`dirty`, `attached`, `missing`, `not-a-repo`,
+    `unfetchable`, `current` — the last one silently, since it is the goal
+    state and not a hazard)
+  - a `stale` pin whose HEAD is not an ancestor of its target (diverged, or the
+    target is BEHIND head) — never `reset`, never checked out backwards
+  - uncommitted changes present right before the checkout, even though
+    `pin_status`'s own `dirty` state cannot see this while `stale` (it only
+    runs its porcelain check once HEAD == target) — an orthogonal safety
+    check, not a re-derivation of pin_status's states
+  - a repo the broker cannot vouch for as protected on `main` (unreachable,
+    refused, or its owner/repo could not even be determined from `origin`) —
+    "could not determine" is never treated as "advance anyway"
+
+WHAT THIS DOES NOT DO. It does not restart any resident process that reads a
+pin (`fleet-watch` chief among them, enrolled as `opshost:fleet-watch` in
+config/services.conf). A resident watcher holds the code it loaded at start,
+so advancing a pin underneath it changes nothing until it restarts — and
+restarting it is a supervised operation gated by `bin/fleet-svc` under a
+`service` lease (plan 0029), not a `launchctl kickstart` this scheduled unit
+could reach for on its own. Every successful advance says so, once, in its
+notification: report the restart is due, never perform one.
+
+FLEET_PINS — same syntax as `fleet-watch` reads (`bin/fleet-watch:pins()`):
+comma list of `path` or `path=ref` DETACHED worktree entries, e.g.
+"~/.local/share/pins/eunomia,~/.local/share/pins/techne=origin/release". No
+default: an unconfigured run advances nothing, the same rule FLEET_WATCH_REPOS
+and FLEET_PINS itself already follow on the watcher.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load_module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+lib = _load_module("fleetlib", BIN / "fleetlib.py")
+# `pin_status`, `pins`, `broker_verdict`, `PROT_*`, `notify` — one definition
+# of each, reused rather than re-derived (the plan's own instruction).
+watch = _load_module("fleet_watch_for_pin_advance", BIN / "fleet-watch")
+
+# This tool's own paging identity (plan 0058) -- one of three callers of
+# `watch.notify`, alongside fleet-watch's own two launchd labels -- so a page
+# from here is not mistaken for a fleet-watch page in pages.jsonl.
+LABEL = "fleet-pin-advance"
+
+
+def warn(msg):
+    print(f"fleet-pin-advance: WARN {msg}", file=sys.stderr)
+
+
+def _sid():
+    return os.environ.get("EUNOMIA_SESSION", "").strip() or "fleet-pin-advance"
+
+
+def _single_instance():
+    """Exclusive, or refuse to run — the same non-blocking flock idiom
+    `fleet-watch._single_instance` uses, on this tool's OWN lockfile so an
+    overlapping run never races another instance's advance decision."""
+    import fcntl
+    lock_dir = lib.locks_dir()
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_dir / "fleet-pin-advance.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _git(path, *args):
+    """(ok, stdout). Never raises — the same contract `fleet-watch._git` makes."""
+    try:
+        r = subprocess.run(("git", "-C", path) + args, capture_output=True,
+                           text=True, timeout=60)
+        return r.returncode == 0, r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+
+
+def _origin_repo(path):
+    """The Forgejo `owner/repo` this pin's `origin` remote names, or None.
+
+    `pin_status` never names a repo — it only ever compares two commits — and
+    the broker's endpoint is `/forgejo/protection/{owner}/{repo}`, so this has
+    to come from somewhere. `origin`'s URL is the same source
+    `fleet-bundle._repo_name` already reads for an analogous purpose; unlike
+    that helper this keeps `owner/repo`, not just the last segment, because the
+    broker needs both.
+
+    Delegates to fleetlib's `pin_origin_repo` (plan 0059) so fleet-watch's own
+    delayed-paging check resolves a stale pin's repo the same way this tool
+    does, rather than a second copy of the regex. Kept as its own name here,
+    not inlined at the one call site below, because a test monkeypatches this
+    exact module attribute.
+    """
+    return lib.pin_origin_repo(path)
+
+
+def plan_pin(path, ref):
+    """(action, detail, facts) for one configured pin. READ ONLY — decides,
+    never touches. `action` is one of:
+      advance  -- stale, fast-forwardable, clean, and the broker vouches for it
+      refuse   -- named in `detail`; the caller warns and moves on
+      current  -- already at `ref`; not a hazard, nothing to report
+    """
+    state, detail, facts = watch.pin_status(path, ref)
+    if state == "current":
+        return "current", detail, facts
+    if state != "stale":
+        # every other pin_status state by name, never a truthiness check:
+        # dirty, attached, missing, not-a-repo, unfetchable
+        return "refuse", f"{state}: {detail}", facts
+    head, target = facts.get("head"), facts.get("target")
+    # The non-fast-forward and dirty-tree checks (pin_status's own `dirty`
+    # state cannot see the latter: its porcelain check only runs once HEAD ==
+    # target, so a pin that is BOTH stale and locally edited reads as plain
+    # `stale` from that function alone) live in fleetlib now (plan 0059) --
+    # fleet-watch's delayed-paging check reads the same predicate rather than
+    # a second copy of this list that could drift from it.
+    local_refusal = lib.pin_advance_local_refusal(path, head, target)
+    if local_refusal:
+        return "refuse", local_refusal, facts
+    repo = _origin_repo(path)
+    if repo is None:
+        return "refuse", (
+            f"{path}: could not determine the Forgejo owner/repo from its "
+            "`origin` remote -- cannot ask the broker whether main is "
+            "protected, and unreadable is never advance-anyway"), facts
+    facts["repo"] = repo
+    code, why, _lane = watch.broker_verdict(repo)
+    if code == watch.PROT_UNKNOWN:
+        return "refuse", (
+            f"{path}: broker could not determine {repo}'s protection -- "
+            f"{why} -- could-not-tell is never advance-anyway"), facts
+    if code == watch.PROT_REFUSED:
+        return "refuse", f"{path}: {repo}'s main is not protected -- {why}", facts
+    return "advance", detail, facts
+
+
+def emit(repo, detail):
+    """Emit `pin-drift`, mirroring `fleet-watch.emit` exactly (same reasons:
+    one append/lock/rotation path for every producer, and a failed emit is
+    awareness lost, never authority lost).
+
+    NOT a new event type. `bin/fleet-emit` and `bin/fleet-events` both enforce
+    the v0.2 closed set in code, and neither is in this tool's paths -- adding
+    `pin-advanced` there is a different lease's change to make. `pin-drift`
+    already carries exactly the shape an advance produces (`check_pins`'s own
+    `dict(facts, state=state, previous=previous or None)`); this reuses it and
+    marks the occurrence apart from a report-only transition with
+    `detail["action"] = "advanced"` plus the `from`/`to` SHAs, so a reader can
+    tell a system-driven recovery from a human's own re-point."""
+    try:
+        emit_mod = _load_module("_fleet_emit_for_pin_advance", BIN / "fleet-emit")
+        emit_mod.FLEET_DIR = lib.fleet_dir()
+        emit_mod.EVENTS = lib.fleet_dir() / "events.jsonl"
+        emit_mod.LOCK = lib.fleet_dir() / "locks" / "events.lock"
+        emit_mod.emit("pin-drift", _sid(), repo=repo, lease=None, detail=detail)
+    except (Exception, SystemExit) as e:
+        warn(f"emit pin-drift failed ({e.__class__.__name__}) -- the log is "
+             "awareness, not authority; continuing")
+
+
+def _do_advance(path, ref, facts, dry_run=False):
+    """Perform (or, under --dry-run, describe) one already-decided advance.
+    Returns True on a verified advance / a dry-run report; False on a failed
+    checkout, which the caller reports as a refusal rather than a partial
+    success."""
+    head, target, repo = facts["head"], facts["target"], facts.get("repo")
+    if dry_run:
+        print(f"DRY-RUN would advance {path} {head[:7]} -> {target[:7]} ({ref})")
+        return True
+    ok, _ = _git(path, "checkout", "--quiet", "--detach", target)
+    if not ok:
+        warn(f"{path}: `git checkout --detach {target[:7]}` failed -- not advanced")
+        return False
+    ok_head, new_head = _git(path, "rev-parse", "HEAD")
+    if not ok_head or new_head != target:
+        warn(f"{path}: checkout exited 0 but HEAD is "
+             f"{(new_head or '?')[:7]}, not {target[:7]} -- treating as a "
+             "failed advance, not a partial success")
+        return False
+    print(f"advanced {path} {head[:7]} -> {target[:7]} ({ref})")
+    emit(repo, {"path": path, "ref": ref, "state": "current", "previous": "stale",
+               "action": "advanced", "from": head, "to": target})
+    watch.notify(
+        "Pin advanced",
+        f"{path}: {head[:7]} -> {target[:7]}. If a resident process reads "
+        "this pin (fleet-watch does), it holds the code it loaded at start "
+        "and restarts itself once it sees this pin move to a clean, reviewed "
+        "commit -- between cycles, never mid-dispatch (plan 0040). "
+        "fleet-pin-advance does not restart anything itself.",
+        LABEL)
+    return True
+
+
+def _deploy_owned():
+    """Realpaths of every pin a `config/environments.conf` binding names (plan
+    0087, ADR-0015 §4: a deploy-owned pin has ONE mover, and it is
+    `fleet-deploy`). None when the file exists but cannot be read: the caller
+    then refuses every pin, because "could not tell who owns it" is never
+    advance-anyway."""
+    try:
+        deploy = _load_module("fleet_deploy_for_pin_advance", BIN / "fleet-deploy")
+        return deploy.owned_pins()
+    except (OSError, Exception):
+        return None
+
+
+def run(dry_run=False):
+    """(advanced, refused) -- lists of (path, detail). Never raises; every
+    pin is independent, so one bad pin must not stop the rest."""
+    advanced, refused = [], []
+    owned = _deploy_owned()
+    for path, ref in watch.pins():
+        if owned is None or os.path.realpath(path) in owned:
+            detail = (f"{path}: owned by a deployment (config/environments.conf) "
+                      "-- only fleet-deploy moves it, never fleet-pin-advance "
+                      "(ADR-0015 §4); fleet-pin-watch still reports its drift"
+                      if owned is not None else
+                      f"{path}: config/environments.conf could not be read, so "
+                      "whether a deployment owns this pin is unknown -- refusing")
+            warn(detail)
+            refused.append((path, detail))
+            continue
+        action, detail, facts = plan_pin(path, ref)
+        if action == "current":
+            continue
+        if action == "refuse":
+            warn(detail)
+            refused.append((path, detail))
+            continue
+        if _do_advance(path, ref, facts, dry_run=dry_run):
+            advanced.append((path, detail))
+        else:
+            refused.append((path, "advance attempt failed -- see the WARN above"))
+    return advanced, refused
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="fleet-pin-advance",
+        description="Fast-forward stale pins whose target is vouched for by "
+                    "the Forgejo protection broker. See FLEET_PINS.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would advance; write nothing")
+    args = ap.parse_args(argv)
+
+    if not watch.pins():
+        print("fleet-pin-advance: FLEET_PINS is empty -- nothing to advance")
+        return 0
+
+    fd = _single_instance()
+    if fd is None:
+        print("fleet-pin-advance: another instance is running -- exiting",
+             file=sys.stderr)
+        return 0
+    try:
+        advanced, refused = run(dry_run=args.dry_run)
+    finally:
+        os.close(fd)
+    print(f"fleet-pin-advance: {len(advanced)} advanced, {len(refused)} refused")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

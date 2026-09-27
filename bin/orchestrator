@@ -1,0 +1,3785 @@
+#!/usr/bin/env python3
+"""orchestrator — the deterministic wrapper around a judgment core (plan 0004).
+
+Plan 0004's central structural rule: **every guarantee lives here, in code, and
+only judgment lives in bin/orchestrator-prompt.md**. A guarantee written as
+prompt text is a hope; a drifted prompt cannot masquerade as a control.
+
+WHAT IS WIRED TODAY, AND WHY THAT MATTERS
+=========================================
+Part 2 is complete. Lease activation, heartbeat, workspace, plan read and
+prompt construction (2a); **the implementer session itself** — spawned under a
+routed runner, in its own process group, with an allowlisted environment, and
+verified afterwards from the forge by `verify_marked_pr` (0010); **the review
+loop** under a fixed mandate, with the verdict read back off the forge and bound
+to the head SHA it reviewed (0011); **the comment/ack protocol and the steward
+phase**, where the pull request thread is the ledger (0031); and **the
+post-approval freeze** (0032). `UNBUILT_PHASES` is empty and `--ready` exits 0,
+which is what lets `fleet-watch` arm.
+
+The session is the judgment core; everything around it here is a guarantee. In
+particular a zero exit from the session proves nothing: the run succeeds only
+when a PR authored by an implementer account, on this lease's branch, based on
+main, carrying `Plan: <id>`, with the plan flipped to `done`, is readable from
+the forge. A model that reports success having opened nothing must fail, because
+dedupe is "a marked PR exists" — an unmarked PR means the plan re-dispatches
+while its work sits in a branch nobody will look at.
+
+That gap is dangerous in a specific way, so it is handled explicitly rather than
+left to fall out. Until this file existed, `fleet-watch` spawning an
+orchestrator raised OSError, and the watcher's handler released the lease,
+emitted `plan-failed`, and paged. The moment a file exists at this path the
+spawn SUCCEEDS, the watcher emits `plan-dispatched`, and the plan reads as
+in-flight — so a half-built wrapper that merely exited would convert a loud
+failure into a plan that looks armed and is not. Ignition must never look
+armed when it is not.
+
+While phases were unbuilt, the boundary between built and unbuilt was a real,
+loud stop (`_unbuilt()`), and each merged PR moved it later without ever making
+it silent. Nothing is unbuilt now: the boundary does not move again and that
+helper is gone rather than left as a page reason no caller can produce.
+
+What survives from it is the rule it enforced, which `_stop` still carries: a
+failure does **not** release the lease. Releasing would return the plan to the
+undispatched pool and the watcher would re-dispatch it every cycle; holding it
+lets the lease lapse into orphanhood, the fleet's surface-once-never-respawn
+path. The one legitimate release is the steward's, when the marked PR is merged
+or closed.
+
+NO APPROVAL CODE PATH
+=====================
+There is no function here that posts a Forgejo review, and there must never be.
+The orchestrator is graded on "revbot approved," so the credential
+separation is not enough on its own — the absence of the code path is the
+control (plan 0004, tested by asserting zero approval calls across the suite).
+
+The boundary is also declared UPWARD, which is the half that keeps the fleet
+quiet. `fleet-watch` already refuses to arm when no orchestrator is executable
+(its r5 M2 gate), precisely so a part-built deployment does not page once per
+plan per cycle. Merely existing at this path would satisfy `os.access` and
+defeat that gate — the storm would return through a different door. So this
+file answers `--ready` with a non-zero exit until the loop is whole, and the
+watcher asks before it arms.
+
+Usage (the contract fleet-watch spawns against):
+  orchestrator <owner/repo> <plan-path> <lease-id>
+  orchestrator --ready          # exit 0 only when the loop can carry a plan
+
+Env: EUNOMIA_SESSION (holder identity, set by the watcher), EUNOMIA_PLAN_ID,
+EUNOMIA_PLAN_ZONE, EUNOMIA_PLAN_TIER, FLEET_WORK_ROOT, FLEET_NTFY_URL,
+FLEET_HEARTBEAT_SECS (default 60), EUNOMIA_INITIATOR (who filed this run;
+unset means the operator), EUNOMIA_IMPL_RUNNER (per-run runner override — sits
+above the repo's own choice; unset, the implementer runner comes from
+`bin/fleet-models`'s repo_model table via resolved_implementer_env, plan 0048),
+EUNOMIA_TRANSCRIPT_DIR (override for the transcript root),
+FLEET_IMPLEMENTER_UIDS / FLEET_IMPLEMENTER_LOGINS (who may author a marked PR),
+FLEET_FORGEJO_URL.
+
+The implementer's wall-clock bound is per repo, read from
+config/impl-bounds.conf (plan 0042) — there is no environment override, and a
+missing or malformed conf is a Stop, not a quiet 90.
+
+Two paths a run writes, both named on every page it sends:
+  <work root>/logs/<lease-id>.log        structured facts, redacted
+  ~/dev/.orchestrator-transcripts/<lease-id>.log   the session's own output,
+                                         redacted, 0600, deliberately OUTSIDE
+                                         the fleet tree (SPEC Principle 6).
+"""
+import base64
+import collections
+import contextlib
+import json
+import importlib.machinery
+import importlib.util
+import os
+import re
+import resource
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+_lib_loader = importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+
+def _load_sibling(name, mod_name):
+    loader = importlib.machinery.SourceFileLoader(mod_name, str(BIN / name))
+    spec = importlib.util.spec_from_loader(mod_name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def warn(msg):
+    print(f"orchestrator: {msg}", file=sys.stderr)
+
+
+class Stop(Exception):
+    """A refusal that already knows what the page should say.
+
+    Every routing, credential, harness and transcript refusal raises this rather
+    than returning a sentinel, so `main` has exactly one place that turns a
+    refusal into `_stop` — and so a new refusal cannot be added that forgets to
+    page. `reason` is the whole message: the watcher spawns with stderr=DEVNULL,
+    so the page's reason is the only channel that survives."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+# ------------------------------------------------------------------ secrecy
+def _redaction_patterns():
+    """The HIGH-SIGNAL shapes from fleet-leak-watch, and deliberately not its
+    PARANOID set.
+
+    Reused rather than restated so one list governs both the monitor and the
+    writer; a second copy would drift and the drift would be invisible until a
+    leak. `PARANOID_FINDINGS` is excluded on purpose: it matches `long-hex`,
+    which is every git SHA — and a head SHA is the single most load-bearing
+    fact an approval binds to (§4.6). Redacting it to be safe would corrupt the
+    evidence this thread exists to carry."""
+    lw = _load_sibling("fleet-leak-watch", "_leak_watch")
+    return list(lw.FINDINGS)
+
+
+def redact(text):
+    """Everything written to a PR thread passes through here (SPEC Principle 6).
+
+    Returns (clean_text, [shape names found]). The caller is expected to treat a
+    non-empty finding list as a fact worth surfacing, not merely as a
+    substitution that quietly happened."""
+    found = []
+    out = text or ""
+    for name, rx in _redaction_patterns():
+        if rx.search(out):
+            found.append(name)
+            out = rx.sub(f"[redacted:{name}]", out)
+    return out, found
+
+
+def _transcript_patterns():
+    """FINDINGS **+ PARANOID_FINDINGS**, which is not what `redact()` uses.
+
+    The difference is the whole point, so it is stated rather than assumed. The
+    credential an implementer session actually holds on this fleet is a Forgejo
+    PAT: 40 hex characters, no prefix, no structure. Not one shape in FINDINGS
+    matches that — `long-hex` is the only pattern that does, and it lives in the
+    PARANOID set. A transcript redacted with FINDINGS alone would pass every
+    "we redact transcripts" review and still carry the token.
+
+    `redact()` keeps the narrow set, and correctly: it governs PR comments,
+    where `long-hex` is every git SHA and a head SHA is the single most
+    load-bearing fact an approval binds to (SPEC §4.6). A transcript has no such
+    field to protect — it is free text — so the noisy shapes cost nothing here
+    and the SHA objection does not transfer."""
+    lw = _load_sibling("fleet-leak-watch", "_leak_watch")
+    return list(lw.FINDINGS) + list(lw.PARANOID_FINDINGS)
+
+
+def redact_transcript(text):
+    """Redact the BUFFERED WHOLE. Never call this per read or per line.
+
+    A 40-hex token that lands with 12 characters at the end of one `read()` and
+    28 at the start of the next matches no per-chunk regex — each half is short,
+    both halves are printable, and the writer that stitched them back together
+    would have written the token out. The reader thread therefore accumulates
+    chunks and nothing is substituted until the process is done and the buffer
+    is joined."""
+    found = []
+    out = text or ""
+    for name, rx in _transcript_patterns():
+        if rx.search(out):
+            found.append(name)
+            out = rx.sub(f"[redacted:{name}]", out)
+    return out, found
+
+
+# ------------------------------------------------------------------ the log
+def check_evidence_paths(lease_id):
+    """Resolve both evidence paths BEFORE the session is spawned.
+
+    `transcript_dir()` used to be first called by `write_transcript`, AFTER the
+    session — so a transcript root inside the fleet tree failed a 90-minute run
+    at the very end, and `main` reported it as "the session failed to run" for a
+    session that had run perfectly.
+
+    Worse, that path skipped `verify_marked_pr` entirely: if the session HAD
+    opened a marked PR, dedupe would treat the plan as done on a pull request
+    nothing verified, while the page said the session never ran (review 2369
+    M3). A misconfiguration must fail before the spend, not after it."""
+    lease_key(lease_id)
+    return transcript_dir()
+
+
+def set_commit_identity(worktree):
+    """Configure who this worktree commits as, BEFORE the session runs.
+
+    From the live scratch-repo run (review of #223): the session committed as
+    `Fleet Operator <operator@opshost.example>` — the operator — so git history
+    said a human wrote model-generated code while every check passed, because
+    `verify_marked_pr` reads the PULL REQUEST's author and never the commit's.
+    Three such commits are on main today.
+
+    In code rather than in the implementer prompt, because a guarantee written
+    as prompt text is a hope: the session can forget it, paraphrase it, or be
+    handed a `-c user.name` by something else. Local to the worktree, so it
+    cannot alter the operator's global config.
+
+    Not fatal if it fails. A run that cannot set an identity still produces work
+    a human reviews; refusing here would trade a wrong `Author:` line for no
+    plan at all."""
+    who = lib.agent_roles()["author"].commit_identity
+    name, _, email = who.partition("<")
+    name, email = name.strip(), email.rstrip(">").strip()
+    if not name or not email:
+        warn(f"FLEET_COMMIT_IDENTITY={who!r} is not 'Name <email>' — leaving the "
+             "worktree's identity alone")
+        return False
+    for key, value in (("user.name", name), ("user.email", email)):
+        r = subprocess.run(["git", "config", "--local", key, value],
+                           cwd=str(worktree), capture_output=True, text=True,
+                           timeout=60)
+        if r.returncode != 0:
+            warn(f"could not set {key} on {worktree}: {r.stderr.strip()[:120]}")
+            return False
+    return True
+
+
+def lease_key(lease_id):
+    """The lease id, refused unless it is id-shaped.
+
+    Every file this module names is `<somewhere>/<lease id>...`, so the check
+    belongs at the ONE place that turns an id into a path rather than at the
+    last of them. `write_transcript` validated and `RunLog` did not — and
+    `RunLog` opens FIRST, so `../../x` was appended under the work root before
+    anything rejected it (review 2369 L3)."""
+    if not lib._ID_RE.match(lease_id or ""):
+        raise Stop(f"{lease_id!r} is not a lease id — refusing to name a file with it")
+    return lease_id
+
+
+def run_log_path(lease_id):
+    """`<work root>/logs/<lease-id>.log` — inside the fleet tree on purpose.
+
+    Principle 6 forbids secret material under this tree, not writing under it.
+    This file carries structured facts only — phase, exit code, fault class,
+    paths — and every line still passes through `redact_transcript` before it is
+    written, because "structured facts only" is a discipline and the redactor is
+    a control."""
+    return lib.work_root() / "logs" / f"{lease_id}.log"
+
+
+class RunLog:
+    """Opened BEFORE the lease is activated, and never a failure channel.
+
+    Before, because the watcher spawns this process with `stderr=DEVNULL`
+    (`bin/fleet-watch:791`): a failure between spawn and the first reachable
+    forge call currently leaves nothing at all to read. A log opened after the
+    step that failed documents every run except the ones worth documenting.
+
+    Never a failure channel, because the page is: a failure that only appends to
+    a log is a failure nobody sees. What the log buys is that the page's one-line
+    reason has somewhere to point, which is why every page names this path.
+
+    Its own open failure is warned about and swallowed — a full disk must not
+    take down a run that could still open a PR."""
+
+    def __init__(self, lease_id):
+        # Validated HERE, not later: this is the first thing in the run that
+        # turns the argv lease id into a path, and it opens the file.
+        self.path = run_log_path(lease_key(lease_id))
+        self._fh = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "a", encoding="utf-8")
+        except OSError as e:
+            warn(f"run log {self.path} unavailable ({e.__class__.__name__})")
+
+    def note(self, phase, **facts):
+        parts = [lib.ts(lib.now_utc()), phase]
+        parts += [f"{k}={v}" for k, v in facts.items()]
+        clean, _ = redact_transcript(" ".join(str(x) for x in parts))
+        if self._fh is None:
+            return
+        try:
+            self._fh.write(clean + "\n")
+            self._fh.flush()
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------ the transcript
+def transcript_dir():
+    """`~/dev/.orchestrator-transcripts`, and provably not under `~/dev/.fleet`.
+
+    SPEC Principle 6: nothing under the fleet tree may contain secret material,
+    and atlas renders that tree. A session transcript is the one artefact here
+    most likely to contain some — so it lives outside, 0600, and only its PATH
+    is ever quoted into an event, a page or (from 0011) a PR comment.
+
+    The containment check is code rather than a convention because
+    `EUNOMIA_TRANSCRIPT_DIR` exists for the suite, and a test fixture pointing
+    it inside the fleet tree would otherwise silently reintroduce exactly what
+    this function exists to prevent."""
+    env = (os.environ.get("EUNOMIA_TRANSCRIPT_DIR") or "").strip()
+    d = Path(env).expanduser() if env else Path.home() / "dev" / ".orchestrator-transcripts"
+    d = d.expanduser().resolve()
+    fleet = lib.fleet_dir().expanduser().resolve()
+    if d == fleet or str(d).startswith(str(fleet) + os.sep):
+        raise Stop(f"transcript dir {d} is inside the fleet tree {fleet} — "
+                   "SPEC Principle 6 forbids session output there")
+    return d
+
+
+# A TAG is not a lease id. An earlier revision validated tags against
+# `lib._ID_RE`, which is `^[a-z]+--slug--\d{3,}$` — the lease-id shape — so NO
+# tag this file generates (`r1`, `c10`, `f10r1`, `u10r2`) could ever match it,
+# and every fix round, steward instruction and follow-up session raised Stop
+# AFTER doing its work and was reported as refused. The whole of 0011/0031/0032
+# was broken at runtime and the suite did not see it, because the tests that
+# exercise those paths stub `run_implementer`. Found as a HIGH in review 2422.
+# This pattern admits what the code produces and still cannot traverse: no `/`,
+# no `.`, so no `..`.
+_TAG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+
+
+def write_transcript(lease_id, text, tag=None):
+    """The session's whole output, redacted as one buffer, mode 0600.
+
+    Returns (path, shapes found). A non-empty shape list is a fact worth
+    surfacing — the token helper's own header records the 2026-08-28 leak where
+    a PAT reached a transcript — not merely a substitution that quietly
+    happened."""
+    d = transcript_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    lease_id = lease_key(lease_id)   # one validation point; see lease_key
+    # A `tag` gives each session in a run its OWN file. Without it every
+    # steward instruction and every fix round reopened one path with O_TRUNC and
+    # destroyed the previous session's transcript — the artefact a failure page
+    # points the reader at.
+    if tag is not None and not _TAG_RE.match(tag):
+        raise Stop(f"{tag!r} is not tag-shaped — refusing to name a file with it")
+    path = d / (f"{lease_id}-{tag}.log" if tag else f"{lease_id}.log")
+    clean, found = redact_transcript(text)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(clean)
+    os.chmod(str(path), 0o600)
+    return path, found
+
+
+# ------------------------------------------------------------------ lifecycle
+def activate(lease_id):
+    """Verification, not acquisition: fleet-claim refuses unless EUNOMIA_SESSION
+    matches the holder the watcher named. A wrapper that ran without its lease
+    would push on a branch row 6's pre-push hook has granted to someone else."""
+    r = subprocess.run([sys.executable, str(BIN / "fleet-claim"), "--activate", lease_id],
+                       capture_output=True, text=True, timeout=60)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()[:200]
+
+
+# No release() here on purpose. Part 2a has no path that legitimately retires a
+# lease: every exit it can reach is a failure with no marked PR, or a VERIFIED
+# marked PR that is not merged yet — and docs/plan-dispatch.md forbids releasing
+# without a merged one. The steward phase — which exits when the marked PR is
+# merged or closed — is where a release belongs, and it should arrive with that
+# caller rather than wait here as a function anything could reach.
+
+
+class Heartbeat:
+    """A daemon thread touching the session heartbeat.
+
+    Daemon on purpose: if the main thread dies, the heartbeat must die with it.
+    A surviving heartbeat would keep a dead run looking alive, and `is_orphaned`
+    — which the watcher's death detection rests on — derives from exactly this
+    mtime."""
+
+    def __init__(self, sid, secs=None):
+        self.sid = sid
+        # not a bare int(): this runs AFTER the lease is activated, so a
+        # malformed knob would raise here and strand a live lease with no
+        # heartbeat — the one state the heartbeat exists to make detectable.
+        self.secs = int(secs) if secs else lib.heartbeat_secs()
+        self._stop = threading.Event()
+        self._t = None
+
+    def start(self):
+        lib.touch_heartbeat(self.sid)
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.secs):
+            lib.touch_heartbeat(self.sid)
+
+    def stop(self):
+        self._stop.set()
+
+
+# The page's durable half. Every page is written here whether or not it was
+# delivered, because the watcher spawns with stderr=DEVNULL and an undelivered
+# page currently vanishes without trace — which is how this fleet ran for weeks
+# with FLEET_NTFY_URL empty on every unit and nobody noticing.
+#
+# A flat append-only file under the ledger tree, per SPEC Principle 2, in the
+# directory lynceus already reads. NOT fleet.db: that is fleet-collect's, and a
+# second writer to it would need its own decision.
+PAGES = "pages.jsonl"
+
+
+def pages_path():
+    return lib.fleet_dir() / PAGES
+
+
+def record_page(title, body, delivered, detail="", extra=None):
+    """Append one page to the log. Never raises — a logging failure must not
+    take down the thing it is logging, and the page has already been attempted
+    by the time we get here."""
+    row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "session": os.environ.get("EUNOMIA_SESSION", ""),
+           "title": title, "body": body,
+           "delivered": bool(delivered), "detail": detail}
+    row.update(extra or {})
+    try:
+        path = pages_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        clean, found = redact(json.dumps(row, ensure_ascii=False))
+        if found:
+            warn(f"redacted {sorted(found)} from a page record")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(clean + "\n")
+    except Exception as e:
+        warn(f"could not record the page ({e.__class__.__name__})")
+
+
+def angelia_token():
+    """The per-app service token, from a COMMAND, never a plist value.
+
+    `FLEET_ANGELIA_TOKEN_CMD` runs and prints the token; the value lives in one
+    local and one header and is never logged. Absent means the angelia channel
+    is not configured, which is a state to report rather than an error."""
+    cmd = os.environ.get("FLEET_ANGELIA_TOKEN_CMD", "").strip()
+    if not cmd:
+        return None
+    try:
+        r = subprocess.run(shlex.split(cmd), capture_output=True, text=True,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        warn(f"angelia token command failed ({e.__class__.__name__})")
+        return None
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not lines:
+        warn("angelia token command produced no token")
+        return None
+    return lines[-1]
+
+
+def send_angelia(title, body, timeout=10):
+    """(delivered, detail). Delivery is judged from angelia's COUNTS.
+
+    A 200 with `sent: 0` is not a page — the device registry can be empty for
+    this app and user, and the request still succeeds. Reading the status code
+    alone is how a channel comes to be believed while silent, which is the
+    failure this whole change exists to end."""
+    base = os.environ.get("FLEET_ANGELIA_URL", "").strip().rstrip("/")
+    app = os.environ.get("FLEET_ANGELIA_APP", "").strip()
+    user = os.environ.get("FLEET_ANGELIA_USER", "operator").strip()
+    if not base or not app:
+        return False, "angelia not configured (FLEET_ANGELIA_URL/APP unset)"
+    token = angelia_token()
+    if not token:
+        return False, "angelia token unavailable"
+    payload = json.dumps({"user": user,
+                          "payload": {"title": title, "body": body}}).encode()
+    req = urllib.request.Request(
+        f"{base}/api/v1/send", data=payload, method="POST",
+        headers={"Content-Type": "application/json",
+                 "X-Angelia-App": app, "X-Angelia-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            code = resp.status
+    except urllib.error.HTTPError as e:
+        # The body can echo the request; never keep it. 404 is the one worth
+        # naming, because it means "authenticated fine, nobody is listening".
+        detail = ("no device registered for this app and user"
+                  if e.code == 404 else f"HTTP {e.code}")
+        return False, detail
+    except Exception as e:
+        return False, f"{e.__class__.__name__}"
+    try:
+        counts = json.loads(raw)
+    except ValueError:
+        return False, f"HTTP {code} with an unreadable body"
+    sent = counts.get("sent")
+    if not isinstance(sent, int) or sent < 1:
+        return False, (f"HTTP {code} but sent={sent!r} — accepted and delivered "
+                       "to nobody")
+    return True, f"sent={sent}"
+
+
+def notify(title, body):
+    """Page a human, and RECORD the attempt either way.
+
+    Two channels, tried in order and both optional: angelia (headers + JSON,
+    the fleet's real push path) and FLEET_NTFY_URL (a bare text POST, ntfy's
+    contract and no one else's — pointing it at angelia yields a 401 the caller
+    swallows, which is why it is not reused here).
+
+    Returns whether the page reached anyone. The log entry is written whatever
+    the answer, and that is the point: an undelivered page must leave a trace."""
+    delivered, detail = False, ""
+    if os.environ.get("FLEET_ANGELIA_URL", "").strip():
+        delivered, detail = send_angelia(title, body)
+
+    url = os.environ.get("FLEET_NTFY_URL", "")
+    if not delivered and url:
+        try:
+            req = urllib.request.Request(url, data=f"{title}: {body}".encode(),
+                                         method="POST")
+            urllib.request.urlopen(req, timeout=5).read()
+            delivered, detail = True, "ntfy"
+        except Exception as e:
+            detail = f"{detail}; ntfy {e.__class__.__name__}".strip("; ")
+
+    if not delivered:
+        # stderr is DEVNULL under the watcher, so this line is for a human
+        # running it by hand. The log entry below is the one that survives.
+        print(f"orchestrator: NOTIFY(undelivered) {title} — {body}",
+              file=sys.stderr)
+        if not detail:
+            detail = "no channel configured"
+        warn(f"page not delivered: {detail}")
+    record_page(title, body, delivered, detail)
+    return delivered
+
+
+def emit(event_type, repo, detail, pr=None):
+    """Awareness, not authority — a failed emit never gates a transition.
+    lease=None always: SPEC requires a null lease on plan-* events, so the
+    lease id rides in detail (the rule fleet-watch's emit documents)."""
+    try:
+        mod = _load_sibling("fleet-emit", "_fleet_emit")
+        mod.FLEET_DIR = lib.fleet_dir()
+        mod.EVENTS = lib.fleet_dir() / "events.jsonl"
+        mod.LOCK = lib.fleet_dir() / "locks" / "events.lock"
+        mod.emit(event_type, os.environ.get("EUNOMIA_SESSION", "orchestrator"),
+                 repo=repo, pr=pr, lease=None, detail=detail)
+    except (Exception, SystemExit) as e:
+        warn(f"emit {event_type} failed ({e.__class__.__name__}) — continuing")
+
+
+# ----------------------------------------------------------- the credential
+Credential = collections.namedtuple("Credential", "kind initiator note")
+
+# initiator -> credential kind. Deliberately tiny, and deliberately not a
+# fallback table: today the fleet has exactly one credential, and the seam
+# exists so that adding a second is a row here rather than a rewrite.
+#
+# Branches that do NOT exist yet, and what each needs before it can:
+#   * a Forgejo person (a PR merger, per plan 0015) -> needs a uid->principal
+#     map, so a run filed by someone else bills someone else.
+#   * `api_key` -> needs an API key path (a keyvault pull at startup, not an
+#     inherited variable) before any runner declaring `needs="api_key"` can run.
+_INITIATOR_CREDENTIALS = {
+    "operator": "local_cli",
+}
+
+
+def resolve_credential(initiator=None):
+    """Which credential this run may spend, from who filed it.
+
+    **Unset means the operator** — the normal production path, and today's only
+    credential: `local_cli`, the operator's own `claude` CLI with no token in the
+    environment, on whichever host runs `fleet-watch`. `docs/plan-dispatch.md`
+    fixed that as opshost, as the logged-in user, on 2026-09-01; plan 0004's
+    Resources section still says cihost and is superseded — the session runs
+    where the watcher spawns it. The watcher learning the real initiator from
+    the plan PR's merger is 0015's work, in `bin/fleet-watch`'s lane, not here.
+
+    A value that is **set and unrecognised** stops the run loudly. That branch is
+    reachable in production by setting the variable — not only by a test double
+    — which is the point: falling back to the operator would be the plausible
+    kindness and is wrong, because a run filed by someone else must bill someone
+    else."""
+    if initiator is None:
+        initiator = os.environ.get("EUNOMIA_INITIATOR", "")
+    initiator = (initiator or "").strip()
+    if not initiator:
+        return Credential("local_cli", "operator",
+                          "EUNOMIA_INITIATOR unset — the operator's own CLI on this host")
+    kind = _INITIATOR_CREDENTIALS.get(initiator)
+    if kind is None:
+        raise Stop(f"EUNOMIA_INITIATOR={initiator!r} names no known principal — "
+                   f"known: {sorted(_INITIATOR_CREDENTIALS)}. Refusing to fall back "
+                   "to the operator's credential: a run filed by someone else "
+                   "must bill someone else")
+    return Credential(kind, initiator, f"initiator {initiator} -> {kind}")
+
+
+# -------------------------------------------------------------- the runners
+#
+# `family` is what a policy may test a runner by — never its name. The reviewer
+# positions accept `family == "fable"` only (plan 0065, bin/fleet-models), and a
+# substring test on the name breaks the day a runner is called `api-fable`, or
+# admits one called `sub-sonnet-fable-ish`.
+#
+# `settings_must_not_grant` is a tuple of tilde-paths to a vendor's OWN settings
+# file, checked by `check_settings_precondition` before that runner is ever
+# spawned (plan 0066 D4b). Empty for every runner but `sub-antigravity`: it is
+# the one vendor CLI with no flag that ignores its own config, so the control is
+# a precondition on the file rather than an argv entry. Defaulted to `()` so
+# every existing call site that builds a `Runner` positionally keeps working.
+#
+# The path is `~/.gemini/antigravity-cli/settings.json`, NOT
+# `~/.gemini/settings.json` — an earlier revision pinned the latter and the
+# precondition passed against every real grant because antigravity never reads
+# that file. Confirmed 2026-09-22 against the installed 1.2.8 binary's own
+# embedded docs: "The CLI is configured via `~/.gemini/antigravity-cli/
+# settings.json`." (`strings /opt/homebrew/bin/antigravity`, "## 3.
+# Configuration" section). `~/.gemini/settings.json` belongs to the legacy
+# `gemini` CLI, a different binary (see D3/Boundaries on why it is not added
+# here).
+#
+# NOT covered: the same embedded changelog also documents "project-specific
+# configurations (located in `~/.gemini/config/projects/`) take precedence
+# over global settings" — a second, cwd-dependent grant surface. Which project
+# file that is depends on the tester's cwd, and there is no tester spawn
+# constructor yet (see the `--add-dir` deferral in this plan's Boundaries) —
+# so it cannot be named here and is left for whoever builds that spawn path.
+Runner = collections.namedtuple(
+    "Runner", "name argv local needs extra_env unwired family "
+              "settings_must_not_grant",
+    defaults=((),))
+
+# The permission mode and tool allowlist are NAMED, and what they are worth is
+# named with them. `--allowedTools` is surface reduction — no WebFetch, no
+# WebSearch, no Task — and nothing more: Claude Code matches Bash permissions on
+# the command PREFIX and never inspects git's arguments, so even a
+# `Bash(git:*)`-shaped entry admits `git -c alias.x='!<anything>' x`,
+# `git -c core.sshCommand=<anything> fetch` and `git -C /any/path`. That is
+# arbitrary execution as the operator's user, and a starting directory confines
+# nothing either. What actually bounds the damage is stated where it lives:
+# verify_marked_pr afterwards, branch protection upstream, and _ENV_ALLOW below.
+# `--dangerously-skip-permissions` is never passed, and a test asserts the
+# string appears nowhere in this file.
+PERMISSION_MODE = "acceptEdits"
+TOOL_ALLOWLIST = ("Bash", "Read", "Write", "Edit", "Glob", "Grep", "TodoWrite")
+# `--output-format stream-json` (which REQUIRES `--verbose` under `-p`, and the
+# CLI refuses without it) because the default text format is the wrong stream to
+# redact.
+#
+# Under `-p`, text format prints the final assistant message and nothing else.
+# Tool results — which is where a credential actually lands, as the 2026-08-28
+# PAT did — never reach this wrapper's pipe at all, so `redact_transcript` has
+# been running over a stream that structurally cannot contain the thing it
+# exists to remove.
+#
+# Measured 2026-09-10 as a controlled A/B: same prompt, same tool call, one file
+# whose contents appear ONLY in tool output.
+#
+#     text format          5 bytes    tool output captured: NO
+#     stream-json     15,556 bytes    tool output captured: YES
+#
+# Record types in the stream-json run: system 11, assistant 4, user 1, result 1.
+# The `user` records carry the tool_result blocks; that is the whole difference.
+#
+# WHAT THIS DOES NOT CLOSE, and the docs say so rather than implying otherwise:
+# Claude Code writes its own full session — tool_use and tool_result included —
+# to ~/.claude/projects/<slug>/<uuid>.jsonl, unredacted, whatever this flag says.
+# That file is a third path to the same material and it still exists; HOME stays
+# on the implementer allowlist, so the session can read it. This change makes the
+# transcript the fleet KEEPS honest. It does not make the fleet's exposure zero.
+#
+# It also stops the fleet being unable to debug itself. Twice on 2026-09-10 a run
+# had to be diagnosed by reading Claude Code's own JSONL, because the transcript
+# the orchestrator wrote was the model's closing summary and carried no evidence
+# of what it had actually run.
+_CLAUDE = ("claude", "-p",
+           "--output-format", "stream-json", "--verbose",
+           "--permission-mode", PERMISSION_MODE,
+           "--allowedTools", ",".join(TOOL_ALLOWLIST))
+
+# Absolute, not resolved from PATH at import time (plan 0066 D1). launchd
+# spawns this wrapper with PATH=/usr/bin:/bin:/usr/sbin:/sbin — no
+# /opt/homebrew/bin — so a lookup made from *this* process's own PATH would
+# still find nothing at dispatch time even if it succeeded on whatever host
+# wrote the code. This fleet already has the failure on record with a bare
+# name: "runner 'sub-sonnet' needs 'claude', which is not on PATH on this
+# host — refusing to spawn". Measured 2026-09-21/22 on opshost.
+ANTIGRAVITY_BIN = "/opt/homebrew/bin/antigravity"
+CODEX_BIN = "/opt/homebrew/bin/codex"
+
+# antigravity's only stdin path (`--input-format stream-json`) takes one line
+# of this exact shape, measured against a real request 2026-09-22: any other
+# event is ignored with a warning, and a `user` event with no `message` is an
+# error (plan 0066 D2).
+def antigravity_stdin_line(prompt):
+    return json.dumps({"event": "user", "message": {"role": "user", "content": prompt}})
+
+
+# antigravity's reply, under `--output-format stream-json`, is the line whose
+# `event` is `result` — not plain text, and not the only line: the CLI writes
+# warnings to the same stream, interleaved and not JSON, so a reader that
+# assumes every line parses breaks on the first one (plan 0066 D2). Returns the
+# parsed `result` record, or None if the stream carries none.
+def read_antigravity_result(text):
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("event") == "result":
+            return rec
+    return None
+
+
+def check_settings_precondition(runner):
+    """Refuse `runner` before it is spawned if any file in its
+    `settings_must_not_grant` carries a `permissions.allow` entry or a `hooks`
+    block — the two ways an operator setting could widen a headless vendor run
+    (plan 0066 D4b). A missing or unreadable file grants nothing and passes.
+
+    Not called from any production spawn path today: there is no tester spawn
+    constructor yet (plan 0066 Boundaries — nothing dispatches a test lane).
+    This is the precondition itself, exercised directly by
+    tests/test_vendor_runners.py and by the plan's manual check, ready for
+    whichever spawn path calls it first."""
+    for rel in runner.settings_must_not_grant:
+        path = Path(rel).expanduser()
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        allow = (data.get("permissions") or {}).get("allow")
+        if allow:
+            raise Stop(f"{path} grants permissions.allow={allow!r} — refusing to "
+                       f"spawn {runner.name!r} headless with a setting that could "
+                       "widen it")
+        if "hooks" in data:
+            raise Stop(f"{path} carries a hooks block — refusing to spawn "
+                       f"{runner.name!r} headless with a setting that could "
+                       "widen it")
+    return True
+
+
+# A registry of RUNNERS, not a model name. Each entry declares the harness to
+# spawn, whether it is local, and which credential kind it requires. A runner
+# whose required kind the resolved credential does not provide is a hard stop,
+# never a fallback: an `api-sonnet` run served by `local_cli` silently spends the
+# operator's subscription while every event and cost report calls it metered.
+RUNNERS = {
+    "sub-sonnet": Runner("sub-sonnet", _CLAUDE + ("--model", "sonnet"),
+                         False, "local_cli", (), "", "claude"),
+    "sub-opus": Runner("sub-opus", _CLAUDE + ("--model", "opus"),
+                       False, "local_cli", (), "", "claude"),
+    # Pinned to the exact id, never an alias: `--model fable` would let the
+    # reviewer's model move without a decision. `claude-fable-5.1` and
+    # `claude-fable-51` are both rejected by the catalog — the id is
+    # `claude-fable-5-1`, as `MODEL` in ~/agent/dispatch-review.py (operator/talos)
+    # carries it. This is the runner the reviewer positions accept (plan 0065).
+    "sub-fable": Runner("sub-fable", _CLAUDE + ("--model", "claude-fable-5-1"),
+                        False, "local_cli", (), "", "fable"),
+    "api-sonnet": Runner("api-sonnet", _CLAUDE + ("--model", "sonnet"),
+                         False, "api_key", ("ANTHROPIC_API_KEY",), "", "claude"),
+    # Declared, and honestly not wired. The agent-bus worker takes a task file
+    # off the bus and polls; it is not a command this wrapper can hand a prompt
+    # on stdin. Naming a path that exists but cannot accept a prompt would be
+    # worse than naming none — the spawn would succeed and do something else —
+    # so `unwired` carries the reason and reaching this runner is a hard stop
+    # with its own message. It is the only runner a `zone: private` plan can
+    # resolve to, so that path fails loudly and legibly rather than silently.
+    "local-qwen": Runner("local-qwen", (), True, None, ("OLLAMA_HOST",),
+                         "the agent-bus worker harness consumes a task file from "
+                         "the bus, not a prompt on stdin — see plan 0010 §5",
+                         "qwen"),
+    # A test lane, not an implementer (plan 0066). `local=False`: both spend a
+    # cloud backend, so ADR-0006 §7's zone allowlist gates them exactly as it
+    # gates `sub-sonnet`. `needs="local_cli"`: like the Claude runners, they
+    # spend the operator's own login on this host (`~/.gemini/`, `~/.codex/`),
+    # never a token in the environment.
+    #
+    # argv is a PINNED LITERAL TUPLE, asserted by equality in
+    # tests/test_vendor_runners.py — not a prefix or a subset check — so no
+    # flag outside it can be present (D4b). The `<schema>` and `<out>` tokens
+    # are filled in by whatever spawns a tester, never by configuration; no
+    # such spawn path exists yet (see `unwired` below and the plan's
+    # Boundaries), so they stay literal placeholders here.
+    "sub-antigravity": Runner(
+        "sub-antigravity",
+        (ANTIGRAVITY_BIN, "--print=", "--input-format", "stream-json",
+         "--output-format", "stream-json", "--mode", "plan", "--sandbox",
+         "--json-schema", "<schema>"),
+        False, "local_cli", (), "", "google",
+        ("~/.gemini/antigravity-cli/settings.json",)),
+    # `unwired`, deliberately, and for a DIFFERENT reason than `local-qwen`'s:
+    # the harness can take a prompt on stdin, but `-s read-only` confines only
+    # writes (ADR-0006 §6) — reads are confined by the workspace, not the CLI,
+    # and this plan does not build that isolation. Reaching it is a hard stop
+    # with its own message, same as `local-qwen`.
+    "sub-codex": Runner(
+        "sub-codex",
+        (CODEX_BIN, "exec", "-s", "read-only", "--skip-git-repo-check",
+         "--ignore-user-config", "--output-schema", "<schema>", "-o", "<out>"),
+        False, "local_cli", (),
+        "codex exec -s read-only confines writes, not reads (ADR-0006 §6) — "
+        "isolation outside the CLI (a container, a VM, or a home holding only "
+        "the bundle) does not exist yet, so this runner cannot be spawned "
+        "blind. See plan 0066 Boundaries",
+        "openai"),
+}
+DEFAULT_RUNNER = "sub-sonnet"
+
+
+def resolved_implementer_env(repo, env=None):
+    """`env`, with `EUNOMIA_IMPL_RUNNER` filled in from `repo_model` when the
+    operator did not already set it (plan 0048 D6).
+
+    This is where `DEFAULT_RUNNER` stopped being the first choice for a real
+    dispatch: `main()` calls this before `route_implementer`, so by the time
+    that function reads `EUNOMIA_IMPL_RUNNER` it is either the operator's own
+    override or the name `bin/fleet-models`'s `repo_model` table resolved for
+    this repo — never a hardcoded constant. A repo with no row, and no
+    `'default'` row either, is a `Stop`: plan 0048 D3 is explicit that a
+    setting silently reverting to a code default is an unattended process
+    spending more than the operator set, and a model doing the same is the
+    same defect, just harder to notice.
+
+    Returns a NEW mapping; the caller's `env` (or `os.environ`) is never
+    mutated, so a route computed for one repo cannot leak into another."""
+    base = dict(os.environ if env is None else env)
+    if (base.get("EUNOMIA_IMPL_RUNNER") or "").strip():
+        return base
+    models = _load_sibling("fleet-models", "_fleet_models")
+    try:
+        name, _layer = models.resolve_repo(repo, "implementer")
+    except models.NotConfigured:
+        # repo_model has never been created on this install: nothing has
+        # adopted plan 0048 yet, so route_implementer's own DEFAULT_RUNNER
+        # fallback applies exactly as it always has. The first `fleet-models`
+        # write anywhere creates the table, and this branch stops being
+        # reachable from that point on.
+        return base
+    except models.UnknownRunner as e:
+        raise Stop(str(e))
+    if name is None:
+        raise Stop(f"no implementer runner configured for {repo!r} — repo_model "
+                   f"has no enabled row for it or for 'default' (run "
+                   f"`fleet-models set {repo} implementer <runner>`, or set the "
+                   "'default' row)")
+    base["EUNOMIA_IMPL_RUNNER"] = name
+    return base
+
+
+def route_implementer(fm, cred, env=None):
+    """Which runner carries this plan. Override first, zone rule LAST.
+
+    The order is the guarantee. `EUNOMIA_IMPL_RUNNER` is what makes a bakeoff arm
+    a one-liner, and it is **subject to** the zone check rather than a way past
+    it — so the check that can refuse comes last and a reader going top to bottom
+    cannot get the ordering wrong.
+
+    This function itself still falls back to `DEFAULT_RUNNER` when no override
+    is present in `env` — but `main()` never lets it reach that path: it calls
+    `resolved_implementer_env` first, which fills the override from
+    `repo_model` or raises `Stop`. The fallback here exists for a caller
+    (tests, a future direct invocation) that has no repo to resolve against.
+
+    The zone rule is stated as an ALLOWLIST, per ADR-0006 §7: `zone: public`
+    dispatches to a cloud backend; anything else — private, absent, malformed,
+    mis-cased — resolves to a local runner or nothing. The opposite polarity
+    (`if zone == "private": refuse`) sends a plan with no `zone:` line to a
+    vendor, and `fleet-watch` forwards the field without validating it.
+
+    The registry's `local` flag is the single local expression of that rule.
+    Nothing here asks oracle: oracle is a completion gateway with one request and
+    one reply and has no surface that names an agentic harness, so there is no
+    oracle answer to honour about which runner to spawn (this supersedes plan
+    0004 §3, and reverts the moment oracle gains a runner-aware route).
+
+    `tier:` is deliberately not consulted. It is the PROVENANCE risk tier and
+    drives review depth; oracle's identically-named cost tiers are a different
+    axis, and conflating them would route a high-risk plan by its cost band."""
+    env = os.environ if env is None else env
+    name = (env.get("EUNOMIA_IMPL_RUNNER") or "").strip() or DEFAULT_RUNNER
+    runner = RUNNERS.get(name)
+    if runner is None:
+        raise Stop(f"EUNOMIA_IMPL_RUNNER={name!r} names no runner "
+                   f"(known: {sorted(RUNNERS)})")
+    if runner.needs and runner.needs != cred.kind:
+        raise Stop(f"runner {name!r} needs a {runner.needs!r} credential and this "
+                   f"run resolved {cred.kind!r} (initiator {cred.initiator!r}) — "
+                   "refusing to serve it from the wrong credential")
+    zone = (fm.get("zone") or env.get("EUNOMIA_PLAN_ZONE") or "").strip()
+    if not runner.local and zone != "public":
+        raise Stop(f"plan zone {zone!r} is not 'public' (ADR-0006 §7 is an "
+                   f"allowlist), and runner {name!r} is not local — refusing to "
+                   "send this plan's text to a cloud backend")
+    return runner
+
+
+# The child runs arbitrary shell, so this is an ALLOWLIST in the shape of
+# `bin/fleet-candidate:_candidate_env` — not `fleet-watch`'s denylist. The
+# reasoning is stated at bin/fleet-candidate:115 and applies here with the same
+# force: enumerating what to withhold from a child that can run anything is the
+# wrong way round, so anything not named below is simply absent.
+#
+# It matters most for FLEET_TOKEN_CMD. `fleet-watch:_child_env` pops it and its
+# docstring calls the hazard "latent rather than live" because nothing reads it
+# in a child yet — THIS PLAN IS THAT YET. On this fleet that variable names the
+# admin-token helper, and an admin token can PATCH a branch-protection rule,
+# push a `status: ready` plan and restore the rule: forging the ignition the
+# whole system exists to make unforgeable.
+#
+# And that hazard is NOT closed, so it is not described as closed. The allowlist
+# removes the VARIABLE, not the RECIPE: the admin helper is a fixed path taking
+# no arguments, runnable by any process running as the operator with HOME — which
+# this allowlist keeps — its name is written in docs/plan-dispatch.md inside the
+# very worktree the session is told to read, and the session can run arbitrary
+# commands. What would actually close it is the helper not being runnable on the
+# implementer host, or gated on something the session does not have. That is the
+# next plan's lane; it is named here so nobody inherits a control that reads as
+# finished.
+#
+# EUNOMIA_SESSION is deliberately NOT here. It would be required the day
+# `fleet-install-hooks` runs against the orchestrator's store — bin/fleet-prepush
+# refuses a push whose branch lease is held by a different session, and without
+# the variable the orchestrator's own lease would block the orchestrator's own
+# push. Two things change together on that day, and the second is that
+# FLEET_PUSH_OVERRIDE stays forbidden: it is the nearest fix a stuck session will
+# find, and it disables row 6 entirely.
+# SSH_AUTH_SOCK is here because WITHHOLDING IT WAS NOT A CONTROL, and its
+# absence broke the one thing the implementer exists to do.
+#
+# Measured 2026-09-10. pr-proxy 0002-ci-logs ran for 700 seconds, closed both
+# gaps in the plan, committed b4cfac4 — and could not push. Its own words:
+#
+#     ssh-add -l  ->  Could not open a connection to your authentication agent.
+#     git push    ->  operator@forge.example: Permission denied (publickey).
+#
+# The commit sat in the shared store until a human rescued it. Every autonomous
+# run would have ended the same way, so the fleet's output would have been
+# orphaned commits rather than pull requests.
+#
+# And the variable's absence bought nothing. A child holding only this allowlist
+# recovers the agent in one line, because the launchd socket directories are
+# enumerable by the owner:
+#
+#     $ ls -1 /var/run/com.apple.launchd.*/Listeners | head -1
+#     /var/run/com.apple.launchd.0r8RuJpHDF/Listeners
+#     $ SSH_AUTH_SOCK=... ssh-add -l
+#     256 SHA256:... opshost-automation-to-edgehost (ED25519)
+#     $ SSH_AUTH_SOCK=... git ls-remote ssh://git@forge.example:2222/...
+#     46cc74cf...  refs/heads/main
+#
+# That is the same argument the FLEET_TOKEN_CMD paragraph above makes and it
+# lands the same way: the allowlist removes the VARIABLE, not the ACCESS. What
+# it actually produced was an obstacle a determined child steps over and an
+# honest one trips on — last night's session globbed /private/tmp instead of
+# /var/run, guessed wrong, and stopped. Worst of both.
+#
+# SPEC principle 5 is what makes this the right call rather than a concession:
+# identity and enforcement assume sessions run our own tooling honestly, and the
+# ledger defends against races and forgetfulness rather than a malicious agent.
+# A control that only stops the honest case is inverted.
+#
+# What WOULD narrow this is a push identity scoped to the one repo and the one
+# branch — a per-dispatch deploy key, so the agent's other reach is not on the
+# table at all. That is a real change, not a variable, and it is not this one.
+_ENV_ALLOW = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ",
+              "USER", "LOGNAME", "SHELL", "TERM", "SSH_AUTH_SOCK")
+
+
+def implementer_env(runner, env=None):
+    """The child's whole environment: the allowlist, plus what the runner needs."""
+    src = os.environ if env is None else env
+    out = {k: src[k] for k in _ENV_ALLOW if k in src}
+    for k in runner.extra_env:
+        if k in src:
+            out[k] = src[k]
+    return out
+
+
+def harness_argv(runner):
+    """The argv to spawn, or a hard stop that says which kind of absent it is.
+
+    Two different faults, two different messages, neither a bare spawn OSError:
+    a runner declared-but-unwired (`local-qwen`) reads nothing like a runner
+    whose binary is missing from PATH, and an operator debugging at 3am needs to
+    know which one they have."""
+    if runner.unwired:
+        raise Stop(f"runner {runner.name!r} is declared but not wired: {runner.unwired}")
+    if not runner.argv:
+        raise Stop(f"runner {runner.name!r} declares no harness command")
+    exe = shutil.which(runner.argv[0], path=os.environ.get("PATH", os.defpath))
+    if not exe:
+        raise Stop(f"runner {runner.name!r} needs {runner.argv[0]!r}, which is not "
+                   "on PATH on this host — refusing to spawn")
+    return (exe,) + tuple(runner.argv[1:])
+
+
+# ------------------------------------------------------------------ the plan
+_FM = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+
+
+def read_plan(worktree: Path, plan_path: str):
+    """(front-matter dict, verbatim full text).
+
+    The full text is returned UNPARSED and UNTOUCHED because it is copied into
+    the implementer's prompt verbatim: plan 0004 makes that copy deterministic
+    precisely so the Boundaries section — the plan's most load-bearing content —
+    reaches the implementer without a model's summary in between."""
+    p = (worktree / plan_path).resolve()
+    # plan_path arrives from the watcher, which read it from the forge; resolve
+    # and confine anyway. A path that escapes the worktree would read a file
+    # from the operator's disk into a prompt.
+    if not str(p).startswith(str(worktree.resolve()) + os.sep):
+        raise ValueError(f"{plan_path!r} escapes the worktree")
+    text = p.read_text()
+    fm = {}
+    m = _FM.match(text)
+    if m:
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                fm[k.strip()] = v.strip()
+    return fm, text
+
+
+PREAMBLE = BIN / "implementer-preamble.md"
+
+IMPLEMENTER_TEMPLATE = """\
+--- RUN FACTS ---
+repository:  {repo}
+worktree:    {worktree}
+branch:      {branch}
+plan file:   {plan_path}
+PR marker:   Plan: {plan_id}
+--- END RUN FACTS ---
+
+You are implementing one feature plan in {repo}.
+
+The plan below was merged to main by a human. That merge is the authorisation
+for this work and is the only authorisation you have: implement what the plan
+says, and nothing the plan does not say.
+
+Read its Boundaries section as binding. Each boundary carries its reasoning
+because the reasoning is what transfers to decisions the plan did not foresee.
+
+Open your work as a pull request whose body carries the line `Plan: {plan_id}`,
+and flip the plan file's `status:` to `done` in that same PR.
+
+--- BEGIN PLAN ({plan_path}) ---
+{plan_text}
+--- END PLAN ---
+"""
+
+
+def read_preamble(path=None):
+    """The environment briefing, read from a FILE and never built as a string.
+
+    It is the operator's only window into what a headless session was told, and
+    a file changes visibly in review where a formatted string does not — the
+    same reasoning that will put the reviewer contract in `bin/reviewer-
+    contract.md` when 0004's part 2b lands.
+
+    A missing preamble is a hard stop, not an empty string. A run that quietly
+    proceeded without the briefing would spawn a session that had been told
+    nothing about its worktree, its token, or what it must not touch, and would
+    look identical in every event and every log to a run that had."""
+    path = Path(path) if path else PREAMBLE
+    try:
+        return path.read_text()
+    except OSError as e:
+        raise Stop(f"implementer preamble {path} unreadable "
+                   f"({e.__class__.__name__}) — refusing to brief a session with "
+                   "nothing")
+
+
+def build_implementer_prompt(repo, plan_id, plan_path, plan_text, worktree,
+                             branch, preamble_path=None):
+    """Preamble verbatim, then fixed template, then the plan verbatim.
+
+    Every byte of both files reaches the session unaltered: the plan is not
+    summarised, trimmed, or template-substituted, because the Boundaries section
+    arriving intact is this system's most load-bearing guarantee and a model
+    asked to 'include the plan' is not one. Length is not a reason to change
+    this. The per-run values live in the template's RUN FACTS block precisely so
+    the preamble can stay byte-for-byte identical across runs and be diffed."""
+    return read_preamble(preamble_path) + "\n" + IMPLEMENTER_TEMPLATE.format(
+        repo=repo, plan_id=plan_id, plan_path=plan_path, plan_text=plan_text,
+        worktree=worktree, branch=branch)
+
+
+# ---------------------------------------------------------------- the branch
+def lease_branch(lease_id):
+    """The branch name, LEARNED from the lease record — never recomputed.
+
+    `fleetlib.add_worktree` checks out `--detach` at origin/main, so the lease's
+    branch does not exist in the tree yet and this wrapper creates it. It reads
+    the name out of the lease rather than re-deriving `slug_of(plan_id)`: a
+    second copy of the slug rule drifts, and the drift lands as a push the
+    pre-push hook refuses (or, worse, does not) on a branch the lease does not
+    cover."""
+    rec = lib.read_lease(lease_id)
+    if not rec:
+        raise Stop(f"lease {lease_id} has no record — cannot learn the branch name")
+    res = lib.resource_of(rec)
+    if res.get("type") != "branch" or not res.get("branch"):
+        raise Stop(f"lease {lease_id} is a {res.get('type')!r} lease, not a branch "
+                   "lease — nothing to check out")
+    return res["branch"]
+
+
+def attach_branch(worktree, branch):
+    """Put a RESUMED worktree on the existing branch, tracking origin.
+
+    `add_worktree` attaches detached. A fix round has to commit and push to the
+    branch the PR is open on, so the tree must be ON it — `-B` so a stale local
+    ref from an earlier run is reset to origin rather than silently reused."""
+    r = subprocess.run(["git", "checkout", "-B", branch, f"origin/{branch}"],
+                       cwd=str(worktree), capture_output=True, text=True,
+                       timeout=120)
+    if r.returncode != 0:
+        raise Stop(f"could not attach to {branch}: {r.stderr.strip()[:200]}")
+    return branch
+
+
+def create_branch(worktree, branch, log=None):
+    """`git checkout -b` in the detached worktree. Never pushes.
+
+    The push is the session's to make, with the implbot token it fetches
+    itself; this wrapper holds no forge write path at all beyond reading
+    (fleetlib makes the same guarantee for every workspace caller, ADR-0002).
+
+    A SECOND RUN OF THE SAME PLAN could not create its branch (review 2369 M2).
+    The ref lives in the shared store and survives `remove_worktree`, so a
+    respawn got `fatal: a branch named 'feat/x' already exists`, exit 128, and
+    every retry after it failed the same way — forever. Measured again
+    2026-09-10: speakhush 0001 failed once on PATH, and the leftover ref then
+    refused every subsequent dispatch.
+
+    The fix is not `-B`. It is asking what an existing branch MEANS, because the
+    three answers are genuinely different:
+
+      on origin      REFUSE. Its work may be the marked PR that retires this
+                     plan, and -B would reset over it.
+      local only     Delete it with `-d` and carry on — but ONLY if git agrees
+                     it is fully merged into HEAD (always origin/main here).
+      undeletable    REFUSE. Either it carries unpushed commits or a worktree
+                     holds it, and both are evidence.
+
+    WHY `-d` AND NOT `-D` (review 2530 HIGH). The first cut used `-D` on the
+    reasoning that a local-only branch is "an unreachable leftover; nothing
+    points at it". That is false in the case this very file documents: on
+    2026-09-10 pr-proxy 0002-ci-logs committed b4cfac4 and could not push, and
+    the commit sat in the shared store reachable only through its branch. A run
+    that commits and then dies on a controlled path — the 90-minute timeout, a
+    push the pre-push hook rejects, the forge down at push time — leaves exactly
+    that shape, and `main`'s `finally` removes the worktree while the ref
+    survives. `-D` would delete the branch AND its reflog, leaving the commit
+    reachable from nothing and findable only via `git fsck --lost-found` until
+    gc. Silently: this function has no failure channel of its own.
+
+    Measured on git 2.50.1 in a store built the way `add_worktree` builds one
+    (bare origin, `clone --no-checkout`, `worktree add --detach origin/main`):
+
+        branch with no commits     `-d` -> rc 0, "Deleted branch feat/empty"
+        branch with one commit     `-d` -> rc 1, "not fully merged"
+                                   `-D` -> rc 0, and the commit is then
+                                           reachable from no ref at all
+
+    So `-d` clears precisely the case the recovery exists for (speakhush 0001:
+    branch created, session died on PATH, no commits) and refuses precisely the
+    case that loses work."""
+    # Asked as a ref question, not by matching git's stderr (review 2530 LOW).
+    # `fatal: a branch named '%s' already exists` is localised, and the
+    # orchestrator inherits LANG from the watcher — so on a non-English host the
+    # recovery branch was never taken and the respawn regressed to the
+    # fails-forever behaviour this function exists to fix.
+    exists = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=str(worktree), capture_output=True, text=True, timeout=60)
+    if exists.returncode != 0:
+        r = subprocess.run(["git", "checkout", "-b", branch], cwd=str(worktree),
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise Stop(f"could not create branch {branch}: "
+                       f"{r.stderr.strip()[:200]}")
+        return branch
+
+    on_origin = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+        cwd=str(worktree), capture_output=True, text=True, timeout=60)
+    if on_origin.returncode == 0:
+        raise Stop(
+            f"branch {branch} already exists ON ORIGIN — refusing to reset it. "
+            "Its commits may be the marked pull request that retires this plan; "
+            "resume the run instead of starting a second one over the top")
+
+    gone = subprocess.run(["git", "branch", "-d", branch], cwd=str(worktree),
+                          capture_output=True, text=True, timeout=60)
+    if gone.returncode != 0:
+        err = (gone.stderr or "").strip()
+        # The two refusals are different problems with different remedies, and
+        # the first cut named only the worktree one (review 2530 LOW) — so an
+        # operator holding unpushed commits was told to go look at a tree that
+        # may not exist.
+        if "not fully merged" in err or "not fully merged" in (gone.stdout or ""):
+            why = ("it carries commits that were never pushed — work from an "
+                   "earlier run of this plan. `--resume` will NOT find them: it "
+                   "checks out origin/<branch>, and they are not on origin. "
+                   "Recover or discard them by hand before dispatching again")
+        else:
+            why = ("a worktree is holding it. If that tree is still on disk it "
+                   "is the evidence of how the earlier run died; if its "
+                   "directory is already gone, `git worktree prune` in the "
+                   "store clears the claim")
+        raise Stop(f"branch {branch} exists locally and would not delete "
+                   f"({err[:120]}) — {why}. Refusing rather than destroying it")
+
+    # Noted, because a ref disappearing with no record is how a later reader
+    # loses the thread. `-d` succeeding means git agreed it held nothing.
+    if log is not None:
+        log.note("branch-cleared", branch=branch,
+                 detail=(gone.stdout or "").strip()[:80] or "-")
+
+    again = subprocess.run(["git", "checkout", "-b", branch], cwd=str(worktree),
+                           capture_output=True, text=True, timeout=120)
+    if again.returncode != 0:
+        raise Stop(f"could not create branch {branch} after clearing a dead "
+                   f"local ref: {again.stderr.strip()[:200]}")
+    return branch
+
+
+# --------------------------------------------------------------- the session
+Session = collections.namedtuple(
+    "Session", "exit_code timed_out transcript shapes seconds reads backend_error",
+    defaults=(None,))
+
+BACKEND_MESSAGE_CHARS = 120
+
+
+def read_backend_error(text):
+    """`{status, message}` from the LAST `result` record in a stream-json
+    transcript that ended on a model-backend error, else None (plan 0079 D1).
+
+    Read from the in-memory `text` before it is written, never by reopening the
+    transcript: mopsus classifies `failure_reason` only, so the evidence has to
+    ride in the reason, and only in a redacted, bounded form. The message is
+    redacted BEFORE it is cut, so a token cannot be split by the cut into a
+    shape the patterns no longer match. A stream with no such record (another
+    harness, a plain-text one) yields None and the caller's behaviour is
+    unchanged."""
+    last = None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("type") == "result":
+            last = rec
+    if not last or not last.get("is_error") or last.get("api_error_status") is None:
+        return None
+    msg = last.get("result")
+    msg = redact_transcript(msg if isinstance(msg, str) else "")[0]
+    msg = " ".join(msg.split())[:BACKEND_MESSAGE_CHARS]
+    return {"status": last["api_error_status"], "message": msg}
+
+
+def work_began(repo, branch, worktree):
+    """Whether the lane's branch has any commit beyond the base it was cut from,
+    locally or on the forge. False ONLY when both were checked and both are
+    empty; a check that fails is "could not tell", and that counts as work
+    (plan 0079 D2) — requeuing a session that pushed is the one thing
+    ADR-0012 §1 forbids."""
+    try:
+        r = subprocess.run(
+            ["git", "rev-list", "--count", f"origin/main..{branch}"],
+            cwd=str(worktree), capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 or not r.stdout.strip().isdigit():
+            return True
+        if int(r.stdout.strip()) > 0:
+            return True
+        tip = subprocess.run(["git", "rev-parse", "--verify", f"{branch}^{{commit}}"],
+                             cwd=str(worktree), capture_output=True, text=True,
+                             timeout=60)
+        base = tip.stdout.strip()
+        if tip.returncode != 0 or not base:
+            return True
+        _mod, forge = _forge()
+        st, body = forge.get_branch(repo, branch)
+        if st == 404:
+            return False
+        commit = (body or {}).get("commit") if isinstance(body, dict) else None
+        head = commit.get("id") if isinstance(commit, dict) else None
+        if st != 200 or not head:
+            return True
+        return head != base
+    except Exception:
+        return True
+
+
+_RESOLVED_IMPL_TIMEOUT = None   # (minutes, source), resolved ONCE per run
+
+
+def implementer_timeout_minutes(repo=None):
+    """This run's wall-clock minutes, resolved ONCE and cached module-wide.
+
+    The first call wins. In production that is main()'s, with the real repo,
+    made before the first session is spawned — every later call, including the
+    three that quote it in a comment, returns that SAME value even if
+    config/impl-bounds.conf is edited mid-run (plan 0042 §2/§4). Malformed or
+    missing is a Stop, never a quiet 90 — see impl_bound()."""
+    global _RESOLVED_IMPL_TIMEOUT
+    if _RESOLVED_IMPL_TIMEOUT is None:
+        _RESOLVED_IMPL_TIMEOUT = impl_bound(repo)
+    return _RESOLVED_IMPL_TIMEOUT[0]
+
+
+def implementer_timeout_source():
+    """'repo-entry' / 'conf-default', for the run that resolved a bound."""
+    return _RESOLVED_IMPL_TIMEOUT[1] if _RESOLVED_IMPL_TIMEOUT else None
+
+
+def _self_peak_kb():
+    """This process's own peak RSS in KILOBYTES, platform normalised.
+
+    `ru_maxrss` is BYTES on Darwin and KILOBYTES on Linux. Getting that wrong is
+    a silent 1024x error in whichever direction, and this fleet runs both — the
+    orchestrator on opshost and the suite on the cihost-linux CI label."""
+    kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return kb // 1024 if sys.platform == "darwin" else kb
+
+
+class _PeakRSS(threading.Thread):
+    """Peak resident memory of the implementer's whole process GROUP.
+
+    WHY THE GROUP, not the child. `claude -p` has grandchildren — that is not a
+    guess, it is why `_kill_group` exists below, after one of them opened a
+    marked PR seconds behind a wrapper that had already declared failure. The
+    memory question is about that whole tree, and the process that happens to
+    lead it is not the only thing resident.
+
+    `start_new_session=True` on the Popen makes the child a process-group
+    LEADER, so its pid IS the pgid. No `os.getpgid` call, and no window where
+    the group does not exist yet.
+
+    WHY SAMPLED, and what that costs. `os.wait4`'s `ru_maxrss` would be exact,
+    but reading it means replacing `proc.wait()` in the timeout/kill-group path
+    — code carrying scar tissue from precisely the grandchild case above. A
+    measurement is not worth destabilising that. So this samples, and the number
+    is therefore a FLOOR on the true peak: a spike falling entirely between two
+    samples is invisible. It is reported as `peak_rss_mb`, never `max_rss_mb`,
+    for that reason. Do not quote it as an exact maximum.
+
+    Never raises into the caller. `ps` failing, the group exiting mid-read, a
+    row that is not an integer — all of it means "no sample", because a resource
+    number must not be able to fail a plan that otherwise worked.
+    """
+
+    def __init__(self, pgid, interval=2.0):
+        super().__init__(daemon=True)
+        self.pgid = pgid
+        self.interval = interval
+        self.peak_kb = 0
+        self.samples = 0
+        self._stop = threading.Event()
+
+    def _sample(self):
+        try:
+            r = subprocess.run(["ps", "-o", "rss=", "-g", str(self.pgid)],
+                               capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return
+        total = 0
+        for field in (r.stdout or "").split():
+            try:
+                total += int(field)
+            except ValueError:
+                continue           # a header or a torn read, not a failure
+        if total:
+            self.samples += 1
+            self.peak_kb = max(self.peak_kb, total)
+
+    def run(self):
+        # Sample once immediately: a session that dies in under `interval`
+        # seconds should still produce a number rather than a silent zero.
+        self._sample()
+        while not self._stop.wait(self.interval):
+            self._sample()
+
+    def stop(self):
+        self._stop.set()
+        # One last look before the group is reaped. On a fast exit this is
+        # often the only sample that saw anything at all.
+        self._sample()
+
+    @property
+    def peak_mb(self):
+        """MB, or None when nothing was sampled — which is NOT zero.
+
+        Zero reads as "it used no memory"; None reads as "not measured". The two
+        have to stay distinguishable, or the first person to chart this charts a
+        floor of zeros as real data."""
+        return round(self.peak_kb / 1024) if self.samples else None
+
+
+def _kill_group(proc):
+    """SIGTERM then SIGKILL to the process GROUP, not the child.
+
+    `subprocess.run(timeout=)` kills the direct child, and `claude -p` has
+    grandchildren. A grandchild surviving the timeout can open the marked PR
+    AFTER the wrapper has declared failure — and the plan then dedupes as done
+    on a PR nothing verified, forever, with an orphaned lease. That is why the
+    session is spawned with `start_new_session=True` and why this signals the
+    group id."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        return
+    # REFUSE to signal our own group (2369 L1). The child is spawned with
+    # start_new_session=True so its pgid is its own pid — but if that had not
+    # taken effect, its group would be OURS, and the SIGKILL below would take
+    # down the orchestrator mid-run. That was survivable while this ran only on
+    # timeout; it runs on every exit now, so it would be every run.
+    if pgid == os.getpgrp():
+        warn(f"refusing to signal process group {pgid}: it is this "
+             "orchestrator's own — start_new_session did not take effect")
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    # SIGKILL the GROUP unconditionally, even when the direct child has already
+    # exited. The child exiting says nothing about a grandchild that trapped
+    # SIGTERM and kept running, and the grandchild is the process that can still
+    # open the marked PR after this wrapper has declared failure. An earlier
+    # version returned as soon as the child was reaped and left exactly that
+    # process alive; ProcessLookupError here simply means the group is gone.
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_implementer(worktree, prompt, cred, route, lease_id, log=None, tag=None):
+    """Spawn the routed session on the built prompt, and always write a
+    transcript.
+
+    Shape, and why each part of it is load-bearing:
+
+    * the prompt goes in on **stdin**, verbatim, never in argv — argv is
+      world-readable in `ps`, and this prompt contains the whole plan;
+    * the child gets `implementer_env(route)` and nothing else;
+    * `start_new_session=True` puts it in its own process group, so a timeout
+      can kill the grandchildren `claude -p` spawns;
+    * output is read by a thread into a list of chunks and **joined before
+      redaction** — see `redact_transcript`;
+    * the transcript is written whatever happened, including on timeout, because
+      the run that went wrong is the one worth reading.
+
+    Returns a Session. It deliberately does NOT decide success: a zero exit
+    proves nothing here, and `verify_marked_pr` is the guarantee."""
+    argv = harness_argv(route)
+    env = implementer_env(route)
+    mins = implementer_timeout_minutes()
+    if log:
+        log.note("implementer-start", runner=route.name, credential=cred.kind,
+                 timeout_min=mins, timeout_source=implementer_timeout_source(),
+                 cwd=worktree)
+    started = time.time()
+    proc = subprocess.Popen(argv, cwd=str(worktree), env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    # start_new_session=True above makes proc.pid the group leader's pid, hence
+    # the pgid. See _PeakRSS on why the group rather than the child.
+    peak = _PeakRSS(proc.pid)
+    peak.start()
+    chunks = []
+
+    def _drain():
+        # read1, not read: `read(n)` on a BufferedReader blocks until it has n
+        # bytes or EOF, which would hide the very case redact_transcript exists
+        # for. read1 hands back whatever the pipe has, so a credential really can
+        # arrive split across two reads — and the suite pins that it does
+        # (Session.reads), because a control tested only against input it never
+        # sees is not tested.
+        try:
+            for chunk in iter(lambda: proc.stdout.read1(65536), b""):
+                chunks.append(chunk)
+        except (OSError, ValueError):
+            pass
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    try:
+        proc.stdin.write(prompt.encode("utf-8"))
+        proc.stdin.close()
+    except (OSError, ValueError):
+        # a harness that died before reading its prompt: the wait below reports
+        # the exit code, and the transcript carries whatever it managed to say
+        pass
+    timed_out = False
+    try:
+        rc = proc.wait(timeout=mins * 60)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_group(proc)
+        rc = proc.returncode if proc.returncode is not None else -signal.SIGKILL
+    else:
+        # Reap the group on a NORMAL exit too (2369 L1). A session that detaches
+        # a child and exits 0 leaves that child able to push AFTER the verdict is
+        # read — the same race _kill_group's own docstring describes for the
+        # timeout path, arriving through the door nobody was watching. The
+        # timeout branch above already ran it, hence `else`.
+        _kill_group(proc)
+    peak.stop()
+    reader.join(timeout=30)
+    text = b"".join(chunks).decode("utf-8", "replace")
+    path, shapes = write_transcript(lease_id, text, tag)
+    seconds = int(time.time() - started)
+    # RUSAGE_SELF is the wrapper's OWN high-water mark, and it IS exact — unlike
+    # the sampled group figure. Reported separately rather than summed: adding an
+    # exact number to a floor yields a number that is neither.
+    self_mb = round(_self_peak_kb() / 1024)
+    if log:
+        log.note("implementer-exit", rc=rc, timed_out=timed_out, seconds=seconds,
+                 transcript=path, shapes=",".join(shapes) or "-",
+                 peak_rss_mb=("-" if peak.peak_mb is None else peak.peak_mb),
+                 rss_samples=peak.samples, orch_rss_mb=self_mb)
+    if shapes:
+        warn(f"transcript {path} carried credential shapes {sorted(shapes)} — "
+             "redacted on write")
+    return Session(rc, timed_out, path, shapes, seconds, len(chunks),
+                   read_backend_error(text))
+
+
+# ---------------------------------------------------------- the verification
+def _forgejo_base_url():
+    return os.environ.get("FLEET_FORGEJO_URL", "http://forge.example:3000").rstrip("/")
+
+
+class TokenError(Exception):
+    """A resolver miss, named by role and configuration key.
+
+    Never built from the helper's stdout or stderr (plan 0055 boundary): that
+    text can quote the token itself — `fleetforge.Forge._request` discards the
+    text of every exception it catches for the same reason, since the standard
+    library's HTTP client raises with the token embedded in the header it
+    failed to send."""
+
+
+# fleet-watch/fleet-orphans/fleet-candidate resolve their one credential from
+# FLEET_TOKEN_CMD, a read-only position: whatever that command mints is free
+# to be reconfigured per deployment because nothing downstream of it can act
+# as an account, only read as one. "authoring" is a different position — this
+# wrapper posts comments and edits pull request bodies with what this
+# resolves, and is graded on the review that identity receives — so it gets
+# its own configuration key rather than sharing the reading one. Configuring
+# only the reading key must never silently supply this one, or a deployment
+# that only meant to change what fleet-watch reads with would change who the
+# orchestrator writes as.
+_TOKEN_ROLES = {
+    "authoring": ("FLEET_AUTHOR_TOKEN_CMD", "~/bin/fetch-forgejo-token.sh"),
+}
+
+
+def token_for(role):
+    """The Forgejo token for `role`, via a command configurable per role.
+
+    Both the env var and the default live in `_TOKEN_ROLES`, not inlined at a
+    `subprocess.run` call site — that inlining was plan 0055's finding: this
+    file and fleet-reviews were the two places on the fleet still hardcoding
+    the helper's path, so a deployment whose secrets come from somewhere else
+    had to edit code rather than configuration."""
+    try:
+        env_key, default = _TOKEN_ROLES[role]
+    except KeyError:
+        raise TokenError(f"token_for(role={role!r}): no such role")
+    cmd = os.environ.get(env_key, "").strip() or os.path.expanduser(default)
+    try:
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise TokenError(f"token_for(role={role!r}) via {env_key}: helper "
+                         f"did not run ({e.__class__.__name__})")
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not lines:
+        raise TokenError(f"token_for(role={role!r}) via {env_key}: helper "
+                         "produced no token")
+    return lines[-1]
+
+
+def _implbot_token():
+    """The identity this wrapper authors as — every forge call in this file,
+    read or write, goes through it. Kept as its own name, wrapping
+    token_for("authoring"), so a caller never has to spell the role out."""
+    try:
+        return token_for("authoring")
+    except TokenError as e:
+        raise Stop(f"{e} — the forge action cannot proceed")
+
+
+def forge_timeout(env=None):
+    """Seconds to allow one forge request. MEASURED, not guessed.
+
+    `fleetforge.Forge` defaults to 20s, and that is below what this fleet's own
+    listing costs. On 2026-09-09, `pulls?state=all&limit=50` against
+    operator/eunomia took **22.6s** for a single page — Forgejo does roughly
+    0.45s of work per pull request on that endpoint and the repo has 247 of
+    them. Measured side by side, curl and urllib agreed: 23.7s and 22.7s.
+
+    So the read did not blip. It failed EVERY time, deterministically, by
+    sitting a couple of seconds over the client's patience — which is why the
+    retry added in #246 could not rescue it: all five attempts hit the same
+    wall. Two complete dispatches were discarded this way (eunomia #245,
+    speakhush #161), and both were misdiagnosed as transient.
+
+    60s is ~3x the measured cost. It is not a fix for the cost itself: a full
+    scan is still ~22s per page, so verification can take minutes on a large
+    repo. Making the lookup cheaper — the PR being sought is the newest one, so
+    a sorted first page would usually answer without paging at all — is a
+    separate change and is noted in docs/forge.md."""
+    env = os.environ if env is None else env
+    raw = (env.get("FLEET_FORGE_TIMEOUT") or "").strip()
+    if not raw:
+        return 60
+    try:
+        n = int(raw)
+    except ValueError:
+        raise Stop(f"FLEET_FORGE_TIMEOUT={raw!r} is not an integer")
+    if n < 1:
+        raise Stop(f"FLEET_FORGE_TIMEOUT={n} — a forge read needs some patience")
+    return n
+
+
+def _forge():
+    mod = _load_sibling("fleetforge.py", "_fleetforge")
+    return mod, mod.Forge(_forgejo_base_url(), _implbot_token(),
+                          timeout=forge_timeout())
+
+
+def implementer_accounts():
+    """uids UNION logins, with the author role's own account always in the
+    login set.
+
+    The union is `fleet-watch`'s rule and is repeated for its reason, not its
+    shape: giving uids precedence meant an operator adding a second
+    implementer's uid — and forgetting the author account's own login — made
+    every login-authored marked PR invisible. `lib.agent_roles()["author"]`
+    guarantees that membership at construction (plan 0056's `lib._role`), not
+    by this caller remembering to union it in."""
+    uids = {x.strip() for x in os.environ.get("FLEET_IMPLEMENTER_UIDS", "").split(",")
+            if x.strip()}
+    return uids, lib.agent_roles()["author"].logins
+
+
+def _plan_status_at(mod, forge, repo, plan_path, ref):
+    """The plan file's `status:` on a ref, or None when it cannot be read.
+
+    Read through the contents API rather than diffed: `status: done` at the PR's
+    head IS the flip, because the watcher only ever dispatches a plan that was
+    `ready` on main. None means unreadable, which the caller must not treat as
+    'not done'."""
+    st, body = forge.get_contents(repo, plan_path, ref=ref)
+    if st != 200 or not isinstance(body, dict):
+        return None
+    raw = body.get("content") or ""
+    try:
+        text = base64.b64decode(raw).decode("utf-8", "replace")
+    except (ValueError, TypeError):
+        return None
+    m = _FM.match(text)
+    if not m:
+        return None
+    for line in m.group(1).splitlines():
+        if line.split(":", 1)[0].strip() == "status" and ":" in line:
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+# Five attempts across ten minutes, doubling. The sleeps sum to exactly 600s,
+# so the last read happens ten minutes after the first — long enough to outlive
+# a forge restart, a network blip, or a reboot of the box serving it.
+READ_ATTEMPTS = 5
+READ_BACKOFF = (40, 80, 160, 320)
+
+
+# Patched by the test wiring so the suite exercises the real retry policy
+# without spending ten minutes per failing-read case. Production never rebinds
+# it; a test that forgets to is a test that hangs, which is loud enough.
+_sleep = time.sleep
+
+
+def read_pulls(mod, forge, repo, log=None, sleep=None):
+    """Every pull request on `repo`, retried. Returns (pulls, None) or
+    (None, outcome).
+
+    A transient read must not discard a run. On 2026-09-09 the first real
+    dispatch produced a complete, correct PR — 654 lines of implementation, 32
+    tests, the marker present and the plan flipped — and this listing failed
+    ONCE, 39 seconds later. The wrapper reported "could not read pull requests"
+    and stopped, throwing away 34 minutes of model time over one HTTP blip. The
+    same read succeeded on every attempt minutes afterwards.
+
+    The rule that unreadable is never 'no' was right and is unchanged. What was
+    wrong was treating unreadable as terminal on the first try, at the exact
+    moment the run had the most to lose.
+
+    `sleep` is injectable so the tests exercise the real backoff without
+    spending ten minutes doing it."""
+    sleep = sleep or _sleep
+    outcome = None
+    for attempt in range(READ_ATTEMPTS):
+        pulls, pages = [], mod.paged(forge.list_pulls, repo, state="all", cap=20)
+        for page in pages:
+            pulls.extend(page)
+        if pages.outcome == mod.EXHAUSTED:
+            if attempt and log is not None:
+                log.note("pulls-read-recovered", attempt=attempt + 1)
+            return pulls, None
+        outcome = pages.outcome
+        if attempt < len(READ_BACKOFF):
+            if log is not None:
+                log.note("pulls-read-retry", attempt=attempt + 1,
+                         outcome=outcome, sleep=READ_BACKOFF[attempt])
+            warn(f"could not read {repo} pull requests ({outcome}) — "
+                 f"attempt {attempt + 1}/{READ_ATTEMPTS}, retrying in "
+                 f"{READ_BACKOFF[attempt]}s")
+            sleep(READ_BACKOFF[attempt])
+    return None, outcome
+
+
+def stamp_marker(mod, forge, repo, num, body, marker, log=None):
+    """Append `marker` to PR `num`'s body. (ok, detail).
+
+    ONLY called once the PR has been proven to be this run's own — implementer
+    author, head is this lease's branch, base is main. Those three checks run
+    BEFORE this in verify_marked_pr and are the licence for writing to it; a
+    stamp that ran earlier would be editing a pull request on the strength of a
+    branch name.
+
+    WHY THE ORCHESTRATOR AND NOT THE PROMPT. The preamble asks for the marker
+    twice, and models produce it wrong. Measured: pr-proxy #42 and #79 carry the
+    plan as a PATH (`Plan: plans/0001-merge-queue.md`) so the line-anchored
+    matcher never saw it and merged work stayed re-dispatchable; speakhush #162,
+    the fleet's first fully autonomous PR, carries no marker at all and its 301
+    lines of finished work were invisible to dedupe. Two failures, two different
+    shapes, from the same hope. The orchestrator knows the id and can write it.
+
+    This is the same move commit-identity already made and for the same stated
+    reason: a guarantee written as prompt text is a hope.
+
+    APPENDS. The body is the implementer's report and a reader's first account of
+    the change; replacing it to satisfy a matcher would destroy the more valuable
+    thing to fix the cheaper one.
+
+    Verifies by READING BACK. A 200 on the PATCH is not evidence the body
+    changed — the same reason forgejo-create-repo re-reads its protection rule."""
+    new = (body.rstrip() + "\n\n" + marker + "\n") if body.strip() else marker + "\n"
+    st, _ = forge.edit_pull_body(repo, num, new)
+    if st is None or not (200 <= int(st) < 300):
+        return False, f"edit returned {st}"
+    st2, fresh = forge.get_pull(repo, num)
+    if st2 is None or not isinstance(fresh, dict):
+        return False, f"stamped, but the read-back returned {st2}"
+    if marker not in (fresh.get("body") or ""):
+        return False, "the edit reported success and the body does not carry it"
+    if log is not None:
+        log.note("marker-stamped", pr=num, marker=marker)
+    return True, "stamped"
+
+
+def verify_marked_pr(repo, branch, plan_id, plan_path, forge=None, mod=None,
+                     log=None):
+    """Five checks, from the forge, run whatever the session reported.
+
+    All five or the run stops: a PR exists, authored by an implementer account,
+    head is this lease's branch, base is `main`, its body carries
+    `Plan: <plan_id>`, and the plan file at its head says `status: done`.
+
+    Unreadable is never 'no'. A PR listing that fails or hits its page cap fails
+    the verification with that as the reason, rather than reporting 'no PR' — a
+    truncated read that reads as absence would let a run fail while its work
+    exists, and (once 0011 lands) comment on it as if nothing had happened.
+
+    Returns (ok, reason, pr_number)."""
+    if forge is None:
+        mod, forge = _forge()
+    marker = f"Plan: {plan_id}"
+    uids, logins = implementer_accounts()
+    pulls, outcome = read_pulls(mod, forge, repo)
+    if pulls is None:
+        return False, (f"could not read {repo} pull requests ({outcome}) after "
+                       f"{READ_ATTEMPTS} attempts over "
+                       f"{sum(READ_BACKOFF) // 60} minutes"), None
+    ours = [pr for pr in pulls
+            if ((pr.get("head") or {}).get("ref") or "") == branch]
+    if not ours:
+        return False, f"no pull request with head {branch}", None
+    marked = [pr for pr in ours if marker in (pr.get("body") or "")]
+    pr = (marked or ours)[0]
+    num = pr.get("number")
+    user = pr.get("user") or {}
+    if not (str(user.get("id")) in uids or (user.get("login") or "").lower() in logins):
+        return False, (f"#{num} on {branch} was opened by "
+                       f"{user.get('login') or '?'}, not an implementer account"), num
+    base = (pr.get("base") or {}).get("ref") or ""
+    if base != "main":
+        return False, f"#{num} targets {base!r}, not main", num
+    if not marked:
+        # Everything above has proven this PR is ours: implementer author, head
+        # is this lease's branch, base is main. So write the marker rather than
+        # abandoning finished work for the want of one line.
+        ok, why = stamp_marker(mod, forge, repo, num, pr.get("body") or "",
+                               marker, log)
+        if not ok:
+            return False, (f"#{num} carries no {marker!r} line and it could not "
+                           f"be added ({why}) — an unmarked PR leaves the plan "
+                           "re-dispatchable with its work in a branch nobody "
+                           "will look at"), num
+    head_sha = (pr.get("head") or {}).get("sha") or branch
+    status = _plan_status_at(mod, forge, repo, plan_path, head_sha)
+    if status is None:
+        return False, f"#{num}: {plan_path} unreadable at {str(head_sha)[:7]}", num
+    if status != "done":
+        return False, f"#{num}: {plan_path} still says status: {status}", num
+    return True, "", num
+
+
+# ------------------------------------------------------------- the review loop
+# Bounds live in a conf file, not here, because a tier-3 repo deserves more
+# rounds than a docs repo. The CEILING lives here because a config integer must
+# never be able to mean "spend until someone notices".
+REVIEW_BOUND_CEILING = 10
+DEFAULT_REVIEW_BOUND = 5
+REVIEW_BOUNDS = BIN.parent / "config" / "review-bounds.conf"
+REVIEWER_CONTRACT = BIN / "reviewer-contract.md"
+
+# Machine-readable anchors so a successor process can find its own prior rounds
+# in the thread. The ledger is posted to the PR rather than kept in a local file
+# for exactly that reason (plan 0011 §2).
+LEDGER_MARKER = "<!-- eunomia:review-ledger -->"
+DEFERRED_MARKER = "<!-- eunomia:deferred-findings -->"
+
+
+def review_bound(repo, path=None):
+    """Rounds allowed for this repo. Per-repo, clamped, never unlimited.
+
+    An unparseable line is a hard stop in the shape config/secret-patterns.conf
+    established: a bound that silently reverts to the default is an unattended
+    process spending more than the operator set. 0 is refused rather than read
+    as infinity — that conventional misreading is the one that costs money."""
+    path = Path(path) if path else REVIEW_BOUNDS
+    values = {}
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise Stop(f"review bounds {path} unreadable ({e.__class__.__name__}) — "
+                   "refusing to run an unbounded fix loop")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise Stop(f"unparseable line in {path}: {line!r} — expected "
+                       "'<owner/repo|default> = <int>'")
+        key, _, raw = line.partition("=")
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            raise Stop(f"non-integer bound in {path} for {key.strip()!r}: "
+                       f"{raw.strip()!r}")
+        if n < 1:
+            raise Stop(f"bound for {key.strip()!r} in {path} is {n}; there is no "
+                       "value meaning unlimited and 0 is not one")
+        values[key.strip()] = n
+    n = values.get(repo, values.get("default", DEFAULT_REVIEW_BOUND))
+    if n > REVIEW_BOUND_CEILING:
+        warn(f"review bound {n} for {repo} exceeds ceiling "
+             f"{REVIEW_BOUND_CEILING} — clamped")
+        return REVIEW_BOUND_CEILING
+    return n
+
+
+# ------------------------------------------------------ the implementer bound
+# Per repo, in the same shape as REVIEW_BOUNDS above, and committed like it. The
+# CEILING lives here for the same reason: a config integer must never be able
+# to mean "spend until someone notices" (plan 0042 §3).
+IMPL_BOUND_CEILING = 240
+IMPL_BOUNDS = BIN.parent / "config" / "impl-bounds.conf"
+
+
+def impl_bound(repo, path=None):
+    """(minutes, source) for this repo's implementer wall-clock bound.
+
+    Deliberately does NOT mirror review_bound all the way: there is no
+    DEFAULT_IMPL_BOUND constant to fall back on. A conf with no entry for
+    `repo` AND no `default` line is a Stop, not the built-in 90 — the default
+    has exactly one home, and it is the conf's `default` line (plan 0042 §3).
+    A conf whose `default` line was lost to a bad edit is the same
+    broken-checkout evidence a missing file is."""
+    path = Path(path) if path else IMPL_BOUNDS
+    values = {}
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise Stop(f"implementer bounds {path} unreadable ({e.__class__.__name__}) "
+                   "— refusing to run an unbounded implementer session")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise Stop(f"unparseable line in {path}: {line!r} — expected "
+                       "'<owner/repo|default> = <int>'")
+        key, _, raw = line.partition("=")
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            raise Stop(f"non-integer bound in {path} for {key.strip()!r}: "
+                       f"{raw.strip()!r}")
+        if n < 1:
+            raise Stop(f"bound for {key.strip()!r} in {path} is {n}; there is no "
+                       "value meaning unlimited and 0 is not one")
+        values[key.strip()] = n
+    if repo in values:
+        n, source = values[repo], "repo-entry"
+    elif "default" in values:
+        n, source = values["default"], "conf-default"
+    else:
+        raise Stop(f"{path} has no entry for {repo!r} and no 'default' line — "
+                   "refusing to guess an implementer bound")
+    if n > IMPL_BOUND_CEILING:
+        warn(f"implementer bound {n} for {repo} exceeds ceiling "
+             f"{IMPL_BOUND_CEILING} — clamped")
+        return IMPL_BOUND_CEILING, source
+    return n, source
+
+
+def read_reviewer_contract(repo, pr, sha, plan_path, path=None):
+    """The mandate, from a FILE, with exactly four substitutions.
+
+    Nothing this wrapper knows about the run may be added. The wrapper is graded
+    on approved, so a mandate it authors lets it steer the reviewer away from its
+    own weak spots without ever touching the reviewer's credentials."""
+    path = Path(path) if path else REVIEWER_CONTRACT
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise Stop(f"reviewer contract {path} unreadable "
+                   f"({e.__class__.__name__}) — refusing to dispatch a review "
+                   "with no mandate")
+    return (text.replace("{repo}", str(repo)).replace("{pr}", str(pr))
+                .replace("{sha}", str(sha)).replace("{plan_path}", str(plan_path)))
+
+
+def review_command():
+    """The review dispatcher, as a COMMAND seam.
+
+    The orchestrator never holds the reviewer's credential — it invokes a command
+    that posts as revbot and holds that token itself. That is coder ≠
+    reviewer at the credential level, and it is also why replacing the reviewer
+    is configuration rather than a rewrite."""
+    raw = os.environ.get("FLEET_REVIEW_CMD", "").strip()
+    if raw:
+        return shlex.split(raw)
+    return [sys.executable, os.path.expanduser("~/agent/dispatch-review.py")]
+
+
+# CI is a WAIT, not a failure. `dispatch-review` refuses a head whose checks are
+# still running — correctly, since reviewing a commit that may not compile wastes
+# a review. The loop treated that refusal as terminal, so on 2026-09-09 it pushed
+# a fix and asked for a review three seconds later, was refused, and gave up with
+# the work sitting unreviewed on #245.
+CI_POLL_SECS = 30
+CI_WAIT_SECS = 1800
+# `warning` is a RESOLVED combined state in Forgejo, not a pending one. Left
+# out, it was waited out for the full bound and then reported as unresolved.
+CI_RESOLVED = ("success", "failure", "error", "warning")
+# How many consecutive unreadable status reads to tolerate before giving up.
+CI_READ_ATTEMPTS = 5
+
+# The CI-fix briefing's own wait for a stored log (plan 0069 §3): one
+# fleet-collect sweep interval (120 s, launchd/org.eunomia.fleet-collect.plist)
+# plus its own 90 s budget (bin/fleet-ci's BUDGET_SECONDS) — a failure resolved
+# a moment ago may have no ci_task row at all until the next sweep. Polled, not
+# fetched: the orchestrator never dials Forgejo or a runner for this, and never
+# calls fleet-ci's sync() — it waits for the collector fleet-collect already
+# runs on its own cadence.
+CI_LOG_POLL_SECS = 15
+CI_LOG_POLL_BOUND = 210
+
+
+def ci_status(repo, sha, forge=None, mod=None):
+    """(state, failed_contexts, n_statuses). n_statuses is -1 when UNREADABLE.
+
+    The count carries readability, not the state string, because Forgejo
+    returns `state: ""` for a commit with no statuses — MEASURED on
+    operator/ladon, 2026-09-09. An earlier version collapsed that empty string to
+    None and read it as unreadable, so `review_loop` would have failed at round
+    one on every repo without CI. Its test missed it by serving `pending` with
+    an empty list, a shape the forge never produces (review 2441 HIGH).
+
+    None as the state now means only "readable, and Forgejo gave no verdict",
+    which -1 vs 0 tells apart."""
+    if forge is None:
+        mod, forge = _forge()
+    st, body = forge.get_commit_status(repo, sha)
+    if st != 200 or not isinstance(body, dict):
+        return None, [], -1
+    statuses = body.get("statuses") or []
+    state = (body.get("state") or "").lower() or None
+    failed = sorted({(s.get("context") or "?") for s in statuses
+                     if (s.get("status") or s.get("state") or "").lower()
+                     in ("failure", "error")})
+    return state, failed, len(statuses)
+
+
+def await_ci(repo, sha, forge=None, mod=None, log=None, sleep=None,
+             bound=None, poll=None):
+    """Block until CI on `sha` resolves. Returns (state, failed_contexts).
+
+    Returns the resolved state — `failure` included, which is a real answer and
+    the caller's problem. `None` means unreadable or never resolved.
+    """
+    if forge is None:
+        mod, forge = _forge()
+    sleep = sleep or _sleep
+    bound = CI_WAIT_SECS if bound is None else bound
+    poll = CI_POLL_SECS if poll is None else poll
+    waited, unreadable, empty_seen = 0, 0, 0
+    settled_n, settled_seen = None, 0
+    while True:
+        state, failed, n = ci_status(repo, sha, forge, mod)
+
+        if n < 0:
+            # Unreadable is never green — but it is also not instantly fatal.
+            # read_pulls in this same file retries a flaky forge read; ending
+            # the whole loop on one bad response while its sibling retries was
+            # an inconsistency, not a policy (review 2441).
+            unreadable += 1
+            if unreadable > CI_READ_ATTEMPTS or waited >= bound:
+                if log is not None:
+                    log.note("ci-unreadable", sha=str(sha)[:8],
+                             attempts=unreadable)
+                return None, []
+            sleep(poll)
+            waited += poll
+            continue
+        unreadable = 0
+
+        if n == 0:
+            # Nothing configured to run — green by absence. But NOT on sight:
+            # a commit pushed a second ago has no statuses yet either, and
+            # Forgejo creates the pending row shortly after. Confirming the
+            # emptiness one poll apart tells "no CI here" from "CI has not
+            # started", which the fix round then dispatches into (review 2441).
+            empty_seen += 1
+            if empty_seen >= 2 or waited >= bound:
+                if log is not None:
+                    log.note("ci-none", sha=str(sha)[:8], polls=empty_seen)
+                return "success", []
+            sleep(poll)
+            waited += poll
+            continue
+        empty_seen = 0
+
+        if state in CI_RESOLVED:
+            # RESOLVED is not SETTLED, and the difference costs a review round.
+            #
+            # Forgejo fires workflows off PATH filters, so the set of statuses a
+            # commit will eventually carry is not knowable in advance and does
+            # not arrive at once. `Plans / lint` runs only when the push diff
+            # touches plans/**, and on 2026-09-10 it reported FAILURE on
+            # eunomia#252 seconds after the four `CI /` contexts had gone green.
+            # A review was dispatched against that momentary green, and
+            # revbot APPROVED a pull request whose CI was red.
+            #
+            # This is the same distinction the empty case above already draws —
+            # "nothing configured" versus "nothing started yet" — applied to the
+            # case where something DID report. Requiring the status COUNT to
+            # hold still across two polls turns "nothing is red right now" into
+            # "nothing is red and nothing new is still arriving". A late red is
+            # then seen here, where it costs one poll, instead of by a reviewer,
+            # where it costs a round and a false approval.
+            #
+            # Deliberately the count and not the contexts: a workflow that
+            # re-reports the same context is not new information, and comparing
+            # sets would make a rerun look like an arrival forever.
+            if n == settled_n:
+                settled_seen += 1
+            else:
+                settled_n, settled_seen = n, 1
+            if settled_seen >= 2 or waited >= bound:
+                if waited and log is not None:
+                    log.note("ci-resolved", sha=str(sha)[:8], state=state,
+                             waited=waited, checks=n)
+                return state, failed
+            sleep(poll)
+            waited += poll
+            continue
+        if waited >= bound:
+            if log is not None:
+                log.note("ci-timeout", sha=str(sha)[:8], waited=waited,
+                         state=state)
+            return None, []
+        if log is not None and waited == 0:
+            log.note("ci-waiting", sha=str(sha)[:8], state=state)
+        sleep(poll)
+        waited += poll
+
+
+def dispatch_review(repo, pr, sha, plan_path, log=None, timeout=2400):
+    """Run one review. Returns (ok, detail); the VERDICT is never read from here.
+
+    `--no-followups` is not optional. The default command files a tracked issue
+    per review, and an orchestrator that runs unattended would mint one per round
+    per plan into a backlog nobody is draining.
+
+    `--post` is not optional either: without it the review runs, costs the same,
+    prints a complete verdict and publishes NOTHING, with no warning because
+    printing is the default. This function's return value deliberately cannot be
+    a verdict for that reason — the verdict is read back off the forge by
+    `verdict_at`, which is the only thing that proves the review exists."""
+    argv = review_command() + [repo, str(pr), "--post", "--no-followups"]
+    env = dict(os.environ)
+    # Passed so that a replacement command CAN honour the versioned mandate.
+    # The default command carries its own and ignores this; bin/reviewer-
+    # contract.md says so rather than implying otherwise.
+    env["FLEET_REVIEW_CONTRACT"] = str(REVIEWER_CONTRACT)
+    if log is not None:
+        log.note("review-dispatch", pr=pr, sha=str(sha)[:8], cmd=argv[-4:][0])
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return False, f"review command timed out after {timeout}s"
+    except OSError as e:
+        return False, f"review command would not run ({e.__class__.__name__})"
+    if r.returncode != 0:
+        tail = redact((r.stderr or r.stdout or "").strip())[0].splitlines()
+        return False, (tail[-1][:200] if tail else f"exit {r.returncode}")
+    return True, ""
+
+
+def verdict_at(repo, pr, sha, forge=None, mod=None):
+    """The review verdict bound to THIS head SHA, or None.
+
+    Bound by `commit_id`, not by recency. A fix round changes the head, and an
+    approval of the earlier tree satisfying the later one is precisely what
+    `dismiss_stale_approvals` prevents upstream — re-implementing the opposite
+    here would quietly undo it. `stale` and `dismissed` disqualify for the same
+    reason.
+
+    None means UNREADABLE, which no caller may treat as 'not approved': a forge
+    read that fails is not evidence about a review."""
+    if forge is None:
+        mod, forge = _forge()
+    reviews, pages = [], mod.paged(forge.list_reviews, repo, pr, cap=10)
+    for page in pages:
+        reviews.extend(page)
+    if pages.outcome != mod.EXHAUSTED:
+        return None
+    at_head = [r for r in reviews
+               if (r.get("commit_id") or "") == str(sha)
+               and not r.get("stale") and not r.get("dismissed")]
+    if not at_head:
+        return {}
+    at_head.sort(key=lambda r: r.get("id") or 0)
+    return at_head[-1]
+
+
+_FENCE = re.compile(r"```findings\s*\n(.*?)```", re.S)
+_SEV_LINE = re.compile(r"^\s*(HIGH|MEDIUM|LOW)\s*[:\-—]\s*(.+?)\s*$", re.M)
+_SEV_BOLD = re.compile(r"^\s*\*\*(HIGH|MEDIUM|LOW)\b[^*]*?[—:-]\s*(.+?)\*\*",
+                       re.M)
+
+
+def parse_findings(body):
+    """[(severity, text)] from a review body.
+
+    The fenced block is authoritative when present because it is what the fleet's
+    reviewers actually emit; the bold-heading form is the fallback the follow-up
+    filer also had to grow. A body with neither yields nothing, and nothing is
+    NOT the same as 'no findings' — the caller decides what an empty parse means,
+    and for a non-APPROVED verdict it must not mean 'nothing blocking'."""
+    body = body or ""
+    m = _FENCE.search(body)
+    scope = m.group(1) if m else body
+    out = [(s.upper(), t.strip()) for s, t in _SEV_LINE.findall(scope)]
+    if not out and not m:
+        out = [(s.upper(), t.strip()) for s, t in _SEV_BOLD.findall(body)]
+    return out
+
+
+def blocking_findings(body):
+    """Only HIGH blocks. The fleet rule the follow-up filer states on every issue
+    it opens: MEDIUM and LOW ship and are worked as follow-ups."""
+    return [t for s, t in parse_findings(body) if s == "HIGH"]
+
+
+def post_comment(repo, pr, body, forge=None, mod=None):
+    """Everything written to the thread passes redact() first.
+
+    The transcript class is where the 2026-08-28 PAT leak happened, and a review
+    body quoting a failing test's output is the same shape."""
+    if forge is None:
+        mod, forge = _forge()
+    clean, found = redact(body)
+    if found:
+        warn(f"redacted {sorted(found)} from a PR comment before posting")
+    st, _ = forge.create_issue_comment(repo, pr, clean)
+    return st in (200, 201)
+
+
+# ------------------------------------------------- a red build's stored log (0069)
+def poll_ci_log_entries(repo, sha, failed_contexts, log=None, sleep=None,
+                        poll=None, bound=None):
+    """For each failing status context, what fleet-collect has swept for it:
+    [(context, (task_id, log_state, payload) | None), ...], same order as
+    `failed_contexts`. `payload` is the excerpt text when log_state is
+    'stored', else `log_detail` (possibly None, for a row still 'pending').
+    `None` in place of the tuple means no `ci_task` row ever matched this
+    context — never confused with a row that matched but never resolved.
+
+    Reads fleet.db READ-ONLY through bin/fleet-ci — the schema's one owner
+    (plan 0045) and now also its one query surface (plan 0069 §3). Never
+    fetches from Forgejo or a runner, and never calls fleet-ci's sync(): this
+    polls every `poll` seconds for up to `bound` for a body to turn 'stored',
+    giving up early on a context whose task has turned terminal without one."""
+    sleep = sleep or _sleep
+    poll = CI_LOG_POLL_SECS if poll is None else poll
+    bound = CI_LOG_POLL_BOUND if bound is None else bound
+    ci = _load_sibling("fleet-ci", "_fleet_ci")
+    resolved = {}       # context -> (task_id, state, payload): stored, or terminal
+    last_seen = {}       # context -> (task_id, state, detail): the last row matched,
+                         # whatever its state — so a row stuck at 'pending' for the
+                         # whole wait is still reported as "log not yet stored",
+                         # never confused with a context no row has ever matched.
+    waited = 0
+    while True:
+        con = ci.open_ro()
+        if con is not None:
+            try:
+                for context in failed_contexts:
+                    if context in resolved:
+                        continue
+                    row = ci.match_context(con, repo, sha, context)
+                    if row is None:
+                        continue
+                    task_id, state, detail, updated_at = row
+                    last_seen[context] = (task_id, state, detail)
+                    if state == "stored":
+                        resolved[context] = (task_id, state,
+                                             ci.task_excerpt(con, repo, task_id))
+                    elif ci.terminal_without_body(state, updated_at):
+                        resolved[context] = (task_id, state, detail)
+            finally:
+                con.close()
+        if len(resolved) == len(failed_contexts) or waited >= bound:
+            break
+        sleep(poll)
+        waited += poll
+    if log is not None:
+        log.note("ci-log-poll", waited=waited, matched=len(resolved),
+                 of=len(failed_contexts))
+    return [(c, resolved.get(c) or last_seen.get(c)) for c in failed_contexts]
+
+
+def render_ci_log_block(sha, entries, bound=None):
+    """(block text, prompt-side redaction hits, [task id], [failing test id]).
+
+    Each matched, stored entry passes through THIS wrapper's own redact() —
+    the stored body already passed fleet-ci's rules at capture; this is a
+    second net, not a tripwire (plan 0069 §2)."""
+    bound = CI_LOG_POLL_BOUND if bound is None else bound
+    ci = _load_sibling("fleet-ci", "_fleet_ci")
+    blocks, hits, task_ids, test_ids = [], 0, [], []
+    for context, found in entries:
+        if found is None:
+            blocks.append(
+                f"--- CI LOG ({context}) ---\n"
+                f"no ci_task row for {str(sha)[:8]} after {bound} s — "
+                "fleet-collect has not swept this failure yet\n"
+                "--- END CI LOG ---")
+            continue
+        task_id, state, payload = found
+        task_ids.append(task_id)
+        if state == "stored":
+            clean, shapes = redact(payload)
+            hits += len(shapes)
+            for tid in ci.failing_test_ids(payload):
+                if tid not in test_ids:
+                    test_ids.append(tid)
+            blocks.append(
+                f"--- BEGIN CI LOG (task {task_id}, {context}) ---\n"
+                f"{clean}\n--- END CI LOG ---")
+        else:
+            blocks.append(
+                f"--- CI LOG (task {task_id}, {context}) ---\n"
+                f"log not yet stored: {state} — {payload or '?'}\n"
+                "--- END CI LOG ---")
+    return "\n\n".join(blocks), hits, task_ids, test_ids[:10]
+
+
+FIX_TEMPLATE = """\
+--- RUN FACTS ---
+repository:  {repo}
+worktree:    {worktree}
+branch:      {branch}
+plan file:   {plan_path}
+pull request: #{pr}
+round:       {round} of {bound}
+--- END RUN FACTS ---
+
+Your pull request #{pr} was reviewed and the reviewer raised findings that block
+a merge. Address every one of them on this branch and push.
+
+Verify each finding against the source before acting on it. A reviewer is
+sometimes wrong, and one that is right about the defect can still be wrong about
+the fix — say so in the PR thread rather than making a change you believe is
+incorrect.
+
+Do not open a new pull request, do not change the `Plan:` marker, and do not
+alter the plan file's Boundaries. The plan below is unchanged and still binding.
+
+--- BEGIN BLOCKING FINDINGS ---
+{findings}
+--- END BLOCKING FINDINGS ---
+
+--- BEGIN PLAN ({plan_path}) ---
+{plan_text}
+--- END PLAN ---
+"""
+
+
+CI_FIX_TEMPLATE = """\
+--- RUN FACTS ---
+repository:  {repo}
+worktree:    {worktree}
+branch:      {branch}
+plan file:   {plan_path}
+pull request: #{pr}
+round:       {round} of {bound}
+--- END RUN FACTS ---
+
+The build is failing on your pull request #{pr}. **No review has been requested
+for this commit** — a reviewer is not asked to read a tree that does not build.
+
+Make the build pass. Reproduce the failure locally first. **When the local run
+passes and the stored CI log below shows a failure, the log is the authority
+over your local run** — say so in the pull request as a comment naming the
+failing tests, and do not stop at "could not reproduce". A fix that changes CI
+configuration to stop reporting the failure is not a fix.
+
+Do not open a new pull request and do not change the `Plan:` marker.
+
+--- BEGIN FAILING CHECKS ---
+{findings}
+--- END FAILING CHECKS ---
+{ci_log_block}
+--- BEGIN PLAN ({plan_path}) ---
+{plan_text}
+--- END PLAN ---
+"""
+
+
+def build_ci_fix_prompt(repo, plan_path, plan_text, worktree, branch, pr,
+                        findings, round_no, bound, preamble_path=None,
+                        ci_log_block=""):
+    """A red build gets its own briefing.
+
+    FIX_TEMPLATE opens with "your pull request was reviewed and the reviewer
+    raised findings", which is false here: nothing was reviewed, because the
+    loop does not spend a review on a commit that fails to build. Telling a
+    session it has reviewer findings when it has a stack trace sends it looking
+    for a review that does not exist (review 2441).
+
+    `ci_log_block` is `render_ci_log_block()`'s output — already passed through
+    this file's own `redact()` by the caller. Empty when the round had no
+    failing context to look up (plan 0069 D2)."""
+    listed = "\n".join(f"- {f}" for f in findings)
+    block = f"\n{ci_log_block}\n" if ci_log_block else ""
+    return read_preamble(preamble_path) + "\n" + CI_FIX_TEMPLATE.format(
+        repo=repo, worktree=worktree, branch=branch, plan_path=plan_path,
+        pr=pr, round=round_no, bound=bound, findings=listed, plan_text=plan_text,
+        ci_log_block=block)
+
+
+def build_fix_prompt(repo, plan_path, plan_text, worktree, branch, pr, findings,
+                     round_no, bound, preamble_path=None):
+    """Same preamble, fixed template, plan verbatim — as the first round.
+
+    The findings are the reviewer's own words, not this wrapper's summary of
+    them: a wrapper that paraphrases a finding it is graded on fixing has an
+    obvious incentive to paraphrase it smaller."""
+    listed = "\n".join(f"- {f}" for f in findings)
+    return read_preamble(preamble_path) + "\n" + FIX_TEMPLATE.format(
+        repo=repo, worktree=worktree, branch=branch, plan_path=plan_path,
+        pr=pr, round=round_no, bound=bound, findings=listed, plan_text=plan_text)
+
+
+def ledger_comment(rows):
+    """The iteration ledger, posted so a successor can reconstruct the rounds
+    without a local file it may not have."""
+    lines = [LEDGER_MARKER, "**Orchestrator review ledger**", "",
+             "| round | head | verdict | blocking |", "|---|---|---|---|"]
+    for r in rows:
+        lines.append(f"| {r['round']} | `{str(r['sha'])[:8]}` | {r['verdict']} "
+                     f"| {r['blocking']} |")
+    return "\n".join(lines)
+
+
+def head_sha(repo, pr, forge=None, mod=None):
+    """The PR's current head, from the forge. None means unreadable."""
+    if forge is None:
+        mod, forge = _forge()
+    st, body = forge.get_pull(repo, pr)
+    if st != 200 or not isinstance(body, dict):
+        return None
+    return ((body.get("head") or {}).get("sha")) or None
+
+
+def review_loop(repo, plan_id, plan_path, plan_text, pr, branch, wt, cred, route,
+                lease_id, log=None, tag_prefix="r"):
+    """Dispatch, read the verdict at head, fix, repeat — bounded.
+
+    Returns (approved, detail, rows). The wrapper has NO approval code path: it
+    reads a verdict the reviewer posted, and every exit that is not an APPROVED
+    verdict at the current head is a failure. In particular a round that raises
+    no parseable blocking finding and is not APPROVED does NOT end the loop as a
+    success — 'no blockers, therefore approved' invents an approval in a system
+    whose central control is that it has none, and it does so without making an
+    API call, which is what makes it easy to miss in review."""
+    bound = review_bound(repo)
+    mod, forge = _forge()
+    rows = []
+    for n in range(1, bound + 1):
+        sha = head_sha(repo, pr, forge, mod)
+        if sha is None:
+            return False, f"could not read #{pr}'s head from the forge", rows
+        # WAIT for CI before asking for a review. `dispatch-review` refuses a
+        # head whose checks are still running, and treating that refusal as
+        # terminal is what ended the 2026-09-09 run three seconds after it
+        # pushed a fix — the review it wanted was one CI cycle away.
+        ci, failed = await_ci(repo, sha, forge, mod, log)
+        if ci is None:
+            return False, (f"round {n}: CI on {str(sha)[:8]} did not resolve "
+                           f"within {CI_WAIT_SECS // 60} minutes, or could not "
+                           "be read — refusing to review an unchecked commit"), rows
+
+        if ci in ("failure", "error"):
+            # A red build is a real answer and a blocking one. Sending it to a
+            # fix round is strictly better than spending a review on a commit
+            # that does not build, and better than stopping: the session is told
+            # what broke and can fix it, which is the same shape as a HIGH.
+            detail = (f" — failing: {', '.join(failed)}") if failed else ""
+            blockers = [f"CI is {ci} on {str(sha)[:8]}{detail}. Fix the build; "
+                        "a review has not been requested for this commit."]
+            state = f"ci-{ci}"
+            ci_log_block, ci_test_ids, ci_task_ids = "", [], []
+            if failed:
+                entries = poll_ci_log_entries(repo, sha, failed, log)
+                ci_log_block, hits, ci_task_ids, ci_test_ids = render_ci_log_block(
+                    sha, entries)
+                if log is not None:
+                    log.note("ci-log-redacted", hits=hits)
+            rows.append({"round": n, "sha": sha, "verdict": state,
+                         "blocking": len(blockers), "body": "",
+                         "ci_log_block": ci_log_block,
+                         "ci_task_ids": ci_task_ids, "ci_test_ids": ci_test_ids})
+            if log is not None:
+                log.note("review-round", round=n, sha=str(sha)[:8],
+                         verdict=state, blocking=len(blockers))
+        else:
+            ok, why = dispatch_review(repo, pr, sha, plan_path, log)
+            if not ok:
+                return False, f"round {n}: review dispatch failed: {why}", rows
+            verdict = verdict_at(repo, pr, sha, forge, mod)
+            if verdict is None:
+                return False, f"round {n}: could not read reviews for #{pr}", rows
+            if not verdict:
+                # The --post lesson, mechanised: a command can exit 0, print a full
+                # verdict, and publish nothing.
+                return False, (f"round {n}: the review command succeeded but no "
+                               f"review stands at {str(sha)[:8]} — the verdict did "
+                               "not land"), rows
+            state = (verdict.get("state") or "").upper()
+            blockers = blocking_findings(verdict.get("body") or "")
+            rows.append({"round": n, "sha": sha, "verdict": state or "?",
+                         "blocking": len(blockers),
+                         "body": verdict.get("body") or ""})
+            if log is not None:
+                log.note("review-round", round=n, sha=str(sha)[:8], verdict=state,
+                         blocking=len(blockers))
+            if state == "APPROVED":
+                if blockers:
+                    # The verdict is the reviewer's to give. The wrapper may not
+                    # invent a rejection any more than an approval — but this is
+                    # inconsistent and must not pass silently.
+                    warn(f"#{pr} APPROVED at {str(sha)[:8]} while listing "
+                         f"{len(blockers)} HIGH finding(s) — accepted as the "
+                         "reviewer's verdict and recorded")
+                return True, "", rows
+            if not blockers:
+                return False, (f"round {n}: verdict {state or 'none'} at "
+                               f"{str(sha)[:8]} with no parseable blocking finding — "
+                               "refusing to read an unparsed review as an approval"), rows
+        if n == bound:
+            break
+        if str(rows[-1].get("verdict", "")).startswith("ci-"):
+            prompt = build_ci_fix_prompt(repo, plan_path, plan_text, wt, branch, pr,
+                                         blockers, n + 1, bound,
+                                         ci_log_block=rows[-1].get("ci_log_block", ""))
+        else:
+            prompt = build_fix_prompt(repo, plan_path, plan_text, wt, branch, pr,
+                                      blockers, n + 1, bound)
+        try:
+            # The prefix separates the initial loop from a follow-up's and a
+            # post-unfreeze re-review's; without it all three wrote r1, r2, ...
+            # and O_TRUNC'd each other (review 2419).
+            session = run_implementer(wt, prompt, cred, route, lease_id, log,
+                                      tag=f"{tag_prefix}{n}")
+        except Stop as stop:
+            return False, f"round {n}: fix session refused: {stop.reason}", rows
+        except Exception as e:
+            return False, (f"round {n}: fix session failed to run "
+                           f"({e.__class__.__name__}: {e})"), rows
+        if session.timed_out:
+            return False, (f"round {n}: fix session timed out after "
+                           f"{implementer_timeout_minutes(repo)} min"), rows
+        moved = head_sha(repo, pr, forge, mod)
+        if moved is None:
+            return False, f"round {n}: could not re-read #{pr}'s head", rows
+        if moved == sha:
+            # Without this the loop re-reviews an unchanged tree until the bound,
+            # paying for a review each time and reporting 'not converging' about
+            # a session that pushed nothing.
+            #
+            # The sentence up to "nothing was pushed" is PINNED: bin/mopsus's
+            # CLASS_RULES matches it verbatim to classify work-exists-unverified
+            # (tests/test_mopsus_classify.py). What follows is additive — the
+            # failing test ids and the fleet-ci task id from THIS round's CI log,
+            # when this was a CI-fix round — so mopsus's brief and a person on
+            # the phone see which tests, not only that CI was red (plan 0069 D4).
+            extra = ""
+            last = rows[-1]
+            if last.get("ci_test_ids"):
+                extra += f" Failing tests: {', '.join(last['ci_test_ids'])}."
+            if last.get("ci_task_ids"):
+                ids = ", ".join(str(t) for t in last["ci_task_ids"])
+                extra += f" fleet-ci task {ids}."
+            return False, (f"round {n}: fix session left the head at "
+                           f"{str(sha)[:8]} — nothing was pushed{extra}"), rows
+    return False, (f"review bound {bound} exhausted for {repo} without an "
+                   "approval"), rows
+
+
+def deferred_comment(rows, verdict_body):
+    """Non-blocking findings, posted ONCE at the end.
+
+    This plan does not turn them into plan files or issues; the comment is the
+    interface a later reader parses, which is why its shape is fixed here."""
+    kept = [(s, t) for s, t in parse_findings(verdict_body or "")
+            if s in ("MEDIUM", "LOW")]
+    lines = [DEFERRED_MARKER, "**Deferred findings** — not blocking; shipped and "
+             "recorded, per the fleet rule that only HIGH blocks a merge.", ""]
+    if not kept:
+        lines.append("_None._")
+    else:
+        # The FENCED form, not a bullet list. parse_findings() treats the fence
+        # as authoritative, and an earlier draft of this function emitted
+        # `- **MEDIUM** — text`, which its own parser could not read back: the
+        # bullet defeats the bold pattern's line anchor and the dash sits
+        # outside the bold run. The writer and the reader must agree or follow-up
+        # work is dropped in silence, which is the one thing plan 0011 §5 asks
+        # this format to guarantee.
+        lines += ["```findings"]
+        lines += [f"{sev}: {text}" for sev, text in kept]
+        lines += ["```"]
+    lines += ["", f"_Rounds spent: {len(rows)}._"]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------ the post-approval freeze (0032)
+# The invariant is a CONDITION, not a counter: pushes are refused whenever an
+# approval stands at the branch head. A counter ("one push is owed") gets the
+# re-freeze wrong — after the next approval it still says a push is owed, and the
+# second approval is silently pushed over.
+# Backticks are optional because the wrapper's OWN ack asks for "`unfreeze` on
+# its own line", and an owner copying that literally posted a token this pattern
+# did not match (review 2421). Still a whole line and nothing else, so
+# "please unfreeze the branch" is still not one.
+_UNFREEZE_RE = re.compile(r"(?im)^\s*`?unfreeze`?\s*$")
+
+
+def approval_stands(repo, pr, sha, forge=None, mod=None):
+    """(stands, detail). True when a live APPROVED review sits at this head.
+
+    Unreadable is treated as STANDING — fail closed. A forge read that fails
+    says nothing about whether an approval exists, and the cost of guessing
+    wrong in the permissive direction is a dismissed human approval, which is
+    the whole failure this phase exists to prevent."""
+    if forge is None:
+        mod, forge = _forge()
+    reviews, pages = [], mod.paged(forge.list_reviews, repo, pr, cap=10)
+    for page in pages:
+        reviews.extend(page)
+    if pages.outcome != mod.EXHAUSTED:
+        return True, "reviews unreadable — treating the branch as frozen"
+    for r in reviews:
+        if ((r.get("commit_id") or "") == str(sha)
+                and (r.get("state") or "").upper() == "APPROVED"
+                and not r.get("stale") and not r.get("dismissed")):
+            who = ((r.get("user") or {}).get("login")) or "?"
+            return True, f"{who} approved {str(sha)[:8]}"
+    return False, ""
+
+
+def is_unfreeze(body):
+    """`unfreeze` alone on a line. Never inferred from intent.
+
+    The choice between a follow-up and discarding an approval is the human's,
+    made in the comment. A wrapper that decides for itself when an approval may
+    be discarded has made approval advisory."""
+    return bool(_UNFREEZE_RE.search(body or ""))
+
+
+def followup_branch(lease_id, pr, cid):
+    """Named by the COMMENT id, which is stable across processes.
+
+    An earlier version counted follow-ups in a local variable. A respawned
+    successor started that count at zero, reused `-follows-<pr>-1`, and
+    verify_followup_pr then reported its PREDECESSOR's pull request as newly
+    opened — a branch name that is not reconstructable from the thread is the
+    same defect as a local ack ledger. Found in review 2418."""
+    return f"{lease_branch(lease_id)}-follows-{int(pr)}-c{int(cid)}"
+
+
+FOLLOWUP_TEMPLATE = """\
+--- RUN FACTS ---
+repository:   {repo}
+worktree:     {worktree}
+base branch:  {base}
+your branch:  {branch}
+plan file:    {plan_path}
+follows:      #{pr}
+instruction:  comment #{cid}
+--- END RUN FACTS ---
+
+Pull request #{pr} is APPROVED and frozen. It must not be pushed to, and you are
+not on it: you are on `{branch}`, branched from `{base}` because your change
+depends on its work.
+
+Carry out the instruction below, then open a pull request that targets `main`
+whose body carries the line `Follows: #{pr}`.
+
+Your PR body MUST NOT contain a `Plan:` line. The marker belongs to #{pr} alone —
+a second marked pull request would make this plan look dispatched twice and
+unbind the status check from the pull request that actually did the work.
+
+--- BEGIN INSTRUCTION (comment #{cid}) ---
+{instruction}
+--- END INSTRUCTION ---
+
+--- BEGIN PLAN ({plan_path}) ---
+{plan_text}
+--- END PLAN ---
+"""
+
+
+def build_followup_prompt(repo, plan_path, plan_text, worktree, base, branch, pr,
+                          cid, instruction, preamble_path=None):
+    return read_preamble(preamble_path) + "\n" + FOLLOWUP_TEMPLATE.format(
+        repo=repo, worktree=worktree, base=base, branch=branch,
+        plan_path=plan_path, pr=pr, cid=cid, instruction=instruction,
+        plan_text=plan_text)
+
+
+def verify_followup_pr(repo, branch, original_pr, plan_id, forge=None, mod=None):
+    """(ok, reason, number) for a follow-up: exists, targets main, carries
+    `Follows: #N`, and carries NO `Plan:` marker.
+
+    The marker check is the load-bearing one and it is asserted rather than
+    trusted to the prompt: dedupe counts a marked PR in ANY state, so a marked
+    follow-up would make the plan look dispatched twice."""
+    if forge is None:
+        mod, forge = _forge()
+    pulls, outcome = read_pulls(mod, forge, repo)
+    if pulls is None:
+        return False, (f"could not read {repo} pull requests ({outcome}) after "
+                       f"{READ_ATTEMPTS} attempts"), None
+    ours = [p for p in pulls
+            if ((p.get("head") or {}).get("ref") or "") == branch]
+    if not ours:
+        return False, f"no pull request with head {branch}", None
+    pr = ours[0]
+    num = pr.get("number")
+    body = pr.get("body") or ""
+    base = (pr.get("base") or {}).get("ref") or ""
+    if base != "main":
+        return False, f"#{num} targets {base!r}, not main", num
+    if not re.search(rf"(?m)^\s*Follows:\s*#{int(original_pr)}\s*$", body):
+        # Anchored: a substring test let `Follows: #71` satisfy PR 7 (review 2421).
+        return False, f"#{num} carries no 'Follows: #{original_pr}' line", num
+    if re.search(r"(?m)^\s*Plan:\s*\S", body):
+        return False, (f"#{num} carries a Plan marker, which belongs to "
+                       f"#{original_pr} alone"), num
+    return True, "", num
+
+
+def branch_from(worktree, base, branch):
+    """Check out the follow-up branch, created FROM the approved branch — the fix
+    depends on that branch's work, so `main` is the wrong base.
+
+    Idempotent: an ack-deleted instruction re-arms and re-enters this path in the
+    same process, where `checkout -b` would fail forever because the branch
+    already exists (review 2419). An existing branch is checked out instead."""
+    exists = subprocess.run(["git", "rev-parse", "--verify", "--quiet", branch],
+                            cwd=str(worktree), capture_output=True, text=True,
+                            timeout=60).returncode == 0
+    argv = (["git", "checkout", branch] if exists
+            else ["git", "checkout", "-b", branch, base])
+    r = subprocess.run(argv, cwd=str(worktree), capture_output=True, text=True,
+                       timeout=120)
+    if r.returncode != 0:
+        raise Stop(f"could not check out {branch} from {base}: "
+                   f"{r.stderr.strip()[:200]}")
+    return branch
+
+
+def checkout(worktree, branch):
+    """Put the worktree back on `branch`. Called after every follow-up session.
+
+    Without it the worktree stays on the follow-up branch, and a later granted
+    instruction is told in its RUN FACTS that it is on the approved branch while
+    HEAD is somewhere else — it would then commit the approved branch's fix onto
+    a follow-up (review 2419)."""
+    r = subprocess.run(["git", "checkout", branch], cwd=str(worktree),
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise Stop(f"could not return the worktree to {branch}: "
+                   f"{r.stderr.strip()[:200]}")
+    return branch
+
+
+# --------------------------------------------------- the command channel (0031)
+# The pull request thread IS the ledger. There is no local ack file, because the
+# successor is a different process on a possibly different host and the fleet's
+# own disposability argument says it may hold nothing of its predecessor's. A
+# local file would be correct exactly until the case it exists for.
+# The wrapper's own marker. Acks are counted only from comments carrying it,
+# because the IMPLEMENTER also posts as an implementer account: a model-authored
+# comment that happened to emit a bare `Ack: #12` line would otherwise consume
+# instruction 12 without anyone having acted on it. Restricting acks to
+# implementer accounts stopped a stranger forging one and put the model inside
+# the trusted set; this marker takes it back out.
+#
+# There is no legacy-ack problem: the orchestrator has never dispatched, so no
+# marker-less ack exists anywhere to be re-armed by this tightening. If one ever
+# did, its instruction would simply re-run — the safe direction.
+ACK_MARKER = "<!-- eunomia:ack -->"
+ACK_PREFIX = "Ack: #"
+_ACK_RE = re.compile(r"^Ack:\s*#(\d+)\s*$", re.M)
+DEFAULT_STEWARD_POLL_SECS = 60
+
+
+def steward_poll_secs(env=None):
+    env = os.environ if env is None else env
+    raw = (env.get("EUNOMIA_STEWARD_POLL") or "").strip()
+    if not raw:
+        return DEFAULT_STEWARD_POLL_SECS
+    try:
+        n = int(raw)
+    except ValueError:
+        raise Stop(f"EUNOMIA_STEWARD_POLL={raw!r} is not an integer")
+    if n < 5:
+        raise Stop(f"EUNOMIA_STEWARD_POLL={n} is below the 5s floor — a tighter "
+                   "poll spends forge reads for no steering latency anyone can use")
+    return n
+
+
+def owner_uid(env=None):
+    """The numeric uid whose comments are instructions, or None.
+
+    Bound to the id and never the login, so a rename cannot grant instruction
+    authority — the same rule the respawn path already follows. Unset means the
+    command channel is CLOSED: no author qualifies, so nothing is actionable.
+    That is the safe default and it is not an error."""
+    env = os.environ if env is None else env
+    raw = (env.get("FLEET_OPERATOR_UID") or "").strip()
+    return raw or None
+
+
+def _author(c):
+    return str(((c.get("user") or {}).get("id")) or "")
+
+
+def _is_implementer(c, uids, logins):
+    login = ((c.get("user") or {}).get("login") or "").lower()
+    return _author(c) in uids or login in logins
+
+
+def read_thread(repo, pr, forge=None, mod=None):
+    """Every comment on the PR's issue thread, or None when unreadable.
+
+    None is never 'no comments'. A truncated read that reads as absence would
+    make a consumed instruction look pending and run it a second time, which is
+    the one thing this protocol exists to prevent."""
+    if forge is None:
+        mod, forge = _forge()
+    out, pages = [], mod.paged(forge.list_issue_comments, repo, pr, cap=20)
+    for page in pages:
+        out.extend(page)
+    if pages.outcome != mod.EXHAUSTED:
+        return None
+    return out
+
+
+def acked_ids(comments, uids=None, logins=None):
+    """Comment ids already consumed, read from IMPLEMENTER-authored acks only.
+
+    Restricting the ack authors matters: if any author's `Ack: #n` counted, a
+    comment could pre-consume a later instruction by naming its id before it was
+    acted on. Deleting an ack re-arms its instruction, and that falls out of
+    recomputing this set every poll rather than being a code path — it is the
+    deliberate human 'run that again' gesture, available only to people who can
+    already delete comments here."""
+    if uids is None:
+        uids, logins = implementer_accounts()
+    done = set()
+    for c in comments or []:
+        body = c.get("body") or ""
+        if not _is_implementer(c, uids, logins) or ACK_MARKER not in body:
+            continue
+        for m in _ACK_RE.finditer(body):
+            done.add(int(m.group(1)))
+    return done
+
+
+def pending_instructions(comments, owner=None, uids=None, logins=None):
+    """Unconsumed instructions, in ascending COMMENT ID order.
+
+    Never timestamp order. Ids are immutable; an edited comment's timestamp
+    moves, so sorting by time lets an edit reorder the queue — and the queue's
+    order is the difference between 'fix the test then push' and 'push then fix
+    the test'.
+
+    An edit to an already-acked comment is not new work: consumed is consumed.
+    The rule is uniform so there is nothing to get subtly wrong, and it closes an
+    injection path where an old comment is quietly rewritten into a new
+    instruction."""
+    owner = owner if owner is not None else owner_uid()
+    if not owner:
+        return []
+    if uids is None:
+        uids, logins = implementer_accounts()
+    done = acked_ids(comments, uids, logins)
+    out = [c for c in comments or []
+           if _author(c) == str(owner) and int(c.get("id") or 0) not in done]
+    return sorted(out, key=lambda c: int(c.get("id") or 0))
+
+
+def foreign_comments(comments, owner=None, uids=None, logins=None):
+    """Unconsumed comments from anyone who is neither the owner nor a bot.
+
+    Quoted as data and never acted on. Today only the owner and the bots can
+    comment on these repos; this exists for the day that changes, and it is much
+    easier to write now than to retrofit after someone is surprised."""
+    owner = owner if owner is not None else owner_uid()
+    if uids is None:
+        uids, logins = implementer_accounts()
+    done = acked_ids(comments, uids, logins)
+    out = [c for c in comments or []
+           if _author(c) != str(owner or "")
+           and not _is_implementer(c, uids, logins)
+           and int(c.get("id") or 0) not in done]
+    return sorted(out, key=lambda c: int(c.get("id") or 0))
+
+
+def ack(repo, pr, cid, note, forge=None, mod=None):
+    """Post the ledger line. `Ack: #<id>` must be alone on its line — the reader
+    anchors on it, and a body that mentions an id in prose must not consume it."""
+    body = f"{ACK_MARKER}\n{ACK_PREFIX}{int(cid)}\n\n{note}"
+    return post_comment(repo, pr, body, forge, mod)
+
+
+def quote_as_data(comment):
+    """A non-owner comment, reproduced and explicitly not executed."""
+    who = ((comment.get("user") or {}).get("login")) or "?"
+    text = (comment.get("body") or "").strip()
+    quoted = "\n".join("> " + l for l in text.splitlines()) or "> _(empty)_"
+    return (f"Comment from **{who}** is recorded as data and **not acted on** — "
+            f"instructions are taken only from the owner uid.\n\n{quoted}")
+
+
+STEWARD_TEMPLATE = """\
+--- RUN FACTS ---
+repository:  {repo}
+worktree:    {worktree}
+branch:      {branch}
+plan file:   {plan_path}
+pull request: #{pr}
+instruction: comment #{cid}
+--- END RUN FACTS ---
+
+The owner left an instruction on pull request #{pr}. Carry it out on this branch.
+
+The instruction is reproduced below verbatim. It is the owner's words, not a
+summary: do what it says and nothing it does not say. If it asks for something
+the plan's Boundaries forbid, say so in the PR thread and make no change.
+
+--- BEGIN INSTRUCTION (comment #{cid}) ---
+{instruction}
+--- END INSTRUCTION ---
+
+--- BEGIN PLAN ({plan_path}) ---
+{plan_text}
+--- END PLAN ---
+"""
+
+
+def build_instruction_prompt(repo, plan_path, plan_text, worktree, branch, pr,
+                             cid, instruction, preamble_path=None):
+    return read_preamble(preamble_path) + "\n" + STEWARD_TEMPLATE.format(
+        repo=repo, worktree=worktree, branch=branch, plan_path=plan_path,
+        pr=pr, cid=cid, instruction=instruction, plan_text=plan_text)
+
+
+def pr_terminal(repo, pr, forge=None, mod=None):
+    """(terminal, detail) — merged or closed. None-safe: an unreadable pull is
+    NOT terminal, because exiting on a transient forge error would release a
+    lease over a network blip."""
+    if forge is None:
+        mod, forge = _forge()
+    st, body = forge.get_pull(repo, pr)
+    if st != 200 or not isinstance(body, dict):
+        return False, ""
+    if body.get("merged"):
+        return True, "merged"
+    if (body.get("state") or "").lower() == "closed":
+        return True, "closed"
+    return False, ""
+
+
+def release_lease(lease_id):
+    """The only place a lease is legitimately retired. See the note where
+    part 2a's activate() declines to offer one."""
+    r = subprocess.run([sys.executable, str(BIN / "fleet-release"), lease_id],
+                       capture_output=True, text=True, timeout=60)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()[:200]
+
+
+def steward(repo, plan_id, plan_path, plan_text, pr, branch, wt, cred, route,
+            lease_id, log=None, max_cycles=None):
+    """Stay alive on the approved PR, take instructions, exit when it is done.
+
+    A Python loop, deliberately — not a model session kept warm. Idle stewarding
+    must cost nothing, because a model held for hours waiting for a comment is
+    the difference between this being free and this being unaffordable. The
+    model is invoked only when an instruction actually arrives.
+
+    **The ack is posted BEFORE the work starts**, and that is the choice this
+    protocol makes rather than an oversight. A successor arriving mid-execution
+    must not re-run an instruction already in flight, and it can only tell by the
+    thread. The cost is the opposite window: a wrapper that dies between the ack
+    and the push loses that instruction silently. The recovery for that is the
+    gesture the protocol already has — delete the ack and it re-arms — so the
+    failure lands on a documented human action instead of a duplicated push.
+
+    `max_cycles` bounds the loop for tests. Production passes None: the exit
+    condition is the pull request reaching a terminal state, which is the only
+    condition under which releasing the lease is legitimate.
+    """
+    poll = steward_poll_secs()
+    mod, forge = _forge()
+    uids, logins = implementer_accounts()
+    owner = owner_uid()
+    if not owner:
+        # Not an error. An unset uid closes the channel, which is the safe
+        # default: the steward still runs, and still exits on terminal state.
+        warn("FLEET_OPERATOR_UID is unset — the command channel is closed and no "
+             "comment is actionable; stewarding for terminal state only")
+    if log is not None:
+        log.note("steward-start", pr=pr, poll=poll, channel=bool(owner))
+    cycles = 0
+    # `grant` is the one-shot override for a STANDING approval. It is not the
+    # invariant — approval_stands() is — and it is deliberately the only piece
+    # of steward state that is NOT reconstructable from the thread: a successor
+    # forgets an accepted unfreeze and re-freezes, which is the safe direction.
+    grant = False
+    last_refusal = None
+    while max_cycles is None or cycles < max_cycles:
+        cycles += 1
+        terminal, why = pr_terminal(repo, pr, forge, mod)
+        if terminal:
+            ok, detail = release_lease(lease_id)
+            if log is not None:
+                log.note("steward-end", pr=pr, state=why, released=ok,
+                         detail=detail or "-")
+            if not ok:
+                # The PR is done either way; a lease that will not release is an
+                # operator problem, not a reason to keep stewarding a merged PR.
+                warn(f"#{pr} is {why} but lease {lease_id} would not release "
+                     f"({detail})")
+                notify("Orchestrator finished but could not release its lease",
+                       f"{repo} {plan_id}: #{pr} {why}; {detail}")
+                return 1
+            warn(f"{repo} {plan_id}: #{pr} {why}; lease {lease_id} released")
+            return 0
+
+        comments = read_thread(repo, pr, forge, mod)
+        if comments is None:
+            # Unreadable is not 'no comments'. Waiting is correct: acting on a
+            # truncated read would make a consumed instruction look pending.
+            warn(f"could not read #{pr}'s thread this cycle — retrying")
+            if max_cycles is None or cycles < max_cycles:
+                time.sleep(poll)
+            continue
+
+        # followup_branch re-reads the lease and review_bound reads a conf;
+        # both raise Stop. An escaping Stop left main() with no page and no
+        # plan-failed while the watcher runs with stderr=DEVNULL — silence for
+        # exactly the failure the steward exists to make visible (review 2420).
+        # One cycle's refusal is not the run's, so it pages and keeps stewarding.
+        try:
+            for c in foreign_comments(comments, owner, uids, logins):
+                ack(repo, pr, int(c.get("id") or 0), quote_as_data(c), forge, mod)
+                if log is not None:
+                    log.note("steward-foreign", comment=c.get("id"),
+                             author=((c.get("user") or {}).get("login") or "?"))
+
+            for c in pending_instructions(comments, owner, uids, logins):
+                cid = int(c.get("id") or 0)
+                text = c.get("body") or ""
+
+                if is_unfreeze(text):
+                    # A MODIFIER, not a terminal branch. An earlier version returned
+                    # here, so "unfreeze\n\nalso fix the docstring" granted the
+                    # override and silently discarded the instruction — acked, so it
+                    # never came back. Found in review 2418. The rest of the comment
+                    # is still an instruction; only a comment that is nothing BUT
+                    # the token is a pure grant.
+                    grant = True
+                    if log is not None:
+                        log.note("steward-unfreeze", comment=cid)
+                    if not _UNFREEZE_RE.sub("", text).strip():
+                        ack(repo, pr, cid,
+                            f"`unfreeze` accepted. The next successful push to "
+                            f"`{branch}` will dismiss the standing approval, and the "
+                            "branch re-freezes when the next approval lands. A failed "
+                            "push does not spend this grant.", forge, mod)
+                        continue
+
+                sha = head_sha(repo, pr, forge, mod)
+                if sha is None:
+                    # Fail closed: an unreadable head cannot be shown to be unapproved.
+                    frozen, why = True, "head unreadable"
+                else:
+                    frozen, why = approval_stands(repo, pr, sha, forge, mod)
+
+                if frozen and not grant:
+                    # The DEFAULT path. The approved PR is untouched and merges
+                    # first; the fix lands as its own PR branched from it.
+                    fb = followup_branch(lease_id, pr, cid)
+                    ack(repo, pr, cid,
+                        f"{why} — `{branch}` is frozen, so this is going to a "
+                        f"follow-up on `{fb}` (`Follows: #{pr}`).\n\n"
+                        "To do it on the approved branch instead, post a NEW comment "
+                        "containing `unfreeze` on its own line **and the instruction "
+                        "repeated**. Replying with `unfreeze` alone will not redirect "
+                        "this one: it is already acked, so it will not be picked up "
+                        "again.", forge, mod)
+                    if log is not None:
+                        log.note("steward-followup", comment=cid, branch=fb,
+                                 reason=why)
+                    failed = None
+                    session = None
+                    try:
+                        branch_from(wt, branch, fb)
+                        prompt = build_followup_prompt(repo, plan_path, plan_text, wt,
+                                                       branch, fb, pr, cid, text)
+                        session = run_implementer(wt, prompt, cred, route, lease_id,
+                                                  log, tag=f"f{cid}")
+                    except Stop as stop:
+                        failed = f"Follow-up for #{cid} refused: {stop.reason}"
+                    except Exception as e:
+                        failed = (f"Follow-up for #{cid} failed to run "
+                                  f"({e.__class__.__name__}).")
+                    if failed:
+                        # NOT a `continue`. A raise that happened AFTER the
+                        # session pushed leaves the worktree on `fb` and the
+                        # frozen branch possibly moved, and skipping the cleanup
+                        # was how both went unnoticed (review 2422). The freeze
+                        # check below runs on every path out of here.
+                        post_comment(repo, pr, failed, forge, mod)
+                    if session is not None and session.timed_out:
+                        # Reported as it is on the on-branch path. A follow-up
+                        # killed mid-push is exactly what the head check below
+                        # exists to catch (review 2421).
+                        post_comment(repo, pr, f"Follow-up for #{cid} timed out "
+                                     f"after {implementer_timeout_minutes(repo)} min "
+                                     "and its process group was killed.",
+                                     forge, mod)
+                    ok, reason, num = ((False, "the session did not complete", None)
+                                       if failed else
+                                       verify_followup_pr(repo, fb, pr, plan_id,
+                                                          forge, mod))
+                    post_comment(repo, pr,
+                                 (f"Follow-up #{num} opened on `{fb}`."
+                                  if ok else
+                                  f"Follow-up on `{fb}` did not verify: {reason}"),
+                                 forge, mod)
+                    if ok:
+                        # The follow-up gets the SAME review loop. A fix that skipped
+                        # review because it arrived as a comment would be a second
+                        # way into main with a weaker gate than the first.
+                        #
+                        # It runs while the worktree is STILL on `fb`. An earlier
+                        # revision returned the worktree to the approved branch
+                        # before this call, so every fix session in the follow-up's
+                        # own review loop was told it was on `fb` while HEAD sat on
+                        # the frozen branch — and would have pushed there, with the
+                        # freeze check already behind it. That was a HIGH in review
+                        # 2420, introduced by the fix for review 2419. The worktree
+                        # goes back AFTER everything that belongs to `fb`.
+                        approved, why, rows = review_loop(repo, plan_id, plan_path,
+                                                          plan_text, num, fb, wt,
+                                                          cred, route, lease_id, log,
+                                                          tag_prefix=f"f{cid}r")
+                        if rows:
+                            post_comment(repo, num, ledger_comment(rows), forge, mod)
+                        if not approved:
+                            post_comment(repo, num,
+                                         f"Review did not reach an approval: {why}",
+                                         forge, mod)
+
+                    # The freeze is enforced, not merely routed around: the sessions
+                    # above held a token and could have pushed the approved branch
+                    # anyway, so the wrapper reads its head rather than trusting the
+                    # prompt. Both of these run whether or not the follow-up
+                    # verified — a session that failed verification is exactly the
+                    # one most likely to have pushed somewhere unintended.
+                    try:
+                        checkout(wt, branch)
+                    except Stop as stop:
+                        post_comment(repo, pr, f"Could not return the worktree to "
+                                     f"`{branch}`: {stop.reason}", forge, mod)
+                    after = head_sha(repo, pr, forge, mod)
+                    if after is not None and sha is not None and after != sha:
+                        post_comment(repo, pr,
+                                     f"**The frozen branch moved.** `{branch}` was "
+                                     f"{str(sha)[:8]} and is now {str(after)[:8]} "
+                                     f"after the follow-up for #{cid}. The approval "
+                                     "has been dismissed by that push.", forge, mod)
+                        notify("Frozen branch was pushed",
+                               f"{repo} {plan_id}: {branch} moved during a follow-up")
+                        if log is not None:
+                            log.note("freeze-violated", comment=cid,
+                                     was=str(sha)[:8], now=str(after)[:8])
+                    continue
+
+                # Either nothing stands at head, or an unfreeze grant is live.
+                ack(repo, pr, cid, "Instruction accepted; work starting on "
+                    f"`{branch}`." + (" This spends the `unfreeze` grant if it "
+                                      "pushes." if grant else ""), forge, mod)
+                if log is not None:
+                    log.note("steward-instruction", comment=cid, granted=grant)
+                prompt = build_instruction_prompt(repo, plan_path, plan_text, wt,
+                                                  branch, pr, cid, text)
+                try:
+                    session = run_implementer(wt, prompt, cred, route, lease_id, log,
+                                              tag=f"c{cid}")
+                except Stop as stop:
+                    post_comment(repo, pr, f"Instruction #{cid} refused: "
+                                 f"{stop.reason}", forge, mod)
+                    continue
+                except Exception as e:
+                    post_comment(repo, pr, f"Instruction #{cid} failed to run "
+                                 f"({e.__class__.__name__}).", forge, mod)
+                    continue
+                if session.timed_out:
+                    post_comment(repo, pr, f"Instruction #{cid} timed out after "
+                                 f"{implementer_timeout_minutes(repo)} min and its "
+                                 "process group was killed.", forge, mod)
+                moved = head_sha(repo, pr, forge, mod)
+                unknown = (sha is None or moved is None)
+                pushed = (not unknown and moved != sha)
+                if grant and (pushed or unknown):
+                    # Fail CLOSED, and this supersedes the r1 behaviour.
+                    #
+                    # Review 2418 asked that an unreadable head not spend the
+                    # grant, so an owner's `unfreeze` was not wasted on a forge
+                    # blip. Review 2422 showed the other side: a head we cannot
+                    # read around a session that DID push leaves the grant live,
+                    # and the next approval gets pushed over. The freeze
+                    # invariant is worth more than a re-typed `unfreeze`, so an
+                    # unreadable head clears the grant and re-enters review.
+                    grant = False
+                    if log is not None:
+                        log.note("steward-grant-spent", comment=cid,
+                                 certain=not unknown)
+                if pushed or unknown:
+                    if unknown and log is not None:
+                        log.note("steward-head-unknown", comment=cid)
+                    # Keyed on the head MOVING, not on the grant. An instruction
+                    # on an UNFROZEN branch pushes too and needs review just as
+                    # much; keying this on the grant left that push unreviewed
+                    # (review 2421). A head we could not read counts as moved,
+                    # because "we cannot show it did not push" is the same
+                    # obligation as "it pushed".
+                    approved, why, rows = review_loop(repo, plan_id, plan_path,
+                                                      plan_text, pr, branch, wt,
+                                                      cred, route, lease_id, log,
+                                                      tag_prefix=f"u{cid}r")
+                    if rows:
+                        post_comment(repo, pr, ledger_comment(rows), forge, mod)
+                    if not approved:
+                        post_comment(repo, pr, f"Re-review after `unfreeze` did not "
+                                     f"reach an approval: {why}", forge, mod)
+        except Stop as stop:
+            warn(f"steward cycle refused: {stop.reason}")
+            if log is not None:
+                log.note("steward-refused", reason=stop.reason)
+            # Paged ONCE per distinct reason. An unreadable lease refuses every
+            # cycle, and at a 60s poll that is a page a minute for one fault
+            # (review 2421). The log still records every occurrence; the page is
+            # the scarce channel, and one that repeats is one people mute.
+            if stop.reason != last_refusal:
+                last_refusal = stop.reason
+                notify("Orchestrator steward cycle refused",
+                       f"{repo} {plan_id}: #{pr}: {stop.reason}")
+        else:
+            last_refusal = None
+
+        if max_cycles is None or cycles < max_cycles:
+            time.sleep(poll)
+    return 0
+
+
+# ------------------------------------------------------------------ boundary
+# Pauses between workspace attempts, in seconds. FIVE attempts over ~6.5 minutes.
+#
+# The first cut of this was (5, 20, 60) — four attempts over 85s — and its
+# reasoning was that the fault was a blip. That was WRONG, and the retry itself
+# is what proved it. On 2026-09-10 the log recorded, for one dispatch:
+#
+#   01:21:47 workspace-attempt n=1 ... ssh: connect ... Undefined error: 0
+#   01:21:52 workspace-attempt n=2 ... same
+#   01:22:12 workspace-attempt n=3 ... same
+#   01:23:12 workspace-attempt n=4 ... same
+#   01:23:12 workspace-failed attempts=4
+#
+# Four identical failures across 85 seconds is not a blip. But the same command
+# from a session two minutes later succeeded, and has succeeded on every probe
+# since — 20 concurrent connections, a 60-call HTTP burst then ssh, both users,
+# both ports, orphaned and parented. So the fault persists for MINUTES and then
+# clears, and a budget sized for a blip lands entirely inside the bad window.
+#
+# The tail is 300s for that reason: it is the first attempt that reaches past
+# the longest failure window actually observed. It is a hypothesis, not a
+# measurement — the window has been seen once, at n=1 — and the -vvv capture
+# below exists because the honest fix needs evidence this retry cannot provide.
+#
+# The ceiling still matters: git clone carries timeout=900, so a genuinely hung
+# forge is bounded by that per attempt, not by these pauses. What these pauses
+# bound is the wait when each attempt fails FAST, which is what a refused
+# connect does.
+WORKSPACE_BACKOFF = (5, 20, 60, 300)
+
+
+def ssh_debug_path(lease_id):
+    """Where a retried workspace attempt writes its ssh handshake."""
+    return run_log_path(lease_id).with_suffix(".ssh.log")
+
+
+@contextlib.contextmanager
+def _ssh_debug(path):
+    """Make the NEXT git call log its ssh handshake to `path`.
+
+    `-E file` rather than plain `-vvv`: with -vvv alone the debug goes to ssh's
+    stderr, which git folds into its own, which this module truncates to 200
+    characters when it raises — so the evidence would be destroyed by the very
+    path that reports it. `-E` sends the handshake to a file and leaves git's
+    stderr clean, so the error message stays readable AND the detail survives.
+
+    WHAT THIS IS FOR. `ssh: connect to host ... port 3022: Undefined error: 0`
+    is errno 0 on connect, which is not a real errno — it is what you get when
+    something refused the connection without setting one. Six of six
+    watcher-spawned dispatches have died on it, and every deliberate
+    reproduction outside that path has passed: Local Network Privacy, launchd
+    context, the ssh user, the port, the watcher's own plist environment, all
+    four Popen shapes, process orphaning, 20-way concurrency, and an HTTP burst
+    immediately before. Each of those was probed and eliminated.
+
+    So this stops trying to summon the failure and instruments it instead. The
+    handshake says how far ssh got — DNS, socket, TCP, banner, kex — and that
+    distinguishes "never left the host" from "the forge closed on us", which no
+    amount of retrying will.
+
+    NOT a credential exposure, and that was checked rather than assumed. A real
+    `-vvv -E` capture of this exact fetch was inspected: 269 lines, and ZERO
+    lines beginning a PEM block. The only hits for a naive /PRIVATE KEY|password/
+    sweep were ssh listing its own preferred auth METHODS (the string "password"
+    appears in `preferred publickey,keyboard-interactive,password`), and the
+    identity lines carry only a key-file PATH and a PUBLIC fingerprint.
+
+    No private key material, and no password or token exists on this path at all:
+    the fleet authenticates to the forge with a key. Principle 6 forbids secret
+    material under the fleet tree; a handshake trace is not that. Anyone widening
+    what gets traced should re-run that check rather than inherit this one.
+
+    Restores the previous value on the way out, always. Leaving GIT_SSH_COMMAND
+    set would hand `-vvv` to every later git call in the run — and to the
+    implementer session, which inherits this environment."""
+    prev = os.environ.get("GIT_SSH_COMMAND")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Cannot write the trace. That must not cost us the attempt: yield
+        # WITHOUT touching the environment, so the retry proceeds unchanged.
+        yield None
+        return
+    os.environ["GIT_SSH_COMMAND"] = f"ssh -vvv -E {shlex.quote(str(path))}"
+    try:
+        yield path
+    finally:
+        if prev is None:
+            os.environ.pop("GIT_SSH_COMMAND", None)
+        else:
+            os.environ["GIT_SSH_COMMAND"] = prev
+
+
+def _workspace_with_retry(make, log=None, debug_path=None):
+    """Call `make()` until it returns, up to len(WORKSPACE_BACKOFF)+1 times.
+
+    WHY THIS EXISTS. Five straight autonomous dispatches on 2026-09-09 —
+    eunomia 0029, agent-bus 0001, pr-proxy 0001/0002/0003 — died here, at the
+    first step, before any of them opened a pull request. That last part is what
+    makes a single workspace failure expensive out of all proportion to its
+    cause: `_stop` deliberately does NOT release the lease (see its docstring —
+    releasing minted a fresh lease and a fresh page every cycle, forever), so
+    the plan is left holding an orphaned lease, and the documented recovery is a
+    human's `respawn` comment ON THE MARKED PR. There is no marked PR. The plan
+    is stuck until someone releases the lease by hand, which is exactly what had
+    to be done for all five.
+
+    So the cheapest correct place to intervene is not to make the corpse.
+
+    Retries EVERYTHING, not a curated list of retryable errors. The caller
+    already catches Exception broadly and says why: this call graph raises
+    TimeoutExpired, OSError and RuntimeError, and sorting transient from
+    permanent by exception type is a guess that fails closed on the case nobody
+    predicted. A permanent fault costs 85 seconds and then fails exactly as it
+    does today; a blip costs one pause and the plan runs.
+
+    Safe to retry, checked rather than assumed: `store_lock` releases via flock
+    in a `finally` (the 0-byte .fetch.lock left on disk is the lock's file, not
+    a held lock), `add_worktree` removes an existing tree for the key before
+    adding, and a failed `git clone` leaves no partial store — verified against
+    the agent-bus work root after its clone failed, which held only .repo and
+    .fetch.lock."""
+    last = None
+    for attempt, pause in enumerate((0, *WORKSPACE_BACKOFF), start=1):
+        if pause:
+            time.sleep(pause)
+        try:
+            if attempt == 1 or debug_path is None:
+                # The first attempt runs clean. Tracing the happy path would
+                # write a handshake file on every successful dispatch for a
+                # fault that has never once appeared on attempt 1.
+                return make()
+            with _ssh_debug(debug_path):
+                return make()
+        except Exception as e:                       # noqa: BLE001 — see above
+            last = e
+            if log:
+                # The run log is what an operator tails, and until now it said
+                # only `workspace-failed fault=RuntimeError` — the actual reason
+                # lived solely in the emitted event. Name it here too.
+                log.note("workspace-attempt", n=attempt,
+                         fault=e.__class__.__name__,
+                         detail=str(e).replace("\n", " ")[:120] or "-",
+                         ssh_trace=(str(debug_path) if attempt > 1
+                                    and debug_path is not None else "-"))
+    raise last
+
+
+def _stop(repo, plan_id, lease_id, reason, log=None, transcript=None, **extra):
+    """Give up on this plan, and DO NOT release the lease.
+
+    docs/plan-dispatch.md states the contract this honours: never release the
+    lease without a marked PR. Releasing returns the plan to the undispatched
+    pool, and the watcher skips a plan only while a dispatch lease is live
+    (bin/fleet-watch:1267) — so releasing here mints a fresh lease and a fresh
+    page on every cycle, forever. An earlier version of this function did
+    exactly that, and claimed to reproduce "the same observable outcome" as the
+    watcher's OSError path, which pages through a one-shot marker. It did not.
+
+    Holding the lease instead lets it lapse into orphanhood by heartbeat, which
+    is the fleet's designed path for a wrapper that died: the sweep surfaces it
+    ONCE and never respawns, and a human's `respawn` comment is what retries.
+
+    `reason` must name what actually happened. It is the only channel that
+    survives — the watcher spawns with stderr=DEVNULL, so warn() goes nowhere.
+
+    `log` and `transcript` are POINTERS, never the failure channel itself: the
+    page is the channel, and a failure that only appends to a log is a failure
+    nobody sees. Every page names the run log so the reason has somewhere to
+    send the reader."""
+    detail = {"plan": plan_id, "lease": lease_id, "reason": reason}
+    detail.update({k: v for k, v in extra.items() if v is not None})
+    where = ""
+    if log is not None:
+        detail["log"] = str(log.path)
+        where += f" (log {log.path}"
+        if transcript is not None:
+            detail["transcript"] = str(transcript)
+            where += f", transcript {transcript}"
+        where += ")"
+    emit("plan-failed", repo, detail)
+    notify("Orchestrator stopped", f"{repo} {plan_id}: {reason}{where}")
+    warn(reason)
+    return 1
+
+
+
+
+# The phases that must be wired before this file may answer --ready with 0.
+# Emptying this list is what "part 2 shipped" MEANS; it is not a flag someone
+# flips when the code looks close.
+# EMPTY. This is what "part 2 shipped" means, and fleet-watch reads it as
+# permission to arm: the moment it is empty a merged plan can spawn a real
+# session that spends real money. It was emptied because the freeze is built and
+# tested, not because the code looked close.
+UNBUILT_PHASES = ()
+
+
+def readiness():
+    """(ready, detail) — the answer fleet-watch's arm gate consumes."""
+    if UNBUILT_PHASES:
+        return False, "not wired: " + ", ".join(UNBUILT_PHASES)
+    return True, ""
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--ready"]:
+        ok, detail = readiness()
+        if not ok:
+            warn(detail)
+        return 0 if ok else 1
+    # ADOPT a branch whose implementer already ran. The wrapper owns the whole
+    # lifecycle in one process, so a run that died after its PR existed left
+    # that PR stranded: dedupe refuses a fresh dispatch because the `Plan:`
+    # marker is there, and nothing could pick it up. Both real dispatches on
+    # 2026-09-09 died exactly there — the implementer succeeded, the pull
+    # listing blipped ~35s later, and #245 and speakhush#161 were left with no
+    # review loop and no steward.
+    resume = argv[:1] == ["--resume"]
+    if resume:
+        argv = argv[1:]
+    if len(argv) != 3:
+        warn("usage: orchestrator [--resume] <owner/repo> <plan-path> "
+             "<lease-id> | --ready")
+        return 2
+    repo, plan_path, lease_id = argv
+    plan_id = os.environ.get("EUNOMIA_PLAN_ID", Path(plan_path).stem)
+    sid = os.environ.get("EUNOMIA_SESSION", "")
+    if not sid:
+        warn("EUNOMIA_SESSION is unset — refusing to run without a holder identity")
+        return 2
+
+    # Opened BEFORE the lease is activated. Everything from here on can fail
+    # somewhere the watcher's stderr=DEVNULL swallows, and a log that starts
+    # after the first failure documents every run except the ones worth reading.
+    log = RunLog(lease_id)
+    log.note("start", repo=repo, plan=plan_id, lease=lease_id, session=sid)
+    try:
+        # BEFORE the lease is activated and before any spend: resolve the paths
+        # this run will need as evidence. Deferring this to write_transcript
+        # meant a misconfigured transcript root failed a 90-minute session at the
+        # very end, reported as "the session failed to run" — and skipped
+        # verify_marked_pr, so a session that HAD opened a marked PR left the
+        # plan deduped as done on a pull request nothing verified (2369 M3).
+        try:
+            check_evidence_paths(lease_id)
+        except Stop:
+            raise
+        except OSError as e:
+            raise Stop(f"transcript root unusable before the run started: "
+                       f"{e.__class__.__name__}: {e}")
+        ok, detail = activate(lease_id)
+        if not ok:
+            # Do NOT release: a lease this process could not activate is not this
+            # process's to retire, and releasing someone else's would strand them.
+            log.note("activate-failed", detail=detail)
+            warn(f"lease {lease_id} would not activate ({detail})")
+            emit("plan-failed", repo, {"plan": plan_id, "lease": lease_id,
+                                       "reason": "lease activate failed",
+                                       "log": str(log.path)})
+            notify("Orchestrator could not take its lease",
+                   f"{repo} {plan_id} (log {log.path})")
+            return 2
+
+        hb = Heartbeat(sid).start()
+        try:
+            try:
+                if resume:
+                    # Fetch the branch explicitly: the store may predate it,
+                    # and `origin/main` is the wrong place to stand when the
+                    # work already exists on a branch.
+                    rb = lease_branch(lease_id)
+                    wt = _workspace_with_retry(
+                        lambda: lib.add_worktree(
+                            repo, lease_id, f"origin/{rb}",
+                            refspecs=(f"+refs/heads/{rb}:refs/remotes/origin/{rb}",)),
+                        log, ssh_debug_path(lease_id))
+                else:
+                    wt = _workspace_with_retry(
+                        lambda: lib.add_worktree(repo, lease_id, "origin/main"),
+                        log, ssh_debug_path(lease_id))
+            except Exception as e:
+                # Deliberately broad. add_worktree's call graph raises far more
+                # than ValueError/RuntimeError — subprocess.TimeoutExpired from
+                # the clone and the worktree add, OSError from mkdir/open/
+                # write_text on a full or read-only work root. Anything escaping
+                # main() loses BOTH the plan-failed event and the page, and
+                # stderr is DEVNULL under the watcher, so the operator would get
+                # silence. A wrong-but-reported failure beats a
+                # right-but-invisible one here.
+                log.note("workspace-failed", fault=e.__class__.__name__,
+                         attempts=len(WORKSPACE_BACKOFF) + 1,
+                         detail=str(e).replace("\n", " ")[:120] or "-")
+                return _stop(repo, plan_id, lease_id,
+                             f"workspace setup failed: {e.__class__.__name__}: {e}",
+                             log)
+            # Who this worktree commits as, decided here rather than hoped for
+            # in the prompt. Three commits on main say `Fleet Operator` because
+            # the session inherited the operator's global config.
+            log.note("commit-identity", set=set_commit_identity(wt))
+            try:
+                fm, plan_text = read_plan(wt, plan_path)
+            except Exception as e:
+                log.note("plan-unreadable", fault=e.__class__.__name__)
+                return _stop(repo, plan_id, lease_id,
+                             f"plan {plan_path!r} unreadable: "
+                             f"{e.__class__.__name__}: {e}", log)
+
+            found = redact(plan_text)[1]
+            if found:
+                # A plan file carrying a credential shape is a human problem, not
+                # something to quietly scrub and proceed on — and it is checked
+                # HERE, on the plan text, before anything is routed or spawned.
+                # The plan is the only UNGUARDED text that enters a prompt: the
+                # preamble is a versioned file in this repo, the RUN FACTS block
+                # is machine-built from the repo, branch and paths, and the one
+                # other unreviewed input a run can carry — a red build's stored
+                # CI log, in a later fix round — passes through this file's own
+                # redact() before it ever reaches one (plan 0069 D2). The plan
+                # text gets no such second pass, which is why it is refused
+                # outright here rather than merely redacted.
+                log.note("plan-carries-credential", shapes=",".join(sorted(found)))
+                return _stop(repo, plan_id, lease_id,
+                             f"plan text carries credential shapes {sorted(found)} — "
+                             "refusing to build a prompt from it", log)
+
+            try:
+                cred = resolve_credential()
+                route = route_implementer(fm, cred, env=resolved_implementer_env(repo))
+                branch = lease_branch(lease_id)
+                prompt = build_implementer_prompt(repo, plan_id, plan_path,
+                                                  plan_text, wt, branch)
+                # Resolved ONCE, here, with the real repo — before the first
+                # session is spawned. Every later read (three comment sites and
+                # the plan-failed reason) is the SAME value, even if the conf is
+                # edited mid-run (plan 0042 §2).
+                implementer_timeout_minutes(repo)
+            except Stop as stop:
+                log.note("routing-refused", reason=stop.reason)
+                return _stop(repo, plan_id, lease_id, stop.reason, log)
+
+            log.note("routed", runner=route.name, credential=cred.kind,
+                     initiator=cred.initiator, zone=fm.get("zone", "?"),
+                     branch=branch, prompt_chars=len(prompt))
+            session = None
+            try:
+                if resume:
+                    # ADOPT an existing branch instead of building one. No
+                    # implementer runs: the work is already pushed, and what
+                    # died was the wrapper around it.
+                    attach_branch(wt, branch)
+                    log.note("resumed", branch=branch)
+                else:
+                    create_branch(wt, branch, log)
+                    # the prompt is passed VERBATIM. redact()'s output above is
+                    # the CHECK's, never what a session is sent: a substituted
+                    # prompt is a silently different prompt
+                    session = run_implementer(wt, prompt, cred, route, lease_id,
+                                              log)
+            except Stop as stop:
+                log.note("session-refused", reason=stop.reason)
+                return _stop(repo, plan_id, lease_id, stop.reason, log)
+            except Exception as e:
+                log.note("session-failed", fault=e.__class__.__name__)
+                return _stop(repo, plan_id, lease_id,
+                             f"implementer session failed to run: "
+                             f"{e.__class__.__name__}: {e}", log)
+
+            # A resumed run has no session of its own; its transcript belongs
+            # to the process that died. Derived once so every later reference
+            # is safe rather than each one re-checking.
+            transcript = session.transcript if session is not None else None
+            exit_code = session.exit_code if session is not None else "resumed"
+
+            # Verification runs REGARDLESS of the session's exit code. The
+            # session is the judgment core; the guarantee is this call.
+            try:
+                verified, why, pr = verify_marked_pr(repo, branch, plan_id,
+                                                     plan_path, log=log)
+            except Stop as stop:
+                log.note("verify-refused", reason=stop.reason)
+                return _stop(repo, plan_id, lease_id, stop.reason, log)
+            except Exception as e:
+                log.note("verify-failed", fault=e.__class__.__name__)
+                return _stop(repo, plan_id, lease_id,
+                             f"could not verify a marked PR "
+                             f"({e.__class__.__name__}: {e})", log)
+            log.note("verified" if verified else "unverified", pr=pr or "-",
+                     detail=why or "-")
+
+            if session is not None and session.timed_out:
+                # A marked PR that appears AFTER the group was killed is a
+                # failure, not a late success: nothing observed the run that
+                # produced it, and letting it stand would dedupe the plan as
+                # done on work no wrapper ever verified.
+                late = (f"; #{pr} appeared after the kill and is NOT accepted "
+                        "as a late success") if verified else ""
+                return _stop(repo, plan_id, lease_id,
+                             f"implementer timed out after "
+                             f"{implementer_timeout_minutes(repo)} min; process group "
+                             f"killed{late}", log, transcript=transcript)
+            if not verified and session is not None and session.backend_error:
+                # The session ended on a model-backend error (plan 0079). Say
+                # so, and say whether any work existed: mopsus requeues only
+                # the "before any work" form.
+                be = session.backend_error
+                phase = ("after work began" if work_began(repo, branch, wt)
+                         else "before any work")
+                return _stop(repo, plan_id, lease_id,
+                             f"session ended on a backend error {phase}: "
+                             f"API {be['status']} after {session.seconds}s — "
+                             f"{be['message']}", log, transcript=transcript)
+            if not verified:
+                return _stop(repo, plan_id, lease_id,
+                             f"no verified marked PR: {why} "
+                             f"(session exit {exit_code})", log,
+                             transcript=transcript)
+
+            warn(f"{repo} {plan_id}: verified marked PR #{pr} on {branch}")
+            # The boundary has moved exactly one phase, and it is still the same
+            # loud stop with the lease HELD: the PR is open and unreviewed, and
+            # releasing would return the plan to the undispatched pool while its
+            # work sits in a branch — a fresh lease and a fresh session every
+            # cycle. The next merged PR moves the boundary again; none of them
+            # make it silent.
+            try:
+                approved, why, rows = review_loop(repo, plan_id, plan_path,
+                                                  plan_text, pr, branch, wt,
+                                                  cred, route, lease_id, log)
+            except Stop as stop:
+                log.note("review-refused", reason=stop.reason)
+                return _stop(repo, plan_id, lease_id, stop.reason, log,
+                             transcript, pr=pr)
+            except Exception as e:
+                log.note("review-failed", fault=e.__class__.__name__)
+                return _stop(repo, plan_id, lease_id,
+                             f"review loop failed ({e.__class__.__name__}: {e})",
+                             log, transcript, pr=pr)
+
+            # The ledger is posted whatever the outcome: an exhausted loop is
+            # exactly the case where a human needs to see how the rounds went,
+            # and a ledger written only on success documents every run except
+            # the ones worth reading.
+            if rows:
+                try:
+                    post_comment(repo, pr, ledger_comment(rows))
+                except Exception as e:
+                    warn(f"review ledger not posted ({e.__class__.__name__})")
+
+            if not approved:
+                log.note("review-stopped", detail=why, rounds=len(rows))
+                return _stop(repo, plan_id, lease_id, why, log,
+                             transcript, pr=pr, rounds=len(rows))
+
+            try:
+                post_comment(repo, pr, deferred_comment(rows, rows[-1]["body"]))
+            except Exception as e:
+                warn(f"deferred findings not posted ({e.__class__.__name__})")
+            log.note("review-approved", pr=pr, rounds=len(rows),
+                     sha=str(rows[-1]["sha"])[:8])
+            warn(f"{repo} {plan_id}: #{pr} approved at "
+                 f"{str(rows[-1]['sha'])[:8]} after {len(rows)} round(s)")
+            # The wrapper does NOT exit at DoD-verified. It stewards the PR —
+            # heartbeating, polling comments, invoking the model only when an
+            # instruction arrives — until the PR is merged or closed, and only
+            # then releases. An instruction arriving after approval does NOT
+            # push: the freeze (0032) sends it to a follow-up unless the owner
+            # has said `unfreeze` on its own line.
+            return steward(repo, plan_id, plan_path, plan_text, pr, branch, wt,
+                           cred, route, lease_id, log)
+        finally:
+            hb.stop()
+            # Removed on any CONTROLLED exit. An uncontrolled death (SIGKILL,
+            # power) skips this and leaves the tree standing — which is exactly
+            # the case fleetlib.orphan_worktrees reports and deliberately does
+            # not delete.
+            try:
+                lib.remove_worktree(repo, lease_id)
+            except Exception as e:
+                warn(f"worktree cleanup failed ({e.__class__.__name__})")
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

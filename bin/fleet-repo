@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""fleet-repo — enrolling a repo in the fleet is a command with a record.
+
+  fleet-repo list [--check]
+  fleet-repo enable  <owner/repo> [--enforce] [--dispatch]
+  fleet-repo disable <owner/repo> [--enforce] [--dispatch]
+  fleet-repo check   <owner/repo>
+
+Enrolment used to be two unrelated gestures with no shared record:
+`fleet-install-hooks <repo>` for enforcement, and `FLEET_WATCH_REPOS=a,b` for
+dispatch — an env var with no default, no command and no persistence, which as
+of 2026-09-06 was set nowhere on this fleet while zero repos carried the
+pre-push hook. This is the record (plan 0013).
+
+`check` exit codes are THREE, not two:
+  0  eligible
+  1  refused — a named protection lane is open
+  2  NOT DETERMINABLE — the broker could not answer (unreachable, keyvault
+     sealed, its Forgejo call failed); says nothing about the repo
+Two codes cannot carry three answers: 0 would read as eligible (false green)
+and 1 as refused, which is the misdiagnosis this tool exists to prevent. The
+watcher's own runbook records the cost — a write-scoped PAT 403ing on every
+repo once paged "Watcher blind — LAN privacy", sending an operator after a
+network fault that did not exist.
+
+A row that still carries `extlane` or `no-extlane` (the consent flag ADR-0013
+removed — every repository has a test lane now) is read without error and the
+token is dropped on the next write, so an old copy of the file is not a parse
+failure.
+
+The file records INTENT. The protection rule AT CYCLE TIME remains the
+AUTHORITY — since ADR-0003 §2 that means asking a verdict resolver
+(`bin/fleet-watch`'s `verdict()`, plan 0054), whose default implementation asks
+keyvault's broker and runs `main_is_protected()` from this repo's own
+`bin/fleet-watch` either way. A repo's protection can be weakened after
+enrolment, and a cached "eligible" is exactly how a repo stays vouched-for
+after the property stopped holding; that is also why the check is made every
+cycle rather than at enrolment. Nothing here writes a protection rule — an
+account that can PATCH a rule can weaken it, land a `status: ready` plan and
+restore it, which is the ignition forgery the guard exists to prevent.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+_lib_loader = importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py"))
+lib = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleetlib", _lib_loader))
+_lib_loader.exec_module(lib)
+
+CONF = BIN.parent / "config" / "repos.conf"
+
+EXIT_OK, EXIT_REFUSED, EXIT_UNKNOWN = 0, 1, 2
+FLAGS = ("enforce", "dispatch")
+
+# Tokens an older copy of the file may carry. Read, never kept: ADR-0013 §1.
+RETIRED = ("extlane", "no-extlane")
+
+# One sentence, three commands. `enable` has always had to say this — the
+# main-via-contents-API read is plan 0013's unbuilt second half — and `list`
+# and `check` are the other two places an operator asks what the fleet is
+# doing. Kept as constants so a future edit cannot fix one and leave two.
+NOTE_NO_READER = (
+    "NOTE: fleet-watch does not read this file yet — it still reads "
+    "FLEET_WATCH_REPOS (bin/fleet-watch:134). Enrolment here is a record, not "
+    "yet a dispatch.")
+
+
+def _notes():
+    """The caveat, on stderr — it is commentary on the state of the system,
+    not part of the record `list` prints to stdout."""
+    print(NOTE_NO_READER, file=sys.stderr)
+
+
+def flag_tokens(entry):
+    """One row's flags, in FLAGS order, rendered exactly as they are written.
+    Single source for both the writer and `list`, so what the operator reads
+    is what the file says."""
+    return [f for f in FLAGS if entry.get(f)]
+
+
+def _watch():
+    """fleet-watch as a module, for `verdict` and the PROT_* codes.
+
+    Imported rather than reimplemented: the whole point is that `check` and the
+    watcher answer identically. The eight-lane rule itself lives one hop
+    further away for the default (broker) source — keyvault's broker imports
+    THIS file's `main_is_protected` too — but the principle is unchanged and
+    load-bearing across two repos either way: a second copy of an eight-lane
+    rule is a second copy to drift. It is extension-less, so SourceFileLoader —
+    the same idiom fleet-watch itself uses for fleetlib.
+    """
+    ldr = importlib.machinery.SourceFileLoader("fleet_watch", str(BIN / "fleet-watch"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleet_watch", ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+# --- config ---------------------------------------------------------------
+# Flat and one level deep on purpose. The reader is the OWNERSHIP.yml idiom —
+# known keys, `#` comments, no nesting — because pulling a general YAML parser
+# into a control-plane binary adds a dependency to something that must run when
+# things are already broken.
+
+
+def read_conf(path=None):
+    """(repos, errs, kept) — {repo: {flag: True}}, complaints, and the raw text
+    of every line the parser could NOT read.
+
+    `kept` exists because both writers regenerate the whole file from `repos`.
+    Without it a one-letter typo (`enfrce`) made the row vanish from the parse
+    and then vanish from the FILE on the next `enable` — the operator's typo
+    silently becoming a deletion, and a repo they believe is enrolled quietly
+    not being. Unparseable lines are reported AND carried through verbatim."""
+    path = Path(path) if path else CONF
+    repos, errs, kept = {}, [], []
+    if not path.exists():
+        return repos, errs, kept
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        def _bad(msg):
+            errs.append(f"{path.name}:{n}: {msg}")
+            kept.append(raw.rstrip())
+        if not line.startswith("repo:"):
+            _bad(f"not a `repo:` line: {raw.strip()!r}")
+            continue
+        parts = line[len("repo:"):].split()
+        if not parts:
+            _bad("`repo:` with no repository")
+            continue
+        name, flags = parts[0], parts[1:]
+        flags = [f for f in flags if f not in RETIRED]
+        bad = [f for f in flags if f not in FLAGS]
+        if bad:
+            _bad(f"unknown flag(s) {bad} on {name}")
+            continue
+        repos[name] = {f: True for f in flags}
+    return repos, errs, kept
+
+
+def write_conf(repos, path=None, kept=()):
+    """Locked and atomic — the ledger's idiom, which plan 0013's DoD requires.
+
+    `write_text` truncates in place: two concurrent `enable`s both read the same
+    file and the second discards the first's row, and a crash mid-write leaves a
+    half-file the next read partially parses. flock a PERMANENT lockfile (never
+    the data file — a rename must not invalidate a held lock), write a temp
+    beside the target, then os.replace.
+
+    `kept` is re-emitted verbatim so a line the parser could not read survives a
+    rewrite instead of being deleted by it."""
+    path = Path(path) if path else CONF
+    lines = ["# Which repos the fleet acts on. `fleet-repo` writes this file.",
+             "#",
+             "# enforce  — the pre-push lease hook is installed in the local checkout",
+             "# dispatch — eligible for merge-ignite, IF main_is_protected() passes at",
+             "#            cycle time. This file records intent; that check is authority.",
+             ""]
+    for name in sorted(repos):
+        flags = " ".join(flag_tokens(repos[name]))
+        lines.append(f"repo: {name}{(' ' + flags) if flags else ''}")
+    if kept:
+        lines += ["",
+                  "# Lines fleet-repo could not parse. Carried through untouched so a",
+                  "# typo is not silently turned into a deletion. Fix or remove them.",
+                  *kept]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with lib.held_lock(path.with_suffix(path.suffix + ".lock")):
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        tmp.write_text("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+
+
+def _checkout(repo):
+    """~/dev/<name>. Derived, never a config field: a configurable path invites
+    a second source of truth about where a repo lives, and REPOS.md is that."""
+    return Path.home() / "dev" / repo.split("/", 1)[1]
+
+
+# --- protection check -----------------------------------------------------
+
+
+def classify(ok, why):
+    """(exit_code, message) from `main_is_protected`'s (ok, why).
+
+    *** keyvault's forgejo-broker IMPORTS THIS. *** It is the other half of the
+    rule: `main_is_protected` decides protected-or-not, and this decides whether
+    a "not" is a REFUSAL or a COULD-NOT-TELL. Splitting them out of `check()`
+    is what lets the broker reuse both without calling `check()`, which now asks
+    the broker and would therefore recurse.
+
+    Only the two TRANSPORT-level messages are could-not-tell. `_api` returns
+    status 0 on transport failure and passes 401/5xx through, so an outage, an
+    EHOSTUNREACH or an expired token would otherwise render as "refused, here is
+    a lane to fix" — a lane that is not the problem.
+
+    Matched by PREFIX, not substring. The substring form also caught the
+    whitelist-MEMBERSHIP refusals ("...membership is unreadable — cannot
+    vouch"), which are a reachable repo whose rule was read and cannot be
+    vouched for: a refusal, with a lane to fix. fleet-watch already used the
+    prefix form for its blind counter (its r6 low) while this used `in`, so the
+    two disagreed about the same repo — and now that the broker is the single
+    place both callers get their answer, that disagreement would have become
+    fleet-wide. One reading, the narrow one.
+    """
+    if ok:
+        return EXIT_OK, "eligible"
+    w = why or ""
+    if (w.startswith("branch protections rejected the token")
+            or w.startswith("branch protections unreadable")):
+        return EXIT_UNKNOWN, why
+    return EXIT_REFUSED, why
+
+
+def check(repo, watch=None):
+    """(exit_code, message). Asks whichever verdict source `bin/fleet-watch`
+    is configured for; holds no credential of its own either way.
+
+    Since infra ADR-0003 §2 this stopped minting an admin PAT and calling
+    `main_is_protected` directly — keyvault's forgejo-broker does both, on
+    vaulthost, importing that same rule so there is still exactly one definition.
+    Since plan 0054, `bin/fleet-watch` can also be configured to ask that rule
+    directly, in-process (`FLEET_VERDICT_SOURCE=direct`); `check()` goes
+    through `w.verdict()`, the resolver, rather than naming the broker
+    implementation itself, so this command answers exactly what the watcher's
+    own next cycle would — whichever source that deployment has chosen.
+
+    The three exits map ONE-TO-ONE onto the resolver's own three states, which
+    is not a coincidence: both verdict sources were built to preserve this
+    distinction. The string-sniffing that used to separate could-not-tell from
+    refused is gone, because the answer now says which it is instead of being
+    inferred from the wording of a message.
+    """
+    w = watch or _watch()
+    code, why, _lane = w.verdict(repo)
+    if code == w.PROT_OK:
+        return EXIT_OK, "eligible"
+    if code == w.PROT_REFUSED:
+        return EXIT_REFUSED, why
+    return EXIT_UNKNOWN, why
+
+
+# --- commands -------------------------------------------------------------
+
+
+def cmd_list(args):
+    repos, errs, _kept = read_conf(args.conf)
+    for e in errs:
+        print(e, file=sys.stderr)
+    if not repos:
+        print("no repos enrolled (config/repos.conf is absent or empty)")
+        _notes()
+        return EXIT_OK
+    w = _watch() if args.check else None
+    for name in sorted(repos):
+        flags = " ".join(flag_tokens(repos[name])) or "-"
+        if args.check and repos[name].get("dispatch"):
+            code, why = check(name, w)
+            state = {EXIT_OK: "eligible", EXIT_REFUSED: "REFUSED",
+                     EXIT_UNKNOWN: "not determinable"}[code]
+            print(f"{name:<28} {flags:<28} {state}: {why}" if code else
+                  f"{name:<28} {flags:<28} {state}")
+        else:
+            print(f"{name:<28} {flags}")
+    _notes()
+    return EXIT_OK if not errs else EXIT_REFUSED
+
+
+def _flags_from(args):
+    picked = [f for f in FLAGS if getattr(args, f)]
+    if not picked:
+        sys.exit("fleet-repo: name at least one of --enforce / --dispatch "
+                 "(they do not imply each other, and guessing is worse)")
+    return picked
+
+
+def cmd_enable(args):
+    repo = lib.validate_repo(args.repo)
+    picked = _flags_from(args)
+    repos, errs, kept = read_conf(args.conf)
+    for e in errs:
+        print(e, file=sys.stderr)
+    entry = repos.setdefault(repo, {})
+    rc = EXIT_OK
+
+    if "enforce" in picked:
+        path = _checkout(repo)
+        if not path.is_dir():
+            print(f"enforce: no checkout at {path} — not enabled", file=sys.stderr)
+            rc = EXIT_REFUSED
+        else:
+            import subprocess
+            r = subprocess.run([str(BIN / "fleet-install-hooks"), str(path)],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                # Surface the installer's own refusal verbatim (bare repo,
+                # core.hooksPath, a foreign hook) and leave the flag unset. A
+                # record claiming enforcement that is not installed is the
+                # false-green shape the pre-push polarity rule exists to avoid.
+                print((r.stderr or r.stdout).strip(), file=sys.stderr)
+                rc = EXIT_REFUSED
+            else:
+                entry["enforce"] = True
+                print(f"enforce: hook installed in {path}")
+
+    if "dispatch" in picked:
+        entry["dispatch"] = True
+        code, why = check(repo)
+        print(f"dispatch: recorded — {why}")
+        if code != EXIT_OK:
+            print("  (recorded as intent; the repo will NOT dispatch until the "
+                  "live check passes)", file=sys.stderr)
+
+    if not entry:
+        repos.pop(repo, None)
+    write_conf(repos, args.conf, kept)
+    print(f"\n{repo}: " + (" ".join(flag_tokens(entry)) or "no flags"))
+    # Say only what is true at this head. `fleet-watch` still reads
+    # FLEET_WATCH_REPOS and nothing else; the main-via-API read is 0013's second
+    # half and is not built. Telling an operator the record "takes effect when
+    # merged" would have them merge and wait for a dispatch that cannot come.
+    print("recorded in config/repos.conf.")
+    _notes()
+    return rc
+
+
+def cmd_disable(args):
+    repo = lib.validate_repo(args.repo)
+    picked = _flags_from(args)
+    repos, errs, kept = read_conf(args.conf)
+    for e in errs:
+        print(e, file=sys.stderr)
+    if repo not in repos:
+        print(f"{repo} is not enrolled")
+        return EXIT_OK
+    entry = repos[repo]
+    for f in picked:
+        entry.pop(f, None)
+    if "enforce" in picked:
+        # Deleting a file in someone's .git/hooks on the strength of a config
+        # edit is not a thing this tool gets to do.
+        print(f"enforce: flag cleared — the pre-push hook is STILL INSTALLED in "
+              f"{_checkout(repo)}\n  remove it with: rm "
+              f"{_checkout(repo)}/.git/hooks/pre-push")
+    if not repos[repo]:
+        repos.pop(repo)
+    write_conf(repos, args.conf, kept)
+    _notes()
+    return EXIT_OK
+
+
+def cmd_check(args):
+    repo = lib.validate_repo(args.repo)
+    code, why = check(repo)
+    label = {EXIT_OK: "eligible", EXIT_REFUSED: "refused",
+             EXIT_UNKNOWN: "not determinable"}[code]
+    print(f"{repo}: {label}" + ("" if code == EXIT_OK else f" — {why}"))
+    # "eligible" is read as "it will dispatch", and today nothing will.
+    _notes()
+    return code
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-repo", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--conf", help="config path (test seam)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list"); p.add_argument("--check", action="store_true")
+    p.set_defaults(fn=cmd_list)
+    for name, fn in (("enable", cmd_enable), ("disable", cmd_disable)):
+        p = sub.add_parser(name)
+        p.add_argument("repo")
+        p.add_argument("--enforce", action="store_true")
+        p.add_argument("--dispatch", action="store_true")
+        p.set_defaults(fn=fn)
+    p = sub.add_parser("check"); p.add_argument("repo"); p.set_defaults(fn=cmd_check)
+
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

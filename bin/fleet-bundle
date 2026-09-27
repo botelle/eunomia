@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""fleet-bundle — emit a repository's generated contract (ADR-0006 §2, plan 0018).
+
+The externally observable surface a black-box integration tester needs, and
+nothing else: OpenAPI for a service, the declared argument surface for a CLI,
+declared event type names and other closed vocabularies, configuration key
+names, and the harness entry points that start the thing and observe it.
+
+Two properties hold by construction rather than by filtering.
+
+Prose never appears from source because prose is never read there. Action
+serialisation works from a fixed field allowlist (_ACTION_FIELDS); `help`,
+`description`, `epilog` and `usage` are not stripped out of a copy, they are
+never fetched. Ten of eunomia's twelve CLIs pass `description=__doc__` to
+argparse, so `--help` is not a contract artifact — see the ADR. One prose
+document is carried whole and on purpose: `DECLARED_BEHAVIOUR_PATH`, a
+hand-written file this generator does not produce and cannot verify beyond
+byte-identity (plan 0019) — see docs/declared-behaviour.md's own boundaries
+for what keeps that file safe to send.
+
+Implementation never appears because no file is copied. Every section is built
+from a parsed AST or from a live parser object, so a function body has no route
+into the output.
+
+Read-only. Takes no token, writes to no repository, and opens nothing.
+"""
+import argparse
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+BUNDLE_VERSION = 1
+SENTINEL = "<<<FLEET-BUNDLE-JSON>>>"
+
+# The one hand-written file this builder carries whole (plan 0019). An
+# allowlist of exactly one path, deliberately: this builder's whole
+# guarantee elsewhere is that nothing enters the bundle unless code put it
+# there on purpose, and a second hand-written path would be a second place
+# that guarantee has to be re-argued.
+DECLARED_BEHAVIOUR_PATH = "docs/declared-behaviour.md"
+
+# The allowlist that makes "no prose" a property of construction. Adding a
+# field here is the only way prose can enter a CLI section, which is what puts
+# the decision in one reviewable place.
+_ACTION_FIELDS = ("option_strings", "dest", "type", "default", "choices",
+                  "required", "nargs", "action")
+
+_SKIP_DIRS = {".git", ".build", ".venv", "venv", "node_modules", "__pycache__",
+              ".claude", "DerivedData", ".pytest_cache", ".mypy_cache",
+              ".xcodeproj", "Pods", "dist", "build"}
+
+# Source files whose surface this builder cannot express. Counted, never read.
+_OTHER_LANG = {".swift": "Swift", ".go": "Go", ".rs": "Rust", ".ts": "TypeScript",
+               ".js": "JavaScript", ".rb": "Ruby", ".java": "Java", ".kt": "Kotlin"}
+
+_INTROSPECT_TIMEOUT = 20
+_VOCAB_MAX = 60
+
+
+# --------------------------------------------------------------------------
+# walking the tree
+
+def _is_virtualenv(p):
+    """A virtualenv by STRUCTURE, not by name.
+
+    `_SKIP_DIRS` covers `.venv` and `venv`, which is every virtualenv this repo's
+    own tooling creates — and only those. A tree carrying one under any other
+    name (`env`, `venv39`, `.direnv`, a scratch `.venv-r`) is walked in full, and
+    its site-packages then reach the corpus the bundle is built from: a thousand
+    vendored modules presented as this project's command-line surface.
+
+    `pyvenv.cfg` is the marker PEP 405 requires at a virtualenv's root, so it
+    identifies one whatever it is called. This costs one stat per directory.
+    """
+    return (p / "pyvenv.cfg").is_file()
+
+
+def _walk(root):
+    """Yield every file under root, skipping build output and vendored trees.
+
+    `.claude` is skipped for a reason worth naming: ares keeps agent worktrees
+    under it, so a naive walk finds a second copy of every probe script and the
+    bundle reports each CLI twice.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in _SKIP_DIRS and not d.endswith(".xcodeproj")
+                             and not _is_virtualenv(Path(dirpath) / d))
+        for fn in sorted(filenames):
+            yield Path(dirpath) / fn
+
+
+def _is_python(p):
+    if p.suffix == ".py":
+        return True
+    if p.suffix:
+        return False
+    try:
+        with open(p, "rb") as fh:
+            first = fh.readline(200)
+    except OSError:
+        return False
+    return first.startswith(b"#!") and b"python" in first
+
+
+def _cli_candidates(root):
+    """Python files that could carry a command-line surface.
+
+    Test files are excluded: a test module is not a CLI, and importing one
+    under introspection would run a test session inside the builder.
+    """
+    out = []
+    for p in _walk(root):
+        if not _is_python(p):
+            continue
+        rel = p.relative_to(root)
+        parts = rel.parts
+        if parts[0] in ("tests", "test") or rel.name.startswith("test_"):
+            continue
+        if rel.name == "conftest.py":
+            continue
+        out.append(p)
+    return out
+
+
+# --------------------------------------------------------------------------
+# the declared argument surface, from the built parser
+
+def _action_kind(action):
+    """A stable token for the action class: _StoreTrueAction -> store_true."""
+    name = type(action).__name__
+    name = re.sub(r"^_+", "", name)
+    name = re.sub(r"Action$", "", name)
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower() or "store"
+
+
+def _plain(value, depth=0):
+    """Reduce a default or choice to something JSON can hold, without prose.
+
+    Falls back to repr() for objects, capped: an unbounded repr of a module or
+    a large structure is not a contract, and the cap keeps one odd default from
+    dominating the bundle.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple, set, frozenset)) and depth < 2:
+        return [_plain(v, depth + 1) for v in sorted(value, key=repr)] \
+            if isinstance(value, (set, frozenset)) else [_plain(v, depth + 1) for v in value]
+    if isinstance(value, dict) and depth < 2:
+        return {str(k): _plain(v, depth + 1) for k, v in value.items()}
+    text = repr(value)
+    return text if len(text) <= 200 else text[:197] + "..."
+
+
+def _serialise_parser(parser, _seen=None):
+    """Walk a live parser into structure, reading only _ACTION_FIELDS."""
+    import argparse as _ap
+    _seen = _seen if _seen is not None else set()
+    if id(parser) in _seen:
+        return {"recursive": True}
+    _seen.add(id(parser))
+
+    options, positionals, subcommands = [], [], {}
+    for action in parser._actions:
+        if isinstance(action, _ap._HelpAction):
+            # Every argparse CLI has --help and none of them should: the ADR
+            # rejects --help as a contract artifact precisely because ten of
+            # these print a module docstring. Listing the flag invites its use.
+            continue
+        if isinstance(action, _ap._SubParsersAction):
+            # choices maps every name AND alias to its parser; group aliases so
+            # the bundle says "these are one command" rather than listing twins.
+            by_parser = {}
+            for name, sub in action.choices.items():
+                by_parser.setdefault(id(sub), (sub, []))[1].append(name)
+            for sub, names in by_parser.values():
+                names.sort()
+                entry = _serialise_parser(sub, _seen)
+                if len(names) > 1:
+                    entry["aliases"] = names[1:]
+                subcommands[names[0]] = entry
+            continue
+
+        item = {}
+        for field in _ACTION_FIELDS:
+            if field == "action":
+                item["action"] = _action_kind(action)
+                continue
+            if field == "type":
+                t = getattr(action, "type", None)
+                item["type"] = getattr(t, "__name__", None) if t is not None else None
+                continue
+            raw = getattr(action, field, None)
+            if field == "choices" and raw is not None:
+                raw = list(raw)
+            item[field] = _plain(raw)
+        flags = item.pop("option_strings") or []
+        item = {k: v for k, v in item.items() if v not in (None, False, [])}
+        if flags:
+            item["flags"] = flags
+            options.append(item)
+        else:
+            # argparse marks every positional required unless nargs makes it
+            # optional; repeating that on each row is noise, not structure.
+            item.pop("required", None)
+            positionals.append(item)
+
+    out = {}
+    if getattr(parser, "prog", None):
+        out["prog"] = parser.prog
+    if positionals:
+        out["arguments"] = positionals
+    if options:
+        out["options"] = options
+    if subcommands:
+        out["subcommands"] = subcommands
+    return out
+
+
+# An allowlist, not a denylist, and for the same reason bin/fleet-candidate
+# gives: enumerating what to withhold is the wrong way round, because it is
+# wrong once and then silently. What makes it load-bearing HERE is narrower and
+# worse than the usual argument.
+#
+# Introspection evaluates every default expression, and the bundle prints what
+# it evaluates to. So `default=os.environ.get("X_TOKEN")` does not put the NAME
+# of a secret in the bundle, it puts the secret — into a document ADR-0006 §2
+# sends to two cloud vendors. That defeats this builder's own rule that config
+# keys are names and never values, by a path that never touches the config-key
+# extractor. Measured on a synthetic target before this existed.
+#
+# HOME stays because the parent normalises host paths out of the finished
+# document using its own Path.home(); a child with a different HOME would
+# resolve path defaults the parent then fails to recognise and rewrite.
+_CHILD_ENV_ALLOW = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ",
+                    "USER", "LOGNAME", "SHELL", "TERM")
+
+
+def _child_env():
+    env = {k: os.environ[k] for k in _CHILD_ENV_ALLOW if k in os.environ}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["FLEET_BUNDLE_INTROSPECTING"] = "1"   # so a target can tell where it is
+    return env
+
+
+def _introspect_file(path):
+    """Import `path` in a child process and return its parser's structure.
+
+    A child rather than an import here, for four reasons. Three are about the
+    second repository: an import-time sys.exit does not end the builder, a hang
+    is bounded, and stdout written at import does not corrupt the bundle. The
+    fourth is that a child is where the environment can be replaced — see
+    _CHILD_ENV_ALLOW, which is what stops an env-derived default from carrying a
+    live secret into the bundle.
+    """
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--introspect", str(path)],
+        capture_output=True, text=True, timeout=_INTROSPECT_TIMEOUT,
+        cwd=tempfile.gettempdir(), env=_child_env())
+    if SENTINEL not in proc.stdout:
+        why = (proc.stderr.strip().splitlines() or ["no parser found"])[-1]
+        return None, why
+    payload = proc.stdout.split(SENTINEL, 1)[1]
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        return None, f"introspection produced no valid structure ({exc.msg})"
+    if "error" in data:
+        return None, data["error"]
+    return data["parser"], None
+
+
+def _run_introspection_child(path):
+    """The child half of _introspect_file. Runs in its own process.
+
+    argparse builds the whole parser — including subparsers added in loops or
+    by helper functions — before parse_args is reached, so intercepting
+    parse_args captures the complete surface and stops before the command runs.
+    """
+    import argparse as _ap
+    import importlib.machinery
+    import importlib.util
+
+    class _Captured(Exception):
+        def __init__(self, parser):
+            self.parser = parser
+
+    def _capture(self, *a, **k):
+        raise _Captured(self)
+
+    _ap.ArgumentParser.parse_args = _capture
+    _ap.ArgumentParser.parse_known_args = _capture
+
+    def _emit(obj):
+        sys.stdout.write("\n" + SENTINEL + json.dumps(obj))
+        sys.stdout.flush()
+
+    src = Path(path)
+    loader = importlib.machinery.SourceFileLoader("_fleet_bundle_target", str(src))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    argv0 = src.name
+    sys.argv = [argv0]
+
+    try:
+        loader.exec_module(mod)
+    except _Captured as cap:
+        _emit({"parser": _serialise_parser(cap.parser)})
+        return 0
+    except SystemExit:
+        _emit({"error": "module exits at import; not introspectable"})
+        return 0
+    except BaseException as exc:  # noqa: BLE001 - any failure is one gap entry
+        _emit({"error": f"import failed: {type(exc).__name__}"})
+        return 0
+
+    entry = getattr(mod, "main", None)
+    if not callable(entry):
+        _emit({"error": "no argparse parser and no main(); argument surface undeclared"})
+        return 0
+    for call in (lambda: entry([]), lambda: entry()):
+        try:
+            call()
+        except _Captured as cap:
+            _emit({"parser": _serialise_parser(cap.parser)})
+            return 0
+        except TypeError:
+            continue
+        except BaseException as exc:  # noqa: BLE001
+            _emit({"error": f"main() raised {type(exc).__name__} before parse_args"})
+            return 0
+    _emit({"error": "main() returned without building a parser"})
+    return 0
+
+
+# --------------------------------------------------------------------------
+# declared vocabularies and config keys, from the AST
+
+def _parse(path):
+    try:
+        return ast.parse(path.read_text(encoding="utf-8", errors="replace"), str(path))
+    except (SyntaxError, OSError):
+        return None
+
+
+def _vocabularies(tree):
+    """Module-level UPPERCASE constants holding a closed set of strings.
+
+    This is how eunomia declares its event type names (fleet-emit's
+    EVENT_TYPES), its lease states and its resource types: a literal container
+    of literal strings at module scope. Anything computed is not a declaration
+    and is not emitted.
+
+    A member is a single line of at most _VOCAB_MAX chars. That is part of the
+    definition of the artifact rather than a filter over one: a declared type
+    name is a token, and an uppercase tuple of paragraphs is prose that happens
+    to be assigned to a constant.
+    """
+    found = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        name = target.id
+        if name.startswith("_") or not name.isupper():
+            continue
+        value = node.value
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) \
+                and value.func.id in ("frozenset", "set", "tuple", "list") and value.args:
+            value = value.args[0]
+        if not isinstance(value, (ast.Set, ast.Tuple, ast.List)):
+            continue
+        items = [e.value for e in value.elts
+                 if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                 and "\n" not in e.value and len(e.value) <= _VOCAB_MAX]
+        if items and len(items) == len(value.elts):
+            found.append({"name": name, "values": sorted(items)})
+    return found
+
+
+COMPUTED = "<computed>"
+
+
+def _declared_defaults(tree):
+    """What each add_argument in a source declares as its default.
+
+    Returns literal (name, value) pairs, and separately the names whose default
+    is declared but not a literal. A default counts as literal only if its AST
+    node survives `ast.literal_eval` — true for exactly the literals and nothing
+    else. `default=20` qualifies; `default=os.environ.get("X")` and
+    `default=Path(__file__).parent / "runs"` do not, and cannot be made to.
+
+    The second set exists because the allowlisted child environment makes
+    `os.environ.get("X_TOKEN")` evaluate to None, which the serialiser drops —
+    so the option would arrive here carrying no default at all, and be reported
+    as having none. It has one. Saying "computed" is the true statement; saying
+    nothing is a false one, and the source is what knows the difference.
+    """
+    pairs, computed = [], set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "attr", None) == "add_argument"):
+            continue
+        names = [a.value for a in node.args
+                 if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        for kw in node.keywords:
+            if kw.arg != "default":
+                continue
+            try:
+                value = ast.literal_eval(kw.value)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                computed.update(names)
+                continue
+            pairs.extend((name, _plain(value)) for name in names)
+    return pairs, computed
+
+
+def _mark_computed(node, declared):
+    """Replace every default the source did not write down as a literal.
+
+    Introspection evaluates default expressions, and that evaluation is what
+    makes the argument surface complete — fleet-repo builds two of its four
+    subcommands in a loop, and only a built parser knows that. The same
+    evaluation is what let an environment lookup resolve to a live secret. This
+    keeps the completeness and gives up the values: a default is emitted only
+    where the source literally wrote it, so a computed default has no route into
+    the bundle regardless of what it computes FROM — environment, file, clock or
+    host.
+
+    Matching is by name and value together. `--repo` appears in three of
+    fleet-cr's subparsers, so a name-only match would let one subcommand's
+    literal vouch for another subcommand's computed default.
+    """
+    literals, computed = declared
+    for item in list(node.get("arguments", [])) + list(node.get("options", [])):
+        names = item.get("flags") or [item.get("dest")]
+        if "default" in item:
+            if not any((name, item["default"]) in literals for name in names):
+                item["default"] = COMPUTED
+        elif any(name in computed for name in names):
+            item["default"] = COMPUTED
+    for sub_node in node.get("subcommands", {}).values():
+        _mark_computed(sub_node, declared)
+
+
+def _config_keys(tree):
+    """Environment variable NAMES read by this module.
+
+    Names only, deliberately. FLEET_TOKEN_CMD's default value is the path to a
+    fixed-path, no-argument token helper — ADR-0006 §6 names it as the
+    escalation route, and printing it is exactly what makes fleet-watch's
+    --help unusable as a contract. A tester needs to know the knob exists.
+    """
+    keys = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            attr = getattr(fn, "attr", None)
+            is_environ_get = (attr == "get" and isinstance(getattr(fn, "value", None), ast.Attribute)
+                              and fn.value.attr == "environ")
+            is_getenv = attr == "getenv" or (isinstance(fn, ast.Name) and fn.id == "getenv")
+            if (is_environ_get or is_getenv) and node.args:
+                a = node.args[0]
+                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    keys.add(a.value)
+        elif isinstance(node, ast.Subscript):
+            v = node.value
+            if isinstance(v, ast.Attribute) and v.attr == "environ" \
+                    and isinstance(node.slice, ast.Constant) \
+                    and isinstance(node.slice.value, str):
+                keys.add(node.slice.value)
+    return sorted(keys)
+
+
+# --------------------------------------------------------------------------
+# OpenAPI
+
+_OPENAPI_NAMES = re.compile(r"^(openapi|swagger)\.(json|ya?ml)$", re.I)
+
+
+def _openapi(root):
+    """Locate an OpenAPI document. Located, never synthesised.
+
+    A framework app object could be started and asked for its schema, but that
+    runs the service; when one is detected without a spec on disk it is
+    reported as a gap so the absence is visible rather than inferred.
+    """
+    specs, hints = [], []
+    for p in _walk(root):
+        rel = str(p.relative_to(root))
+        if _OPENAPI_NAMES.match(p.name):
+            entry = {"path": rel}
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+            except (json.JSONDecodeError, OSError):
+                entry["routes"] = None
+                entry["note"] = "present; not JSON, so routes were not enumerated"
+            else:
+                paths = doc.get("paths") or {}
+                entry["routes"] = sorted(
+                    f"{m.upper()} {route}" for route, ops in paths.items()
+                    if isinstance(ops, dict) for m in ops
+                    if m.lower() in ("get", "post", "put", "patch", "delete", "head", "options"))
+            specs.append(entry)
+        elif p.suffix == ".py":
+            head = p.read_text(encoding="utf-8", errors="replace")[:4000]
+            if re.search(r"^\s*(from|import)\s+(fastapi|flask)\b", head, re.M):
+                hints.append(rel)
+    return specs, sorted(set(hints))
+
+
+# --------------------------------------------------------------------------
+# harness entry points
+
+def _scalar(value):
+    """A YAML scalar with its trailing comment removed.
+
+    ares's ci.yml writes `runs-on: cihost  # self-hosted Actions runner on the
+    cihost (has Swift toolchain)`. Dropping whole-line comments is not enough
+    when prose rides on the same line as the structure.
+    """
+    return re.sub(r"\s+#.*$", "", value.strip()).strip().strip("'\"")
+
+
+def _scan_workflow(text):
+    """Pull job and step structure out of a CI workflow without a YAML parser.
+
+    SPEC.md §CLI surface binds every CLI here to the standard library, and CI
+    installs pytest and pytest-randomly only, so PyYAML is not available. This
+    reads the handful of keys wanted and nothing else.
+
+    Whole-line comments are dropped by rule, which is the point rather than an
+    optimisation: eunomia's ci.yml carries forty lines of reasoning above
+    twenty lines of steps, and a reader that copied the file would ship it.
+    """
+    out = {"jobs": []}
+    job, step, run_indent, in_jobs = None, None, None, False
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        line = raw.strip()
+
+        if run_indent is not None:
+            if indent >= run_indent:
+                step["run"].append(raw[run_indent:])
+                continue
+            run_indent = None
+
+        if indent == 0:
+            m = re.match(r"^name:\s*(.+)$", line)
+            if m:
+                out["name"] = _scalar(m.group(1))
+            # `on:` also carries two-space keys (`push:`), which read as job
+            # ids to an indentation scanner and put a phantom job in the
+            # harness section. Only the jobs block declares jobs.
+            in_jobs = line == "jobs:"
+            job = None
+            continue
+        if in_jobs and indent == 2 and re.match(r"^[A-Za-z0-9_-]+:$", line):
+            job = {"id": line[:-1], "steps": []}
+            out["jobs"].append(job)
+            step = None
+            continue
+        if job is None:
+            continue
+        m = re.match(r"^runs-on:\s*(.+)$", line)
+        if m:
+            job["runs_on"] = _scalar(m.group(1))
+            continue
+        # A step begins at a list item, not at every key it contains: a step
+        # written as `- name: Checkout` over `uses: actions/checkout@v4` is one
+        # step with two keys, and keying on the keys reports it twice.
+        m = re.match(r"^(-?)\s*(uses|name|run):", line)
+        if m and (m.group(1) == "-" or step is None or m.group(2) in step
+                  or ("step" if m.group(2) == "name" else m.group(2)) in step):
+            step = {}
+            job["steps"].append(step)
+        m = re.match(r"^-?\s*(uses|name):\s*(.+)$", line)
+        if m:
+            step["step" if m.group(1) == "name" else "uses"] = _scalar(m.group(2))
+            continue
+        m = re.match(r"^-?\s*run:\s*(.*)$", line)
+        if m:
+            rest = m.group(1).strip()
+            if rest in ("|", ">", "|-", ">-", ""):
+                step["run"] = []
+                run_indent = indent + 2
+            else:
+                step["run"] = [rest]
+            continue
+    return out
+
+
+def _harness(root):
+    """How a tester starts the thing and observes it."""
+    workflows, tests, executables = [], [], []
+    for p in _walk(root):
+        rel = str(p.relative_to(root))
+        parts = p.relative_to(root).parts
+        if len(parts) > 2 and parts[0] in (".forgejo", ".github") \
+                and parts[1] == "workflows" and p.suffix in (".yml", ".yaml"):
+            wf = _scan_workflow(p.read_text(encoding="utf-8", errors="replace"))
+            wf["path"] = rel
+            workflows.append(wf)
+        elif p.name.startswith("test_") and p.suffix == ".py":
+            tests.append(rel)
+        elif re.search(r"(Tests?|UITests)\.swift$", p.name):
+            tests.append(rel)
+        elif parts[0] == "bin" and len(parts) == 2 and os.access(p, os.X_OK):
+            executables.append(rel)
+    return {"workflows": workflows, "test_files": sorted(tests),
+            "executables": sorted(executables)}
+
+
+def _unrepresented(root):
+    """Source this builder has no extractor for, counted and named by kind.
+
+    Silence here would be the dangerous output. A tester reading a bundle with
+    two CLIs cannot tell whether the repository has two CLIs or has a hundred
+    thousand lines of Swift whose surface nothing in this tool can describe.
+    """
+    counts, markers = {}, {}
+    for p in _walk(root):
+        lang = _OTHER_LANG.get(p.suffix)
+        if not lang:
+            continue
+        counts[lang] = counts.get(lang, 0) + 1
+        if p.suffix == ".swift":
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            n = len(re.findall(r"\baccessibilityIdentifier\b", text))
+            if n:
+                markers["accessibilityIdentifier"] = markers.get("accessibilityIdentifier", 0) + n
+    return counts, markers
+
+
+# --------------------------------------------------------------------------
+# assembly
+
+def _normalise(obj, repo_root, home):
+    """Rewrite host paths out of every string in the finished document.
+
+    This used to be the control that kept an evaluated path default — ares's
+    `--probe-bin`, resolving to an absolute path under the operator's home —
+    out of a document sent to two cloud vendors. It is no longer: _mark_computed
+    stops such a default being emitted at all, which is ADR-0006 §2's own
+    distinction between generating and filtering, applied to the one place this
+    builder still filtered.
+
+    It stays as a backstop over the sections that are not built from parser
+    defaults, and `test_normalisation_is_inert` asserts it changes nothing for
+    either repository. If it ever starts firing, the primary mechanism has a
+    hole and that test is where it surfaces — a backstop nobody checks cannot be
+    told apart from one that is load-bearing.
+    """
+    if isinstance(obj, str):
+        out = obj.replace(repo_root, "<repo>")
+        if home and home != "/":
+            out = out.replace(home, "~")
+        return out
+    if isinstance(obj, list):
+        return [_normalise(v, repo_root, home) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _normalise(v, repo_root, home) for k, v in obj.items()}
+    return obj
+
+
+def _repo_name(root):
+    """The repository's name, not the checkout's.
+
+    A worktree directory is named for the branch's purpose, so `Path.name`
+    reports "bundle" for a checkout of eunomia — and the bundle's own header is
+    the one place a tester has to identify what they were sent.
+    """
+    try:
+        url = subprocess.run(["git", "-C", str(root), "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        url = ""
+    if url:
+        return re.sub(r"\.git$", "", url.rstrip("/").rsplit("/", 1)[-1])
+    return root.name
+
+
+def build(root):
+    root = Path(root).resolve()
+    gaps, clis, vocabularies, config_keys = [], [], [], {}
+
+    for path in _cli_candidates(root):
+        rel = str(path.relative_to(root))
+        tree = _parse(path)
+        if tree is None:
+            gaps.append({"target": rel, "reason": "does not parse as Python"})
+            continue
+
+        for entry in _vocabularies(tree):
+            entry["source"] = rel
+            vocabularies.append(entry)
+        for key in _config_keys(tree):
+            config_keys.setdefault(key, []).append(rel)
+
+        if "argparse" not in {n.names[0].name for n in ast.walk(tree)
+                              if isinstance(n, ast.Import)} \
+                and not any(isinstance(n, ast.ImportFrom) and n.module == "argparse"
+                            for n in ast.walk(tree)):
+            gaps.append({"target": rel,
+                         "reason": "no argparse import; argument surface undeclared"})
+            continue
+        try:
+            parser, why = _introspect_file(path)
+        except subprocess.TimeoutExpired:
+            parser, why = None, f"introspection timed out after {_INTROSPECT_TIMEOUT}s"
+        if parser is None:
+            gaps.append({"target": rel, "reason": why})
+            continue
+        _mark_computed(parser, _declared_defaults(tree))
+        clis.append({"path": rel, **parser})
+
+    specs, framework_hints = _openapi(root)
+    if not specs:
+        gaps.append({"target": "openapi",
+                     "reason": "no OpenAPI document on disk"
+                               + (f"; {len(framework_hints)} module(s) import a web framework: "
+                                  + ", ".join(framework_hints) if framework_hints else "")})
+
+    other, markers = _unrepresented(root)
+    for lang, count in sorted(other.items()):
+        detail = ""
+        if lang == "Swift" and markers.get("accessibilityIdentifier"):
+            detail = (f"; {markers['accessibilityIdentifier']} accessibilityIdentifier "
+                      "declarations found, which are this repository's black-box UI "
+                      "contract and have no extractor here")
+        gaps.append({"target": f"{lang} sources",
+                     "reason": f"{count} file(s); no extractor for this language{detail}"})
+
+    db_path = root / DECLARED_BEHAVIOUR_PATH
+    if db_path.is_file():
+        declared_behaviour = db_path.read_text(encoding="utf-8")
+    else:
+        declared_behaviour = None
+        gaps.append({"target": DECLARED_BEHAVIOUR_PATH,
+                     "reason": "no declared-behaviour document"})
+
+    doc = {
+        "bundle_version": BUNDLE_VERSION,
+        "repo": _repo_name(root),
+        "openapi": specs,
+        "clis": clis,
+        "vocabularies": vocabularies,
+        "config_keys": [{"name": k, "read_by": v} for k, v in sorted(config_keys.items())],
+        "harness": _harness(root),
+        "declared_behaviour": declared_behaviour,
+        "gaps": gaps,
+    }
+    return _normalise(doc, str(root), str(Path.home()))
+
+
+# --------------------------------------------------------------------------
+# rendering
+
+def _render_text(doc):
+    """A reading of the JSON. Cannot show what the JSON does not hold."""
+    L = [f"# generated contract — {doc['repo']} (bundle v{doc['bundle_version']})", ""]
+
+    L.append(f"## openapi ({len(doc['openapi'])})")
+    for spec in doc["openapi"]:
+        L.append(f"  {spec['path']}")
+        for route in spec.get("routes") or []:
+            L.append(f"    {route}")
+    if not doc["openapi"]:
+        L.append("  (none)")
+
+    L.append("")
+    L.append(f"## clis ({len(doc['clis'])})")
+    for cli in doc["clis"]:
+        L.append(f"  {cli['path']}  [{cli.get('prog', '?')}]")
+        _render_surface(L, cli, "    ")
+    if not doc["clis"]:
+        L.append("  (none)")
+
+    L.append("")
+    L.append(f"## vocabularies ({len(doc['vocabularies'])})")
+    for v in doc["vocabularies"]:
+        L.append(f"  {v['name']} ({v['source']}): {', '.join(v['values'])}")
+    if not doc["vocabularies"]:
+        L.append("  (none)")
+
+    L.append("")
+    L.append(f"## config keys ({len(doc['config_keys'])}) — names only")
+    for c in doc["config_keys"]:
+        L.append(f"  {c['name']}  <- {', '.join(c['read_by'])}")
+    if not doc["config_keys"]:
+        L.append("  (none)")
+
+    L.append("")
+    L.append("## harness")
+    for wf in doc["harness"]["workflows"]:
+        L.append(f"  workflow {wf['path']} ({wf.get('name', '?')})")
+        for job in wf["jobs"]:
+            L.append(f"    job {job['id']} on {job.get('runs_on', '?')}")
+            for step in job["steps"]:
+                label = " ".join(x for x in (step.get("step"), step.get("uses")) if x)
+                L.append(f"      - {label or 'run'}")
+                for line in step.get("run", []):
+                    L.append(f"          {line}")
+    L.append(f"  executables: {', '.join(doc['harness']['executables']) or '(none)'}")
+    L.append(f"  test files: {len(doc['harness']['test_files'])}")
+
+    L.append("")
+    L.append(f"## gaps ({len(doc['gaps'])})")
+    for gap in doc["gaps"]:
+        L.append(f"  {gap['target']}: {gap['reason']}")
+    return "\n".join(L)
+
+
+def _render_surface(L, node, pad):
+    for arg in node.get("arguments", []):
+        L.append(f"{pad}<{arg.get('dest')}>{_render_bits(arg)}")
+    for opt in node.get("options", []):
+        L.append(f"{pad}{', '.join(opt['flags'])}{_render_bits(opt)}")
+    for name, sub in sorted(node.get("subcommands", {}).items()):
+        alias = f" (aliases: {', '.join(sub['aliases'])})" if sub.get("aliases") else ""
+        L.append(f"{pad}{name}{alias}")
+        _render_surface(L, sub, pad + "  ")
+
+
+def _render_bits(item):
+    bits = []
+    for key in ("type", "nargs", "action", "choices", "default", "required"):
+        if key in item and key != "action":
+            bits.append(f"{key}={item[key]}")
+        elif key == "action" and item.get("action") not in (None, "store"):
+            bits.append(f"action={item['action']}")
+    return f"  [{'; '.join(bits)}]" if bits else ""
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="fleet-bundle",
+        description="Emit a repository's generated contract (ADR-0006 §2).")
+    ap.add_argument("repo", nargs="?", default=".",
+                    help="repository root to read (default: cwd)")
+    ap.add_argument("--format", choices=["json", "text"], default="json")
+    ap.add_argument("--out", default=None, help="write here instead of stdout")
+    ap.add_argument("--introspect", default=None,
+                    help="internal: report one file's parser structure and exit")
+    args = ap.parse_args(argv)
+
+    if args.introspect:
+        return _run_introspection_child(args.introspect)
+
+    root = Path(args.repo)
+    if not root.is_dir():
+        print(f"fleet-bundle: not a directory: {root}", file=sys.stderr)
+        return 2
+    doc = build(root)
+    text = json.dumps(doc, indent=2) if args.format == "json" else _render_text(doc)
+    if args.out:
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+    else:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

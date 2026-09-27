@@ -1,0 +1,920 @@
+#!/usr/bin/env python3
+"""mopsus — a failed dispatch arrives with a handle, not an investigation (plan 0046).
+
+  mopsus                 sweep fleet.db for newly-terminally-failed leases,
+                         compose a brief for each, and page a handle for it
+  mopsus <handle>        open a session already holding that brief
+  mopsus list            list every handle recorded, with the repo and plan
+                         id read from that handle's own brief (plan 0050)
+  mopsus <handle> --format json
+                         the same failure as data: class, ordered action
+                         shortlist, PR and links (plan 0064)
+
+The FIRST sweep this fleet dir has ever seen (no mopsus.state.json yet) pages
+ONE summary naming how many pre-existing failures it found, instead of one
+page per failure — plan 0050's D5: the real first run, 2026-09-14, sent 18
+pages in one burst because the idempotence key this file already had works
+forward and nothing marked where "now" began. Every brief is still written
+and every lease still marked paged; `mopsus list` is how the pre-existing
+backlog stays reachable when the page named only a count.
+
+Named for the Argo's seer, who read the signs and told the crew what they
+meant — and, the owner's version, because it mops up after the processes that
+leaked.
+
+A failed dispatch already records everything a brief needs — see
+docs/fleet-db.md's `dispatch` view. What did not exist was anything that
+DECIDES what a failure means: fleet-watch orphans the lease and pages once
+(the surface-once-never-respawn path); mopsus's job is only to make what
+already happened cheap to read, never to act on it.
+
+Modes, per `config/mopsus.conf`, one repo per line:
+  escalate    compose a brief, page with a handle, act never       (BUILT)
+  mechanical  classify by failure reason, requeue a class in RETRYABLE_CLASSES
+              up to `retry_limit` times, escalate the rest   (BUILT, ADR-0012)
+  triage      a model reads the failure and chooses                (named,
+              not built — refused if selected)
+  off         nothing
+
+`escalate` is the default for any repo the conf does not name. Under
+`escalate` mopsus never releases a lease, never pushes, never comments, never
+retries. Under `mechanical` the ONE thing it does beyond that is release a
+failed lease of a retryable class through `bin/fleet-release --force`, at most
+`retry_limit` times per plan, recording each as `plan-requeued` (ADR-0012). It
+never spawns: the watcher re-dispatches under the dispatch cap.
+
+State (idempotence: one brief per failure, not one per cycle):
+  <fleet-dir>/mopsus.state.json     lease -> handle, once assigned, forever
+  <fleet-dir>/mopsus/briefs/<h>.txt the brief text `mopsus <handle>` opens
+
+Config (env):
+  EUNOMIA_FLEET_DIR     fleet tree root (default ~/dev/.fleet) — same override
+                        fleetlib, fleet-collect and the orchestrator honor
+  MOPSUS_CLAUDE_CMD     the interactive command `mopsus <handle>` execs into,
+                        with the brief as its final argument (default "claude")
+  FLEET_ANGELIA_URL/APP/USER, FLEET_ANGELIA_TOKEN_CMD, FLEET_NTFY_URL
+                        the page channel — reused from bin/orchestrator's own
+                        notify()/record_page(), never reimplemented here. Since
+                        plan 0058 every pager in this fleet reuses record_page
+                        the same way (fleet-watch under both its labels,
+                        fleet-leak-watch, fleet-orphans, fleet-pin-advance, the
+                        orchestrator and mopsus), so every page any of them
+                        sends lands in the ONE durable pages.jsonl
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+# notify()/record_page() are bin/orchestrator's, reused rather than restated
+# so every page this fleet sends lands in the one pages.jsonl (Resources) —
+# since plan 0058, that is every pager on the fleet, not only mopsus's.
+orch = _load("orchestrator", BIN / "orchestrator")
+# `retry_limit` is read through fleet-config's own resolver, so mopsus sees the
+# value a person or lynceus set — never a second copy of the default.
+fconfig = _load("fleet_config", BIN / "fleet-config")
+# `marked_pr` is fleet-watch's dedupe scan (ANY-state, implbot-authored,
+# `Plan: <id>` in the body) — reused rather than restated so mopsus's notion
+# of "a marked PR exists" can never drift from dedupe's own (ADR-0012 §1,
+# amended). The general read-only token comes from the same place fleet-watch
+# itself reads it from — `_token()` over `TOKEN_CMD` — never the authoring
+# token orchestrator pushes with, since this is a read.
+fwatch = _load("fleet_watch", BIN / "fleet-watch")
+
+CONF = BIN.parent / "config" / "mopsus.conf"
+
+VALID_MODES = ("escalate", "mechanical", "triage", "off")
+BUILT_MODES = ("escalate", "mechanical", "off")
+
+# A phone lock-screen preview is a few lines of maybe 40-ish characters each —
+# there is no portable API to ask a device, so this is a judgment call made
+# once, named, and asserted against in tests rather than eyeballed per push.
+PAGE_MAX_CHARS = 180
+TAIL_LINES = 15
+
+FAILED_QUERY = """
+SELECT lease, repo, plan_id, session, pr, failure_reason, failure_log,
+       failure_transcript, rc, timed_out, seconds
+FROM dispatch
+WHERE outcome = 'failed'
+ORDER BY lease
+"""
+
+
+class ConfigError(Exception):
+    pass
+
+
+# --- config/mopsus.conf ------------------------------------------------------
+
+
+def load_conf(path=None):
+    """{repo|"default": mode} from config/mopsus.conf.
+
+    An unreadable file is not a hard stop, unlike impl-bounds.conf/
+    review-bounds.conf: THOSE guard spend, and a silently-reverted bound is an
+    unattended process spending more than the operator set. `escalate` guards
+    nothing — it composes a brief and pages, the one thing this plan builds —
+    so a missing conf degrading to "every repo gets the safe default" is
+    itself the safe default, not a defect to fail loudly over.
+
+    An unparseable line, or a mode name that is not one of the four, IS a hard
+    stop: a typo that silently fell back to escalate would hide the refusal
+    the operator meant to configure."""
+    path = Path(path) if path else CONF
+    values = {}
+    try:
+        text = path.read_text()
+    except OSError as e:
+        sys.stderr.write(f"mopsus: {path} unreadable ({e.__class__.__name__}) "
+                         "— treating every repo as 'escalate'\n")
+        return values
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ConfigError(f"unparseable line in {path}: {line!r} — expected "
+                              "'<owner/repo|default> = escalate|mechanical|triage|off'")
+        key, _, raw = line.partition("=")
+        mode = raw.strip()
+        if mode not in VALID_MODES:
+            raise ConfigError(f"unknown mode {mode!r} in {path} for "
+                              f"{key.strip()!r} — expected one of {VALID_MODES}")
+        values[key.strip()] = mode
+    return values
+
+
+def mode_for(repo, values):
+    return values.get(repo, values.get("default", "escalate"))
+
+
+# --- fleet.db ------------------------------------------------------------
+
+
+def db_path():
+    return lib.fleet_dir() / "fleet.db"
+
+
+def failed_dispatches(path=None):
+    """[dict, ...] over every terminally-failed lease in fleet.db.
+
+    A missing DB, or one whose `dispatch` view is not there yet, reads as "no
+    failures visible" — never an error. fleet-collect is a separate, optional
+    process (docs/fleet-db.md): a host where it was never installed, or one
+    that is behind, must not make mopsus crash; its slice of history is simply
+    invisible, exactly as fleet-collect's own docs describe."""
+    path = Path(path) if path else db_path()
+    if not path.exists():
+        return []
+    con = sqlite3.connect(str(path))
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(FAILED_QUERY).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        con.close()
+    out = [dict(r) for r in rows]
+    for r in out:
+        r["class"] = classify(r["failure_reason"])
+    return out
+
+
+def branch_for(lease):
+    """The lease's branch, LEARNED from the lease record, never re-derived —
+    the same reason bin/orchestrator's own lease_branch() gives: a second copy
+    of the slug rule can drift. A lease already retired, or not a branch
+    lease, answers None rather than raising — a brief with an unknown branch
+    is still worth reading."""
+    rec = lib.read_lease(lease)
+    if not rec:
+        return None
+    res = lib.resource_of(rec)
+    if res.get("type") != "branch":
+        return None
+    return res.get("branch")
+
+
+def log_tail(path_str, n=TAIL_LINES):
+    """The last `n` lines of the run log at `path_str`, or a note explaining
+    why there are none. Never the transcript — see compose_brief."""
+    if not path_str:
+        return "(no run log recorded)"
+    try:
+        lines = Path(path_str).read_text(errors="replace").splitlines()
+    except OSError as e:
+        return f"(log unreadable at {path_str}: {e.__class__.__name__})"
+    return "\n".join(lines[-n:]) if lines else "(log is empty)"
+
+
+# --- the class: which of these two, not what are my options (plan 0064) ------
+
+# A UNIVERSAL LINK, not a custom scheme. Verified live 2026-09-19:
+#
+#   GET https://minospr.app/.well-known/apple-app-site-association -> 200
+#     appIDs     ["TM63PG5C3F.org.eunomia.minos"]
+#     components [{"/": "/pr/*", "comment": "Open a pull request in Minos"}]
+#   GET https://minospr.app/pr/operator/pr-proxy/70                 -> 302
+#
+# Plan 0064 said Minos had no deep link and specified a guessed `minos://`
+# scheme carried NEXT TO the forge URL so a client could pick. That was wrong:
+# the claim came from grepping a checkout whose newest commit is an Android
+# sync, and the owner produced a working link. `minos://` resolves to nothing
+# and a phone tapping it gets silence.
+#
+# One URL is enough, and the fallback stops being anyone's code: iOS opens
+# Minos when it is installed, and follows the 302 to the web when it is not.
+MINOS_PR_LINK = "https://minospr.app/pr/{repo}/{pr}"
+
+# Each rule is (class, compiled regex over `failure_reason` ONLY). First match
+# wins, so order is the precedence. A reason that matches no rule is
+# `unclassified` — never the nearest guess: `Permission denied (publickey)`
+# on a clone is deliberately NOT transport, because the forge answered and
+# said no, and a retry fails identically.
+CLASS_RULES = [
+    # plan 0079's three backend rules come FIRST (eunomia#559): their reason
+    # strings embed a free-text excerpt of whatever the backend said, e.g.
+    # "session ended on a backend error after work began: API 500 after 30s —
+    # Connection reset by peer" — and that excerpt can itself contain
+    # "Connection reset"/"timed out"/etc, the very words `transport` and
+    # `timeout` match on. Checked first, the backend rules claim those reasons
+    # before the looser transport/timeout patterns ever see them; checked
+    # after, a backend failure whose excerpt happens to mention a reset was
+    # misclassified as `transport` and retried after work had already begun.
+    # Quota first among the three — a spend/usage limit fails identically
+    # until it resets — then the two forms by whether work existed.
+    ("quota", re.compile(
+        r"session ended on a backend error before any work: "
+        r"(?:API 429\b|.*(?:spend(?:ing)?|usage) limit)", re.I)),
+    ("backend-before-work", re.compile(
+        r"session ended on a backend error before any work:")),
+    ("backend-after-work", re.compile(
+        r"session ended on a backend error after work began:")),
+    # the forge was never reached, so no work began — nothing to lose by retrying.
+    # NOT "could not read <repo> pull requests": that is the verification read
+    # failing AFTER a session ran to exit 0, so the work exists (see below).
+    ("transport", re.compile(
+        r"ssh: connect to host"
+        r"|Could not resolve host"
+        r"|Connection (?:refused|timed out|reset)")),
+    ("timeout", re.compile(r"timed out after \d+ min")),
+    ("plan-text-refused", re.compile(r"plan text carries credential shapes")),
+    ("branch-collision", re.compile(r"could not create branch .*already exists")),
+    ("host-missing-tool", re.compile(r"needs '[^']+', which is not on PATH")),
+    ("raced-ci", re.compile(r"CI is still running")),
+    # the session ran to the end and the wrapper refused what it left
+    ("work-exists-unverified", re.compile(
+        r"no verified marked PR:"
+        r"|fix session left the head at \w+ — nothing was pushed")),
+]
+
+# class -> ordered [(action, what it costs)]. DATA, not code paths: nothing
+# here is ever executed by mopsus. No action changes a plan's status — setting
+# a plan `abandoned` is a reviewed merge (docs/plan-triage.md), so a shortlist
+# may point at the PR where that gets decided and may not offer the flip.
+CLASS_ACTIONS = {
+    "work-exists-unverified": [
+        ("check-branch", "one look at the branch and its pull requests on the "
+                        "forge — the session ran, and may have pushed work the "
+                        "wrapper refused to verify"),
+        ("retry", "a whole new session that rebuilds work possibly already "
+                  "pushed — only if the branch is empty"),
+    ],
+    "backend-before-work": [
+        ("retry", "a fresh session, unchanged — the model backend failed before "
+                  "any work began, so nothing is rebuilt"),
+    ],
+    "quota": [
+        ("wait-for-reset", "free — a spend or usage limit fails identically "
+                           "until it resets"),
+        ("retry", "only after the limit has reset; before that it spends an "
+                  "attempt on nothing"),
+    ],
+    "backend-after-work": [
+        ("check-branch", "one look at the branch and its pull requests on the "
+                         "forge — the backend failed after work began, and "
+                         "commits may already be pushed"),
+        ("retry", "a whole new session that rebuilds work possibly already "
+                  "pushed — only if the branch is empty"),
+    ],
+    "transport": [
+        ("retry", "a fresh session, unchanged — the forge answering again is "
+                  "the whole fix"),
+        ("check-forge", "confirm forge.example answers before you retry, so "
+                        "the retry does not fail identically"),
+    ],
+    "timeout": [
+        ("retry-longer-bound", "another full session at a raised bound "
+                               "(config/impl-bounds.conf) — same bound, same "
+                               "result"),
+        ("split-plan", "a plan PR that cuts the work smaller — reviewed, slower"),
+    ],
+    "plan-text-refused": [
+        ("edit-plan", "a reviewed plan PR that removes the refused text — a "
+                      "retry fails identically, forever"),
+    ],
+    "branch-collision": [
+        ("clear-stale-branch", "delete the leftover branch on the forge, then "
+                               "retry — check it holds no work first"),
+        ("retry", "fails identically until the branch is cleared"),
+    ],
+    "host-missing-tool": [
+        ("fix-host", "install the missing tool on the dispatch host — a retry "
+                     "on the same host fails the same way"),
+    ],
+    "raced-ci": [
+        ("wait-for-ci", "free — the review was refused only because CI was "
+                        "still running"),
+        ("retry", "once CI is green; retrying now hits the same refusal"),
+    ],
+    "unclassified": [
+        ("read-log", "the run log named in this brief — no rule fit this reason"),
+        ("retry", "a fresh session; there is no evidence yet that it helps"),
+    ],
+}
+
+
+# Classes whose evidence shows NO work began, so a fresh dispatch loses nothing
+# (ADR-0012 §1). Held as data beside the rules. Every other class means a
+# session ran or a PR exists — a retry rebuilds pushed work or hits the same
+# wall — so it is never listed here. `backend-before-work` (plan 0079) is the
+# model backend failing before any commit existed; `quota` is NOT listed, since
+# a spend limit fails identically until it resets.
+RETRYABLE_CLASSES = frozenset({"transport", "backend-before-work"})
+
+
+def classify(failure_reason):
+    """The class of `failure_reason`, or "unclassified" when no rule matches.
+
+    Reads ONLY the reason string (plan 0064 Boundaries): never the run log,
+    never the transcript. The transcript is 0600 and outside the fleet tree on
+    purpose (compose_brief), and a classifier that reached for richer evidence
+    would cross that boundary to save itself a rule."""
+    reason = failure_reason or ""
+    for name, rx in CLASS_RULES:
+        if rx.search(reason):
+            return name
+    return "unclassified"
+
+
+def _forge_pr_url(repo, pr):
+    return f"{orch._forgejo_base_url()}/{repo}/pulls/{pr}"
+
+
+def build_actions(row, cls):
+    """[{action, cost}, ...] in the order to consider them. `open-pr` leads
+    whenever the failed lease left a PR behind (D3): work sitting in a pull
+    request is reviewed or merged, and `retry` there rebuilds it. Every
+    action carries what it costs, so the choice is between costs."""
+    actions = [{"action": a, "cost": c} for a, c in CLASS_ACTIONS[cls]]
+    if row.get("pr") is not None:
+        actions.insert(0, {
+            "action": "open-pr",
+            "cost": (f"review or merge #{row['pr']} — the work is already "
+                     "there; a retry would rebuild it"),
+            "pr": row["pr"],
+            # `minos` is a universal link and degrades to the web on its own,
+            # so `forge` is not a fallback — it is the direct forge URL, kept
+            # for a reader who wants the raw pull request rather than the app.
+            "links": {"minos": MINOS_PR_LINK.format(repo=row["repo"], pr=row["pr"]),
+                      "forge": _forge_pr_url(row["repo"], row["pr"])},
+        })
+    return actions
+
+
+def failure_view(row):
+    """The failure as data — what `--format json` prints. `class` and
+    `actions` are derived from `failure_reason` and the PR the dispatch view
+    already carries; nothing here is re-read from disk."""
+    cls = row.get("class") or classify(row["failure_reason"])
+    return {
+        "repo": row["repo"], "plan_id": row["plan_id"], "lease": row["lease"],
+        "reason": row["failure_reason"], "class": cls,
+        "pr": row["pr"], "actions": build_actions(row, cls),
+    }
+
+
+def _class_section(row):
+    """The lines a text brief appends after the run-log tail, or "" for a
+    row that never carried a class (old briefs; unit fixtures that predate
+    this) — the text brief is byte-identical to before for those."""
+    if "class" not in row:
+        return ""
+    view = failure_view(row)
+    out = [f"\n--- class: {view['class']} ---"]
+    if view["class"] == "unclassified":
+        out.append(f"no rule matches this reason — raw reason: {row['failure_reason'] or '-'}")
+    for i, a in enumerate(view["actions"], 1):
+        out.append(f"{i}. {a['action']} — {a['cost']}")
+        if "links" in a:
+            out.append(f"   minos: {a['links']['minos']}")
+            out.append(f"   forge: {a['links']['forge']}")
+    return "\n".join(out) + "\n"
+
+
+# --- the brief -------------------------------------------------------------
+
+
+def compose_brief(row, requeued=None, release_error=None, requeue_skip=None):
+    """The full brief `mopsus <handle>` opens a session holding (D2).
+
+    `requeue_skip` is ADR-0012 §1's marked-PR condition or its "not recorded"
+    guard (try_requeue) — a one-line reason a mechanical-mode escalation
+    never got as far as trying to release, in the same style as `requeued:`
+    (limit reached) and `release:` (fleet-release itself failed).
+
+    `failure_transcript`'s VALUE is used — as a path, in the text below — but
+    its CONTENTS are never opened. Transcripts are written 0600 and
+    deliberately outside the fleet tree (SPEC Principle 6); reading one into a
+    brief that lands under `<fleet-dir>/mopsus/` would move it inside that
+    boundary and change its permissions, undoing a decision made on purpose."""
+    branch = branch_for(row["lease"]) or "-"
+    pr = row["pr"] if row["pr"] is not None else "-"
+    rc = row["rc"] if row["rc"] is not None else "-"
+    timed_out = {1: "yes", 0: "no"}.get(row["timed_out"], "-")
+    seconds = row["seconds"] if row["seconds"] is not None else "-"
+    log_path = row["failure_log"] or "-"
+    transcript_path = row["failure_transcript"] or "-"
+    tail = log_tail(row["failure_log"])
+    extra = ""
+    if requeued is not None:
+        n, limit = requeued
+        extra = f"requeued:   {n} of {limit} — limit reached\n"
+    if requeue_skip is not None:
+        extra += f"requeue:    skipped — {requeue_skip}\n"
+    if release_error is not None:
+        extra += f"release:    fleet-release failed — {release_error}\n"
+    return (
+        f"Dispatch failure: {row['repo']} {row['plan_id']}\n"
+        f"lease:      {row['lease']}\n"
+        f"branch:     {branch}\n"
+        f"reason:     {row['failure_reason'] or '-'}\n"
+        + extra +
+        f"rc:         {rc}\n"
+        f"timed_out:  {timed_out}\n"
+        f"seconds:    {seconds}\n"
+        f"pr:         {pr}\n"
+        f"log:        {log_path}\n"
+        f"transcript: {transcript_path}\n"
+        f"\n--- tail of run log ({TAIL_LINES} lines) ---\n{tail}\n"
+        + _class_section(row)
+    )
+
+
+def compose_page(repo, plan_id, reason, handle):
+    """One line of cause, then the handle (D3) — never the other way round,
+    and never truncated so the handle is the part that goes missing: the
+    reason is what shrinks under PAGE_MAX_CHARS, the handle line is added
+    whole, always."""
+    suffix = f"\nmopsus {handle}"
+    budget = PAGE_MAX_CHARS - len(suffix)
+    head = f"{repo} {plan_id}: {reason or '-'}"
+    if len(head) > budget:
+        head = head[:max(budget - 1, 0)].rstrip() + "…"
+    return head + suffix
+
+
+def compose_first_run_page(n):
+    """The ONE page a first-ever sweep sends, however many pre-existing
+    failures it found (D5) — never one per failure, which is the 18-page
+    burst this exists to prevent. `mopsus list` is the pointer to the
+    briefs this page does not have room to name."""
+    plural = "" if n == 1 else "s"
+    return f"mopsus: first run — {n} pre-existing failure{plural} found\nmopsus list"
+
+
+# --- state: one brief per failure, not one per cycle -----------------------
+
+
+def _state_path():
+    return lib.fleet_dir() / "mopsus.state.json"
+
+
+def _briefs_dir():
+    return lib.fleet_dir() / "mopsus" / "briefs"
+
+
+def _load_state():
+    try:
+        data = json.loads(_state_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("next_id"), int):
+        data["next_id"] = 1
+    if not isinstance(data.get("leases"), dict):
+        data["leases"] = {}
+    return data
+
+
+def _save_state(state):
+    p = _state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lock = p.with_suffix(p.suffix + ".lock")
+    with lib.held_lock(lock):
+        tmp = p.with_suffix(p.suffix + f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
+        os.replace(tmp, p)
+
+
+def _new_handle(state):
+    n = state["next_id"]
+    state["next_id"] = n + 1
+    return f"h{n}"
+
+
+def _write_brief(handle, text):
+    d = _briefs_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{handle}.txt").write_text(text)
+
+
+def _read_brief(handle):
+    try:
+        return (_briefs_dir() / f"{handle}.txt").read_text()
+    except OSError:
+        return None
+
+
+# --- mechanical: requeue a failure that happened before any work began -------
+
+
+def retry_limit(db=None):
+    """`retry_limit` as fleet-config resolves it (row, then env, then default)."""
+    fallback, source = fconfig._env_fallback("retry_limit")
+    value, _, _ = fconfig.resolve_setting("retry_limit", fallback, source,
+                                          db_path=str(Path(db) if db else db_path()))
+    return value
+
+
+def _requeue_counts_from_jsonl(repo, plan_id):
+    n = 0
+    d = lib.fleet_dir()
+    for p in [d / "events.jsonl", *sorted(d.glob("events-*.jsonl"))]:
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if "plan-requeued" not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            detail = ev.get("detail") if isinstance(ev, dict) else None
+            if (isinstance(detail, dict) and ev.get("type") == "plan-requeued"
+                    and ev.get("repo") == repo and detail.get("plan") == plan_id):
+                n += 1
+    return n
+
+
+def earlier_requeues(repo, plan_id, db=None):
+    """How many `plan-requeued` events the LEDGER holds for (repo, plan_id).
+
+    Never the mopsus state file: that is a private idempotence record, and an
+    attempt count that reset when it was lost would undo the bound ADR-0012
+    rests on. The ledger is read two ways — the raw event log (current and
+    rotated), which is the authority and is never behind, and fleet.db's
+    ingested copy — and the larger count wins, so neither a lagging collector
+    nor a rotated-away archive can lower it."""
+    n_db = 0
+    path = Path(db) if db else db_path()
+    if path.exists():
+        con = sqlite3.connect(str(path))
+        try:
+            n_db = con.execute(
+                "SELECT COUNT(*) FROM event WHERE type = 'plan-requeued' "
+                "AND repo = ? AND json_extract(detail_json, '$.plan') = ?",
+                (repo, plan_id)).fetchone()[0]
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            con.close()
+    return max(n_db, _requeue_counts_from_jsonl(repo, plan_id))
+
+
+def _marked_pr_check(repo, plan_id):
+    """The marked-PR check ADR-0012 §1 requires before a requeue: "no marked
+    PR in any state, and the check could be made. An unreadable forge counts
+    as a PR." Returns a PR dict (a marked PR exists), "unreadable" (the check
+    could not be made — treated the same as a PR existing), or None (no
+    marked PR, and the check succeeded).
+
+    Delegates entirely to fleet-watch's own `marked_pr` — dedupe's scan for
+    "does a marked PR already exist for this plan" — rather than a second
+    forge-scanning implementation that could disagree with it about what
+    counts. The token is fetched the same way fleet-watch fetches it for that
+    same call: the general, read-only `_token()` over `TOKEN_CMD`, never the
+    authoring token orchestrator pushes with. A token-helper failure, or any
+    exception fleet-watch's scan itself raises, is read as "unreadable" —
+    never as "no PR" — for the same reason ADR-0012 gives: an unreadable
+    forge must never be read as permission to requeue."""
+    try:
+        token, err = fwatch._token()
+        if not token:
+            return "unreadable"
+        return fwatch.marked_pr(repo, plan_id, token)
+    except Exception:
+        return "unreadable"
+
+
+def _lease_holder_state(lease):
+    rec = lib.read_lease(lease)
+    if not isinstance(rec, dict):
+        return None, None
+    return rec.get("holder"), rec.get("state")
+
+
+def _release_lease(lease):
+    """(ok, stderr). Always through bin/fleet-release, the one writer of
+    `lease-released`, under mopsus's own identity so the event's `forced` /
+    `holder_was` detail tells this release from a person's. Never retried."""
+    env = dict(os.environ, EUNOMIA_SESSION="mopsus")
+    r = subprocess.run([sys.executable, str(BIN / "fleet-release"), lease, "--force"],
+                       capture_output=True, text=True, env=env)
+    return r.returncode == 0, (r.stderr or "").strip()
+
+
+def _emit_requeued(row, attempt, limit):
+    """(ok, stderr). Emits BEFORE the lease is released (see try_requeue): a
+    caller that gets `ok=False` must not release, because a release the
+    ledger never recorded would let the same lease requeue past `retry_limit`
+    unnoticed — the count IS the bound (ADR-0012 §2)."""
+    env = dict(os.environ, EUNOMIA_SESSION="mopsus")
+    detail = {"plan": row["plan_id"], "lease": row["lease"], "class": row["class"],
+              "attempt": attempt, "limit": limit}
+    r = subprocess.run([sys.executable, str(BIN / "fleet-emit"), "plan-requeued",
+                        "--repo", row["repo"], "--lease", row["lease"],
+                        "--detail-json", json.dumps(detail)],
+                       capture_output=True, text=True, env=env)
+    ok = r.returncode == 0
+    err = (r.stderr or "").strip()
+    if not ok:
+        sys.stderr.write(f"mopsus: plan-requeued for {row['lease']} not recorded: "
+                         f"{err}\n")
+    return ok, err
+
+
+def try_requeue(row, limit, db=None):
+    """(requeued, brief_kwargs). Requeue when the class is retryable, the lease
+    record still shows the failed holder `active`, the plan carries no marked
+    PR (ADR-0012 §1, amended), and earlier requeues are below `limit`;
+    otherwise say why not, as the arguments the escalation brief needs.
+
+    The marked-PR condition runs in two parts: `row["pr"]` from fleet.db is
+    checked first, for free, before the lease-holder check even runs; the
+    forge scan (_marked_pr_check) runs after the lease-holder check holds,
+    since that scan is the expensive part and there is no reason to pay for
+    it once some other condition has already ruled out a release. Either way
+    a marked PR means dedupe will never dispatch this plan again — releasing
+    onto it would orphan the lease with nobody watching (ADR-0012's
+    amendment).
+
+    The event is emitted BEFORE the lease is released, and a failed emit
+    stops the release outright — see _emit_requeued. If the emit succeeds and
+    the release then fails, the attempt still stays counted: an
+    over-counted, never-released attempt just costs one page early, and
+    `retry_limit` is a bound to protect, not a count to keep exact
+    (ADR-0012 §2 — the count IS the bound, and over-counting is the safe
+    direction). A failed release escalates with its stderr — never retried."""
+    if row["class"] not in RETRYABLE_CLASSES:
+        return False, {}
+    if row.get("pr") is not None:
+        return False, {"requeue_skip": f"marked PR #{row['pr']} exists"}
+    holder, state = _lease_holder_state(row["lease"])
+    if state != "active" or not row.get("session") or holder != row["session"]:
+        return False, {}
+    marked = _marked_pr_check(row["repo"], row["plan_id"])
+    if marked == "unreadable":
+        return False, {"requeue_skip": "could not read the forge for a marked PR"}
+    if marked is not None:
+        return False, {"requeue_skip": f"marked PR #{marked.get('number')} exists"}
+    n = earlier_requeues(row["repo"], row["plan_id"], db)
+    if n >= limit:
+        return False, {"requeued": (n, limit)}
+    ok, err = _emit_requeued(row, n + 1, limit)
+    if not ok:
+        return False, {"requeue_skip": f"plan-requeued not recorded: {err or 'no stderr'}"}
+    rel_ok, rel_err = _release_lease(row["lease"])
+    if not rel_ok:
+        return False, {"release_error": rel_err or "no stderr"}
+    return True, {}
+
+
+# --- the sweep --------------------------------------------------------------
+
+
+def sweep(conf_path=None, db=None, dry_run=False):
+    """(n_paged, n_refused). Every lease already in state["leases"] is
+    skipped BEFORE its mode is even looked up — idempotence holds regardless
+    of a later conf edit, and regardless of whether the page it sent was ever
+    delivered (bin/orchestrator's own notify() already logs delivery; a
+    channel outage must not turn into a re-page storm on top of it).
+
+    D5: the trigger for the first-run summary is the STATE FILE being
+    absent before this call — never a row count, which would collapse two
+    genuine failures landing in one ordinary cycle into a single page. A
+    first-ever sweep still writes a brief and a handle for every newly-seen
+    failure; it just pages ONE summary for the lot instead of one each."""
+    first_run = not dry_run and not _state_path().exists()
+    values = load_conf(conf_path)
+    rows = failed_dispatches(db)
+    state = _load_state()
+    paged = state["leases"]
+    n_paged = n_refused = 0
+    newly_paged = []           # [(row, handle), ...] — this sweep's own briefs
+    limit = None               # resolved once, and only if `mechanical` needs it
+    for row in rows:
+        lease, repo = row["lease"], row["repo"]
+        if lease in paged:
+            continue
+        mode = mode_for(repo, values)
+        if mode == "off":
+            continue
+        if mode not in BUILT_MODES:
+            sys.stderr.write(
+                f"mopsus: {repo} {row['plan_id']} failed under mode {mode!r} "
+                "— not built yet, refusing rather than treating it as "
+                "'escalate' (config/mopsus.conf)\n"
+            )
+            n_refused += 1
+            continue
+        # mode == "escalate" or "mechanical"
+        brief_kwargs = {}
+        if mode == "mechanical":
+            if limit is None:
+                limit = retry_limit(db)
+            if dry_run:
+                n_paged += 0 if (row["class"] in RETRYABLE_CLASSES and limit > 0) else 1
+                continue
+            requeued, brief_kwargs = try_requeue(row, limit, db)
+            if requeued:
+                # No page and no brief: the event is the record. Marked so a
+                # second sweep does nothing.
+                paged[lease] = {"requeued": True}
+                continue
+        if dry_run:
+            n_paged += 1
+            continue
+        brief = compose_brief(row, **brief_kwargs)
+        handle = _new_handle(state)
+        _write_brief(handle, brief)
+        paged[lease] = {"handle": handle}
+        newly_paged.append((row, handle))
+    if not dry_run and newly_paged:
+        if first_run:
+            orch.notify("mopsus: first run", compose_first_run_page(len(newly_paged)))
+            n_paged = 1
+        else:
+            for row, handle in newly_paged:
+                page = compose_page(row["repo"], row["plan_id"], row["failure_reason"], handle)
+                orch.notify(f"mopsus: {row['repo']} {row['plan_id']}", page)
+            n_paged = len(newly_paged)
+    if not dry_run:
+        _save_state(state)
+    return n_paged, n_refused
+
+
+# --- opening a handle --------------------------------------------------------
+
+
+def _default_exec(brief):
+    cmd = shlex.split(os.environ.get("MOPSUS_CLAUDE_CMD", "claude"))
+    os.execvp(cmd[0], cmd + [brief])
+
+
+def open_session(handle, exec_fn=None):
+    """0 on a brief found and handed to `exec_fn` (which, for the real
+    `os.execvp`, never returns); 1 if this handle holds nothing. Decides
+    nothing about the brief's content — that is the whole of D4."""
+    brief = _read_brief(handle)
+    if brief is None:
+        sys.stderr.write(f"mopsus: no brief held for handle {handle!r}\n")
+        return 1
+    (exec_fn or _default_exec)(brief)
+    return 0
+
+
+def handle_view(handle, db=None):
+    """The failure a handle names, as `failure_view` data — or None when the
+    handle is unknown or its fleet.db row has rotated away. Looked up through
+    the state file's handle -> lease map and re-read from fleet.db, so it also
+    answers for handles issued before the class existed, and reads nothing
+    from disk but the database."""
+    lease = next((l for l, info in _load_state()["leases"].items()
+                  if isinstance(info, dict) and info.get("handle") == handle), None)
+    row = next((r for r in failed_dispatches(db) if r["lease"] == lease), None)
+    if row is None:
+        return None
+    return {"handle": handle, **failure_view(row)}
+
+
+# --- D5b: `mopsus list` -------------------------------------------------------
+
+_BRIEF_HEADER_RE = re.compile(r"^Dispatch failure: (\S+) (\S+)")
+
+
+def list_handles():
+    """[(lease, handle, repo_or_None, plan_id_or_None)] over every handle
+    `mopsus.state.json` recorded, for every lease — never derived from
+    anywhere but that state file and the brief it points at, so `list` and
+    `mopsus <handle>` can never disagree about what a handle holds. repo and
+    plan_id are read from the brief's OWN first line (the same one
+    compose_brief writes) rather than re-fetched from fleet.db, which may
+    have rotated the row away by the time someone runs `list`. A handle
+    whose brief has gone missing is listed as such, never silently dropped."""
+    state = _load_state()
+    out = []
+    for lease, info in sorted(state["leases"].items()):
+        if isinstance(info, dict) and info.get("requeued"):
+            continue            # requeued, never briefed: no handle to list
+        handle = info.get("handle") if isinstance(info, dict) else None
+        brief = _read_brief(handle) if handle else None
+        if brief is None:
+            out.append((lease, handle, None, None))
+            continue
+        m = _BRIEF_HEADER_RE.match(brief.splitlines()[0] if brief else "")
+        out.append((lease, handle, m.group(1) if m else None, m.group(2) if m else None))
+    return out
+
+
+def cmd_list():
+    entries = list_handles()
+    if not entries:
+        print("mopsus: no handles recorded")
+        return 0
+    for lease, handle, repo, plan_id in entries:
+        if repo is None:
+            print(f"{handle or '-'}\t{lease}\tMISSING BRIEF")
+        else:
+            print(f"{handle}\t{repo}\t{plan_id}\t{lease}")
+    return 0
+
+
+# --- main --------------------------------------------------------------------
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "list":
+        return cmd_list()
+
+    ap = argparse.ArgumentParser(prog="mopsus", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("handle", nargs="?",
+                    help="open a session holding this handle's brief; omit to "
+                         "sweep fleet.db for newly-failed dispatches; 'list' "
+                         "to list every handle recorded")
+    ap.add_argument("--conf", help="config path (test seam)")
+    ap.add_argument("--db", help="fleet.db path (test seam)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would page — write no state, page nobody")
+    ap.add_argument("--format", choices=("text", "json"), default="text",
+                    help="with a handle: 'json' prints the class, action "
+                         "shortlist and PR as data instead of opening a session")
+    args = ap.parse_args(argv)
+
+    if args.format == "json":
+        if not args.handle:
+            ap.error("--format json needs a handle")
+        view = handle_view(args.handle, args.db)
+        if view is None:
+            sys.stderr.write(f"mopsus: no failure held for handle {args.handle!r}\n")
+            return 1
+        print(json.dumps(view, indent=1, sort_keys=True))
+        return 0
+    if args.handle:
+        return open_session(args.handle)
+
+    try:
+        n_paged, n_refused = sweep(args.conf, args.db, args.dry_run)
+    except ConfigError as e:
+        sys.stderr.write(f"mopsus: {e}\n")
+        return 2
+    print(f"mopsus: {n_paged} paged, {n_refused} refused (mode not built)")
+    return 2 if n_refused else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

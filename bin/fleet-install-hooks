@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""fleet-install-hooks — install the fleet pre-push hook into ONE repo.
+
+  fleet-install-hooks <repo-path>
+
+Resolves the real hooks directory through git itself (`rev-parse --git-path
+hooks`), so linked WORKTREES — the fleet's own practice — install correctly
+(1522 #12 M3). Refuses when the repo sets `core.hooksPath` (git would silently
+ignore `.git/hooks`, and enforcement that reports success while providing none
+is worse than none), refuses bare repos, refuses to clobber a hook it did not
+write; re-running on its own hook is idempotent. Run by a human or coordinator
+per repo — never by CI (plan 0008 §6).
+"""
+import os
+import shlex
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+MARKER = "# fleet-install-hooks v1"
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 1:
+        sys.exit("usage: fleet-install-hooks <repo-path>")
+    repo = Path(argv[0]).expanduser().resolve()
+
+    def _git(*args):
+        return subprocess.run(["git", "-C", str(repo), *args],
+                              capture_output=True, text=True,
+                              errors="replace", timeout=15)
+
+    bare = _git("rev-parse", "--is-bare-repository")
+    if bare.returncode != 0:
+        sys.exit(f"fleet-install-hooks: {repo} is not a git repo")
+    if bare.stdout.strip() == "true":
+        sys.exit(f"fleet-install-hooks: {repo} is bare — install into a "
+                 "clone or worktree, where pushes originate")
+    hp = _git("config", "core.hooksPath")
+    if hp.returncode == 0 and hp.stdout.strip():
+        sys.exit(f"fleet-install-hooks: {repo} sets "
+                 f"core.hooksPath={hp.stdout.strip()!r} — git would ignore "
+                 ".git/hooks entirely, and enforcement that reports success "
+                 "while providing none is worse than none. Add the fleet hook "
+                 "into that path by hand (keep the marker line).")
+    gp = _git("rev-parse", "--git-path", "hooks")
+    if gp.returncode != 0:
+        sys.exit(f"fleet-install-hooks: cannot resolve hooks dir in {repo}")
+    hooks = Path(gp.stdout.strip())
+    if not hooks.is_absolute():
+        hooks = repo / hooks
+    hooks.mkdir(parents=True, exist_ok=True)
+
+    prepush = Path(__file__).resolve().parent / "fleet-prepush"
+    if not prepush.is_file():
+        sys.exit(f"fleet-install-hooks: {prepush} missing — run from a real "
+                 "eunomia checkout")
+    q = shlex.quote(str(prepush))
+    body = (
+        "#!/bin/sh\n"
+        f"{MARKER}\n"
+        "# Polarity holds at THIS layer too (1522 #12 r2 H1): a moved eunomia\n"
+        "# checkout, a missing python3, or a syntax error in fleet-prepush must\n"
+        "# WARN and allow, never freeze pushes. Only exit 3 — fleet-prepush's\n"
+        "# explicit BLOCK code — aborts the push; every other failure is a\n"
+        "# crash, and crashes fail open. Reinstall with fleet-install-hooks\n"
+        "# after moving the eunomia checkout.\n"
+        'command -v python3 >/dev/null 2>&1 || {\n'
+        '  echo "fleet-prepush: WARN python3 missing — allowing push" >&2; exit 0; }\n'
+        f'[ -f {q} ] || {{\n'
+        '  echo "fleet-prepush: WARN eunomia checkout missing — allowing push" >&2; exit 0; }\n'
+        f'python3 {q} "$@"\n'
+        'rc=$?\n'
+        '[ "$rc" -eq 3 ] && exit 1\n'
+        '[ "$rc" -ne 0 ] && echo "fleet-prepush: WARN hook crashed (rc=$rc) — allowing push" >&2\n'
+        'exit 0\n'
+    )
+    target = hooks / "pre-push"
+    if target.is_symlink():
+        # writing through a link would clobber a SHARED hooks file used by
+        # other repos — "installers touch only what they name" (r8 low)
+        sys.exit(f"fleet-install-hooks: {target} is a symlink — refusing to "
+                 "write through it; install into the link target by hand")
+    if target.exists():
+        existing = target.read_text(errors="replace")
+        if MARKER not in existing:
+            sys.exit(f"fleet-install-hooks: {target} exists and is not ours — "
+                     "refusing to clobber a foreign hook; merge it by hand")
+        if existing == body:
+            print(f"already installed: {target}")
+            return 0
+        # Marked-but-different is the upgrade path — but it is ALSO what a
+        # hand-merged hook looks like (our own refusals say "merge it by hand"
+        # and "keep the marker line"). Preserve the displaced content instead
+        # of silently destroying it (1522 #12 r3 M1).
+        backup = hooks / "pre-push.fleet-replaced"
+        n = 1
+        while True:
+            # a second hand-merge must not destroy the first backup — the r3
+            # data-loss fix, one level down (r4 L2). O_EXCL, not
+            # exists()-then-write (r10 L5): two concurrent runs picking the
+            # same name would have one backup clobber the other.
+            try:
+                fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                break
+            except FileExistsError:
+                backup = hooks / f"pre-push.fleet-replaced.{n}"
+                n += 1
+        with os.fdopen(fd, "wb") as bf:
+            bf.write(target.read_bytes())          # byte-faithful (r6 L3):
+                                                   # errors="replace" text
+                                                   # would mangle non-UTF-8
+        print(f"note: previous hook content differed — preserved at {backup}; "
+              "re-merge by hand if it carried your own logic")
+    target.write_text(body)
+    target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    print(f"installed: {target}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

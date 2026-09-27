@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""fleet-heartbeat — touch this session's liveness file. Stop-hook safe.
+
+Invoked by the Claude Code Stop hook after every turn. Reads the hook's JSON on
+stdin for `session_id` (hooks do not inherit a session's shell exports), falls
+back to EUNOMIA_SESSION, and touches `sessions/<sid>/hb` under the fleet tree.
+
+Contract (plan 0005 §3):
+  * ALWAYS exits 0 — a heartbeat failure is telemetry lost, never a turn lost.
+  * Touch-only: never writes lease files, never emits events. Liveness is the
+    mtime, full stop (SPEC §Heartbeat).
+  * Nothing on stderr — Stop-hook stderr can surface into the user's terminal.
+    Failures append to `<fleet>/heartbeat.log` when that is itself writable.
+  * Off-opshost (EUNOMIA_LEDGER_HOST set): the touch rides ssh through an EXISTING
+    ControlMaster channel only (`-o ControlMaster=no` + BatchMode over the
+    configured control path). A per-turn fresh TCP dial is the 2026-08 TIME_WAIT
+    incident again — 90k connections killed TCP on opshost. No master, no dial:
+    give up silently.
+
+Install (opshost, one entry in ~/.claude/settings.json beside workspace-autosync).
+From the SAME detached worktree the secret guard uses, never from ~/dev/eunomia --
+a hook command naming the shared clone runs whatever branch a session last left
+checked out there, on every session Stop. Same defect as the guard's, same fix
+(ADR-0005; docs/secret-guard.md carries the worktree setup):
+  {"hooks": {"Stop": [{"hooks": [{"type": "command",
+    "command": "python3 ~/.local/share/pins/eunomia/bin/fleet-heartbeat"}]}]}}
+Verify it fires: fleet-status liveness advances while a session works.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Leading char must be alphanumeric: rejects "." / ".." (which would touch
+# `<fleet>/hb` or make `sessions/hb` a file) and leading-dash/underscore ids.
+# `\Z`, not `$`: Python's `$` matches before a terminal newline, so `$` would
+# admit "abc\n" — which locally heartbeats sessions/abc\n/hb (never joins holder
+# "abc") and remotely makes a two-line shell command (1522 r5 L1).
+_SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def _fleet_dir() -> Path:
+    return Path(os.environ.get("EUNOMIA_FLEET_DIR", str(Path.home() / "dev" / ".fleet")))
+
+
+def _log(msg: str) -> None:
+    try:
+        p = _fleet_dir() / "heartbeat.log"
+        # Bound growth: a persistent no-master misconfig would otherwise append one
+        # WARN per turn forever (1522 r3 L4). This file is telemetry, not audit, and
+        # lives outside the event log's rotation — a coarse size cap that drops the
+        # old lines is the right trade.
+        if p.exists() and p.stat().st_size > 1_000_000:
+            p.write_text("")
+        with open(p, "a") as fh:
+            fh.write(msg.rstrip() + "\n")
+    except OSError:
+        pass                    # nowhere to complain that is safe to complain to
+
+
+def _session_id() -> str:
+    raw = ""
+    try:
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read()
+    except OSError:
+        raw = ""
+    if raw.strip():
+        try:
+            sid = str(json.loads(raw).get("session_id") or "")
+            if sid and _SID_RE.match(sid):
+                return sid
+            if sid:
+                # A payload sid that fails validation must not SUPPRESS a valid
+                # env fallback (1522 r8 L1). Logged without echoing the value.
+                _log("WARN payload session_id failed validation — trying env")
+        except (json.JSONDecodeError, AttributeError):
+            _log("WARN unparseable hook payload")
+    env_sid = os.environ.get("EUNOMIA_SESSION", "").strip()
+    return env_sid if _SID_RE.match(env_sid) else ""
+
+
+def main() -> int:
+    sid = _session_id()
+    if not sid or not _SID_RE.match(sid):
+        return 0                # no identity, nothing to record — silently done
+
+    remote = os.environ.get("EUNOMIA_LEDGER_HOST", "").strip()
+    if remote.startswith("-"):
+        _log("WARN EUNOMIA_LEDGER_HOST begins with '-' (ssh would parse it as an "
+             "option) — ignoring")
+        remote = ""
+    if remote:
+        # Reuse-only: never dial. `ssh -O check` asks the multiplexer whether a
+        # master socket is already up for this host WITHOUT opening one; if none
+        # is, give up silently. A per-turn fresh TCP dial is the 2026-08 TIME_WAIT
+        # incident again (90k connections killed TCP on opshost). ControlMaster=no
+        # alone does not guarantee this — it declines to *become* a master but
+        # still dials when no socket exists, so the check gate is load-bearing.
+        # `timeout=` is load-bearing: ConnectTimeout only bounds a fresh dial, and
+        # the intended mode here dials nothing (it multiplexes). A master whose
+        # remote end has hung would otherwise block the Stop hook every turn until
+        # the harness's own hook timeout — felt latency on every session. Bound
+        # both calls and treat a timeout like any other failure: log, exit 0.
+        # The remote path is deliberately pinned to the ledger host's default
+        # ~/dev/.fleet (EUNOMIA_FLEET_DIR is not forwarded over ssh). If the ledger
+        # host ever moves its fleet dir, this constant must move with it — else
+        # off-opshost touches land in a dead tree and those sessions read as
+        # heartbeat-less, orphaning after ttl while alive.
+        # `ProxyCommand=false` makes "no master, no dial" literal, closing the
+        # check->use window: a control socket, when present, is used and never
+        # runs ProxyCommand, so this only poisons the FALLBACK dial that would
+        # otherwise happen if the master died between `-O check` and the touch.
+        try:
+            check = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-O", "check", remote],
+                capture_output=True, text=True, timeout=3)
+            if check.returncode != 0:
+                _log(f"WARN no ssh master for {remote}; skipping heartbeat for {sid}")
+                return 0
+            res = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ControlMaster=no",
+                 "-o", "ProxyCommand=false", "-o", "ConnectTimeout=2", remote,
+                 f"mkdir -p ~/dev/.fleet/sessions/{sid} && touch ~/dev/.fleet/sessions/{sid}/hb"],
+                # 2s, not 3: a live LAN mux round-trip is milliseconds, so a longer
+                # touch is a half-dead master — and a missed best-effort heartbeat
+                # just retries next turn. Bounds felt Stop-hook latency (1522 r4 L2).
+                capture_output=True, text=True, timeout=2)
+            if res.returncode != 0:
+                _log(f"WARN remote touch failed for {sid}: {res.stderr.strip()[:120]}")
+        except subprocess.TimeoutExpired:
+            _log(f"WARN ssh heartbeat timed out for {sid} on {remote}")
+        return 0
+
+    try:
+        hb = _fleet_dir() / "sessions" / sid / "hb"
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.touch()
+    except OSError as e:
+        _log(f"WARN local touch failed for {sid}: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    # The §3 boundary is "must never break a session." Make the always-exit-0,
+    # nothing-on-stderr contract structural, not merely empirical: any unexpected
+    # exception (ssh off a lean hook PATH, unresolvable home) is swallowed to a
+    # best-effort log and exit 0 (1522 L2).
+    try:
+        rc = main()
+    except BaseException as e:
+        try:
+            _log(f"WARN unexpected {e.__class__.__name__}: {e}")
+        except BaseException:
+            pass
+        rc = 0
+    sys.exit(rc)

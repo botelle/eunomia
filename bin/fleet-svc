@@ -1,0 +1,987 @@
+#!/usr/bin/env python3
+"""fleet-svc — the `service` lease gate (plan 0029, postmortem 2026-09-07 cihost).
+
+  fleet-svc status [<host:unit>]
+  fleet-svc start|stop|restart|kickstart <host:unit>
+  fleet-svc bootstrap|bootout|enable|disable <host:unit>
+  fleet-svc kill [--signal TERM] <host:unit>
+  fleet-svc edit-config <host:unit> [--sync-sha]
+  fleet-svc audit
+
+`audit` (plan 0050) reconciles three registries of what runs on THIS host —
+the repo's `launchd/`, `config/services.conf`, and what launchd actually has
+loaded — that nothing else in this tool, or anywhere on the fleet, ever
+compares against each other. It is read-only (no lease, like `status`) and
+reports; it never installs, loads, repairs or enrols. See docs/unit-audit.md.
+
+A supervised process (`<host:unit>`, resolved against `config/services.conf`) is
+started, stopped, killed or reconfigured only by the session holding an ACTIVE
+`service` lease for it — `{"type":"service","host":<host>,"service":"<host:unit>"}`
+— and never by launchd label or systemd unit name, which two supervisors of one
+config can each register under (the incident: one `forgejo-runner daemon`, two
+labels, two accepted "leases" if identity had been the label).
+
+Read-only (`status`) never requires a lease (§2.3 — a lease diagnosis needs is a
+lease diagnosis will route around). Every mutating verb, in order:
+  1. refuse a <host:unit> whose host is not this machine;
+  2. resolve it in config/services.conf, refusing an unenrolled name by name;
+  3. require an ACTIVE lease for that resource held by EUNOMIA_SESSION;
+  4. refuse if ANY OTHER lease is state=active on that same resource with a
+     DIFFERENT holder — regardless of orphanhood. This is not redundant with
+     step 3: past a lease's ttl, fleet-claim's own orphan-skip grants a second
+     --assign (docs/service-lease.md records the measurement), so two ACTIVE
+     rows on one unit is reachable and both holders pass step 3. This step is
+     the only thing that turns that into a visible refusal instead of a second
+     daemon.
+  5. on refusal, name the holder(s), `activated`, ttl and lease id(s);
+  6. perform the operation against the row's `primary` label only — never its
+     `also` labels, which are enrolment data, never a target;
+  7. `kill` re-resolves the pid from the supervisor at kill time and refuses if
+     it (or its start instant) differs from the lease's bound pid — a
+     KeepAlive respawn is ~3 seconds wide and the ledger's `binding.pid` is
+     stale that fast;
+  8. bind {pid, started_at, label, config_sha, bound_at} onto the lease's
+     TOP-LEVEL `binding` (never into `resource` — that field must stay
+     immutable so `_refuse_conflicting_holder`'s exact-dict-equality keeps
+     matching it), re-verifying the holder under the lease's lock. A bind that
+     fails after a successful operation is a loud WARN, never a silent success.
+
+This is cooperative tooling (Principle 5): raw `launchctl`/`systemctl` bypasses
+every word of this, and the wrapper cannot and will not stop it.
+
+FLEET_LAUNCHCTL / FLEET_SYSTEMCTL override the supervisor CLI (default
+`launchctl` / `systemctl`) — the `FLEET_SIMCTL` seam verbatim, so the suite
+never touches a real daemon.
+
+Off-opshost (EUNOMIA_LEDGER_HOST set): the ledger read (steps 3-4) and the bind
+(step 8) each cross once through the `fleet-heartbeat` reuse-only ssh idiom —
+`-O check` gate first, then `-o ControlMaster=no -o ProxyCommand=false`, never a
+fresh dial. Exactly two connecting invocations per mutating verb: the read, and
+the bind — the local supervisor call runs between them. The bind runs
+`fleet-svc --bind` ON the ledger host, because the write needs the ledger's own
+`flock` and other hosts do not mount it (SPEC §Session identity).
+
+Unlike docs/enforcement.md's push/sim/pkill installers, this gate FAILS CLOSED:
+no ledger, no service operation. A missed block here is a repeat of the
+incident (two supervisors, seven red CI runs); a false block costs one operator
+one operation, and raw `launchctl` remains the escape hatch. See
+docs/service-lease.md for the full reasoning and the boundaries this plan set.
+"""
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import re
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+_lib_loader = importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+USAGE = """usage:
+  fleet-svc status [<host:unit>]
+  fleet-svc start|stop|restart|kickstart <host:unit>
+  fleet-svc bootstrap|bootout|enable|disable <host:unit>
+  fleet-svc kill [--signal SIG] <host:unit>
+  fleet-svc edit-config <host:unit> [--sync-sha]
+  fleet-svc audit"""
+
+_MUTATING_VERBS = ("start", "stop", "restart", "kickstart",
+                   "bootstrap", "bootout", "enable", "disable")
+_SIGNAL_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}\Z")
+_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_REMOTE_BIND_PATH = "~/.local/share/pins/eunomia/bin/fleet-svc"
+
+
+def _host() -> str:
+    return socket.gethostname().split(".")[0].lower()
+
+
+def _launchctl():
+    return shlex.split(os.environ.get("FLEET_LAUNCHCTL", "launchctl"))
+
+
+def _systemctl():
+    return shlex.split(os.environ.get("FLEET_SYSTEMCTL", "systemctl"))
+
+
+# ---------------------------------------------------------------- config/services.conf
+
+def _services_conf_path() -> Path:
+    env = os.environ.get("FLEET_SERVICES_CONF")
+    return Path(env) if env else BIN.parent / "config" / "services.conf"
+
+
+_ROW_RE = re.compile(r"^service:\s*(\S+)\s+(.*)$")
+_ROW_FIELDS = ("supervisor", "domain", "primary", "also", "config")
+
+
+def _parse_services_conf():
+    """{"<host>:<unit>": {host, unit, supervisor, domain, primary, also, config}}.
+
+    Grammar borrowed from config/repos.conf's reader (`#` comments, one record
+    per line) — but `key=value` fields, not positional flags: a service row
+    carries five attributes and three optional-shaped ones, where repos.conf's
+    own fields are booleans. `also` is a comma list or `-`; `config` is an
+    ABSOLUTE path on the row's host or `-` (never `~` — nothing here expands a
+    tilde, and expanding one against the wrong host's home is the worst of the
+    three outcomes because it reads as ok, per the plan)."""
+    path = _services_conf_path()
+    try:
+        text = path.read_text()
+    except OSError as e:
+        sys.exit(f"fleet-svc: cannot read {path} ({e.__class__.__name__})")
+    rows = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _ROW_RE.match(line)
+        if not m:
+            sys.exit(f"fleet-svc: {path}:{lineno}: unparseable row: {raw!r}")
+        key, rest = m.group(1), m.group(2)
+        if not _KEY_RE.match(key):
+            sys.exit(f"fleet-svc: {path}:{lineno}: {key!r} is not host:unit")
+        host, unit = key.split(":", 1)
+        fields = {}
+        for tok in rest.split():
+            if "=" not in tok:
+                sys.exit(f"fleet-svc: {path}:{lineno}: bad field {tok!r} (want key=value)")
+            k, v = tok.split("=", 1)
+            fields[k] = v
+        missing = [f for f in _ROW_FIELDS if f not in fields]
+        if missing:
+            sys.exit(f"fleet-svc: {path}:{lineno}: missing field(s) {missing}")
+        if fields["supervisor"] not in ("launchd", "systemd"):
+            sys.exit(f"fleet-svc: {path}:{lineno}: supervisor must be "
+                     f"launchd|systemd, got {fields['supervisor']!r}")
+        config = None if fields["config"] == "-" else fields["config"]
+        if config is not None and not config.startswith("/"):
+            sys.exit(f"fleet-svc: {path}:{lineno}: config must be an absolute "
+                     "path or '-' — nothing here expands '~', and doing so "
+                     "would resolve against the wrong host's home")
+        also = [] if fields["also"] == "-" else [a for a in fields["also"].split(",") if a]
+        if key in rows:
+            sys.exit(f"fleet-svc: {path}:{lineno}: duplicate row for {key!r}")
+        rows[key] = {"host": host, "unit": unit, "supervisor": fields["supervisor"],
+                     "domain": fields["domain"], "primary": fields["primary"],
+                     "also": also, "config": config}
+    return rows
+
+
+# ---------------------------------------------------------------- reuse-only ssh
+
+def _ssh_check(host: str) -> bool:
+    """`-O check` — asks an existing multiplexer whether it is up, WITHOUT
+    dialing. `docs/service-lease.md` explains why this may never be skipped:
+    a 60s polling loop once left 90k TIME_WAIT sockets and killed TCP on opshost."""
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-O", "check", host],
+                           capture_output=True, text=True, timeout=3)
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _ssh_run(host: str, remote_cmd: str, timeout: int = 10):
+    """One reuse-only connecting invocation, gated by `_ssh_check`. None on any
+    failure — the caller decides what "unreachable" means for it."""
+    if host.startswith("-") or not _ssh_check(host):
+        return None
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ControlMaster=no",
+             "-o", "ProxyCommand=false", "-o", "ConnectTimeout=2", host, remote_cmd],
+            capture_output=True, text=True, errors="replace", timeout=timeout)
+        return r.stdout if r.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _ledger_host() -> str:
+    return os.environ.get("EUNOMIA_LEDGER_HOST", "").strip()
+
+
+def _remote_leases_readonly(host: str):
+    """The fleet-prepush `_remote_leases` idiom, verbatim (plan §2.6): one
+    JSON lease record per line, `NO-FLEET-TREE` treated as unreachable rather
+    than an empty ledger. None on any failure."""
+    out = _ssh_run(
+        host,
+        'if [ -d ~/dev/.fleet/leases ]; then'
+        ' for f in ~/dev/.fleet/leases/*.json; do'
+        ' [ -f "$f" ] && tr -d "\\n" < "$f" && echo; done; true;'
+        ' else echo NO-FLEET-TREE; fi')
+    if out is None or out.strip() == "NO-FLEET-TREE":
+        return None
+    recs = []
+    for line in out.splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            recs.append(rec)
+    return recs
+
+
+def _leases_or_none():
+    """All lease records, or None meaning "unreachable" — never an empty list
+    standing in for that, or a mutating verb would refuse with the wrong
+    reason (DoD: the message must name the LEDGER, not "no active lease")."""
+    host = _ledger_host()
+    if host:
+        return _remote_leases_readonly(host)
+    if not lib.leases_dir().is_dir():
+        return None
+    return lib.all_leases()
+
+
+def _bind_locked(lease_id: str, sid: str, binding: dict) -> bool:
+    """Runs on the ledger host, under the lease's lock, re-verifying the
+    holder (fleet-sim's `_bind` discipline). `binding` replaces the TOP-LEVEL
+    key — never `resource`, which must stay byte-identical to what was
+    granted (plan §2.5's measurement: binding it into `resource` silently
+    disarms fleet-claim's exact-equality conflict check)."""
+    try:
+        with lib.held_lock(lib.lock_path(lease_id)):
+            rec = lib.read_lease_checked(lease_id)
+            if rec is None or rec.get("holder") != sid or rec.get("state") != "active":
+                return False
+            rec["binding"] = binding
+            lib.write_lease(rec)
+            return True
+    except lib.LockUnavailable:
+        return False
+
+
+def _remote_bind(host: str, lease_id: str, sid: str, binding: dict) -> bool:
+    """The one remote command that runs fleet-svc's own bind on the ledger
+    host (plan §2.6) — other hosts do not mount the ledger, so the write must
+    happen where the lock means something."""
+    remote_cmd = (f"EUNOMIA_SESSION={shlex.quote(sid)} python3 {_REMOTE_BIND_PATH} "
+                 f"--bind {shlex.quote(lease_id)} {shlex.quote(json.dumps(binding))}")
+    out = _ssh_run(host, remote_cmd, timeout=15)
+    return out is not None and out.strip() == "OK"
+
+
+def _bind(lease_id: str, sid: str, binding: dict) -> bool:
+    host = _ledger_host()
+    return _remote_bind(host, lease_id, sid, binding) if host \
+        else _bind_locked(lease_id, sid, binding)
+
+
+# ---------------------------------------------------------------- the gate (steps 1-5)
+
+def _describe(rec: dict) -> str:
+    return (f"lease={rec.get('id')} holder={rec.get('holder')!r} "
+            f"activated={rec.get('activated')} ttl={rec.get('ttl_minutes')}")
+
+
+def _require_row(key: str) -> dict:
+    rows = _parse_services_conf()
+    row = rows.get(key)
+    if row is None:
+        sys.exit(f"fleet-svc: {key!r} is not enrolled in "
+                 f"{_services_conf_path()} — an unenrolled service is "
+                 "unprotected by this tool; enroll it with a reviewed PR "
+                 "before gating it")
+    return row
+
+
+def _gate(key: str, verb: str):
+    """Steps 1-5. Returns (row, sid, lease_record) on success; exits on
+    refusal, always naming who holds what."""
+    if not _KEY_RE.match(key or ""):
+        sys.exit(f"fleet-svc: {key!r} is not host:unit")
+    host = key.split(":", 1)[0]
+    if host != _host():
+        sys.exit(f"fleet-svc: {key} names host {host!r}; this machine is "
+                 f"{_host()!r} — fleet-svc only acts on its own host, because "
+                 "the ledger is shared but the launchd/systemd domain is not")
+    row = _require_row(key)
+    sid = lib.session_id()
+    leases = _leases_or_none()
+    if leases is None:
+        sys.exit(f"fleet-svc: cannot reach the lease ledger — refusing {verb} "
+                 f"on {key}. This gate fails CLOSED (docs/service-lease.md): "
+                 "a missed block here is the incident it exists to prevent.")
+    resource = {"type": "service", "host": host, "service": key}
+    want = json.dumps(resource, sort_keys=True)
+    mine, foreign = None, []
+    for rec in leases:
+        if rec.get("state") != "active":
+            continue
+        if json.dumps(lib.resource_of(rec), sort_keys=True) != want:
+            continue
+        holder = rec.get("holder")
+        if not holder:
+            continue
+        if holder == sid:
+            mine = rec
+        else:
+            foreign.append(rec)
+    if mine is None:
+        if foreign:
+            other = foreign[0]
+            sys.exit(f"fleet-svc: no ACTIVE service lease for {key} held by "
+                     f"{sid!r} — it is held instead by {_describe(other)}. "
+                     "Coordinate with that session, or `fleet-claim "
+                     f"--takeover {other.get('id')}` if it is dead "
+                     "(docs/takeover.md).")
+        sys.exit(f"fleet-svc: no ACTIVE service lease for {key} held by "
+                 f"{sid!r} — get one with fleet-claim before running {verb}")
+    if foreign:
+        # Step 4 — NOT redundant with the mine-lookup above: past the ttl,
+        # fleet-claim's orphan-skip grants a second --assign, so BOTH holders
+        # reach this point with a lease that individually satisfies step 3.
+        # This refuses for both of them (docs/service-lease.md has the
+        # measurement) rather than reaping or auto-taking-over either.
+        rows_desc = "\n  ".join([_describe(mine)] + [_describe(f) for f in foreign])
+        sys.exit(f"fleet-svc: {key} has MORE THAN ONE active lease — refusing "
+                 f"{verb} until this is resolved:\n  {rows_desc}\nfleet-svc "
+                 "refuses, never reaps: coordinate, or `fleet-claim "
+                 "--takeover <lease-id>` on whichever holder is actually dead "
+                 "(docs/takeover.md).")
+    return row, sid, mine
+
+
+# ---------------------------------------------------------------- supervisor invocation
+
+def _launchd_target(domain: str, label: str) -> str:
+    if domain == "system":
+        return f"system/{label}"
+    if domain == "gui":
+        return f"gui/{os.getuid()}/{label}"
+    sys.exit(f"fleet-svc: unknown launchd domain {domain!r} (expected system|gui)")
+
+
+def _systemd_scope_args(domain: str):
+    if domain == "system":
+        return []
+    if domain == "user":
+        return ["--user"]
+    sys.exit(f"fleet-svc: unknown systemd domain {domain!r} (expected system|user)")
+
+
+def _build_argv(row: dict, verb: str):
+    label = row["primary"]
+    if row["supervisor"] == "launchd":
+        target = _launchd_target(row["domain"], label)
+        return {
+            "start": ["kickstart", target],
+            "restart": ["kickstart", "-k", target],
+            "kickstart": ["kickstart", "-k", target],
+            "stop": ["kill", "SIGTERM", target],
+            "bootstrap": ["bootstrap", target.rsplit("/", 1)[0], label],
+            "bootout": ["bootout", target],
+            "enable": ["enable", target],
+            "disable": ["disable", target],
+        }[verb]
+    scope = _systemd_scope_args(row["domain"])
+    return scope + {
+        "start": ["start", label],
+        "restart": ["restart", label],
+        "kickstart": ["restart", label],
+        "stop": ["stop", label],
+        "bootstrap": ["start", label],
+        "bootout": ["stop", label],
+        "enable": ["enable", label],
+        "disable": ["disable", label],
+    }[verb]
+
+
+def _run_supervisor(row: dict, argv) -> None:
+    exe = _launchctl() if row["supervisor"] == "launchd" else _systemctl()
+    try:
+        res = subprocess.run(exe + argv, capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.exit(f"fleet-svc: {row['supervisor']} invocation failed: {e}")
+    if res.returncode != 0:
+        sys.exit(f"fleet-svc: {row['supervisor']} {' '.join(argv)} failed: "
+                 f"{res.stderr.strip()[:200]}")
+
+
+def _lstart(pid: int):
+    """Process start time — the fleet-pkill idiom verbatim: it survives
+    setproctitle retitling and still catches pid reuse, which a bare pid
+    comparison would miss across a ~3-second KeepAlive respawn."""
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                           capture_output=True, text=True, errors="replace",
+                           timeout=10, env={**os.environ, "LC_ALL": "C"})
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and out else None
+
+
+def _current_pid(row: dict):
+    """(pid, started_at) the supervisor reports RIGHT NOW for row's primary
+    label — never read from the ledger's `binding` (plan §2.4 step 7). (None,
+    None) when unresolvable, which `kill` treats as a mismatch."""
+    label = row["primary"]
+    try:
+        if row["supervisor"] == "launchd":
+            target = _launchd_target(row["domain"], label)
+            res = subprocess.run(_launchctl() + ["print", target],
+                                 capture_output=True, text=True, timeout=15)
+            if res.returncode != 0:
+                return None, None
+            m = re.search(r"^\s*pid\s*=\s*(\d+)", res.stdout, re.M)
+        else:
+            res = subprocess.run(
+                _systemctl() + _systemd_scope_args(row["domain"]) +
+                ["show", label, "--property=MainPID"],
+                capture_output=True, text=True, timeout=15)
+            if res.returncode != 0:
+                return None, None
+            m = re.search(r"MainPID=(\d+)", res.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None, None
+    if not m:
+        return None, None
+    pid = int(m.group(1))
+    if pid == 0:
+        return None, None
+    return pid, _lstart(pid)
+
+
+def _finish_bind(key: str, row: dict, sid: str, lease: dict, *, pid=None,
+                 started_at=None, config_sha=None) -> int:
+    prev = lease.get("binding") if isinstance(lease.get("binding"), dict) else {}
+    binding = {
+        "pid": pid, "started_at": started_at, "label": row["primary"],
+        "config_sha": prev.get("config_sha") if config_sha is None else config_sha,
+        "bound_at": lib.ts(lib.now_utc()),
+    }
+    if not _bind(lease["id"], sid, binding):
+        print(f"fleet-svc: WARN operation on {key} succeeded but the bind "
+              "FAILED — the lease changed hands or the ledger write failed; "
+              "the process is up and UNATTRIBUTED", file=sys.stderr)
+    print(key)
+    return 0
+
+
+# ---------------------------------------------------------------- config sha
+
+def _read_config_sha(host: str, path: str):
+    """sha256 of the config file, computed on the HOST IT LIVES ON — a local
+    read on this host, or one reuse-only ssh hop otherwise (plan §2.9). None
+    (never a guessed "ok") on any failure to read."""
+    if host == _host():
+        try:
+            return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except OSError:
+            return None
+    out = _ssh_run(
+        host,
+        "python3 -c \"import hashlib,sys;"
+        "print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())\" "
+        + shlex.quote(path))
+    if out is None:
+        return None
+    out = out.strip()
+    return out if re.fullmatch(r"[0-9a-f]{64}", out) else None
+
+
+def _config_sha_state(row: dict, binding):
+    if row["config"] is None:
+        return "-"
+    current = _read_config_sha(row["host"], row["config"])
+    if current is None:
+        return "UNKNOWN"
+    recorded = (binding or {}).get("config_sha")
+    if not recorded:
+        return "UNKNOWN"
+    return "ok" if current == recorded else "DRIFT"
+
+
+# ---------------------------------------------------------------- audit (plan 0050)
+#
+# Three registries, treated as three facts and never inferred from one
+# another (§3 boundary — every one of them was individually "correct" while
+# mopsus sat undeployed): the repo's `launchd/*.plist` (shipped), this host's
+# rows in `config/services.conf` (enrolled), and what launchd actually has
+# installed under ~/Library/LaunchAgents and loaded (installed / loaded).
+# Read-only: this never installs, loads, repairs or enrols anything.
+
+_FLEET_ORCH_RE = re.compile(r"^org\.eunomia\.fleet-orch\.")
+_OPERATOR_LABEL_RE = re.compile(r"^org\.eunomia\.")
+
+# Quoted verbatim from config/services.conf's own header — D4/boundary: an
+# audit that enrolled what it found would erase the distinction between the
+# file's lease-protected set and "everything eunomia ships", so the report
+# names the bar instead of applying it.
+SERVICES_CONF_CRITERION = (
+    "each one, stuck, stops the dispatch flow in a way the operator "
+    "cannot see from the outside"
+)
+
+_STRUCTURAL_DRIFT_KEYS = ("ProgramArguments", "WorkingDirectory", "StartInterval",
+                          "StartCalendarInterval", "KeepAlive", "ThrottleInterval")
+
+
+def _launchd_dir() -> Path:
+    env = os.environ.get("FLEET_LAUNCHD_DIR")
+    return Path(env) if env else BIN.parent / "launchd"
+
+
+def _launch_agents_dir() -> Path:
+    env = os.environ.get("FLEET_LAUNCH_AGENTS_DIR")
+    return Path(env) if env else Path.home() / "Library" / "LaunchAgents"
+
+
+def _describe_parse_error(exc: Exception) -> str:
+    """Class name (+ line, for an ExpatError) ONLY — never `str(exc)`
+    verbatim. D1d: no line of this audit's output may carry file content,
+    and some parse-error messages echo a fragment of the bytes that failed."""
+    line = getattr(exc, "lineno", None)
+    return f"{exc.__class__.__name__} at line {line}" if line is not None \
+        else exc.__class__.__name__
+
+
+def _load_plist_strict(path: Path):
+    """(data, error) — `plistlib.loads` ONLY, never `plutil` (D3: a check
+    that agrees with launchd's lenient parser reports zero problems on the
+    two files that are broken today — a `--` inside an XML comment, which
+    `plutil` and launchd both silently accept)."""
+    try:
+        return plistlib.loads(path.read_bytes()), None
+    except Exception as e:
+        return None, _describe_parse_error(e)
+
+
+def _load_shipped_plists(launchd_dir: Path):
+    """{label: (path, data_or_None, error_or_None)} for every launchd/*.plist
+    this repo ships, keyed by filename stem (== Label, by this repo's own
+    convention)."""
+    out = {}
+    if not launchd_dir.is_dir():
+        return out
+    for path in sorted(launchd_dir.glob("*.plist")):
+        data, err = _load_plist_strict(path)
+        out[path.stem] = (path, data, err)
+    return out
+
+
+def _load_installed_plist(label: str, launch_agents_dir: Path):
+    """(path, data_or_None, error_or_None, installed:bool)."""
+    path = launch_agents_dir / f"{label}.plist"
+    if not path.is_file():
+        return path, None, None, False
+    data, err = _load_plist_strict(path)
+    return path, data, err, True
+
+
+def _domain_loaded_labels(launchctl_argv, domain: str):
+    """Every label in `launchctl print <domain>`'s `services = {...}` block,
+    or None on any failure to ask. This is the only way to learn about a
+    loaded label this host never told us to expect (docs/unit-audit.md) —
+    D1c: the domain asked is gui/$UID, never the background domain a plain
+    `launchctl list` over ssh would land in."""
+    try:
+        res = subprocess.run(launchctl_argv + ["print", domain],
+                             capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    labels = set()
+    in_block = False
+    for line in res.stdout.splitlines():
+        if not in_block:
+            if re.search(r"services\s*=\s*\{\s*\Z", line):
+                in_block = True
+            continue
+        if line.strip() == "}":
+            break
+        parts = line.split()
+        if parts:
+            labels.add(parts[-1])
+    return labels
+
+
+def _env_from(data):
+    env = data.get("EnvironmentVariables") if isinstance(data, dict) else None
+    return env if isinstance(env, dict) else None
+
+
+def _kv_state(env, key: str) -> str:
+    """SET | EMPTY | ABSENT — three distinct answers for a missing key, a
+    blank value and a value (D2). The `fleet-push` skill's audit loop once
+    rendered a missing key exactly like a blank one, because PlistBuddy's
+    stderr on a missing key was discarded."""
+    if env is None or key not in env:
+        return "ABSENT"
+    return "SET" if env.get(key) else "EMPTY"
+
+
+def _classify_env_drift(shipped_env, installed_env):
+    """[(key, class)] over the union of keys in either dict (each side
+    treated as {} if absent entirely — a shipped plist with no
+    EnvironmentVariables dict at all must compare clean against an
+    installed copy carrying an empty one). `class` is one of D1's table:
+      install-filled  shipped empty, installed non-empty    — information
+      unfilled        shipped empty, installed empty/absent — information
+      drifted         shipped non-empty and different, OR shipped present
+                      and installed absent
+      install-added   present only in the installed copy    — information,
+                      and NOT verified as safe (§3 boundary) — a key added
+                      by mistake reads exactly like PATH/FLEET_SPAWN
+      ok              identical — never reported
+    Never an enumerated exclusion list (§2's own history: that was wrong
+    twice) — classified from what the SHIPPED copy says, every time."""
+    shipped_env = shipped_env or {}
+    installed_env = installed_env or {}
+    out = []
+    for key in sorted(set(shipped_env) | set(installed_env)):
+        if key in shipped_env and shipped_env[key] == "":
+            out.append((key, "install-filled" if installed_env.get(key) else "unfilled"))
+        elif key in shipped_env and key not in installed_env:
+            out.append((key, "drifted"))
+        elif key in shipped_env:
+            out.append((key, "ok" if shipped_env[key] == installed_env[key] else "drifted"))
+        else:
+            out.append((key, "install-added"))
+    return out
+
+
+def _classify_structural_drift(shipped: dict, installed: dict):
+    """[(key, "drifted")] over _STRUCTURAL_DRIFT_KEYS — direct comparison,
+    any difference is drift; a key absent from BOTH copies is never
+    reported (fleet-broker-tunnel and fleet-collect carry no
+    EnvironmentVariables dict, and the same "absent on both = clean" rule
+    applies here for e.g. StartCalendarInterval vs StartInterval)."""
+    out = []
+    for key in _STRUCTURAL_DRIFT_KEYS:
+        if key not in shipped and key not in installed:
+            continue
+        if shipped.get(key) != installed.get(key):
+            out.append((key, "drifted"))
+    return out
+
+
+def audit_collect(*, host=None, uid=None, launchctl_argv=None):
+    """The whole picture behind `fleet-svc audit` — never installs, loads,
+    repairs or enrols (§3 boundary). Returns a dict; see render_audit and
+    audit_has_problem for what is done with it."""
+    host = host or _host()
+    uid = os.getuid() if uid is None else uid
+    domain = f"gui/{uid}"
+    launchctl_argv = _launchctl() if launchctl_argv is None else launchctl_argv
+
+    shipped = _load_shipped_plists(_launchd_dir())
+
+    all_rows = _parse_services_conf()
+    enrolled_for_host = {
+        row["primary"]: key
+        for key, row in all_rows.items()
+        if row["host"] == host and row["supervisor"] == "launchd"
+    }
+    other_host_rows = [
+        {"key": key, "host": row["host"], "unit": row["unit"]}
+        for key, row in sorted(all_rows.items())
+        if row["host"] != host
+    ]
+
+    launch_agents_dir = _launch_agents_dir()
+    domain_labels = _domain_loaded_labels(launchctl_argv, domain)
+    loaded_query_ok = domain_labels is not None
+    # Scope (D1b): only this repo's OWN convention, and never the
+    # per-dispatch fleet-orch.<lease> jobs — those come and go with a
+    # dispatch and this audit has no business judging them at all.
+    loaded_operator = {
+        l for l in (domain_labels or set())
+        if _OPERATOR_LABEL_RE.match(l) and not _FLEET_ORCH_RE.match(l)
+    }
+
+    in_scope_labels = sorted(set(shipped) | set(enrolled_for_host))
+
+    units = []
+    for label in in_scope_labels:
+        shipped_path, shipped_data, shipped_err = shipped.get(label, (None, None, None))
+        is_shipped = label in shipped
+        enrolled_key = enrolled_for_host.get(label)
+        installed_path, installed_data, installed_err, is_installed = \
+            _load_installed_plist(label, launch_agents_dir)
+        is_loaded = label in loaded_operator
+
+        drifted = False
+        drift_detail = []
+        info_detail = []
+        if shipped_data is not None and installed_data is not None:
+            for key, cls in _classify_env_drift(_env_from(shipped_data),
+                                                _env_from(installed_data)):
+                if cls == "drifted":
+                    drifted = True
+                    drift_detail.append((key, "env"))
+                elif cls != "ok":
+                    info_detail.append((key, cls))
+            for key, cls in _classify_structural_drift(shipped_data, installed_data):
+                drifted = True
+                drift_detail.append((key, "structural"))
+
+        alert_data = installed_data if installed_data is not None else shipped_data
+        alert_env = _env_from(alert_data) if alert_data is not None else None
+        ntfy = _kv_state(alert_env, "FLEET_NTFY_URL")
+        angelia = _kv_state(alert_env, "FLEET_ANGELIA_URL")
+
+        # D1b's non-zero table, for an IN-SCOPE unit only:
+        problem = (
+            (is_shipped and not (is_installed and is_loaded)) or
+            drifted or
+            bool(shipped_err) or
+            bool(installed_err) or
+            (enrolled_key is not None and not is_installed)
+        )
+
+        units.append({
+            "label": label, "shipped": is_shipped,
+            "shipped_path": str(shipped_path) if shipped_path else None,
+            "shipped_error": shipped_err,
+            "enrolled_key": enrolled_key,
+            "installed": is_installed,
+            "installed_path": str(installed_path) if installed_path else None,
+            "installed_error": installed_err,
+            "loaded": is_loaded, "drifted": drifted,
+            "drift_detail": drift_detail, "info_detail": info_detail,
+            "ntfy": ntfy, "angelia": angelia, "problem": problem,
+        })
+
+    # Loaded, org.eunomia.*, but neither shipped nor enrolled for this host —
+    # reported, and NEVER counted toward the exit status (D1b): a label
+    # eunomia does not ship is not this audit's to judge, including its own
+    # parse failures (the org.eunomia.lynceus case).
+    out_of_scope = []
+    for label in sorted(loaded_operator - set(in_scope_labels)):
+        _, _, err, _ = _load_installed_plist(label, launch_agents_dir)
+        out_of_scope.append({"label": label, "parse_error": err})
+
+    return {"host": host, "domain": domain, "units": units,
+           "out_of_scope": out_of_scope, "other_host_rows": other_host_rows,
+           "loaded_query_ok": loaded_query_ok}
+
+
+def audit_has_problem(data) -> bool:
+    return any(u["problem"] for u in data["units"])
+
+
+def _yn(b) -> str:
+    return "yes" if b else "no"
+
+
+def render_audit(data):
+    lines = [f"fleet-svc audit — host={data['host']} domain={data['domain']} "
+            f"(this run only covers the local host)"]
+    if not data["loaded_query_ok"]:
+        lines.append("WARN: could not query the launchd domain — loaded/"
+                     "out-of-scope data below is incomplete")
+    for u in data["units"]:
+        lines.append(
+            f"unit {u['label']} shipped={_yn(u['shipped'])} "
+            f"enrolled={u['enrolled_key'] or 'no'} "
+            f"installed={_yn(u['installed'])} loaded={_yn(u['loaded'])} "
+            f"drift={'DRIFT' if u['drifted'] else 'clean'} "
+            f"ntfy={u['ntfy']} angelia={u['angelia']}")
+        if u["shipped_error"]:
+            lines.append(f"  parse-error shipped {u['label']}: {u['shipped_error']}")
+        if u["installed_error"]:
+            lines.append(f"  parse-error installed {u['label']}: {u['installed_error']}")
+        for key, kind in u["drift_detail"]:
+            lines.append(f"  drift {u['label']} {key} ({kind})")
+        for key, cls in u["info_detail"]:
+            shown = "install-added (not verified)" if cls == "install-added" else cls
+            lines.append(f"  info {u['label']} {key} {shown}")
+        if u["shipped"] and u["enrolled_key"] is None:
+            lines.append(f"  info {u['label']} shipped, not enrolled in "
+                         f"config/services.conf — criterion: "
+                         f"\"{SERVICES_CONF_CRITERION}\"")
+    for o in data["out_of_scope"]:
+        line = f"out-of-scope {o['label']} loaded=yes shipped-by-eunomia=no"
+        if o["parse_error"]:
+            line += f" parse-error: {o['parse_error']}"
+        lines.append(line)
+    for row in data["other_host_rows"]:
+        lines.append(f"other-host {row['key']} host={row['host']} — not audited "
+                     "here (this run only covers the local host)")
+    n_problem = sum(1 for u in data["units"] if u["problem"])
+    lines.append(f"{len(data['units'])} unit(s) in scope, {n_problem} with a problem")
+    return lines
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_status(target) -> int:
+    rows = _parse_services_conf()
+    if target is not None:
+        if target not in rows:
+            sys.exit(f"fleet-svc: {target!r} is not enrolled in "
+                     f"{_services_conf_path()}")
+        keys = [target]
+    else:
+        keys = sorted(rows)
+    leases = _leases_or_none()
+    if leases is None:
+        print("fleet-svc: WARN ledger unreachable — holder/binding shown as "
+              "unknown (read verbs degrade rather than refuse)", file=sys.stderr)
+        leases = []
+    if not keys:
+        print("no services enrolled")
+    for key in keys:
+        row = rows[key]
+        resource = {"type": "service", "host": row["host"], "service": key}
+        want = json.dumps(resource, sort_keys=True)
+        active = [r for r in leases if r.get("state") in ("assigned", "active")
+                 and json.dumps(lib.resource_of(r), sort_keys=True) == want]
+        binding = None
+        if active:
+            holder_txt = " | ".join(_describe(r) for r in active)
+            for r in active:
+                b = r.get("binding")
+                if isinstance(b, dict):
+                    binding = b
+        else:
+            holder_txt = "holder=- (unclaimed)"
+        bind_txt = f" pid={binding['pid']} label={binding['label']}" if binding else ""
+        sha = _config_sha_state(row, binding)
+        print(f"{key:34} supervisor={row['supervisor']:8} domain={row['domain']:6} "
+              f"primary={row['primary']} also={','.join(row['also']) or '-'} "
+              f"config_sha={sha}{bind_txt} {holder_txt}")
+    return 0
+
+
+def cmd_mutate(verb: str, key: str) -> int:
+    row, sid, lease = _gate(key, verb)
+    _run_supervisor(row, _build_argv(row, verb))
+    pid, started = _current_pid(row)
+    return _finish_bind(key, row, sid, lease, pid=pid, started_at=started)
+
+
+def cmd_kill(key: str, signal_name: str) -> int:
+    if not _SIGNAL_RE.match(signal_name):
+        sys.exit(f"fleet-svc: {signal_name!r} is not a signal name (e.g. TERM, KILL)")
+    sig = getattr(signal, f"SIG{signal_name}", None)
+    if sig is None:
+        sys.exit(f"fleet-svc: no such signal SIG{signal_name}")
+    row, sid, lease = _gate(key, "kill")
+    binding = lease.get("binding") if isinstance(lease.get("binding"), dict) else {}
+    bound_pid, bound_started = binding.get("pid"), binding.get("started_at")
+    cur_pid, cur_started = _current_pid(row)
+    if bound_pid is None or cur_pid != bound_pid or cur_started != bound_started:
+        sys.exit(f"fleet-svc: refusing to signal {key} — the supervisor "
+                 f"currently reports pid={cur_pid} started={cur_started!r}, "
+                 f"but the lease binds pid={bound_pid} started={bound_started!r}. "
+                 "A respawn between stop and kill is exactly this case (~3s "
+                 "wide in the 2026-09-07 incident); re-run `fleet-svc status` "
+                 "and re-bind before killing.")
+    try:
+        os.kill(cur_pid, sig)
+    except ProcessLookupError:
+        pass                      # already gone — the goal state, however reached
+    except PermissionError:
+        sys.exit(f"fleet-svc: no permission to signal pid {cur_pid}")
+    return _finish_bind(key, row, sid, lease, pid=cur_pid, started_at=cur_started)
+
+
+def cmd_edit_config(key: str, sync_sha: bool) -> int:
+    """Gates the edit under the lease and records the file's CURRENT sha256
+    into the lease's binding. fleet-svc has no editor of its own — the human
+    edit happens outside this tool, under the lease it requires — so there is
+    nothing for `--sync-sha` to change about what this command DOES; it exists
+    so the operator can say, explicitly, "I just edited this out of band, sync
+    now" rather than that being implicit in every edit-config call. Accepted
+    and otherwise a no-op."""
+    row, sid, lease = _gate(key, "edit-config")
+    if row["config"] is None:
+        sys.exit(f"fleet-svc: {key} has no gated config file (config=- in "
+                 f"{_services_conf_path()})")
+    sha = _read_config_sha(row["host"], row["config"])
+    if sha is None:
+        sys.exit(f"fleet-svc: cannot read {row['config']} on {row['host']} — "
+                 "refusing to bind an unknown sha")
+    return _finish_bind(key, row, sid, lease,
+                        pid=(lease.get("binding") or {}).get("pid"),
+                        started_at=(lease.get("binding") or {}).get("started_at"),
+                        config_sha=sha)
+
+
+def cmd_audit() -> int:
+    """Read-only, no lease (§3 boundary: a lease gate on `audit` would make
+    it refuse on exactly the unit holding a lease on itself, fleet-watch)."""
+    data = audit_collect()
+    for line in render_audit(data):
+        print(line)
+    return 1 if audit_has_problem(data) else 0
+
+
+def cmd_bind_internal(argv) -> int:
+    """`--bind <lease_id> <binding_json>` — the remote target `_remote_bind`
+    invokes on the ledger host over ssh (plan §2.6). Not part of the public
+    CLI: a caller reaches this only because the write must happen where the
+    lease's flock means something."""
+    if len(argv) != 2:
+        sys.exit("usage: fleet-svc --bind <lease_id> <binding_json>")
+    lease_id, binding_json = argv
+    sid = lib.session_id()
+    try:
+        binding = json.loads(binding_json)
+    except json.JSONDecodeError:
+        sys.exit("fleet-svc: --bind payload is not valid JSON")
+    if not isinstance(binding, dict):
+        sys.exit("fleet-svc: --bind payload must be a JSON object")
+    ok = _bind_locked(lease_id, sid, binding)
+    print("OK" if ok else "FAIL")
+    return 0 if ok else 1
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "--bind":
+        return cmd_bind_internal(argv[1:])
+    if not argv:
+        sys.exit(USAGE)
+    verb, rest = argv[0], argv[1:]
+    if verb == "status":
+        if len(rest) > 1:
+            sys.exit(USAGE)
+        return cmd_status(rest[0] if rest else None)
+    if verb == "audit":
+        if rest:
+            sys.exit(USAGE)
+        return cmd_audit()
+    if verb in _MUTATING_VERBS:
+        if len(rest) != 1:
+            sys.exit(USAGE)
+        return cmd_mutate(verb, rest[0])
+    if verb == "kill":
+        signal_name, key = "TERM", None
+        if len(rest) == 1:
+            key = rest[0]
+        elif len(rest) == 3 and rest[0] == "--signal":
+            signal_name, key = rest[1], rest[2]
+        else:
+            sys.exit(USAGE)
+        return cmd_kill(key, signal_name)
+    if verb == "edit-config":
+        sync_sha = False
+        if rest and rest[-1] == "--sync-sha":
+            sync_sha, rest = True, rest[:-1]
+        if len(rest) != 1:
+            sys.exit(USAGE)
+        return cmd_edit_config(rest[0], sync_sha)
+    sys.exit(USAGE)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

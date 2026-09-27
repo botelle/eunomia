@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""fleet-status — leases joined with heartbeats, orphans derived (SPEC.md §Heartbeat).
+
+  fleet-status [--json] [--budget]
+
+Almost a pure reader: display derivation is lock-free, but on FIRST observing a
+derived orphan it takes that lease's flock, re-derives under it, and creates
+`leases/<id>.orphaned` with O_CREAT|O_EXCL — the excl create is the once-only
+guard on the `lease-orphaned` event — then emits before dropping the lock.
+(Deliberate trade, 1522 r10: emitting under the lease lock couples the sweep to
+the events lock, so a wedged events-lock holder briefly blocks that lease's
+activate/takeover — accepted so a racing takeover's event can never precede the
+orphaning it resolves in the tail. No lock-order inversion: nothing takes a lease
+lock while holding the events lock.) It never reaps,
+releases, or reassigns: nothing automated acts on staleness (SPEC Principle 4).
+Takeover is always an explicit `fleet-claim --takeover` by a successor.
+
+--budget compares budget-lease slices against the fleet history DB's per-session
+usage. ADVISORY: it reports and emits `budget-checkpoint`; it refuses nothing.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+_lib_loader = importlib.machinery.SourceFileLoader(
+    "fleetlib", str(Path(__file__).resolve().parent / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+
+def _mark_and_emit_orphan(lease_id: str, actor: str) -> bool:
+    """O_CREAT|O_EXCL: exactly one observer wins the right to emit.
+
+    Marking re-derives orphanhood UNDER the lease's lock first: the sweep's
+    display derivation is lock-free by design, but a takeover racing the sweep
+    could otherwise get a spurious `lease-orphaned` and a stale marker that
+    suppresses the next genuine one (revbot 1493 demonstrated exactly
+    that). Display stays cheap; the write path pays for correctness."""
+    try:
+        with lib.held_lock(lib.lock_path(lease_id), blocking=False):
+            rec = lib.read_lease(lease_id)
+            if rec is None or not lib.is_orphaned(rec):
+                return False        # the race resolved it — nothing to announce
+            marker = lib.marker_path(lease_id)
+            try:
+                fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.close(fd)
+            except FileExistsError:
+                # A marker already stands. If the holder was seen alive AFTER it
+                # was created, the marker belongs to a PREVIOUS orphaning that
+                # resolved via heartbeat resume with no sweep in the live window —
+                # so this is a NEW orphaning: replace the marker and emit, still
+                # under the lock (once-only holds). Liveness older than the marker
+                # (or None — the assigned-state case) means it is the SAME
+                # orphaning, already emitted (1522 r7 M1: sweeps are ad-hoc, so
+                # marker hygiene must not depend on one running in the live
+                # window).
+                if rec.get("state") != "active":
+                    # Assigned-state orphanhood derives from `created`, not
+                    # liveness — but the holder's hb still advances every turn
+                    # (the push model bakes a real session id in), so the
+                    # liveness test below would re-emit on EVERY sweep for an
+                    # unactivated lease with a live holder (1522 r9 H1). A
+                    # standing marker on a non-active orphan is always the SAME
+                    # orphaning.
+                    return False
+                alive = lib.liveness(rec)
+                try:
+                    marker_mtime = marker.stat().st_mtime
+                except FileNotFoundError:
+                    return False        # raced away — the next sweep re-derives
+                if alive is None or alive.timestamp() <= marker_mtime:
+                    return False
+                os.unlink(marker)
+                fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.close(fd)
+            # Emit UNDER the lease lock so a takeover cannot slot its
+            # `lease-takeover` between our marker and our emit and leave the event
+            # tail showing a live, held lease as most-recently orphaned (1522 low).
+            # No lock-order inversion: takeover also emits outside the events lock,
+            # and nothing takes a lease lock while holding the events lock.
+            try:
+                lib.emit("lease-orphaned", lease_id, actor, detail=None)
+            except BaseException:
+                # emit failed AFTER the once-only marker create: unlink it (still
+                # under the lock) so a repaired log re-emits, instead of the marker
+                # suppressing this orphaning forever (1522 r3 L2). BaseException,
+                # not Exception: fleet-emit fails via sys.exit in places, and
+                # SystemExit would otherwise skip the unlink (1522 r4 L1). The
+                # excl-create stays the once-only guard on the success path.
+                try:
+                    os.unlink(lib.marker_path(lease_id))
+                except FileNotFoundError:
+                    pass
+                raise
+        return True
+    except lib.LockUnavailable:
+        # A takeover/activate is in flight, or a hung-alive holder has the lock.
+        # Observation must never block on the incident-time tool: skip marking
+        # this sweep; marking is idempotent-by-marker, so the next sweep retries
+        # (1522 L4).
+        return False
+
+
+def _clear_stale_marker(lease_id: str) -> None:
+    """Mirror of _mark_and_emit_orphan, for the ONE orphan-resolving path that has
+    no ledger write: the holder's heartbeat resumed (a long tool call ended, per
+    the runbook's own "merely quiet" case). activate/takeover/release all unlink
+    the marker on their ledger write; without this, a resume leaves the marker and
+    the NEXT genuine death emits nothing (1522 r6 MEDIUM). Same discipline:
+    re-derive under the NB lock, skip on contention — the next sweep retries."""
+    try:
+        with lib.held_lock(lib.lock_path(lease_id), blocking=False):
+            rec = lib.read_lease(lease_id)
+            if rec is not None and lib.is_orphaned(rec):
+                return          # still genuinely orphaned — the marker stands
+            try:
+                os.unlink(lib.marker_path(lease_id))
+            except FileNotFoundError:
+                pass
+    except lib.LockUnavailable:
+        pass
+    except (Exception, SystemExit) as e:
+        # read_lease sys.exits on a file torn between the scan and this clear
+        # (out-of-library writer). This is HYGIENE, not load-bearing (the mark
+        # path self-heals via marker mtime) — it must never blank the sweep
+        # (1522 r10 low 1). Warn and move on; the torn file is reported loudly
+        # by every mutating path.
+        print(f"fleet: WARN marker hygiene skipped for {lease_id}: "
+              f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+
+def _rows(actor: str):
+    rows = []
+    mark_errors = []
+    for rec in lib.all_leases():
+        lease_id = rec.get("id")
+        id_ok = isinstance(lease_id, str) and lib._ID_RE.match(lease_id)
+        orphaned = lib.is_orphaned(rec)
+        if orphaned:
+            # The id here comes from the lease file BODY, under the same
+            # hand-edited threat model the ttl fix designs for. Validate it before
+            # it becomes a lock/marker path (the H1 hole, at the ledger-content
+            # boundary), and never let one bad row (missing/malformed id) KeyError
+            # the whole sweep — the row still displays; only its mark is skipped
+            # (1522 r4 M2).
+            if id_ok:
+                try:
+                    _mark_and_emit_orphan(lease_id, actor)
+                except (Exception, SystemExit) as e:
+                    # NOT BaseException: KeyboardInterrupt must still interrupt
+                    # the sweep (1522 r7 low); SystemExit is how fleet-emit
+                    # fails, Exception covers the rest.
+                    # A broken events log (disk full on the ledger host) is itself
+                    # an incident-time condition, and this is the incident-time
+                    # tool: keep sweeping and DISPLAY everything, then fail
+                    # non-zero after printing (1522 r6 low). The marker was
+                    # already unlinked by the mark path's own failure handler, so
+                    # nothing is suppressed.
+                    mark_errors.append(
+                        f"{lease_id}: {e.__class__.__name__}: {e}")
+            else:
+                print(f"fleet: WARN un-markable lease id {lease_id!r} — mark skipped",
+                      file=sys.stderr)
+        elif id_ok and lib.marker_path(lease_id).exists():
+            # Derives live again but the marker survived — the heartbeat-resume
+            # recovery (no ledger write ever clears it). Cheap exists() pre-check
+            # keeps the common all-live sweep lock-free.
+            _clear_stale_marker(lease_id)
+        alive = lib.liveness(rec)
+        rows.append({
+            "id": lease_id,
+            "type": lib.resource_of(rec).get("type"),
+            "state": rec.get("state"),
+            "holder": rec.get("holder"),
+            "orphaned": orphaned,
+            "liveness": lib.ts(alive) if alive else None,
+            "ttl_minutes": rec.get("ttl_minutes"),
+            "created": rec.get("created"),
+            "note": rec.get("note") or "",
+        })
+    return rows, mark_errors
+
+
+def _budget(actor: str):
+    """Advisory: slices vs the fleet history DB (the only meter that exists).
+    Returns (entries, emit_errors) — emit failures are deferred so the display
+    happens first (1522 r7 low)."""
+    db = lib.fleet_dir() / "fleet.db"
+    out = []
+    emit_errors = []
+    con = None
+    if db.exists():
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            con = None
+    for rec in lib.all_leases():
+        if lib.resource_of(rec).get("type") != "budget":
+            continue
+        if rec.get("state") != "active":
+            continue
+        # Same ledger-content rule as _rows: a hand-edited budget lease with a
+        # missing/malformed body id degrades THIS row, never the whole --budget
+        # run (1522 r6 low — rec["id"] KeyError'd here).
+        bid = rec.get("id")
+        if not (isinstance(bid, str) and lib._ID_RE.match(bid)):
+            print(f"fleet: WARN un-reportable budget lease id {bid!r} — skipped",
+                  file=sys.stderr)
+            continue
+        try:
+            slice_tok = int(lib.resource_of(rec).get("tokens") or 0)
+        except (TypeError, ValueError):
+            # the ttl_minutes lesson, for tokens: degrade the row, never the run
+            # (1522 r8 M2).
+            print(f"fleet: WARN non-integer budget tokens on {bid} — treated as 0",
+                  file=sys.stderr)
+            slice_tok = 0
+        used = None
+        if con is not None and rec.get("holder"):
+            try:
+                row = con.execute(
+                    "SELECT COALESCE(SUM(t.out_tok),0) FROM turn t "
+                    "JOIN session s ON s.id = t.session_id "
+                    "WHERE s.session_uuid = ? AND t.ts >= ?",
+                    (rec["holder"], rec.get("activated") or ""),
+                ).fetchone()
+                used = int(row[0])
+            except sqlite3.Error:
+                used = None
+        entry = {"id": bid, "holder": rec.get("holder"),
+                 "slice_tokens": slice_tok, "used_out_tokens": used,
+                 "meter": "fleet.db" if used is not None else "no meter"}
+        out.append(entry)
+        # budget-checkpoint is not a lease-* event, so SPEC's lease-field rule
+        # (enforced by fleet-emit, which refused exactly this call in testing)
+        # requires lease=null — the lease id rides in detail instead.
+        try:
+            lib.emit("budget-checkpoint", None, actor,
+                     detail={"lease_id": bid, "slice": slice_tok, "used_out": used})
+        except (Exception, SystemExit) as e:
+            # Same incident-time rule as _rows: a broken events log must not
+            # blank the observation — display everything, fail non-zero after
+            # printing (1522 r7 low).
+            emit_errors.append(f"{bid}: {e.__class__.__name__}: {e}")
+    if con is not None:
+        con.close()
+    return out, emit_errors
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="fleet-status", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--budget", action="store_true")
+    args = ap.parse_args(argv)
+
+    actor = os.environ.get("EUNOMIA_SESSION", "").strip() or "fleet-status"
+    rows, mark_errors = _rows(actor)
+    budget, budget_errors = _budget(actor) if args.budget else (None, [])
+
+    def _fail_if_marks_failed() -> int:
+        # After everything printed: a failed emit is still loud (non-zero, named
+        # on stderr) but never blanks the observation (1522 r6/r7 low).
+        for m in mark_errors:
+            print(f"fleet: ERROR lease-orphaned emit failed — {m}", file=sys.stderr)
+        for m in budget_errors:
+            print(f"fleet: ERROR budget-checkpoint emit failed — {m}", file=sys.stderr)
+        return 1 if (mark_errors or budget_errors) else 0
+
+    if args.json:
+        payload = {"leases": rows}
+        if budget is not None:
+            payload["budget"] = budget
+        print(json.dumps(payload, indent=1, sort_keys=True))
+        return _fail_if_marks_failed()
+
+    if not rows:
+        print("no leases")
+    for r in rows:
+        flag = " ORPHANED" if r["orphaned"] else ""
+        # str() before the width spec: a hand-edited body can make any of these a
+        # dict/list, and truthy non-strings raise TypeError inside a format spec
+        # (1522 r7 M2 — `or '?'` only caught the falsy cases).
+        print(f"{str(r['state'] or '?'):9} {str(r['type'] or '?'):7} "
+              f"{str(r['id'] or '?'):44} "
+              f"holder={r['holder'] or '-'} live={r['liveness'] or '-'}{flag}")
+    if budget is not None:
+        for b in budget:
+            print(f"budget    {b['id']:44} used={b['used_out_tokens']} "
+                  f"of {b['slice_tokens']} ({b['meter']})")
+    return _fail_if_marks_failed()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

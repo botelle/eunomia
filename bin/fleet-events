@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""fleet-events — read the fleet ledger's append-only event log.
+
+Per SPEC.md ("Event record", "CLI surface"): `fleet-events` is the "tail/filter
+CLI" sessions use to read the tail before touching shared state (Producers/
+Consumers). Readers never lock (SPEC "Locking protocol" — rename is atomic, so a
+reader sees a complete old version or a complete new one, never a torn write); this
+script only ever opens files for plain reads.
+
+Scope: by default this reads only the LIVE `events.jsonl` — the "tail" sessions
+actually care about for awareness. Rotated archives (`events-YYYYMMDD-HHMMSS.jsonl`,
+SPEC "Directory layout") are the audit trail, not the live channel, so they are
+only consulted when `--since` asks for a time window that could reach back past a
+rotation. See docs/fleet-history.md for the reasoning.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+FLEET_DIR = Path(os.environ.get("EUNOMIA_FLEET_DIR") or Path.home() / "dev" / ".fleet")
+EVENTS = FLEET_DIR / "events.jsonl"
+
+# v0.2 closed set (SPEC.md "Event record"). Pinned equal to bin/fleet-emit AND
+# to SPEC.md by tests/test_event_type_sync.py. The comment this replaced said
+# "kept in sync with bin/fleet-emit" and nothing checked: the plan-* values
+# landed in fleet-emit alone at 78a9155 (2026-08-29) and were missing here for
+# nine days. An earlier draft of this comment said "for three releases" — this
+# repo has no releases, and a comment that dates the drift should cite the
+# commit it can prove.
+# Standalone scripts by project convention (fleet-collect, fleet-snapshot,
+# fleet-emit); a shared module would need to be importable by hyphenated
+# filenames, which is more machinery than one constant set justifies.
+EVENT_TYPES = {
+    "session-spawned", "session-stopped", "session-killed",
+    "lease-assigned", "lease-activated", "lease-released", "lease-orphaned",
+    "lease-takeover",
+    "cr-filed", "cr-applied",
+    "pr-opened", "pr-pushed", "review-posted", "pr-armed", "candidate-testing",
+    "pr-merged", "pr-bounced",
+    "token-minted", "token-revoked",
+    "deploy-started", "deploy-verified",
+    # row 6b (plan 0004): merge-is-ignition dispatch. Absent here until
+    # 2026-09-07 while fleet-emit and SPEC.md both had them, so the watcher's
+    # own events could be written and never read back by type.
+    "plan-dispatched", "plan-done", "plan-failed",
+    # plan 0039: a `ready` plan withheld before dispatch because a declared
+    # `depends_on` is unmet — emitted by the watcher ON TRANSITION ONLY (first
+    # blocked, or the reason changes), never once per cycle. No `plan-unblocked`:
+    # a plan that clears its block already produces `plan-dispatched`.
+    "plan-blocked",
+    "budget-checkpoint",
+    # plan 0025: a capability (skill, script, policy, repo) changed under
+    # long-running sessions. Awareness only — never an input to automation.
+    "capability-published",
+    # a pinned worktree drifted from its origin/main: reviewed work is not
+    # reaching sessions. Awareness only -- the watcher never moves a pin.
+    "pin-drift",
+    # plan 0063: a per-repo model choice changed (`bin/fleet-models`, one event per
+    # `repo_model_change` row). This is what makes `repo_model` DERIVABLE from the
+    # ledger after `fleet.db` is lost. `detail` carries runner names, positions and
+    # ordinals ONLY — never a credential; see SPEC.md "repo-model-changed".
+    "repo-model-changed",
+    # plan 0068: a fleet-scoped setting changed (`bin/fleet-config`, one event
+    # per `fleet_setting_change` row) — the same durability shape as
+    # `repo-model-changed`, on a plainer table. `detail` carries the setting's
+    # key and its old/new value ONLY; see SPEC.md "fleet-setting-changed".
+    "fleet-setting-changed",
+    # plan 0078 / ADR-0012: `bin/mopsus` (mechanical mode) released a failed
+    # dispatch lease so the watcher can dispatch the plan again. `detail`:
+    # plan, lease, class, attempt, limit.
+    "plan-requeued",
+}
+
+_ARCHIVE_RE = re.compile(r"^events-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.jsonl$")
+_DURATION_RE = re.compile(r"^(\d+)([smhdw])$")
+_DURATION_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+_FOLLOW_POLL_SECONDS = 0.5
+
+
+def _parse_types(raw_values):
+    """--type accepts repeated flags and/or comma-separated lists; validated
+    against the closed set up front so a typo fails loudly, not silently
+    (matches fleet-emit's "reject unknown types" stance)."""
+    if not raw_values:
+        return None
+    types = set()
+    for raw in raw_values:
+        for t in raw.split(","):
+            t = t.strip()
+            if not t:
+                continue
+            if t not in EVENT_TYPES:
+                sys.exit(f"fleet-events: unknown event type {t!r} (v0.2 closed set)")
+            types.add(t)
+    return types
+
+
+def _validate_calendar(v, fmt):
+    """Shape-valid but impossible dates (2026-08-32) must refuse, not silently
+    match nothing — string comparison would accept them, which is the same
+    swallowed-failure class the grammar exists to close."""
+    try:
+        datetime.strptime(v, fmt)
+    except ValueError:
+        sys.exit(f"fleet-events: invalid --since {v!r} — not a real date/time")
+
+
+def _parse_since(value):
+    """A relative duration (`30m`, `2h`, `1d`, `1w`), a bare date (`2026-08-23`,
+    midnight UTC), or a full event timestamp (`2026-08-23T21:07:40Z`), returned as
+    the fixed-width string the event `ts` field uses — SPEC's format sorts
+    lexicographically, so downstream comparison stays string-only.
+
+    Anything else exits non-zero. The first version accepted arbitrary text and
+    compared it as a string, so `--since yesterday` silently returned zero events —
+    a swallowed failure, exactly the class the SPEC's fail-loud rule exists for.
+    (Grafted from the losing bakeoff arm, whose judge called this its one clear win.)"""
+    m = _DURATION_RE.match(value)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=n * _DURATION_SECONDS[unit])
+        return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    v = value.strip().replace(" ", "T", 1)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        _validate_calendar(v, "%Y-%m-%d")
+        return v + "T00:00:00Z"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", v):
+        _validate_calendar(v, "%Y-%m-%dT%H:%M:%S")
+        return v + "Z"          # bare "T"-form assumed UTC, matching every producer
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", v):
+        _validate_calendar(v[:-1], "%Y-%m-%dT%H:%M:%S")
+        return v
+    sys.exit(
+        f"fleet-events: invalid --since {value!r} — expected a duration "
+        "('30m', '2h', '1d', '1w'), a date ('2026-08-23'), or a timestamp "
+        "('2026-08-23T21:07:40Z')"
+    )
+
+
+def _archive_upper_bound(path):
+    """The rotation stamp in an archive's filename is a safe upper bound on every
+    event `ts` inside it: writes are serialized under locks/events.lock and a
+    rotation reads the current wall clock strictly after the last append that
+    landed in the file being rotated. Returns None if the name doesn't parse."""
+    m = _ARCHIVE_RE.match(path.name)
+    if not m:
+        return None
+    y, mo, d, h, mi, s = m.groups()
+    return f"{y}-{mo}-{d}T{h}:{mi}:{s}Z"
+
+
+def _relevant_archives(since):
+    """Archives that could hold a matching event when `since` is set, oldest
+    first so output stays chronological. Empty (no archive I/O at all) when
+    `since` is unset — the default is the live tail, not the audit trail."""
+    if not since:
+        return []
+    paths = []
+    for p in sorted(FLEET_DIR.glob("events-*.jsonl")):
+        ub = _archive_upper_bound(p)
+        if ub is not None and ub < since:
+            continue  # every event inside is provably older than `since`
+        paths.append(p)
+    return paths
+
+
+def _matches(event, types, since):
+    if types is not None and event.get("type") not in types:
+        return False
+    if since is not None and (event.get("ts") or "") < since:
+        return False
+    return True
+
+
+def _format_human(event):
+    bits = [event.get("ts", "?"), f"{event.get('type', '?'):<18}", f"actor={event.get('actor')}"]
+    for k in ("repo", "pr", "sha", "lease"):
+        v = event.get(k)
+        if v is not None:
+            bits.append(f"{k}={v}")
+    detail = event.get("detail")
+    if detail:
+        bits.append(json.dumps(detail, separators=(",", ":")))
+    return " ".join(bits)
+
+
+def _emit_line(line, types, since, as_json):
+    """Parse one raw log line and print it if it matches; return the parsed
+    event (or None if the line was skipped — malformed, or filtered out)."""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        # Readers never lock (SPEC): a concurrent append can, in principle, be
+        # observed mid-write. Skip rather than crash — the next poll picks up
+        # the complete line once the writer finishes.
+        return None
+    if not isinstance(event, dict) or not _matches(event, types, since):
+        return None
+    # flush=True: --follow is piped to a file or another process more often
+    # than to a TTY, and Python block-buffers stdout in that case — without
+    # this, output sits in the buffer indefinitely since this loop never exits
+    # on its own to trigger a flush.
+    print(line.rstrip("\n") if as_json else _format_human(event), flush=True)
+    return event
+
+
+def _read_archives(archives, types, since, as_json):
+    for path in archives:
+        try:
+            with path.open() as fh:
+                for line in fh:
+                    _emit_line(line, types, since, as_json)
+        except FileNotFoundError:
+            continue  # rotated out from under us between glob() and open()
+
+
+def _stream_live(types, since, as_json, do_follow, expect_ino=None):
+    """Read whatever is currently in events.jsonl and, if `do_follow`, keep
+    reading as it grows — through the SAME open fd, so there is no gap between
+    "caught up" and "now following" where an append could be missed. A rotation
+    renames the path out from under the fd; the fd stays valid and still yields
+    anything left unread in it (SPEC: rename is atomic, never invalidates an
+    in-flight read), so it is drained fully before the path is reopened."""
+    fh = None
+    ino = None
+    while True:
+        if fh is None:
+            try:
+                fh = EVENTS.open()
+                ino = os.fstat(fh.fileno()).st_ino
+                if expect_ino is not None and ino != expect_ino:
+                    # Rotated between our snapshot and this open: content we
+                    # globbed archives against moved into one or MORE new
+                    # archives we did not read. Drain the archive the snapshot
+                    # inode became and every archive newer than it — two
+                    # rotations can land during a long archive pass, and
+                    # draining only one repeats the class F3 fixed (1490 m3).
+                    snap_stamp = None
+                    for arch in sorted(FLEET_DIR.glob("events-*.jsonl")):
+                        try:
+                            if os.stat(arch).st_ino == expect_ino:
+                                snap_stamp = _archive_upper_bound(arch)
+                                break
+                        except FileNotFoundError:
+                            continue
+                    for arch in sorted(FLEET_DIR.glob("events-*.jsonl")):
+                        ub = _archive_upper_bound(arch)
+                        if snap_stamp is None or (ub is not None and ub >= snap_stamp):
+                            try:
+                                with arch.open() as afh:
+                                    for aline in afh:
+                                        if aline.endswith("\n"):
+                                            _emit_line(aline, types, since, as_json)
+                            except FileNotFoundError:
+                                continue
+                expect_ino = None
+            except FileNotFoundError:
+                if not do_follow:
+                    return
+                time.sleep(_FOLLOW_POLL_SECONDS)
+                continue
+
+        pos = fh.tell()
+        line = fh.readline()
+        if line:
+            if not line.endswith("\n"):
+                # A writer is mid-append: readline() consumed a PARTIAL line, and
+                # emitting it would both print a torn record and lose its tail
+                # forever. Rewind to where the line began (absolute seek — text
+                # mode forbids relative ones). Crucially, do NOT `continue` past
+                # the rotation check below: if this torn tail is the file's last
+                # word (writer died) and a rotation then archives it, a follower
+                # that only ever re-polls this line stalls forever (review 1490
+                # M1). Falling through lets the inode check move us on.
+                fh.seek(pos)
+                if not do_follow:
+                    fh.close()
+                    return
+            else:
+                _emit_line(line, types, since, as_json)
+                continue
+
+        if not do_follow:
+            fh.close()
+            return
+
+        try:
+            cur_ino = os.stat(EVENTS).st_ino
+        except FileNotFoundError:
+            cur_ino = None
+        if cur_ino != ino:
+            fh.close()
+            # More than one rotation can land inside a single poll interval, in
+            # which case the renamed file we just drained is not the only thing
+            # between us and the fresh live log — whole intermediate archives
+            # would be skipped. Drain every archive newer than the one our old
+            # fd became before reopening the live file.
+            for arch in sorted(FLEET_DIR.glob("events-*.jsonl")):
+                try:
+                    st = os.stat(arch)
+                except FileNotFoundError:
+                    continue
+                if st.st_ino == ino:
+                    ino_stamp = _archive_upper_bound(arch)
+                    for later in sorted(FLEET_DIR.glob("events-*.jsonl")):
+                        lb = _archive_upper_bound(later)
+                        if lb is not None and ino_stamp is not None and lb > ino_stamp:
+                            with later.open() as afh:
+                                for aline in afh:
+                                    if aline.endswith("\n"):
+                                        _emit_line(aline, types, since, as_json)
+                    break
+            fh = None  # reopen at the top of the loop, from offset 0
+            continue
+
+        time.sleep(_FOLLOW_POLL_SECONDS)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="fleet-events",
+        description="Read the fleet ledger's append-only event log.",
+    )
+    ap.add_argument("--type", action="append", default=None,
+                     help="event type filter; repeatable and/or comma-separated")
+    ap.add_argument("--since", default=None,
+                     help="relative duration (30m, 2h, 1d, 1w) or an absolute ts; "
+                          "reaches back into rotated archives as needed")
+    ap.add_argument("--follow", action="store_true", help="tail events.jsonl for new events")
+    ap.add_argument("--json", action="store_true", help="print raw JSON lines instead of a summary")
+    args = ap.parse_args(argv)
+
+    types = _parse_types(args.type)
+    since = _parse_since(args.since) if args.since else None
+
+    # A rotation can land between the archive glob and the live-file open, which
+    # would silently drop the just-rotated events from a --since query. Take a
+    # stable snapshot: glob, open live, re-glob; if the archive set changed,
+    # retry (rotation is rare, so this converges immediately in practice).
+    for _ in range(5):
+        archives = _relevant_archives(since)
+        try:
+            live_ino = os.stat(EVENTS).st_ino
+        except FileNotFoundError:
+            live_ino = None
+        if [a.name for a in _relevant_archives(since)] == [a.name for a in archives]:
+            break
+    _read_archives(archives, types, since, args.json)
+    _stream_live(types, since, args.json, args.follow, expect_ino=live_ino)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

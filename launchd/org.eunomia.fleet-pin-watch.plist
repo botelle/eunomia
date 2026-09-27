@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-pin-watch — report pinned worktrees that stopped receiving merged work.
+
+  THIS UNIT ARMS NOTHING, two ways. It passes the pins-only flag, which checks pins and
+  returns before cycle() is reached at all; and FLEET_WATCH_REPOS is deliberately
+  ABSENT, so even without that flag cycle() warns "nothing to scan" and returns 0
+  before any lease, spawn or spend.
+  That flag also keeps this out of the dispatch watcher's cycle lock, which it
+  would otherwise hold across two network fetches. That is the watcher's own rule — an unconfigured
+  allowlist dispatches nothing — used on purpose here. Verified before shipping by
+  running the watcher in dry-run with FLEET_WATCH_REPOS unset and FLEET_PINS set:
+      -> "FLEET_WATCH_REPOS is empty — nothing to scan" / "0 would dispatch"
+  If you ever add FLEET_WATCH_REPOS to THIS unit you have armed plan dispatch on
+  a 30-minute timer. Don't; give dispatch its own unit and its own decision.
+
+  It runs from the PINNED eunomia worktree, not ~/dev/eunomia. fleet-collect and
+  fleet-leak-watch were installed from the shared clone until 2026-09-07 and so
+  executed whatever branch a session last left checked out — the exact defect
+  this check exists to report. Both are installed from the pin now. The repo
+  copies were themselves wrong until 2026-09-07 and were deployed the same day,
+  so the gap here was never repo-vs-deployment — it was that nothing reported
+  either half, which is what this unit is for. The checker therefore also checks its OWN pin: a fix to it does not
+  reach this unit until someone re-points, and until then the check says so.
+
+  Install (opshost) — AFTER the pin carries a fleet-watch that has check_pins,
+  or this runs and reports nothing while looking installed:
+    (advance the pin first — docs/secret-guard.md owns the fetch-and-detach
+     procedure; a second copy here is the drift risk this repo keeps finding)
+    grep -c 'def check_pins' ~/.local/share/pins/eunomia/bin/fleet-watch   # must be 1
+    cp launchd/org.eunomia.fleet-pin-watch.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-pin-watch.plist
+
+  Verify per PROVENANCE 8.3 — see it report before trusting it: move a pin
+  backwards — check it out one commit back, detached — and confirm the next run
+  logs `pin stale:`. Then put it back. Ordering trap: check_pins is
+  transition-gated, so a pin already recorded stale stays silent. Bring it
+  current, let one cycle record that, and only then move it back.
+
+  DO NOT also expect a PUSH on that same run (plan 0059). A pin moved back one
+  commit is still fast-forwardable, so fleet-pin-advance would heal it
+  unaided, and check_pins now delays a page for exactly that case until its
+  StartInterval plus a margin has passed with nothing having healed it. The
+  `pin stale:` log line is the proof this unit ran and saw the drift; no push
+  on that same run is expected behaviour here, not a defect.
+
+  30 minutes, not 2: a pin changes when a human merges and re-points, and each
+  cycle fetches once per pin.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-pin-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-watch</string>
+    <string>--pins-only</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FLEET_PINS</key>
+    <string>/Users/operator/.local/share/pins/eunomia,/Users/operator/.local/share/pins/techne</string>
+    <!-- replace with the real Fleet-ops push URL at install; empty = log-only -->
+    <key>FLEET_NTFY_URL</key><string></string>
+    <!-- FLEET_WATCH_REPOS is ABSENT ON PURPOSE. See the comment above. -->
+  </dict>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/pin-watch.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/pin-watch.log</string>
+</dict>
+</plist>

@@ -1,0 +1,169 @@
+name: Plans
+
+# The cheap gate for the one tree the suite checks by linting rather than by
+# executing: `plans/**`. NOT docs/ — the suite EXECUTES docs/launch-preamble.md and
+# docs/takeover.md, and this workflow does not, so ignoring docs/ in ci.yml would
+# leave those two files with no gate at all. An addition here must come with the
+# equivalent check, not just the trigger.
+# `ci.yml` ignores those two trees, so without this workflow a plans-only PR would
+# carry NO status at all — and `tests/test_fleet_plan.py::test_repo_plans_are_valid`
+# ("the plans actually committed here must lint") is the only automated check a new
+# plan file gets. Skipping the suite must not mean skipping that.
+#
+# `bin/fleet-plan lint` is what that test calls, and it imports nothing outside the
+# standard library, so this needs no venv and no pip install. That is the whole
+# point: seconds, not four minutes.
+#
+# It also keeps a review dispatchable. `dispatch-review.py:ci_verdict` treats a
+# missing status on a repo that DOES configure workflows as a warning to
+# investigate rather than a clean pass, so a statusless plan PR would be reviewed
+# under a caveat every time. A real green is better than a warning nobody reads.
+
+on:
+  push:
+    paths:
+      - 'plans/**'
+    # Same lane-branch exclusion as ci.yml, and for the same reason (see the
+    # comment there): a test lane result under agent/tests/<plan>/<runner>
+    # must trigger neither workflow, not just the suite-running one.
+    branches-ignore:
+      - 'agent/tests/**'
+
+# Same literal key as ci.yml, for the reason stated there: the collision is the
+# runner's shared per-repository workspace, not the workflow identity.
+concurrency:
+  group: eunomia-cihost-workspace
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    runs-on: cihost
+    timeout-minutes: 5
+    # Same four identity vars as ci.yml's `tests` job, for the same reason
+    # (git operations outside the tests suite need ambient identity the
+    # cihost-linux image doesn't supply). CI_LABEL is a literal here, not a
+    # matrix expression — this job has no matrix — but it plays the same
+    # role: the pinned steps below read $CI_LABEL, not matrix.label.
+    env:
+      GIT_AUTHOR_NAME: forgejo-runner
+      GIT_AUTHOR_EMAIL: runner@cihost.example
+      GIT_COMMITTER_NAME: forgejo-runner
+      GIT_COMMITTER_EMAIL: runner@cihost.example
+      CI_LABEL: cihost-first-push
+    steps:
+      # fetch-depth: 0 so `scope` below can diff against the real merge base.
+      # It costs this lane its shallow clone, which is the price of asking the
+      # right question — see that step. The `cihost` runner's workspace is a
+      # persistent per-repository checkout, so the history is fetched once and
+      # reused, not re-cloned per run.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A code branch can land in THIS workflow and skip the suite entirely,
+      # taking this workflow's green over untested code. The review dispatcher
+      # consumes that green automatically and cannot read a comment, so the
+      # mitigation has to be a job.
+      #
+      # It happens because the forge filters workflows on the PUSH diff (the
+      # `before` SHA to the `after` SHA), which is not the change. Three ways of
+      # pushing make the two disagree, and this gate no longer tries to
+      # enumerate them:
+      #
+      #   (a) FIRST PUSH — filtered on the tip commit alone (ci.yml, FIRST PUSH
+      #       (a)). A branch whose last commit touches only plans/ skips.
+      #   (b) MERGE-COMMIT TIP — the file list comes back empty (ci.yml (b)).
+      #       Both workflows skip and the head gets no status, which is the safe
+      #       direction and stays unmitigated.
+      #   (c) FORCE PUSH — `before` is a real SHA that is not an ancestor of
+      #       `after`, so the push diff is the REBASE DELTA. Measured on #211
+      #       (2026-09-08): a branch changing one file, tests/test_launchd_units.py,
+      #       was rebased onto a main that had moved only in plans/. Push diff
+      #       plans-only, suite skipped, `Plans / lint` green, and a review round
+      #       was cleared on a commit nobody had built.
+      #
+      # (c) is why this is no longer gated on the zero SHA. That gate encoded
+      # ci.yml's claim that "every later push to the branch has a real `before`
+      # SHA and ci.yml decides correctly" — which a force-push falsifies, and a
+      # rebase before opening a PR is routine.
+      #
+      # So stop proxying. Ask what the CHANGE contains, not how it arrived:
+      # `merge-base..HEAD` is the same range the reviewer and the PR see, and it
+      # is unaffected by how the branch was pushed. Still narrow — a genuinely
+      # plans-only PR skips the suite exactly as before, which is what keeps this
+      # lane fast and the ignore list paying for itself.
+      - name: scope — does this change leave plans/?
+        id: scope
+        shell: bash
+        run: |
+          git fetch -q origin main
+          base=$(git merge-base origin/main HEAD || true)
+          head=$(git rev-parse HEAD)
+          if [ -z "$base" ] || [ "$base" = "$head" ]; then
+            # HEAD is main, or an ancestor of it: there is no branch change to
+            # scope. Pushes to main are ci.yml's business.
+            echo "on main (or an ancestor) — lint only"
+            echo "full_suite=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # --no-renames is load-bearing, not tidiness. git's rename detection
+          # is ON by default and prints only a rename's DESTINATION, so
+          # `git mv docs/launch-preamble.md plans/lp.md` reports `plans/lp.md`
+          # alone — the gate sees a plans-only change and skips the suite over a
+          # tree that just lost a file. Not a hypothetical file: the suite
+          # EXECUTES docs/launch-preamble.md (tests/test_fleet_cr.py runs every
+          # fenced block in it), which is exactly why ci.yml refuses to ignore
+          # docs/**. With --no-renames the deletion and the addition are both
+          # printed, and the deletion is what fails the plans/ filter.
+          outside=$(git diff --no-renames --name-only "$base" "$head" | grep -v '^plans/' || true)
+          if [ -n "$outside" ]; then
+            echo "this change leaves plans/ — the suite runs below:"
+            echo "$outside" | sed 's/^/  /'
+            echo "full_suite=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "plans-only change ($base..$head) — lint only"
+            echo "full_suite=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The two steps below (`install`, `full suite (when the change
+      # leaves plans/)`) are verbatim copies of ci.yml's `tests` job's `install` and
+      # `tests` steps; test_the_first_push_suite_matches_ci keeps them
+      # identical, because a drifted copy is a mitigation that stops
+      # mitigating without failing. PINNED VERBATIM — edit ci.yml first, then
+      # copy its `run:` bodies here unchanged, or the test fails.
+      - name: install
+        if: ${{ steps.scope.outputs.full_suite == 'true' }}
+        shell: bash
+        run: |
+          start=$(date +%s)
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -q --upgrade pip
+          # pytest-randomly is deliberate: this suite's env-leak class of bug
+          # (a var read at import, not cleared between loads) is invisible in
+          # a fixed order and was found twice by random ordering.
+          .venv/bin/python -m pip install -q pytest pytest-randomly
+          end=$(date +%s)
+          echo "TIMING label=$CI_LABEL step=install seconds=$((end - start))"
+
+      - name: full suite (when the change leaves plans/)
+        if: ${{ steps.scope.outputs.full_suite == 'true' }}
+        shell: bash
+        run: |
+          start=$(date +%s)
+          # -rs: a skip's reason goes to the job log, not only a count — the
+          # root-user chmod-lease skip is otherwise invisible next to a bare
+          # "1 skipped".
+          .venv/bin/python -m pytest -q -rs
+          end=$(date +%s)
+          echo "TIMING label=$CI_LABEL step=tests seconds=$((end - start))"
+
+      - name: fleet-plan lint
+        shell: bash
+        run: |
+          shopt -s nullglob
+          plans=(plans/*.md)
+          if [ ${#plans[@]} -eq 0 ]; then
+            echo "::error::no plans found — plans/ is empty or the checkout is wrong"
+            exit 1
+          fi
+          python3 bin/fleet-plan lint "${plans[@]}"

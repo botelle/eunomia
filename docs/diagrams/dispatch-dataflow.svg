@@ -1,0 +1,344 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1900 2840" width="1900" height="2840" font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+<style>
+ .t{font-size:27px;font-weight:700;fill:#1c1c1c}
+ .sub{font-size:14px;fill:#5c6670}
+ .h{font-size:15px;font-weight:700;fill:#1c1c1c}
+ .b{font-size:13px;fill:#222}
+ .n{font-size:11.5px;fill:#5c6670;font-style:italic}
+ .w{font-size:10px;font-weight:700;letter-spacing:.08em;fill:#0e6b70}
+ .wv{font-size:12px;fill:#0e6b70;font-family:ui-monospace,Menlo,monospace}
+ .bandl{font-size:13px;font-weight:700;letter-spacing:.12em;fill:#5c6670}
+ .band{stroke:#ddd8cf;stroke-width:1}
+ .proc{fill:#ffffff;stroke:#444;stroke-width:1.8}
+ .agent{fill:#f5f0fb;stroke:#7c3aed;stroke-width:1.8}
+ .gate{fill:#f5ecfd;stroke:#6b21a8;stroke-width:2}
+ .store{fill:#e6f3f3;stroke:#0e6b70;stroke-width:1.6}
+ .panel{fill:#f7f7f9;stroke:#cccccc;stroke-width:1.5}
+ .fl{fill:none;stroke:#444;stroke-width:2.2;marker-end:url(#a)}
+ .ret{fill:none;stroke:#1d4ed8;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#ab)}
+ .bus{fill:none;stroke:#444;stroke-width:2.2}
+ .fail{fill:none;stroke:#b91c1c;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#af)}
+ .actA{font-size:9.5px;letter-spacing:.09em;font-weight:700;fill:#7c3aed}
+ .actM{font-size:9.5px;letter-spacing:.09em;font-weight:700;fill:#6b7280}
+ .actH{font-size:9.5px;letter-spacing:.09em;font-weight:700;fill:#a21caf}
+</style>
+<defs>
+ <marker id="a" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+  <path d="M0,0 L10,4 L0,8 z" fill="#444"/></marker>
+ <marker id="ab" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+  <path d="M0,0 L10,4 L0,8 z" fill="#1d4ed8"/></marker>
+ <marker id="af" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+  <path d="M0,0 L10,4 L0,8 z" fill="#b91c1c"/></marker>
+</defs>
+<rect class="bg" x="0" y="0" width="1900" height="2840" fill="#ffffff"/>
+<text class="t" x="950" y="52" text-anchor="middle">Plan dispatch — the processes that run, and the data each one writes</text>
+<text class="sub" x="950" y="76" text-anchor="middle">Version 1.0 — 2026-09-22 by Fleet Operator</text>
+<text class="n" x="60" y="46" text-anchor="start">One plan, from a filed PR to a merged PR, as it actually runs on opshost.</text>
+<text class="n" x="60" y="62" text-anchor="start">Bands are phases. Every box names the program; `writes` names what it leaves behind.</text>
+<text class="n" x="60" y="78" text-anchor="start">The right rail lists every store, its writer and its readers.</text>
+<rect class="band" x="40" y="100" width="1820" height="403" rx="10" fill="#f7f5f0"/>
+<text class="bandl" transform="translate(66,301.5) rotate(-90)" text-anchor="middle">1 · FILE</text>
+<rect class="band" x="40" y="521" width="1820" height="554" rx="10" fill="#f1f4f7"/>
+<text class="bandl" transform="translate(66,798.0) rotate(-90)" text-anchor="middle">2 · IGNITE</text>
+<text class="n" x="714" y="535" text-anchor="start">fleet-watch --resident on opshost, one cycle every 120 s</text>
+<rect class="band" x="40" y="1093" width="1820" height="570" rx="10" fill="#f7f5f0"/>
+<text class="bandl" transform="translate(66,1378.0) rotate(-90)" text-anchor="middle">3 · IMPLEMENT</text>
+<text class="n" x="714" y="1107" text-anchor="start">bin/orchestrator — one process per plan, phases stamped to its run log</text>
+<rect class="band" x="40" y="1681" width="1820" height="487" rx="10" fill="#f1f4f7"/>
+<text class="bandl" transform="translate(66,1924.5) rotate(-90)" text-anchor="middle">4 · REVIEW</text>
+<text class="n" x="714" y="1695" text-anchor="start">bounded: per-repo passes (review-bounds.conf), each round a fresh session</text>
+<rect class="band" x="40" y="2186" width="1820" height="278" rx="10" fill="#f7f5f0"/>
+<text class="bandl" transform="translate(66,2325.0) rotate(-90)" text-anchor="middle">5 · MERGE</text>
+<rect class="panel" x="1560" y="96" width="300" height="236" rx="8"/>
+<text class="h" x="1578" y="124" text-anchor="start">Legend</text>
+<rect class="proc" x="1578" y="144" width="26" height="15" rx="3"/>
+<text class="b" x="1614" y="156" text-anchor="start">a program (bin/ or ~/agent)</text>
+<rect class="agent" x="1578" y="168" width="26" height="15" rx="3"/>
+<text class="b" x="1614" y="180" text-anchor="start">a model session</text>
+<rect class="gate" x="1578" y="192" width="26" height="15" rx="3"/>
+<text class="b" x="1614" y="204" text-anchor="start">a human, in Minos</text>
+<rect class="store" x="1578" y="216" width="26" height="15" rx="3"/>
+<text class="b" x="1614" y="228" text-anchor="start">a data store</text>
+<path class="fl" d="M1578,248 L1604,248"/>
+<text class="b" x="1614" y="252" text-anchor="start">flow</text>
+<path class="ret" d="M1578,272 L1604,272"/>
+<text class="b" x="1614" y="276" text-anchor="start">return path</text>
+<path class="fail" d="M1578,296 L1604,296"/>
+<text class="b" x="1614" y="300" text-anchor="start">a run that failed</text>
+<text class="w" x="1578" y="324" text-anchor="start">writes</text>
+<text class="b" x="1640" y="324" text-anchor="start">what the step leaves behind</text>
+<rect class="proc" x="420" y="116" width="560" height="122" rx="8"/>
+<text class="actM" x="964" y="140" text-anchor="end">MECHANICAL</text>
+<text class="h" x="436" y="140">① Plan PR opened</text>
+<text class="b" x="436" y="161">file-a-plan → forgejo-open-pr.sh, as implbot.</text>
+<text class="b" x="436" y="178">Front matter: id, status: ready, paths (the lease),</text>
+<text class="b" x="436" y="195">depends_on. No Plan: marker on a plan PR.</text>
+<text class="w" x="436" y="216">writes</text>
+<text class="wv" x="490" y="216">forge: pull request, branch plans/NNNN-slug</text>
+<rect class="agent" x="420" y="258" width="560" height="121" rx="8"/>
+<text class="actA" x="964" y="282" text-anchor="end">AGENT</text>
+<text class="h" x="436" y="282">② Plan review</text>
+<text class="b" x="436" y="303">dispatch-review.py → a Fable session reads the</text>
+<text class="b" x="436" y="320">plan against the checkout; HIGH blocks, else deferred.</text>
+<text class="w" x="436" y="341">writes</text>
+<text class="wv" x="490" y="341">forge: review (APPROVE/COMMENT), review-ledger</text>
+<text class="wv" x="490" y="357">comment, follow-ups issue</text>
+<rect class="gate" x="420" y="399" width="560" height="88" rx="8"/>
+<text class="actH" x="964" y="423" text-anchor="end">HUMAN</text>
+<text class="h" x="436" y="423">③ Merge the plan PR</text>
+<text class="b" x="436" y="444">Two approvals; the operator merges. Merge is ignition.</text>
+<text class="w" x="436" y="465">writes</text>
+<text class="wv" x="490" y="465">main: plans/NNNN-slug.md at status: ready</text>
+<rect class="proc" x="420" y="555" width="560" height="138" rx="8"/>
+<text class="actM" x="964" y="579" text-anchor="end">MECHANICAL</text>
+<text class="h" x="436" y="579">④ Verdict per enrolled repo</text>
+<text class="b" x="436" y="600">FLEET_WATCH_REPOS is the allowlist. The branch-</text>
+<text class="b" x="436" y="617">protection verdict comes from keyvault's forgejo-broker</text>
+<text class="b" x="436" y="634">over FLEET_BROKER_SOCKET; undetermined = scan nothing.</text>
+<text class="w" x="436" y="655">writes</text>
+<text class="wv" x="490" y="655">pages.jsonl (once, on refusal)</text>
+<text class="wv" x="490" y="671">leases/*.watch-notified</text>
+<rect class="proc" x="420" y="713" width="560" height="155" rx="8"/>
+<text class="actM" x="964" y="737" text-anchor="end">MECHANICAL</text>
+<text class="h" x="436" y="737">⑤ Scan main, dedupe, gate</text>
+<text class="b" x="436" y="758">plans/ read via the contents API at ref=main, never a</text>
+<text class="b" x="436" y="775">working tree. A PR carrying `Plan: &lt;id&gt;` in ANY state</text>
+<text class="b" x="436" y="792">= already dispatched. depends_on unmet = blocked.</text>
+<text class="b" x="436" y="809">Live leases ≥ FLEET_WATCH_CAP (default 1) = deferred.</text>
+<text class="w" x="436" y="830">writes</text>
+<text class="wv" x="490" y="830">events.jsonl: plan-blocked (on transition only)</text>
+<text class="wv" x="490" y="846">watch.log: deferred — at cap N</text>
+<rect class="proc" x="420" y="888" width="560" height="171" rx="8"/>
+<text class="actM" x="964" y="912" text-anchor="end">MECHANICAL</text>
+<text class="h" x="436" y="912">⑥ Spawn one orchestrator</text>
+<text class="b" x="436" y="933">fleet-claim --assign → a branch lease for the plan.</text>
+<text class="b" x="436" y="950">fleetjob.start → a one-shot launchd job</text>
+<text class="b" x="436" y="967">org.eunomia.fleet-orch.&lt;lease&gt;, env EUNOMIA_SESSION,</text>
+<text class="b" x="436" y="984">EUNOMIA_PLAN_ID / ZONE / TIER.</text>
+<text class="w" x="436" y="1005">writes</text>
+<text class="wv" x="490" y="1005">leases/&lt;lease&gt;.json (state: assigned), locks/</text>
+<text class="wv" x="490" y="1021">events.jsonl: lease-assigned, plan-dispatched</text>
+<text class="wv" x="490" y="1037">launchd: the job label</text>
+<rect class="proc" x="420" y="1127" width="560" height="171" rx="8"/>
+<text class="actM" x="964" y="1151" text-anchor="end">MECHANICAL</text>
+<text class="h" x="436" y="1151">⑦ Start: lease, workspace, branch</text>
+<text class="b" x="436" y="1172">Activates the lease; heartbeats it. add_worktree from</text>
+<text class="b" x="436" y="1189">the private .git-store clone at origin/main; core.hooksPath</text>
+<text class="b" x="436" y="1206">pinned. create_branch feat/&lt;plan-slug&gt;. Runner resolved</text>
+<text class="b" x="436" y="1223">from fleet-models (repo row, else default).</text>
+<text class="w" x="436" y="1244">writes</text>
+<text class="wv" x="490" y="1244">leases/&lt;lease&gt;.json (state: active); events: lease-activated</text>
+<text class="wv" x="490" y="1260">work/&lt;repo&gt;/&lt;lease&gt;/ (worktree)</text>
+<text class="wv" x="490" y="1276">work/logs/&lt;lease&gt;.log; sessions/&lt;sid&gt;/</text>
+<rect class="agent" x="420" y="1318" width="560" height="171" rx="8"/>
+<text class="actA" x="964" y="1342" text-anchor="end">AGENT</text>
+<text class="h" x="436" y="1342">⑧ Implementer session</text>
+<text class="b" x="436" y="1363">claude -p as the resolved runner, stdin prompt = preamble</text>
+<text class="b" x="436" y="1380">+ plan + bounds. Commits on the branch, pushes, opens</text>
+<text class="b" x="436" y="1397">the work PR itself with `Plan: &lt;id&gt;` in the body.</text>
+<text class="b" x="436" y="1414">Timeout per repo (impl-bounds.conf).</text>
+<text class="w" x="436" y="1435">writes</text>
+<text class="wv" x="490" y="1435">forge: branch, pull request (marker)</text>
+<text class="wv" x="490" y="1451">.orchestrator-transcripts/&lt;lease&gt;.log (redacted)</text>
+<text class="wv" x="490" y="1467">run log: implementer-start / implementer-exit</text>
+<rect class="proc" x="420" y="1509" width="560" height="138" rx="8"/>
+<text class="actM" x="964" y="1533" text-anchor="end">MECHANICAL</text>
+<text class="h" x="436" y="1533">⑨ Verify, then wait for CI</text>
+<text class="b" x="436" y="1554">Finds the PR by marker; refuses if the plan file still says</text>
+<text class="b" x="436" y="1571">ready (unverified). Polls the combined commit status</text>
+<text class="b" x="436" y="1588">until every check has registered and resolved.</text>
+<text class="w" x="436" y="1609">writes</text>
+<text class="wv" x="490" y="1609">forge: PR body edited (marker stamped)</text>
+<text class="wv" x="490" y="1625">run log: verified / unverified, ci-waiting, ci-resolved</text>
+<rect class="agent" x="420" y="1715" width="560" height="138" rx="8"/>
+<text class="actA" x="964" y="1739" text-anchor="end">AGENT</text>
+<text class="h" x="436" y="1739">⑩ Review round</text>
+<text class="b" x="436" y="1760">CI red → a CI-fix session (check names only today; 0069</text>
+<text class="b" x="436" y="1777">adds the stored log). CI green → dispatch-review.py: a</text>
+<text class="b" x="436" y="1794">Fable session posts the verdict; MEDIUM/LOW → issue.</text>
+<text class="w" x="436" y="1815">writes</text>
+<text class="wv" x="490" y="1815">forge: review, review-ledger comment, follow-ups issue</text>
+<text class="wv" x="490" y="1831">fleet.db review (via fleet-reviews)</text>
+<rect class="agent" x="420" y="1873" width="560" height="121" rx="8"/>
+<text class="actA" x="964" y="1897" text-anchor="end">AGENT</text>
+<text class="h" x="436" y="1897">⑪ Fix round, or stop</text>
+<text class="b" x="436" y="1918">HIGH → a fix session on the same branch, push, back</text>
+<text class="b" x="436" y="1935">to ⑩. Bound exhausted, or nothing pushed → stop.</text>
+<text class="w" x="436" y="1956">writes</text>
+<text class="wv" x="490" y="1956">forge: commits; run log: review-round, review-stopped</text>
+<text class="wv" x="490" y="1972">events.jsonl: plan-failed (on stop)</text>
+<rect class="proc" x="420" y="2014" width="560" height="138" rx="8"/>
+<text class="actM" x="964" y="2038" text-anchor="end">MECHANICAL</text>
+<text class="h" x="436" y="2038">⑫ Approved: freeze and steward</text>
+<text class="b" x="436" y="2059">Pushes refused while an approval stands. Polls the PR</text>
+<text class="b" x="436" y="2076">every 60 s for a merge; top-level comments are the</text>
+<text class="b" x="436" y="2093">command channel (unfreeze, instruction, followup).</text>
+<text class="w" x="436" y="2114">writes</text>
+<text class="wv" x="490" y="2114">run log: review-approved, steward-start, steward-*</text>
+<text class="wv" x="490" y="2130">forge: ack comments</text>
+<rect class="gate" x="420" y="2202" width="560" height="105" rx="8"/>
+<text class="actH" x="964" y="2226" text-anchor="end">HUMAN</text>
+<text class="h" x="436" y="2226">⑬ Merge the work PR</text>
+<text class="b" x="436" y="2247">Two approvals; the operator merges in Minos. The steward sees</text>
+<text class="b" x="436" y="2264">merged and releases.</text>
+<text class="w" x="436" y="2285">writes</text>
+<text class="wv" x="490" y="2285">main: the feature</text>
+<rect class="proc" x="420" y="2327" width="560" height="121" rx="8"/>
+<text class="actM" x="964" y="2351" text-anchor="end">MECHANICAL</text>
+<text class="h" x="436" y="2351">⑭ Release</text>
+<text class="b" x="436" y="2372">release_lease; the worktree is kept for the record; the job</text>
+<text class="b" x="436" y="2389">exits and fleet-watch reaps its launchd label next cycle.</text>
+<text class="w" x="436" y="2410">writes</text>
+<text class="wv" x="490" y="2410">leases (released); events: lease-released</text>
+<text class="wv" x="490" y="2426">run log: steward-end</text>
+<path class="fl" d="M700,238 L700,258"/>
+<path class="fl" d="M700,379 L700,399"/>
+<path class="fl" d="M700,487 L700,555"/>
+<path class="fl" d="M700,693 L700,713"/>
+<path class="fl" d="M700,868 L700,888"/>
+<path class="fl" d="M700,1059 L700,1127"/>
+<path class="fl" d="M700,1298 L700,1318"/>
+<path class="fl" d="M700,1489 L700,1509"/>
+<path class="fl" d="M700,1647 L700,1715"/>
+<path class="fl" d="M700,1853 L700,1873"/>
+<path class="fl" d="M700,1994 L700,2014"/>
+<path class="fl" d="M700,2152 L700,2202"/>
+<path class="fl" d="M700,2307 L700,2327"/>
+<path class="ret" d="M420,1933 L380,1933 L380,1784 L416,1784"/>
+<text class="n" x="372" y="1776" text-anchor="end">fix → re-review</text>
+<rect class="gate" x="1040" y="1127" width="460" height="105" rx="8"/>
+<text class="actH" x="1484" y="1151" text-anchor="end">HUMAN</text>
+<text class="h" x="1056" y="1151">⑰ A person answers</text>
+<text class="b" x="1056" y="1172">`respawn` as a top-level comment on the PR (bound to</text>
+<text class="b" x="1056" y="1189">FLEET_OPERATOR_UID); or a fix by hand; or nothing.</text>
+<text class="w" x="1056" y="1210">writes</text>
+<text class="wv" x="1110" y="1210">forge: comment</text>
+<rect class="proc" x="1040" y="1252" width="460" height="138" rx="8"/>
+<text class="actM" x="1484" y="1276" text-anchor="end">MECHANICAL</text>
+<text class="h" x="1056" y="1276">⑯ mopsus (every cycle)</text>
+<text class="b" x="1056" y="1297">Reads leases and fleet.db, classifies the stop reason</text>
+<text class="b" x="1056" y="1314">(CLASS_RULES) and composes a brief with a shortlist</text>
+<text class="b" x="1056" y="1331">that fits THIS failure and a Minos deep link.</text>
+<text class="w" x="1056" y="1352">writes</text>
+<text class="wv" x="1110" y="1352">pages.jsonl + angelia push: the brief</text>
+<text class="wv" x="1110" y="1368">mopsus.state.json (what was briefed)</text>
+<rect class="proc" x="1040" y="1410" width="460" height="154" rx="8"/>
+<text class="actM" x="1484" y="1434" text-anchor="end">MECHANICAL</text>
+<text class="h" x="1056" y="1434">⑮ Orphan sweep (fleet-watch)</text>
+<text class="b" x="1056" y="1455">A lease whose heartbeat lapsed or whose process is gone</text>
+<text class="b" x="1056" y="1472">is orphaned. Paged ONCE per lease; never respawned</text>
+<text class="b" x="1056" y="1489">without a human's `respawn` comment newer than the lease.</text>
+<text class="w" x="1056" y="1510">writes</text>
+<text class="wv" x="1110" y="1510">pages.jsonl + angelia push: 'Orchestrator dead'</text>
+<text class="wv" x="1110" y="1526">leases/&lt;lease&gt;.watch-notified</text>
+<text class="wv" x="1110" y="1542">events.jsonl: lease-orphaned</text>
+<path class="fl" d="M1270,1410 L1270,1390"/>
+<path class="fl" d="M1270,1252 L1270,1232"/>
+<path class="fail" d="M980,1933 L1270,1933 L1270,1564"/>
+<text class="n" x="992" y="1925" text-anchor="start">stopped / died</text>
+<path class="ret" d="M1500,1179 L1530,1179 L1530,973 L984,973"/>
+<text class="n" x="992" y="965" text-anchor="start">respawn → a fresh dispatch of the same plan, at the cap</text>
+<rect class="band" x="40" y="2508" width="1820" height="240" rx="10" fill="#f1f4f7"/>
+<text class="bandl" transform="translate(66,2628.0) rotate(-90)" text-anchor="middle">7 · OBSERVE</text>
+<text class="n" x="420" y="2530" text-anchor="start">no arrows: these read the stores above on their own schedules</text>
+<rect class="proc" x="420" y="2544" width="340" height="139" rx="8"/>
+<text class="actM" x="744" y="2568" text-anchor="end">MECHANICAL</text>
+<text class="h" x="436" y="2568">fleet-collect (120 s)</text>
+<text class="b" x="436" y="2589">transcripts → session, turn, tool_use</text>
+<text class="b" x="436" y="2606">events.jsonl → event</text>
+<text class="b" x="436" y="2623">run logs → dispatch_phase (+ dispatch view)</text>
+<text class="b" x="436" y="2640">forge tasks + cihost logs → ci_task, ci_log</text>
+<text class="w" x="436" y="2661">writes</text>
+<text class="wv" x="490" y="2661">fleet.db (the one writer of its schema)</text>
+<rect class="proc" x="780" y="2544" width="340" height="155" rx="8"/>
+<text class="actM" x="1104" y="2568" text-anchor="end">MECHANICAL</text>
+<text class="h" x="796" y="2568">fleet-reviews / fleet-models</text>
+<text class="b" x="796" y="2589">fleet-reviews --backfill: forge reviews →</text>
+<text class="b" x="796" y="2606">review, model_price. fleet-models:</text>
+<text class="b" x="796" y="2623">repo_model + repo_model_change + event;</text>
+<text class="b" x="796" y="2640">the one writer for per-repo runners.</text>
+<text class="w" x="796" y="2661">writes</text>
+<text class="wv" x="850" y="2661">fleet.db: review, repo_model*</text>
+<text class="wv" x="850" y="2677">events.jsonl: repo-model-changed</text>
+<rect class="proc" x="1140" y="2544" width="340" height="139" rx="8"/>
+<text class="actM" x="1464" y="2568" text-anchor="end">MECHANICAL</text>
+<text class="h" x="1156" y="2568">Pagers and keepers</text>
+<text class="b" x="1156" y="2589">fleet-stalled (daily): PRs waiting on nobody.</text>
+<text class="b" x="1156" y="2606">fleet-orphans (07:00): plans only on branches.</text>
+<text class="b" x="1156" y="2623">fleet-pin-advance / pin-watch: the pins.</text>
+<text class="b" x="1156" y="2640">fleet-snapshot (04:30): VACUUM copy of fleet.db.</text>
+<text class="w" x="1156" y="2661">writes</text>
+<text class="wv" x="1210" y="2661">pages.jsonl; ~/dev/.fleet/snapshots/</text>
+<rect class="proc" x="1500" y="2544" width="340" height="139" rx="8"/>
+<text class="actM" x="1824" y="2568" text-anchor="end">MECHANICAL</text>
+<text class="h" x="1516" y="2568">Readers</text>
+<text class="b" x="1516" y="2589">lynceus API (opshost:8795) → the phone:</text>
+<text class="b" x="1516" y="2606">live sessions, dispatches, failures, reviews.</text>
+<text class="b" x="1516" y="2623">Minos → the PR, the merge, the comments.</text>
+<text class="b" x="1516" y="2640">atlas → history views.</text>
+<text class="w" x="1516" y="2661">writes</text>
+<text class="wv" x="1570" y="2661">nothing in the fleet tree</text>
+<rect class="panel" x="1560" y="350" width="300" height="1700" rx="8"/>
+<text class="h" x="1578" y="378" text-anchor="start">Data stores — writer → readers</text>
+<rect class="store" x="1576" y="400" width="268" height="88" rx="5"/>
+<text class="wv" x="1586" y="416" text-anchor="start">forge (Forgejo)</text>
+<text class="b" x="1586" y="432" text-anchor="start">PR, reviews, comments, status;</text>
+<text class="b" x="1586" y="447" text-anchor="start">written by implbot, revbot,</text>
+<text class="b" x="1586" y="462" text-anchor="start">the orchestrator, the operator. Read by</text>
+<text class="b" x="1586" y="477" text-anchor="start">everything.</text>
+<rect class="store" x="1576" y="498" width="268" height="73" rx="5"/>
+<text class="wv" x="1586" y="514" text-anchor="start">main: plans/*.md</text>
+<text class="b" x="1586" y="530" text-anchor="start">written only by a merge (③).</text>
+<text class="b" x="1586" y="545" text-anchor="start">read by fleet-watch via the API,</text>
+<text class="b" x="1586" y="560" text-anchor="start">never from a working tree.</text>
+<rect class="store" x="1576" y="581" width="268" height="73" rx="5"/>
+<text class="wv" x="1586" y="597" text-anchor="start">~/dev/.fleet/leases/*.json</text>
+<text class="b" x="1586" y="613" text-anchor="start">fleet-claim; states assigned →</text>
+<text class="b" x="1586" y="628" text-anchor="start">active → released/orphaned.</text>
+<text class="b" x="1586" y="643" text-anchor="start">*.watch-notified = paged once.</text>
+<rect class="store" x="1576" y="664" width="268" height="43" rx="5"/>
+<text class="wv" x="1586" y="680" text-anchor="start">~/dev/.fleet/locks/</text>
+<text class="b" x="1586" y="696" text-anchor="start">fleet-claim's write locks.</text>
+<rect class="store" x="1576" y="717" width="268" height="73" rx="5"/>
+<text class="wv" x="1586" y="733" text-anchor="start">~/dev/.fleet/events.jsonl</text>
+<text class="b" x="1586" y="749" text-anchor="start">fleet-emit, append-only, closed</text>
+<text class="b" x="1586" y="764" text-anchor="start">EVENT_TYPES; read by fleet-events</text>
+<text class="b" x="1586" y="779" text-anchor="start">and fleet-collect → event.</text>
+<rect class="store" x="1576" y="800" width="268" height="58" rx="5"/>
+<text class="wv" x="1586" y="816" text-anchor="start">~/dev/.fleet/work/&lt;repo&gt;/&lt;lease&gt;/</text>
+<text class="b" x="1586" y="832" text-anchor="start">the orchestrator's worktree off</text>
+<text class="b" x="1586" y="847" text-anchor="start">the private .git-store clone.</text>
+<rect class="store" x="1576" y="868" width="268" height="73" rx="5"/>
+<text class="wv" x="1586" y="884" text-anchor="start">~/dev/.fleet/work/logs/&lt;lease&gt;.log</text>
+<text class="b" x="1586" y="900" text-anchor="start">the orchestrator's phase stream;</text>
+<text class="b" x="1586" y="915" text-anchor="start">read by mopsus, fleet-collect,</text>
+<text class="b" x="1586" y="930" text-anchor="start">and (0067) the cap count.</text>
+<rect class="store" x="1576" y="951" width="268" height="73" rx="5"/>
+<text class="wv" x="1586" y="967" text-anchor="start">~/dev/.orchestrator-transcripts/</text>
+<text class="b" x="1586" y="983" text-anchor="start">implementer/fix session output,</text>
+<text class="b" x="1586" y="998" text-anchor="start">redacted at write; outside the</text>
+<text class="b" x="1586" y="1013" text-anchor="start">tree atlas renders.</text>
+<rect class="store" x="1576" y="1034" width="268" height="58" rx="5"/>
+<text class="wv" x="1586" y="1050" text-anchor="start">~/dev/.fleet/pages.jsonl</text>
+<text class="b" x="1586" y="1066" text-anchor="start">every page any unit sent (0058):</text>
+<text class="b" x="1586" y="1081" text-anchor="start">ts, unit, title, delivered.</text>
+<rect class="store" x="1576" y="1102" width="268" height="43" rx="5"/>
+<text class="wv" x="1586" y="1118" text-anchor="start">~/dev/.fleet/mopsus.state.json</text>
+<text class="b" x="1586" y="1134" text-anchor="start">which failures were briefed.</text>
+<rect class="store" x="1576" y="1155" width="268" height="43" rx="5"/>
+<text class="wv" x="1586" y="1171" text-anchor="start">~/dev/.fleet/sessions/&lt;sid&gt;/</text>
+<text class="b" x="1586" y="1187" text-anchor="start">fleet-bind: sid → pid, host.</text>
+<rect class="store" x="1576" y="1208" width="268" height="58" rx="5"/>
+<text class="wv" x="1586" y="1224" text-anchor="start">launchd (gui/501)</text>
+<text class="b" x="1586" y="1240" text-anchor="start">org.eunomia.fleet-orch.&lt;lease&gt;</text>
+<text class="b" x="1586" y="1255" text-anchor="start">one-shot jobs; reaped by ⑤.</text>
+<rect class="store" x="1576" y="1276" width="268" height="133" rx="5"/>
+<text class="wv" x="1586" y="1292" text-anchor="start">~/dev/.fleet/fleet.db</text>
+<text class="b" x="1586" y="1308" text-anchor="start">session turn tool_use event</text>
+<text class="b" x="1586" y="1323" text-anchor="start">dispatch_phase (dispatch view)</text>
+<text class="b" x="1586" y="1338" text-anchor="start">ci_task ci_log ci_sync ingest</text>
+<text class="b" x="1586" y="1353" text-anchor="start">review model_price</text>
+<text class="b" x="1586" y="1368" text-anchor="start">repo_model repo_model_change</text>
+<text class="b" x="1586" y="1383" text-anchor="start">fleet_setting (0068, to come).</text>
+<text class="b" x="1586" y="1398" text-anchor="start">Snapshots: ~/dev/.fleet/snapshots/</text>
+</svg>

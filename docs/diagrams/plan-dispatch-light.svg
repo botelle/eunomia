@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1350" width="1080" height="1350" font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+<style>
+ .t{font-size:39px;font-weight:700;fill:#1c1c1c}
+ .st{font-size:23px;fill:#5c6670}
+ .meta{font-size:21px;fill:#8a9099}
+ .h{font-size:34px;font-weight:700;fill:#1c1c1c}
+ .b{font-size:24px;fill:#3d454d}
+ .badge{font-size:16px;font-weight:700;letter-spacing:.09em}
+ .lg{font-size:20px;fill:#3d454d}
+ .fix{font-size:25px;font-weight:700;fill:#9a3412}
+ .note{font-size:19px;fill:#8a9099;font-style:italic}
+</style>
+<defs><marker id="a" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 4 L0 8 z" fill="#8a9099"/></marker><marker id="af" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 4 L0 8 z" fill="#9a3412"/></marker></defs>
+<rect class="bg" width="1080" height="1350" fill="#ffffff"/>
+<text class="t" x="56" y="62">Plan dispatch — how a feature ships</text>
+<text class="st" x="56" y="96">One plan, from a request to a merge. Two gates need a person, and nothing skips them.</text>
+<text class="meta" x="56" y="126">v1.10-lite · 2026-09-14 · Fleet Operator</text>
+<text class="lg" x="56" y="168" font-weight="700">Legend</text>
+<rect x="148" y="150" width="22" height="22" rx="4" fill="#eef2fd" stroke="#1d4ed8" stroke-width="3"/>
+<text class="lg" x="180" y="168">Agent</text>
+<rect x="281" y="150" width="22" height="22" rx="4" fill="#f2f3f4" stroke="#4a5560" stroke-width="3"/>
+<text class="lg" x="313" y="168">Mechanical</text>
+<rect x="469" y="150" width="22" height="22" rx="4" fill="#f7f0fc" stroke="#6b21a8" stroke-width="3"/>
+<text class="lg" x="501" y="168">Human</text>
+<rect x="56" y="200" width="864" height="100" rx="10" fill="#eef2fd" stroke="#1d4ed8" stroke-width="3"/>
+<text class="badge" x="82" y="229" fill="#1d4ed8">AGENT</text>
+<text class="h" x="82" y="263">① Planning session</text>
+<text class="b" x="82" y="290">A request becomes one written plan per feature.</text>
+<path d="M488 300 V338" stroke="#8a9099" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+<rect x="56" y="340" width="864" height="100" rx="10" fill="#eef2fd" stroke="#1d4ed8" stroke-width="3"/>
+<text class="badge" x="82" y="369" fill="#1d4ed8">AGENT</text>
+<text class="h" x="82" y="403">② Plan review</text>
+<text class="b" x="82" y="430">A second model approves it, or raises a blocking question.</text>
+<path d="M488 440 V478" stroke="#8a9099" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+<rect x="56" y="480" width="864" height="100" rx="10" fill="#f7f0fc" stroke="#6b21a8" stroke-width="3"/>
+<text class="badge" x="82" y="509" fill="#6b21a8">HUMAN</text>
+<text class="h" x="82" y="543">③ A person approves the plan</text>
+<text class="b" x="82" y="570">No work starts until someone signs off.</text>
+<path d="M488 580 V618" stroke="#8a9099" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+<rect x="56" y="620" width="864" height="100" rx="10" fill="#f2f3f4" stroke="#4a5560" stroke-width="3" stroke-dasharray="10 7"/>
+<text class="badge" x="82" y="649" fill="#4a5560">MECHANICAL</text>
+<text class="h" x="82" y="683">④ Ignition gate</text>
+<text class="b" x="82" y="710">Automated checks. Ambiguity never counts as approval.</text>
+<path d="M488 720 V758" stroke="#8a9099" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+<rect x="56" y="760" width="864" height="100" rx="10" fill="#f2f3f4" stroke="#4a5560" stroke-width="3"/>
+<text class="badge" x="82" y="789" fill="#4a5560">MECHANICAL</text>
+<text class="h" x="82" y="823">⑤ Work starts, isolated</text>
+<text class="b" x="82" y="850">Each feature runs in its own workspace, so work cannot collide.</text>
+<path d="M488 860 V898" stroke="#8a9099" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+<rect x="56" y="900" width="864" height="100" rx="10" fill="#eef2fd" stroke="#1d4ed8" stroke-width="3"/>
+<text class="badge" x="82" y="929" fill="#1d4ed8">AGENT</text>
+<text class="h" x="82" y="963">⑥ Implementation</text>
+<text class="b" x="82" y="990">A model writes the code against the approved plan.</text>
+<path d="M488 1000 V1038" stroke="#8a9099" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+<rect x="56" y="1040" width="864" height="100" rx="10" fill="#eef2fd" stroke="#1d4ed8" stroke-width="3"/>
+<text class="badge" x="82" y="1069" fill="#1d4ed8">AGENT</text>
+<text class="h" x="82" y="1103">⑦ Review, with a hard limit</text>
+<text class="b" x="82" y="1130">Five attempts, then it stops and hands it to a person.</text>
+<path d="M488 1140 V1178" stroke="#8a9099" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+<rect x="56" y="1180" width="864" height="100" rx="10" fill="#f7f0fc" stroke="#6b21a8" stroke-width="3"/>
+<text class="badge" x="82" y="1209" fill="#6b21a8">HUMAN</text>
+<text class="h" x="82" y="1243">⑧ A person merges the code</text>
+<text class="b" x="82" y="1270">Nothing here ships without someone approving it.</text>
+<path d="M920 1090 H968 V950 H922" stroke="#9a3412" stroke-width="2.5" fill="none" marker-end="url(#af)"/>
+<text class="fix" x="980" y="1029">fix</text>
+<text class="note" x="56" y="1324">Dashed = specified, not yet built. Everything else is running.</text>
+</svg>

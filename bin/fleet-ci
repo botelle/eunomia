@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""fleet-ci — what the fleet's CI did, ingested into fleet.db and served from it.
+
+Plan 0045. "Why is this build red" becomes a query, the way "what is this
+dispatch doing" became one in plan 0036.
+
+  fleet-ci failures REPO [--limit N]           the failing tasks, newest first
+  fleet-ci show REPO TASK_ID                   one task's stored body
+  fleet-ci excerpt REPO TASK_ID [--lines N]     the lines that explain the failure
+  fleet-ci missing REPO [--state S ...]        tasks with no stored body, and why
+
+REPO is `owner/name`, or a bare name under $FLEET_FORGE_OWNER (default operator).
+
+`excerpt`, and the functions behind it (`excerpt()`, `match_context()`,
+`task_excerpt()`, `open_ro()`), are also the reader plan 0069's orchestrator
+consults when a fix round is briefed on a red build: this file is not only the
+schema's one owner (below) but its one query surface, so nothing else has to
+know the shape of `ci_task`/`ci_log`.
+
+THIS FILE IS A SOURCE, NOT A SECOND WRITER. `bin/fleet-collect` loads it every
+sweep and calls `sync(con)`; the tables (`ci_task`, `ci_log`, `ci_sync`) and the
+`ci_task_dispatch` view are created by fleet-collect's own SCHEMA, so there is
+one owner of the schema and of `PRAGMA user_version`. The commands above only
+READ, and they open the database read-only. There is deliberately no `ingest`
+command: a second process writing this file's tables would be a second writer on
+a database whose collector refuses to run when it meets a version it did not
+stamp (see fleet-collect's newer-database refusal). To ingest, run the collector.
+
+WHAT IS STORED, AND WHY THIS MUCH.
+  * every task, as metadata, from Forgejo's task list — `/actions/tasks`;
+  * a BODY only for a task that did not succeed, from cihost's actions_log.
+On the day this was designed the host held 2,679 task logs, 27 MB compressed,
+against a 54 MB fleet.db: storing every body roughly doubles the database to
+carry output for runs that succeeded and that nobody reads. Metadata says what
+ran and what happened; only a failure has a "why".
+
+THE ONE-SSH RULE. The ledger host is opshost and the logs are on cihost, and
+nothing opens an opshost->cihost master. macOS's TIME_WAIT is 30 s against a
+120-second cycle, so one dial per cycle is 0.25 sockets in TIME_WAIT on average
+and 720 dials a day; the 2026-08 incident was ~90,000. So `sync` makes exactly
+ONE ssh per cycle, with no master (ControlMaster=no, ControlPath=none — a user's
+ssh_config cannot quietly turn one into a mux), carrying every log it wants over
+that one connection. Needing more than one connection per cycle is a different
+change, not a stretch of this one.
+
+DECOMPRESSION HAPPENS ON CIHOST, by absolute path (/opt/homebrew/bin/zstd), in
+a small stdlib script sent as the ssh command. `command -v zstd` cannot be
+trusted on either side — launchd and ssh both hand a process a PATH with no brew
+— and the pinned interpreter here is /usr/bin/python3 (3.9), which has no
+`zstandard` and gets one in the stdlib only at 3.14. Decompressing there also
+puts the cap where it bites: the remote reads at most cap+1 bytes of output, so
+a log that expands enormously is refused after 2 MiB, not after it fills a disk.
+
+ABSENT MUST NOT LOOK LIKE ZERO. A table whose purpose is "why did it fail" must
+never answer "no rows" when it means "I could not read it". Every task that
+should have a body and does not says why on its own row (`log_state` /
+`log_detail`), a repo whose last sync failed says so in `ci_sync`, and these
+commands print both — and refuse, loudly, on a database that predates the
+tables, which is normal on a host whose pin has not advanced.
+
+NOTHING AUTOMATED MAY GATE ON THESE TABLES. SPEC Principle 3: the ledger is
+awareness, not authority. A collector that is behind must not become a silent
+input to control flow.
+
+REDACTION. A build log is the fleet artifact most likely to contain a credential,
+and fleet.db is read by atlas and by lynceus, which is published. What is stored
+is redacted, and the stored text carries the RULE NAME and never the matched span
+(`[redacted:aws-key-id]`). The contract is the shape table in plan 0045 §4,
+each row of which has its own test. None of the fleet's three older definitions
+(fleet-collect's `_SECRETISH`, config/secret-patterns.conf, fleet-leak-watch's
+FINDINGS) is a superset of the others, so this is a fourth, written against the
+table rather than copied from any of them. Storing failures only shrinks the
+surface; it does not remove it.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import sqlite3
+import stat as _stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import zlib
+from datetime import datetime, timezone
+from pathlib import Path
+
+_forge_loader = importlib.machinery.SourceFileLoader(
+    "fleetforge", str(Path(__file__).resolve().parent / "fleetforge.py"))
+_forge_spec = importlib.util.spec_from_loader("fleetforge", _forge_loader)
+fleetforge = importlib.util.module_from_spec(_forge_spec)
+_forge_loader.exec_module(fleetforge)
+
+DB = os.path.expanduser(os.environ.get("FLEET_DB", "~/dev/.fleet/fleet.db"))
+FORGEJO_URL = (os.environ.get("FLEET_FORGEJO_URL", "").strip().rstrip("/")
+               or "http://forge.example:3000")
+OWNER = os.environ.get("FLEET_FORGE_OWNER", "operator")
+
+# The host that holds Forgejo's actions_log. `local` reads this machine's own
+# tree (a dev box, or the test suite) and dials nothing.
+LOG_HOST = os.environ.get("FLEET_CI_LOG_HOST", "cihost")
+LOG_ROOT = os.environ.get("FLEET_CI_LOG_ROOT",
+                          "/opt/homebrew/var/forgejo/data/actions_log")
+# By absolute path, on purpose — see the module docstring.
+ZSTD = "/opt/homebrew/bin/zstd"
+REMOTE_PYTHON = "/usr/bin/python3"
+
+# The cap is on the DECOMPRESSED size of one log, and a log over it is not
+# truncated into the table: it is recorded as over-cap, with its size, and no
+# body is stored. Nothing here ever stores a log it could not read whole.
+# Measured on cihost: 2,679 logs, 27 MB compressed, largest 155 KB compressed.
+LOG_CAP = int(os.environ.get("FLEET_CI_LOG_CAP", str(2 * 1024 * 1024)))
+# A ceiling on what one compressed file may be before it is not even opened.
+WIRE_CAP = 8 * 1024 * 1024
+BATCH = 200                 # logs asked for per sweep; the rest wait for the next
+PAGE = 50
+BUDGET_SECONDS = int(os.environ.get("FLEET_CI_BUDGET", "90"))   # < the 120 s cycle
+# A failed task whose file is absent/unreadable is retried while it is this
+# young: Forgejo finishes a task and archives its log a moment apart. After
+# that it is final, so a log pruned by Forgejo is not asked for every 2 minutes
+# forever.
+RETRY_SECONDS = 24 * 3600
+# An `in-progress` task older than this is treated as abandoned when deciding
+# how deep to page, so one row Forgejo lost cannot make every sweep read every
+# page of a repo.
+OPEN_HORIZON_SECONDS = 30 * 24 * 3600
+
+# status -> what becomes of its body.
+NO_BODY = ("success", "skipped")
+OPEN = ("waiting", "running", "blocked", "unknown")
+
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+# ------------------------------------------------------------------ redaction
+#
+# One rule per line: (name, pattern, applies-to-metadata). Order is behaviour:
+# a span is claimed by the first rule that matches it, so the multi-line and the
+# specific rules come before the general ones. The stored marker names the rule
+# and nothing else.
+#
+# Deliberate choices, because each is a place a reasonable reader would differ:
+#   * `hex40` redacts EVERY standalone run of 40+ hex digits, git shas
+#     included. A Forgejo PAT is exactly 40 hex and is indistinguishable from a
+#     sha by shape; the config's answer (leave them) leaks a credential, and the
+#     cost of this answer is small because ci_task.head_sha carries the sha the
+#     task ran at as a column, outside the redacted text.
+#   * the keyword rule matches a keyword ANYWHERE in the name, not only at the
+#     end, so AWS_SECRET_ACCESS_KEY= is caught. fleet-collect's `_SECRETISH`
+#     requires the name to END in a keyword and passes it.
+#   * the assignment rule stops at whitespace (or a closing quote) rather than
+#     end of line, so `TOKEN=x npm test` loses `TOKEN=x`, not the command. The
+#     price is `password: two words`, which keeps the second word.
+#   * a private key with no END line is redacted through the base64-looking
+#     lines that follow its header, not through the end of the log: a log that
+#     merely MENTIONS the header must not lose everything after it.
+_PEM = (r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"
+        r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"
+        r"|[^\n]*(?:\n[^\n]*[A-Za-z0-9+/=]{32,}[^\n]*){0,200})")
+
+_KEYWORDS = (r"token|secret|passw(?:or)?d|pwd|credential|api[_-]?key|"
+             r"access[_-]?key|private[_-]?key|auth[_-]?key")
+
+RULES = [
+    ("private-key", re.compile(_PEM, re.S), True),
+    # `Authorization: Basic …`, and `scheme://user:pass@host`.
+    ("basic-auth", re.compile(
+        r"(?i)\bAuthorization[\"']?[ \t]*[:=][ \t]*[\"']?Basic[ \t]+[A-Za-z0-9+/=._~-]+"
+        r"|(?<![A-Za-z0-9+.-])[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@"), True),
+    # `Authorization: token <40 hex>`, `Bearer …`, or any other scheme.
+    ("auth-header", re.compile(
+        r"(?i)\bAuthorization[\"']?[ \t]*[:=][ \t]*[\"']?(?:[A-Za-z]+[ \t]+)?[^\s\"']+"),
+     True),
+    ("github-token", re.compile(r"(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{10,}"), True),
+    ("gitlab-token", re.compile(r"glpat-[A-Za-z0-9_-]{16,}"), True),
+    ("npm-token", re.compile(r"npm_[A-Za-z0-9]{30,}"), True),
+    ("slack-token", re.compile(r"xox[abprs]-[A-Za-z0-9-]{10,}"), True),
+    # The lookbehind is what keeps `task-…` and `disk-…` out; `\n` is allowed
+    # before it as TWO characters, because a JSON-encoded log puts a backslash
+    # and an `n` there and the `n` would otherwise hide the key.
+    ("openai-key", re.compile(
+        r"(?:(?<![A-Za-z0-9])|(?<=\\n))sk-[A-Za-z0-9_-]{16,}"), True),
+    ("jwt", re.compile(
+        r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), True),
+    ("aws-key-id", re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"), True),
+    ("bao-token", re.compile(r"(?:(?<![A-Za-z0-9])|(?<=\\n))hv[sbr]\.[A-Za-z0-9_-]{16,}"),
+     True),
+    # Not for metadata: a commit title that says "token: rotate weekly" is
+    # prose, and a title is not where a credential lands.
+    ("keyword-assignment", re.compile(
+        r"(?i)(?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]*(?:" + _KEYWORDS + r")[A-Za-z0-9_.-]*"
+        r"[\"']?[ \t]*[:=][ \t]*(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s\"']+)"), False),
+    ("hex40", re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{40,}(?![A-Fa-f0-9])"), False),
+]
+
+
+def redact(text, metadata=False):
+    """(redacted text, {rule name: count}). The marker names the rule, never the
+    span. `metadata=True` runs only the shape rules that cannot mistake prose
+    for a credential — used on the few free-text columns of `ci_task`."""
+    counts = {}
+    for name, rx, in_metadata in RULES:
+        if metadata and not in_metadata:
+            continue
+        marker = f"[redacted:{name}]"
+        text, n = rx.subn(lambda _m, marker=marker: marker, text)
+        if n:
+            counts[name] = n
+    return text, counts
+
+
+# ---------------------------------------------------------- the excerpt (D1)
+#
+# The lines that explain a failure, out of a body that may run to the 2 MB cap.
+# `excerpt()` takes stored text ONLY — no path argument — so it can never re-read
+# the raw runner file and carry something the capture-time redact() above did
+# not already see (plan 0069 §3: "do not let the excerpt carry anything the
+# capture redacted").
+DEFAULT_EXCERPT_LINES = 120
+# The prompt this feeds is not the 2 MB the body may reach: a briefing whose
+# cost is set by the failure, not by how large the log happened to be (plan
+# 0069 §3: "do not paste the whole body").
+EXCERPT_BYTE_CAP = 16 * 1024
+# Long enough to hold pytest's own summary section (`=== short test summary
+# info ===` through the final `N failed, M passed in Ns`) even when nothing
+# upstream of it matched a failure shape; short enough that a log with NO
+# failure shape at all is still a small excerpt, not the whole log.
+EXCERPT_TAIL_LINES = 20
+
+# pytest ("FAILED", "AssertionError", and any other *Error exception name — the
+# case-insensitive "error" also catches lynceus's own build tool, which logs
+# bare "ERROR: <message>" with no exception class at all), and a Forgejo
+# runner step ("::error", "Process completed with exit code") — the shapes a
+# fleet build has actually failed under (see Handoff).
+_EXCERPT_SHAPE_RE = re.compile(
+    r"FAILED\b|::error\b|Process completed with exit code|(?i:error)")
+
+
+def excerpt(body, lines=DEFAULT_EXCERPT_LINES, redactions=0):
+    """The lines that explain a failure: every line matching a failure shape,
+    with two lines of context each, plus the tail — bounded to `lines` and to
+    EXCERPT_BYTE_CAP, oldest cut first. `redactions` is the count already
+    applied at capture (ci_log.redactions, summed) and is stated in the header,
+    never recomputed here — this function never scans for secrets, it only
+    selects lines a capture-time pass already cleared.
+
+    On a body with no failure shape, returns the tail alone. On an empty body,
+    returns the header alone."""
+    text = body or ""
+    all_lines = text.splitlines()
+    total = len(all_lines)
+    if total == 0:
+        return f"[excerpt: 0 of 0 lines; {redactions} redactions applied at capture]"
+    keep = set()
+    for i, line in enumerate(all_lines):
+        if _EXCERPT_SHAPE_RE.search(line):
+            keep.update(range(max(0, i - 2), min(total, i + 3)))
+    keep.update(range(max(0, total - EXCERPT_TAIL_LINES), total))
+    kept = sorted(keep)
+    if len(kept) > lines:
+        kept = kept[-lines:]                  # oldest cut first
+    kept = _excerpt_cut_to_bytes(all_lines, kept, EXCERPT_BYTE_CAP)
+    header = (f"[excerpt: {len(kept)} of {total} lines; "
+             f"{redactions} redactions applied at capture]")
+    return header + "\n" + "\n".join(all_lines[i] for i in kept)
+
+
+def _excerpt_cut_to_bytes(all_lines, kept, cap):
+    """Oldest cut first: keep as much of the TAIL of `kept` as fits under `cap`
+    bytes, dropping the earliest-occurring lines when it does not all fit.
+    Always keeps at least one line, however long, rather than returning empty."""
+    out, used = [], 0
+    for i in reversed(kept):
+        n = len(all_lines[i].encode("utf-8")) + 1
+        if used + n > cap and out:
+            break
+        out.append(i)
+        used += n
+    return sorted(out)
+
+
+_FAILED_TEST_RE = re.compile(r"^FAILED (\S+::\S+)", re.M)
+
+
+def failing_test_ids(text, limit=10):
+    """The `FAILED tests/...::name` lines in `text`, deduplicated, in the order
+    they first appear, capped at `limit`."""
+    seen = []
+    for m in _FAILED_TEST_RE.finditer(text or ""):
+        tid = m.group(1)
+        if tid not in seen:
+            seen.append(tid)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+# ------------------------------------------------------- the read-only query surface (D2/D3)
+#
+# What the orchestrator's CI-fix briefing consults. This file is the schema's
+# one owner (module docstring); these functions are the one place that knows
+# `ci_task`'s and `ci_log`'s columns, so nothing else has to.
+_CONTEXT_EVENT_RE = re.compile(r"^(.*) \(([^()]*)\)$")
+
+
+def context_job(context):
+    """The `ci_task.name` a Forgejo status context names, from a context of the
+    shape `<workflow> / <job> (<event>)` — measured on eunomia#487's head:
+    `Plans / lint (push)`, `CI / tests (cihost) (push)`.
+
+    Strip one trailing ` (<event>)` group, then split what remains on the
+    FIRST ` / ` — so `CI / tests (cihost) (push)` yields `tests (cihost)`,
+    parentheses inside the job name intact (plan 0069 D2)."""
+    context = context or ""
+    m = _CONTEXT_EVENT_RE.match(context)
+    remaining = m.group(1) if m else context
+    if " / " in remaining:
+        return remaining.split(" / ", 1)[1]
+    return remaining
+
+
+def open_ro(db=None):
+    """A read-only connection to fleet.db, or None when it — or the CI tables —
+    are not there yet. Never raises for an environmental reason: "not there
+    yet" is exactly as legible to a caller as "no matching row", and the CI-fix
+    briefing path (plan 0069 §3) treats both the same way."""
+    path = os.path.expanduser(db or DB)
+    if not os.path.exists(path):
+        return None
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    have = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
+    if "ci_task" not in have:
+        con.close()
+        return None
+    return con
+
+
+def match_context(con, repo, head_sha, context):
+    """(id, log_state, log_detail, updated_at) for the task a failing status
+    context names, or None. Matches on (repo, head_sha, name) — name is the
+    job alone, from `context_job()`, never the context itself. When several
+    rows share (head_sha, name) — a rerun — the highest id wins."""
+    return con.execute(
+        "SELECT id, log_state, log_detail, updated_at FROM ci_task"
+        " WHERE repo=? AND head_sha=? AND name=? ORDER BY id DESC LIMIT 1",
+        (repo, head_sha, context_job(context))).fetchone()
+
+
+def terminal_without_body(state, updated_at, now=None):
+    """True once `state` has nothing more coming: `over-cap` always (the log
+    decompresses past the cap, permanently), and `absent`/`unreadable` only
+    once the collector's own retry window (RETRY_SECONDS) has passed — before
+    that, the next sweep may still find the file (fleet-collect retries a
+    young absent/unreadable task every sweep; see `_sync_logs`)."""
+    if state == "over-cap":
+        return True
+    if state in ("absent", "unreadable"):
+        now = now or datetime.now(timezone.utc)
+        age = _age_seconds(updated_at, now)
+        return age is None or age > RETRY_SECONDS
+    return False
+
+
+def task_excerpt(con, repo, task_id, lines=DEFAULT_EXCERPT_LINES):
+    """The excerpt of a stored body, or None when `ci_log` has no row for this
+    task (there is nothing stored, whatever `ci_task.log_state` says)."""
+    row = con.execute(
+        "SELECT body_z, redactions FROM ci_log WHERE repo=? AND task_id=?",
+        (repo, task_id)).fetchone()
+    if row is None:
+        return None
+    body_z, redactions_json = row
+    body = zlib.decompress(body_z).decode("utf-8", "replace")
+    counts = json.loads(redactions_json or "{}")
+    return excerpt(body, lines=lines, redactions=sum(counts.values()))
+
+
+# ----------------------------------------------------------------- the source
+class TokenError(RuntimeError):
+    """Never built from the helper's output: its stderr can quote the token."""
+
+
+def _token():
+    """The implbot token, via ~/bin/fetch-forgejo-token.sh.
+
+    FLEET_CI_TOKEN_CMD, NOT FLEET_TOKEN_CMD: on this fleet the latter can name the
+    ADMIN helper (see bin/fleet-candidate's _child_env), and the admin PAT is
+    retired from fleet processes (infra ADR-0003). The command is also refused if
+    it names an admin helper, so a mis-set variable fails here rather than
+    quietly using the wrong credential."""
+    cmd = (os.environ.get("FLEET_CI_TOKEN_CMD", "").strip()
+           or os.path.expanduser("~/bin/fetch-forgejo-token.sh"))
+    if "admin" in cmd.lower():
+        raise TokenError("FLEET_CI_TOKEN_CMD names an admin helper; refusing")
+    try:
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True,
+                           timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise TokenError(f"token helper did not run ({e.__class__.__name__})")
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not lines:
+        raise TokenError("token helper produced no token")
+    return lines[-1]
+
+
+class _CiForge(fleetforge.Forge):
+    """fleetforge.Forge plus the one verb this needs and the module lacks.
+
+    fleetforge is the one door to the forge (plan 0022) and has no verb for the
+    task list; adding one belongs in fleetforge.py, which is outside this plan's
+    lane. Until then this subclass extends the same door — same request path,
+    same never-raises contract, same token handling — rather than open-coding a
+    second one. `__slots__ = ()` keeps the no-__dict__ property that stops
+    `vars(forge)` handing back the token."""
+    __slots__ = ()
+
+    def list_actions_tasks(self, repo, page=1, limit=PAGE):
+        ow = fleetforge._split_repo(repo)
+        if ow is None:
+            return 0, None
+        owner, name = ow
+        return self._request(
+            "GET",
+            f"/repos/{fleetforge._quote(owner)}/{fleetforge._quote(name)}/actions/tasks",
+            query={"page": page, "limit": limit})
+
+
+def _now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _age_seconds(ts, now):
+    """Seconds since an ISO timestamp, or None if it cannot be read."""
+    try:
+        t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return (now - t).total_seconds()
+
+
+def _initial_state(status):
+    if status in NO_BODY:
+        return "not-failed"
+    if status in OPEN:
+        return "in-progress"
+    return "pending"        # failure, cancelled, and any terminal status not yet named
+
+
+def _rel_path(repo, task_id):
+    """Forgejo shards a repo's logs by the task id's low byte, in hex:
+    <owner>/<repo>/<id % 256 as %02x>/<id>.log.zst (verified on cihost)."""
+    return f"{repo}/{task_id % 256:02x}/{task_id}.log.zst"
+
+
+def _text(v, metadata=True):
+    if v is None:
+        return None
+    return redact(str(v), metadata=metadata)[0]
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sync_tasks(con, forge, repo, report, deadline, now):
+    """Page one repo's task list newest-first into ci_task. Returns an error
+    string, or None on success.
+
+    It does not read every page every sweep: 3,000 tasks and growing would be a
+    request a second for nothing. It stops at the first page in which no task is
+    new or changed AND no stored task still in progress lies deeper — an
+    in-progress task can finish long after the tasks newer than it, so the page
+    holding it has to be re-read until it is."""
+    open_ids = [r[0] for r in con.execute(
+        "SELECT id, created_at FROM ci_task WHERE repo=? AND log_state='in-progress'",
+        (repo,)) if (_age_seconds(r[1], now) or 0) < OPEN_HORIZON_SECONDS]
+    open_min = min(open_ids) if open_ids else None
+    known = {r[0]: (r[1], r[2], r[3]) for r in con.execute(
+        "SELECT id, status, updated_at, log_state FROM ci_task WHERE repo=?", (repo,))}
+    fetched = _now()
+    page = 1
+    while True:
+        if time.monotonic() > deadline:
+            return "time budget exhausted mid-repo"
+        status, body = forge.list_actions_tasks(repo, page=page, limit=PAGE)
+        runs = body.get("workflow_runs") if isinstance(body, dict) else None
+        if status != 200 or not isinstance(runs, list):
+            return f"HTTP {status}" if status else "unreachable"
+        changed = 0
+        ids = []
+        for t in runs:
+            if not isinstance(t, dict) or _int(t.get("id")) is None:
+                continue
+            tid = int(t["id"])
+            ids.append(tid)
+            st = str(t.get("status") or "")
+            prev = known.get(tid)
+            if prev and prev[0] == st and prev[1] == t.get("updated_at"):
+                continue
+            changed += 1
+            same_status = bool(prev) and prev[0] == st
+            if prev and not same_status:
+                # Its status moved, so the body it had belongs to the old status.
+                con.execute("DELETE FROM ci_log WHERE repo=? AND task_id=?", (repo, tid))
+            con.execute(
+                "INSERT INTO ci_task (repo, id, name, run_number, head_branch, head_sha,"
+                " event, display_title, status, workflow_id, url, created_at, updated_at,"
+                " run_started_at, log_state, fetched_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(repo, id) DO UPDATE SET"
+                " name=excluded.name, run_number=excluded.run_number,"
+                " head_branch=excluded.head_branch, head_sha=excluded.head_sha,"
+                " event=excluded.event, display_title=excluded.display_title,"
+                " status=excluded.status, workflow_id=excluded.workflow_id,"
+                " url=excluded.url, created_at=excluded.created_at,"
+                " updated_at=excluded.updated_at, run_started_at=excluded.run_started_at,"
+                " fetched_at=excluded.fetched_at,"
+                # Same status: whatever became of the body stands. A new status
+                # reclassifies the task and forgets the old body's fate.
+                + (" log_state=ci_task.log_state" if same_status else
+                   " log_state=excluded.log_state, log_detail=NULL, log_zbytes=NULL,"
+                   " log_checked_at=NULL"),
+                (repo, tid, _text(t.get("name")), _int(t.get("run_number")),
+                 _text(t.get("head_branch")), t.get("head_sha"), t.get("event"),
+                 _text(t.get("display_title")), st, t.get("workflow_id"), t.get("url"),
+                 t.get("created_at"), t.get("updated_at"), t.get("run_started_at"),
+                 _initial_state(st), fetched))
+            report["tasks_changed" if prev else "tasks_new"] += 1
+        con.commit()
+        if len(runs) < PAGE or not ids:
+            return None
+        if changed == 0 and (open_min is None or open_min >= min(ids)):
+            return None
+        page += 1
+
+
+def _discover(forge):
+    """Every repo the token can see that has Actions, or (None, error)."""
+    repos, page = [], 1
+    while True:
+        status, body = forge.search_repos(page=page, limit=PAGE)
+        data = body.get("data") if isinstance(body, dict) else None
+        if status != 200 or not isinstance(data, list):
+            return None, (f"HTTP {status}" if status else "unreachable")
+        repos += [r["full_name"] for r in data
+                  if isinstance(r, dict) and r.get("has_actions") and r.get("full_name")]
+        if len(data) < PAGE:
+            return repos, None
+        page += 1
+
+
+# The script that runs on the log host. Stdlib only, Python 3.9-safe, no PATH
+# lookups: the interpreter and zstd are both absolute paths. It reads relative
+# paths from stdin and answers each with a JSON header line and, for an `ok`,
+# exactly `n` bytes of decompressed log. It refuses anything that is not a plain
+# relative path, so a hostile line cannot leave the log root.
+_REMOTE_SCRIPT = r'''
+import json, os, stat, subprocess, sys
+root, zstd, cap, wire = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+out = sys.stdout.buffer
+def send(hdr, body=b""):
+    out.write(json.dumps(hdr).encode() + b"\n")
+    if body:
+        out.write(body)
+    out.flush()
+for line in sys.stdin:
+    rel = line.rstrip("\n")
+    parts = rel.split("/")
+    if not rel or rel.startswith("/") or any(p in ("", ".", "..") for p in parts):
+        send({"rel": rel, "state": "unreadable", "why": "refused: not a relative path"})
+        continue
+    path = os.path.join(root, rel)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        send({"rel": rel, "state": "absent", "path": path})
+        continue
+    except OSError as e:
+        send({"rel": rel, "state": "unreadable", "path": path,
+              "why": "stat: " + e.__class__.__name__})
+        continue
+    if not stat.S_ISREG(st.st_mode):
+        send({"rel": rel, "state": "unreadable", "path": path, "why": "not a regular file"})
+        continue
+    z = st.st_size
+    if z > wire:
+        send({"rel": rel, "state": "over-cap", "path": path, "zbytes": z, "why": "compressed"})
+        continue
+    try:
+        p = subprocess.Popen([zstd, "-dc", "-q", "--", path],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        send({"rel": rel, "state": "unreadable", "path": path, "zbytes": z,
+              "why": "cannot run " + zstd + ": " + e.__class__.__name__})
+        continue
+    data = p.stdout.read(cap + 1)
+    if len(data) > cap:
+        p.kill()
+        p.stdout.close()
+        p.wait()
+        send({"rel": rel, "state": "over-cap", "path": path, "zbytes": z, "why": "decompressed"})
+        continue
+    p.stdout.close()
+    rc = p.wait()
+    if rc != 0:
+        send({"rel": rel, "state": "unreadable", "path": path, "zbytes": z,
+              "why": "zstd exit %d" % rc})
+        continue
+    send({"rel": rel, "state": "ok", "path": path, "zbytes": z, "n": len(data)}, data)
+'''
+
+
+def _log_argv():
+    """The one command a sweep runs to reach the logs.
+
+    Over ssh: BatchMode (never prompt), ControlMaster=no and ControlPath=none (no
+    master, whatever ~/.ssh/config says), and a connect timeout. The remote
+    command is ONE string, every word shell-quoted, because ssh hands it to the
+    remote login shell; the paths of the logs are NOT in it — they go on stdin,
+    so nothing derived from a task can reach a shell."""
+    if LOG_HOST.startswith("-"):
+        raise ValueError("FLEET_CI_LOG_HOST begins with '-'; ssh would parse it as an option")
+    remote = [REMOTE_PYTHON if LOG_HOST != "local" else sys.executable,
+              "-c", _REMOTE_SCRIPT, LOG_ROOT, ZSTD, str(LOG_CAP), str(WIRE_CAP)]
+    if LOG_HOST == "local":
+        return remote
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ControlMaster=no",
+            "-o", "ControlPath=none", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+            LOG_HOST, " ".join(shlex.quote(a) for a in remote)]
+
+
+class _Stream:
+    """One run of `_log_argv()`, yielding (header, body) per answered log.
+
+    After iteration `.error` is None only if the run ended cleanly. A truncated
+    or garbled stream ends iteration with an error rather than guessing where
+    the next frame starts — every log it did not answer stays pending."""
+
+    def __init__(self, rels, timeout):
+        self.rels = rels
+        self.timeout = max(5.0, timeout)
+        self.error = None
+
+    def __iter__(self):
+        try:
+            argv = _log_argv()
+        except ValueError as e:
+            self.error = str(e)
+            return
+        err = tempfile.TemporaryFile()
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=err)
+        except OSError as e:
+            self.error = f"could not start {argv[0]} ({e.__class__.__name__})"
+            err.close()
+            return
+        timed_out = []
+
+        def _kill():
+            timed_out.append(True)
+            proc.kill()
+
+        timer = threading.Timer(self.timeout, _kill)
+        timer.start()
+        try:
+            try:
+                proc.stdin.write(("\n".join(self.rels) + "\n").encode())
+                proc.stdin.close()
+            except OSError:
+                pass            # the child died first; the read below reports it
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    hdr = json.loads(line)
+                    n = int(hdr.get("n") or 0) if hdr.get("state") == "ok" else 0
+                    if not isinstance(hdr, dict) or n < 0 or n > LOG_CAP:
+                        raise ValueError
+                except (ValueError, TypeError, AttributeError):
+                    self.error = "unexpected output from the log host (not a frame header)"
+                    break
+                body = proc.stdout.read(n) if n else b""
+                if len(body) != n:
+                    self.error = "the log host's stream ended mid-log"
+                    break
+                yield hdr, body
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+            proc.stdout.close()
+            rc = proc.wait()
+            if self.error is None and (rc != 0 or timed_out):
+                err.seek(0)
+                tail = err.read(400).decode("utf-8", "replace").strip()[-200:]
+                self.error = ("timed out" if timed_out else f"exit {rc}") + (
+                    f": {tail}" if tail else "")
+            err.close()
+
+
+def _sync_logs(con, report, deadline, now):
+    """Ask for the bodies that are owed, over ONE connection."""
+    rows = con.execute(
+        "SELECT repo, id, log_state, updated_at FROM ci_task"
+        " WHERE log_state IN ('pending','absent','unreadable') ORDER BY id DESC").fetchall()
+    want = []
+    for repo, tid, state, updated in rows:
+        if state != "pending":
+            age = _age_seconds(updated, now)
+            if age is None or age > RETRY_SECONDS:
+                continue                # final: not asked for again
+        if _REPO_RE.match(repo) and not any(p in (".", "..") for p in repo.split("/")):
+            want.append((repo, tid))
+        if len(want) >= BATCH:
+            break
+    if not want:
+        return
+    by_rel = {_rel_path(r, t): (r, t) for r, t in want}
+    stream = _Stream(list(by_rel), deadline - time.monotonic())
+    answered = set()
+    for hdr, body in stream:
+        key = by_rel.get(hdr.get("rel"))
+        if key is None or key in answered:
+            continue
+        answered.add(key)
+        _record_frame(con, key, hdr, body, report)
+    stale = [k for k in by_rel.values() if k not in answered]
+    if stale:
+        why = stream.error or "the log host answered nothing"
+        report["failures"].append(f"logs: {len(stale)} not read ({why})")
+        for repo, tid in stale:
+            con.execute(
+                "UPDATE ci_task SET log_detail=?, log_checked_at=?"
+                " WHERE repo=? AND id=? AND log_state='pending'",
+                (f"not read yet: {why}", _now(), repo, tid))
+    elif stream.error:
+        report["failures"].append(f"logs: {stream.error}")
+    con.commit()
+
+
+def _record_frame(con, key, hdr, body, report):
+    repo, tid = key
+    state = hdr.get("state")
+    where = f"{LOG_HOST}:{hdr.get('path') or _rel_path(repo, tid)}"
+    zbytes = _int(hdr.get("zbytes"))
+    when = _now()
+    if state == "ok":
+        text, counts = redact(body.decode("utf-8", "replace"))
+        con.execute(
+            "INSERT OR REPLACE INTO ci_log (repo, task_id, body_z, raw_bytes, cap_bytes,"
+            " redactions, captured_at) VALUES (?,?,?,?,?,?,?)",
+            (repo, tid, zlib.compress(text.encode("utf-8"), 9), len(body), LOG_CAP,
+             json.dumps(counts, sort_keys=True), when))
+        new_state, detail = "stored", None
+        report["logs_stored"] += 1
+    elif state == "over-cap":
+        if hdr.get("why") == "compressed":
+            detail = (f"over-cap: {zbytes} bytes compressed exceeds the {WIRE_CAP}-byte "
+                      f"transfer ceiling ({where})")
+        else:
+            detail = (f"over-cap: decompresses past the {LOG_CAP}-byte cap; "
+                      f"{zbytes} bytes compressed ({where})")
+        new_state = "over-cap"
+        report["logs_over_cap"] += 1
+    elif state == "absent":
+        new_state, detail = "absent", f"absent: no file at {where}"
+        report["logs_absent"] += 1
+    else:
+        new_state = "unreadable"
+        detail = f"unreadable: {hdr.get('why') or 'unknown reason'} ({where})"
+        report["logs_unreadable"] += 1
+    con.execute(
+        "UPDATE ci_task SET log_state=?, log_detail=?, log_zbytes=?, log_checked_at=?"
+        " WHERE repo=? AND id=?", (new_state, detail, zbytes, when, repo, tid))
+    if new_state != "stored":
+        con.execute("DELETE FROM ci_log WHERE repo=? AND task_id=?", (repo, tid))
+    con.commit()
+
+
+def _record_sync(con, repo, error, when):
+    con.execute(
+        "INSERT INTO ci_sync (repo, attempted_at, succeeded_at, error) VALUES (?,?,?,?)"
+        " ON CONFLICT(repo) DO UPDATE SET attempted_at=excluded.attempted_at,"
+        " succeeded_at=CASE WHEN excluded.error IS NULL THEN excluded.attempted_at"
+        "                   ELSE ci_sync.succeeded_at END,"
+        " error=excluded.error",
+        (repo, when, None if error else when, error))
+
+
+def sync(con, forge=None, repos=None):
+    """One sweep of the CI source. Returns
+    {"summary": str, "failures": [str]} and never raises for an environmental
+    reason — Forgejo down, a missing token, cihost unreachable are failures in
+    the report, recorded per repo, not exceptions.
+
+    `forge` and `repos` are for callers that already have them (the tests);
+    otherwise the token comes from the helper and the repo list from
+    $FLEET_CI_REPOS, else Forgejo's own list of repos with Actions enabled — so
+    a new repo needs no edit here."""
+    report = {"tasks_new": 0, "tasks_changed": 0, "logs_stored": 0, "logs_over_cap": 0,
+              "logs_absent": 0, "logs_unreadable": 0, "failures": []}
+    now = datetime.now(timezone.utc)
+    deadline = time.monotonic() + BUDGET_SECONDS
+    n_repos = 0
+
+    if forge is None:
+        try:
+            forge = _CiForge(FORGEJO_URL, _token(), timeout=20)
+        except TokenError as e:
+            report["failures"].append(f"no Forgejo token ({e}); task list not refreshed")
+
+    if forge is not None:
+        env = [r.strip() for r in os.environ.get("FLEET_CI_REPOS", "").split(",") if r.strip()]
+        if repos is None and env:
+            repos = env
+        if repos is None:
+            repos, err = _discover(forge)
+            if repos is None:
+                report["failures"].append(f"repo list -> {err}")
+                # Keep the repos already known syncing rather than go dark.
+                repos = [r[0] for r in con.execute("SELECT DISTINCT repo FROM ci_task")]
+        for repo in repos:
+            if not _REPO_RE.match(repo) or any(p in (".", "..") for p in repo.split("/")):
+                report["failures"].append(f"{repo!r}: not an owner/name; skipped")
+                continue
+            if time.monotonic() > deadline:
+                report["failures"].append(f"{repo}: not reached (time budget exhausted)")
+                _record_sync(con, repo, "not reached: time budget exhausted", _now())
+                continue
+            n_repos += 1
+            err = _sync_tasks(con, forge, repo, report, deadline, now)
+            _record_sync(con, repo, err, _now())
+            con.commit()
+            if err:
+                report["failures"].append(f"{repo}: task list -> {err}")
+
+    # Bodies do not need the forge, so a token or API failure above does not
+    # stop the ones already owed from being fetched.
+    try:
+        _sync_logs(con, report, deadline, now)
+    except Exception as e:      # a bug here must not cost the metadata already committed
+        con.rollback()
+        report["failures"].append(f"logs: {e.__class__.__name__}: {str(e)[:120]}")
+
+    pending = con.execute(
+        "SELECT COUNT(*) FROM ci_task WHERE log_state='pending'").fetchone()[0]
+    report["summary"] = (
+        f"{n_repos} repos, {report['tasks_new']} new / {report['tasks_changed']} changed "
+        f"tasks; logs: {report['logs_stored']} stored, {report['logs_over_cap']} over-cap, "
+        f"{report['logs_absent']} absent, {report['logs_unreadable']} unreadable, "
+        f"{pending} still pending")
+    return report
+
+
+# ------------------------------------------------------------------- the CLI
+def _qualify(repo):
+    return repo if "/" in repo else f"{OWNER}/{repo}"
+
+
+class _Absent(Exception):
+    """The database, or its CI tables, are not there. Reported, never an empty answer."""
+
+
+def _connect(db):
+    path = os.path.expanduser(db)
+    if not os.path.exists(path):
+        raise _Absent(f"no database at {path} — nothing has been collected here")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    have = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
+    if "ci_task" not in have:
+        raise _Absent(
+            f"{path} has no ci_task table. Either fleet-collect on this host predates "
+            "plan 0045 (its pin has not advanced) or it has not run since. This is NOT "
+            "'no failing builds' — the CI source has never written here.")
+    return con, "ci_task_dispatch" in have
+
+
+def _freshness(con, repo):
+    """Lines that say how far to trust the answer. Never silent."""
+    row = con.execute("SELECT attempted_at, succeeded_at, error FROM ci_sync WHERE repo=?",
+                      (repo,)).fetchone()
+    if row is None:
+        return [f"WARNING: {repo} has never been synced — the CI source has not "
+                "reached it, so an empty answer here means nothing"]
+    attempted, ok, err = row
+    if err:
+        return [f"WARNING: the last sync of {repo} FAILED at {attempted} ({err}); "
+                f"the data below is as of {ok or 'never'}"]
+    return [f"synced {ok}"]
+
+
+def _leases(con, has_view, repo, task_id):
+    if not has_view:
+        return "-"
+    rows = con.execute(
+        "SELECT DISTINCT lease, plan_id FROM ci_task_dispatch"
+        " WHERE repo=? AND task_id=? AND lease IS NOT NULL", (repo, task_id)).fetchall()
+    return ", ".join(f"{p or '?'} ({l})" for l, p in rows) or "-"
+
+
+def cmd_failures(args):
+    repo = _qualify(args.repo)
+    con, has_view = _connect(args.db)
+    total = con.execute("SELECT COUNT(*) FROM ci_task WHERE repo=?", (repo,)).fetchone()[0]
+    rows = con.execute(
+        "SELECT id, run_number, name, status, head_branch, head_sha, created_at, log_state"
+        " FROM ci_task WHERE repo=? AND log_state NOT IN ('not-failed','in-progress')"
+        " ORDER BY id DESC", (repo,)).fetchall()
+    for line in _freshness(con, repo):
+        print(line, file=sys.stderr if line.startswith("WARNING") else sys.stdout)
+    if total == 0:
+        print(f"no CI tasks recorded for {repo}. That is unknown, not zero failures: "
+              "either it has no Actions runs or none have been collected.", file=sys.stderr)
+        return 1
+    print(f"{repo}: {len(rows)} failing of {total} tasks recorded")
+    print(f"{'id':>6} {'run':>5}  {'name':<22} {'status':<10} {'sha':<8}  "
+          f"{'created':<25} {'body':<10} dispatch")
+    for tid, run, name, status, branch, sha, created, state in rows[:args.limit]:
+        print(f"{tid:>6} {run if run is not None else '':>5}  {(name or '')[:22]:<22} "
+              f"{status:<10} {(sha or '')[:8]:<8}  {(created or ''):<25} {state:<10} "
+              f"{_leases(con, has_view, repo, tid)}")
+    if len(rows) > args.limit:
+        print(f"… {len(rows) - args.limit} older not shown (--limit)")
+    nobody = sum(1 for r in rows if r[7] != "stored")
+    if nobody:
+        print(f"{nobody} of these have no stored body — `fleet-ci missing {repo}` says why")
+    return 0
+
+
+def cmd_show(args):
+    repo = _qualify(args.repo)
+    con, has_view = _connect(args.db)
+    t = con.execute(
+        "SELECT name, run_number, status, head_branch, head_sha, created_at, url,"
+        " log_state, log_detail FROM ci_task WHERE repo=? AND id=?",
+        (repo, args.task_id)).fetchone()
+    if t is None:
+        print(f"no task {args.task_id} recorded for {repo} — not collected, or not a task "
+              "of this repo", file=sys.stderr)
+        return 1
+    name, run, status, branch, sha, created, url, state, detail = t
+    print(f"{repo} task {args.task_id} (run {run}, {name!r}) — {status}", file=sys.stderr)
+    print(f"  branch {branch}  sha {(sha or '')[:8]}  {created}", file=sys.stderr)
+    if url:
+        print(f"  {url}", file=sys.stderr)
+    print(f"  dispatch: {_leases(con, has_view, repo, args.task_id)}", file=sys.stderr)
+    row = con.execute("SELECT body_z, raw_bytes, cap_bytes, redactions, captured_at FROM ci_log"
+                      " WHERE repo=? AND task_id=?", (repo, args.task_id)).fetchone()
+    if row is None:
+        print(f"  NO BODY: {state}" + (f" — {detail}" if detail else ""), file=sys.stderr)
+        return 1
+    body_z, raw, cap, redactions, captured = row
+    print(f"  captured {captured}: {raw} bytes (cap {cap}), redacted {redactions}",
+          file=sys.stderr)
+    sys.stdout.write(zlib.decompress(body_z).decode("utf-8", "replace"))
+    return 0
+
+
+def cmd_excerpt(args):
+    repo = _qualify(args.repo)
+    con, _ = _connect(args.db)
+    t = con.execute("SELECT log_state, log_detail FROM ci_task WHERE repo=? AND id=?",
+                    (repo, args.task_id)).fetchone()
+    if t is None:
+        print(f"no task {args.task_id} recorded for {repo} — not collected, or not a task "
+              "of this repo", file=sys.stderr)
+        return 1
+    state, detail = t
+    out = task_excerpt(con, repo, args.task_id, lines=args.lines)
+    if out is None:
+        print(f"NO BODY: {state}" + (f" — {detail}" if detail else ""), file=sys.stderr)
+        return 1
+    print(out)
+    return 0
+
+
+def cmd_missing(args):
+    repo = _qualify(args.repo)
+    con, _ = _connect(args.db)
+    counts = dict(con.execute(
+        "SELECT log_state, COUNT(*) FROM ci_task WHERE repo=? GROUP BY log_state",
+        (repo,)).fetchall())
+    for line in _freshness(con, repo):
+        print(line, file=sys.stderr if line.startswith("WARNING") else sys.stdout)
+    if not counts:
+        print(f"no CI tasks recorded for {repo}. That is unknown, not 'nothing missing'.",
+              file=sys.stderr)
+        return 1
+    print(f"{repo}: " + ", ".join(f"{s} {n}" for s, n in sorted(counts.items())))
+    states = args.state or [s for s in counts if s not in ("not-failed", "stored")]
+    if not states:
+        print("every task that should have a body has one")
+        return 0
+    q = ",".join("?" * len(states))
+    rows = con.execute(
+        f"SELECT id, name, status, created_at, log_state, log_detail FROM ci_task"
+        f" WHERE repo=? AND log_state IN ({q}) ORDER BY id DESC LIMIT ?",
+        (repo, *states, args.limit)).fetchall()
+    for tid, name, status, created, state, detail in rows:
+        print(f"{tid:>6}  {state:<11} {status:<10} {(name or '')[:22]:<22} {created}"
+              + (f"\n        {detail}" if detail else ""))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-ci", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", default=DB, help="fleet.db (default $FLEET_DB or ~/dev/.fleet/fleet.db)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("failures", help="failing tasks for a repo, newest first")
+    p.add_argument("repo")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=cmd_failures)
+    p = sub.add_parser("show", help="one task's stored body")
+    p.add_argument("repo")
+    p.add_argument("task_id", type=int)
+    p.set_defaults(fn=cmd_show)
+    p = sub.add_parser("excerpt", help="the lines that explain a stored failure")
+    p.add_argument("repo")
+    p.add_argument("task_id", type=int)
+    p.add_argument("--lines", type=int, default=DEFAULT_EXCERPT_LINES)
+    p.set_defaults(fn=cmd_excerpt)
+    p = sub.add_parser("missing", help="tasks with no stored body, and why")
+    p.add_argument("repo")
+    p.add_argument("--state", action="append",
+                   choices=["not-failed", "in-progress", "pending", "over-cap",
+                            "absent", "unreadable"],
+                   help="only these (default: every reason except not-failed)")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(fn=cmd_missing)
+    args = ap.parse_args(argv)
+    try:
+        return args.fn(args)
+    except _Absent as e:
+        print(f"fleet-ci: {e}", file=sys.stderr)
+        return 2
+    except sqlite3.Error as e:
+        print(f"fleet-ci: could not read the database ({e.__class__.__name__}: {e})",
+              file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

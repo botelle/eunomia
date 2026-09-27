@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""fleet-prepush — the git pre-push hook body (plan 0008, SPEC §Enforcement).
+
+Invoked by git with argv = (remote_name, remote_url) and one stdin line per
+ref: `<local_ref> <local_sha> <remote_ref> <remote_sha>`.
+
+Blocks a push ONLY on positive evidence:
+  1. an ACTIVE `branch` lease on this repo+branch held by a DIFFERENT session;
+  2. pushed commits touching another session's ACTIVE `paths`-lease globs;
+  3. pushed commits touching `integrator:` globs from the repo's OWNERSHIP.yml
+     while the pusher holds no integrator-role lease for the repo.
+
+Everything else degrades OPEN with a stderr WARN: ledger absent, repo
+underivable, OWNERSHIP.yml unparseable, off-opshost with no ControlMaster. An
+enforcement hook that can fail closed on infrastructure flake is the 2026-08-27
+guard incident at push granularity (Principle 5: cooperative).
+
+FLEET_PUSH_OVERRIDE=1 allows a would-be-blocked push, naming what it overrode.
+The hook never mutates the ledger and never emits events.
+"""
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+_ZEROS = "0" * 40
+_REPO_RE = re.compile(r"[:/]([a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*?)(?:\.git)?/?\Z")
+
+
+BLOCK_RC = 3      # the wrapper maps 3 -> git-abort; ANY other nonzero would
+                  # be a crash, which the wrapper converts to WARN+allow — the
+                  # polarity rule enforced at the layer that decides (r2 H1)
+
+
+def _warn(msg: str) -> None:
+    # no "allowing push" suffix here: mid-check warns can precede a BLOCK
+    # (r2 low); terminal allow-sites append it themselves.
+    print(f"fleet-prepush: WARN {msg}", file=sys.stderr)
+
+
+def _repo_from_url(url: str):
+    """owner/name from ssh://host:port/owner/name.git, git@host:owner/name.git,
+    https://host/owner/name — lowercased (repo identity is case-insensitive
+    upstream, exact-string here). None when underivable."""
+    # honesty note (r6 L2, corrected r7): this is "last two path segments",
+    # not forge-URL parsing — /Users/x/dev/foo derives dev/foo. A lookalike
+    # whose last two segments EQUAL a lease key (a local mirror at
+    # ~/backups/operator/sniff.git) can therefore false-BLOCK; the override
+    # covers it, and the e2e test deliberately exploits the same behavior.
+    m = _REPO_RE.search(url.strip().lower())
+    return m.group(1) if m else None
+
+
+def _local_leases():
+    fleet = Path(os.environ.get("EUNOMIA_FLEET_DIR",
+                                str(Path.home() / "dev" / ".fleet")))
+    d = fleet / "leases"
+    if not d.is_dir():
+        return None
+    out = []
+    for p in sorted(d.glob("*.json")):
+        try:
+            rec = json.loads(p.read_text(errors="replace"))
+        except (json.JSONDecodeError, ValueError, OSError):
+            continue                      # a torn lease never blocks a push —
+                                          # errors="replace" + ValueError cover a
+                                          # cut multi-byte char (1522 #12 H1)
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def _remote_leases(host: str):
+    """Reuse-only ssh read (the fleet-heartbeat idiom verbatim): -O check gate,
+    ProxyCommand=false so the check->use window cannot dial, hard timeouts.
+    One JSON record per output line. None on any failure."""
+    if host.startswith("-"):
+        return None
+    try:
+        chk = subprocess.run(["ssh", "-o", "BatchMode=yes", "-O", "check", host],
+                             capture_output=True, text=True, timeout=3)
+        if chk.returncode != 0:
+            return None
+        res = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ControlMaster=no",
+             "-o", "ProxyCommand=false", "-o", "ConnectTimeout=2", host,
+             'if [ -d ~/dev/.fleet/leases ]; then'
+             ' for f in ~/dev/.fleet/leases/*.json; do'
+             ' [ -f "$f" ] && tr -d "\\n" < "$f" && echo; done; true;'
+             ' else echo NO-FLEET-TREE; fi'],
+            capture_output=True, text=True, errors="replace", timeout=5)
+        if res.returncode != 0:
+            return None
+        if res.stdout.strip() == "NO-FLEET-TREE":
+            # a reachable host WITHOUT a fleet tree is not an empty ledger —
+            # it is a misconfiguration; None routes to the loud local fallback
+            # (1522 #12 r6 L1)
+            return None
+        out = []
+        for line in res.stdout.splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+        return out
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _leases():
+    host = os.environ.get("EUNOMIA_LEDGER_HOST", "").strip()
+    if host:
+        # remote FIRST when a ledger host is configured (1522 #12 r4 M3): a
+        # stray local leases/ dir on a satellite (one stray fleet-claim run)
+        # would otherwise silently shadow the real ledger with an empty one —
+        # an enforcement void indistinguishable from normal operation.
+        remote = _remote_leases(host)
+        if remote is not None:
+            return remote
+        local = _local_leases()
+        if local is not None:
+            _warn(f"ledger host {host!r} unreachable — using the LOCAL tree, "
+                  "which may be stale or shadowing")
+            return local
+        return None
+    return _local_leases()
+
+
+def _res(rec):
+    r = rec.get("resource")
+    return r if isinstance(r, dict) else {}
+
+
+def _has_tracking_refs(remote_name: str) -> bool:
+    """--remotes=<name> with ZERO tracking refs excludes nothing and treats all
+    history as pushed (r2 low: a configured-but-never-fetched remote is a
+    plausible act). Fall back only when refs actually exist."""
+    try:
+        r = subprocess.run(["git", "for-each-ref", "--count=1",
+                            f"refs/remotes/{remote_name}"],
+                           capture_output=True, text=True,
+                           errors="replace", timeout=10)
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _changed_files(remote_name: str, local_sha: str, remote_sha: str):
+    """Files this push introduces. With a known remote tip the EXACT range
+    `remote_sha..local_sha` needs no tracking refs (1522 #12 M2: `--remotes=`
+    on a URL-push or first-push matches nothing and treats ALL history as
+    pushed — false blocks). `--remotes` is the fallback for a new branch on a
+    configured remote only; otherwise None (path checks skip, with a WARN at
+    the call site). None also on git failure."""
+    try:
+        if remote_sha and remote_sha != _ZEROS:
+            # ENDPOINT diff, not per-commit union (1522 #12 r4 H1): a pure
+            # rewind has an EMPTY rev-list range (silently skipping every path
+            # check while force-pushing leased work out of existence), and
+            # diff-tree shows nothing for merge commits (evil-merge changes
+            # live in no parent). The endpoint tree diff captures both — and is
+            # one git call instead of up to 500.
+            dr = subprocess.run(
+                # --no-renames (1522 #12 r5 M1): rename detection is ON by
+                # default in porcelain diff, so `git mv leased/file elsewhere`
+                # printed only the DESTINATION — the leased source path never
+                # matched a glob and the move sailed through. The check wants
+                # touched paths, not rename pairing.
+                ["git", "diff", "--name-only", "--no-renames",
+                 remote_sha, local_sha],
+                capture_output=True, text=True, errors="replace", timeout=60)
+            if dr.returncode != 0:
+                # The remote tip object may simply not exist locally — which is
+                # LIKELIEST when force-pushing over work never fetched, i.e.
+                # the rewind scenario itself (1522 #12 r6 M2). Loud + specific.
+                _warn("remote tip object not available locally — a possible "
+                      "rewind/foreign change could NOT be path-checked")
+                return None
+            return {f for f in dr.stdout.splitlines() if f}
+        if _has_tracking_refs(remote_name):
+            rl = subprocess.run(
+                ["git", "rev-list", local_sha, "--not", f"--remotes={remote_name}"],
+                capture_output=True, text=True, errors="replace", timeout=30)
+        else:
+            return None
+        if rl.returncode != 0:
+            return None
+        files = set()
+        commits = rl.stdout.split()
+        if len(commits) > 500:
+            _warn(f"push has {len(commits)} new commits; path checks cover the "
+                  "newest 500 only")
+        for c in commits[:500]:
+            dt = subprocess.run(
+                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", c],
+                capture_output=True, text=True, errors="replace", timeout=30)
+            if dt.returncode == 0:
+                files.update(f for f in dt.stdout.splitlines() if f)
+        return files
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _blob(sha: str, path: str):
+    """Blob id at <sha>:<path>; None = absent; "ERR" = probe failed."""
+    try:
+        r = subprocess.run(["git", "rev-parse", "-q", "--verify", f"{sha}:{path}"],
+                           capture_output=True, text=True,
+                           errors="replace", timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return "ERR"
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def _keep_current_excusals(changed, local_sha, remote_sha, ref):
+    """Paths excusable from the path checks. TWO conditions (1522 #12 r9 HIGH —
+    the first alone excused reverting someone's UNLANDED change back to main's
+    content, wiping their work with an ordinary push):
+      (a) content at local_sha is identical to the tracked default tip
+          (already-on-main content cannot be a lane intrusion), AND
+      (b) the branch NEVER TOUCHED the path: its blob at the old remote tip
+          equals its blob at merge-base(old tip, default tip). A keep-current
+          merge satisfies (b) (the old tip carries the merge-base version); a
+          revert-over-unlanded-work fails it (the old tip carries the change).
+          A brand-new branch (no old tip) satisfies (b) vacuously.
+    Anything unknowable stays blocked (conservative)."""
+    try:
+        dd = subprocess.run(
+            ["git", "diff", "--name-only", "--no-renames", local_sha, ref],
+            capture_output=True, text=True, errors="replace", timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    if dd.returncode != 0:
+        return set()
+    differing = {f for f in dd.stdout.splitlines() if f}
+    candidates = changed - differing          # equal-or-both-absent vs the tip
+    if not candidates:
+        return set()
+    mb = None
+    if remote_sha and remote_sha != _ZEROS:
+        try:
+            r = subprocess.run(["git", "merge-base", remote_sha, ref],
+                               capture_output=True, text=True,
+                               errors="replace", timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            return set()
+        if r.returncode != 0 or not r.stdout.strip():
+            return set()
+        mb = r.stdout.strip()
+    out = set()
+    for f in candidates:
+        lb = _blob(local_sha, f)
+        if lb in (None, "ERR"):
+            continue                          # absent/unknown at local: keep (r7)
+        if mb is not None:
+            ob, bb = _blob(remote_sha, f), _blob(mb, f)
+            if ob == "ERR" or bb == "ERR" or ob != bb:
+                continue                      # the branch touched it: keep (r9)
+        out.add(f)
+    return out
+
+
+def _remote_default_ref(remote_name: str):
+    """The LOCALLY-TRACKED tip of the remote's default branch — an ordinary
+    ref, only as current as the last fetch, and rewritable by the pusher
+    (r8 M2 corrected the earlier "non-pusher-editable" overclaim). Good enough
+    for the cooperative model; freshness is the operator's job."""
+    for cand in (f"refs/remotes/{remote_name}/HEAD",
+                 f"refs/remotes/{remote_name}/main",
+                 f"refs/remotes/{remote_name}/master"):
+        try:
+            rp = subprocess.run(["git", "rev-parse", "--verify", cand],
+                                capture_output=True, text=True,
+                                errors="replace", timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if rp.returncode == 0 and rp.stdout.strip():
+            return rp.stdout.strip()
+    return None
+
+
+def _ownership_integrator_globs(base_sha=None):
+    """`integrator: <glob>` lines from OWNERSHIP.yml — read from the REMOTE-side
+    base commit when one exists (1522 #12 M4: the worktree copy is rewritable by
+    the very push being validated; `git show <remote_sha>:OWNERSHIP.yml` is
+    not), falling back to the worktree for brand-new branches.
+    Deliberately not full YAML — a '#'-commentable line format keeps the
+    stdlib-only parser honest. Unparseable lines are skipped with a WARN
+    (degrade the CHECK, never the push)."""
+    text = None
+    if base_sha and base_sha != _ZEROS:
+        try:
+            res = subprocess.run(["git", "show", f"{base_sha}:OWNERSHIP.yml"],
+                                 capture_output=True, text=True,
+                                 errors="replace", timeout=15)
+            if res.returncode == 0:
+                text = res.stdout
+            else:
+                # absent at base OR object missing locally — indistinguishable
+                # here; degrade LOUDLY to the worktree copy (r2 low)
+                _warn("OWNERSHIP.yml not readable at the remote base — "
+                      "checking the worktree copy instead")
+        except (subprocess.TimeoutExpired, OSError):
+            text = None               # fall through to the worktree copy
+    if text is None:
+        p = Path("OWNERSHIP.yml")
+        if not p.is_file():
+            return []
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            _warn(f"OWNERSHIP.yml unreadable ({e.__class__.__name__})")
+            return []
+    globs = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            _warn(f"OWNERSHIP.yml line without ':' skipped: {line[:40]!r}")
+            continue
+        key, _, val = line.partition(":")
+        if key.strip() == "integrator" and val.strip():
+            globs.append(val.strip())
+    return globs
+
+
+def _matches(files, globs):
+    return sorted({f for f in files for g in globs if fnmatch.fnmatch(f, g)})
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) < 2:
+        _warn("invoked without remote args — allowing push")
+        return 0
+    remote_name, remote_url = argv[0], argv[1]
+    repo = _repo_from_url(remote_url)
+    if repo is None:
+        # greedy to the LAST @ before the path (r7 L1: a literal @ inside the
+        # password leaked its tail under the first-@ scrub)
+        shown = re.sub(r"//[^/]*@", "//", remote_url)    # never echo userinfo
+        _warn(f"cannot derive owner/name from {shown!r} — allowing push")
+        return 0
+
+    leases = _leases()
+    if leases is None:
+        _warn("fleet ledger unreachable (no local tree, no usable ControlMaster) — allowing push")
+        return 0
+
+    sid = os.environ.get("EUNOMIA_SESSION", "").strip()
+    override = os.environ.get("FLEET_PUSH_OVERRIDE", "") == "1"
+    blocks = []
+
+    active = [r for r in leases if r.get("state") == "active"]
+    my_integrator = any(
+        _res(r).get("role") == "integrator" and _res(r).get("repo") == repo
+        and r.get("holder") == sid and sid
+        for r in active)
+
+    lines = sys.stdin.read().splitlines()
+    all_changed = set()
+    base_sha = None
+    n_branch_refs = 0
+    last_local_sha = None
+    last_remote_sha = None
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        local_ref, local_sha, remote_ref, remote_sha = parts
+        if local_sha == _ZEROS:
+            continue                      # branch deletion — never blocked here
+        if not remote_ref.startswith("refs/heads/"):
+            continue                      # tags etc. pass through
+        branch = remote_ref[len("refs/heads/"):]
+        if remote_sha != _ZEROS and base_sha is None:
+            # remote-side base for OWNERSHIP (M4). Multi-ref pushes use the
+            # FIRST ref's base for the whole union — acknowledged (r4 L4):
+            # multi-ref pushes are rare and the alternative is per-ref check
+            # plumbing; revisit if the fleet ever pushes ref bundles.
+            base_sha = remote_sha
+
+        # (1) a foreign ACTIVE branch lease on this exact repo+branch
+        for rec in active:
+            res = _res(rec)
+            if (res.get("type") == "branch" and res.get("repo") == repo
+                    and res.get("branch") == branch
+                    and rec.get("holder") and rec.get("holder") != sid):
+                hint = ("" if sid else
+                        " (no EUNOMIA_SESSION set — if this lease is yours, "
+                        f"export EUNOMIA_SESSION={rec.get('holder')} first)")
+                blocks.append(
+                    f"branch {branch!r} is held by session "
+                    f"{rec.get('holder')!r} (lease {rec.get('id')}) — the "
+                    "2026-08-17 anti-pattern is pushing into someone else's "
+                    "lane. Coordinate, or take the lease over first "
+                    f"(docs/takeover.md).{hint}")
+
+        changed = _changed_files(remote_name, local_sha, remote_sha)
+        if changed is None:
+            _warn(f"cannot enumerate pushed files for {branch}; path checks skipped")
+            continue
+        all_changed |= changed
+        n_branch_refs += 1
+        last_local_sha = local_sha
+        last_remote_sha = remote_sha
+
+    if all_changed and n_branch_refs == 1 and last_local_sha:
+        ref = _remote_default_ref(remote_name)
+        if ref:
+            excused = _keep_current_excusals(
+                all_changed, last_local_sha, last_remote_sha, ref)
+            if excused:
+                all_changed -= excused
+                # LOUD, with the paths named (r8 M2 + r9): a stale tracking
+                # ref could still mis-excuse — make any loss findable.
+                _warn("excused as already-on-main and untouched by this "
+                      f"branch: {sorted(excused)[:5]} — verify your tracking "
+                      "ref is current (git fetch)")
+
+    if all_changed:
+        # (2) another session's ACTIVE paths lease
+        for rec in active:
+            res = _res(rec)
+            if (res.get("type") == "paths" and res.get("repo") == repo
+                    and rec.get("holder") and rec.get("holder") != sid):
+                globs = res.get("globs")
+                if not isinstance(globs, list):
+                    continue
+                hit = _matches(all_changed, [str(g) for g in globs])
+                if hit:
+                    blocks.append(
+                        f"paths {hit[:5]} are inside session "
+                        f"{rec.get('holder')!r}'s lane (lease {rec.get('id')}) "
+                        "— file a change-request instead "
+                        "(docs/change-requests.md).")
+
+        # (3) integrator-owned globs without the role
+        if base_sha is None:
+            # First push of a lane: the remote's tracked default branch is a
+            # better base than the worktree (not rewritten by THIS push,
+            # though only as fresh as the last fetch — r8 M2); the worktree
+            # copy is the last resort.
+            base_sha = _remote_default_ref(remote_name)
+        ig = _ownership_integrator_globs(base_sha)
+        if ig and not my_integrator:
+            hit = _matches(all_changed, ig)
+            if hit:
+                blocks.append(
+                    f"paths {hit[:5]} are integrator-owned (OWNERSHIP.yml) and "
+                    f"{sid or 'this shell'!r} holds no integrator-role lease "
+                    f"for {repo} — file a change-request "
+                    "(docs/change-requests.md).")
+
+    if not blocks:
+        return 0
+    for b in blocks:
+        print(f"fleet-prepush: {'OVERRIDDEN' if override else 'BLOCKED'} — {b}",
+              file=sys.stderr)
+    if override:
+        print("fleet-prepush: FLEET_PUSH_OVERRIDE=1 honored — pushing anyway",
+              file=sys.stderr)
+        return 0
+    print("fleet-prepush: set FLEET_PUSH_OVERRIDE=1 to push anyway (logged above)",
+          file=sys.stderr)
+    return BLOCK_RC
+
+
+if __name__ == "__main__":
+    # Structural polarity guard (1522 #12 H1): the fail-open rule cannot depend
+    # on every callsite catching every exception — an uncaught anything must
+    # WARN and allow, never abort the push with a traceback.
+    try:
+        rc = main()
+    except SystemExit:
+        raise
+    except BaseException as e:
+        _warn(f"internal error ({e.__class__.__name__}: {e}) — "
+              "the polarity rule fails open")
+        rc = 0
+    sys.exit(rc)

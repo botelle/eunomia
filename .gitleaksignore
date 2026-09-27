@@ -1,0 +1,7 @@
+# Synthetic tokens in test fixtures. Each line is a gitleaks fingerprint.
+tests/test_declared_behaviour.py:github-pat:265
+tests/test_fleetforge.py:generic-api-key:36
+tests/test_fleet_collect.py:curl-auth-header:157
+tests/test_orchestrator_review.py:generic-api-key:27
+tests/test_forge_backends.py:generic-api-key:40
+tests/test_orchestrator_session.py:generic-api-key:44

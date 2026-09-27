@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""fleet-sim — the simulator boot gate (plan 0008, postmortem control #7).
+
+  fleet-sim boot <udid>
+  fleet-sim shutdown <udid>
+
+`boot` refuses a 4th booted simulator on this host, requires an ACTIVE `sim`
+lease for this host held by EUNOMIA_SESSION, and on success binds the UDID onto
+that lease under its lock (a legal transition, like `activated`). It refuses,
+never reaps: at capacity it lists who holds what and stops — shutting down
+someone else's sim to make room is Principle 4's line.
+
+`shutdown` shuts the sim down and clears the lease binding when it matches.
+
+FLEET_SIMCTL overrides the simulator CLI (default `xcrun simctl`) — the test
+seam that keeps the suite off real simulators.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+_lib_loader = importlib.machinery.SourceFileLoader(
+    "fleetlib", str(Path(__file__).resolve().parent / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+MAX_BOOTED = 3
+# own copy of the lease-id shape (r8 low): reaching into lib._ID_RE would
+# silently drop every lease if fleetlib renamed a private — the fleet-pkill
+# _SID_RE precedent
+_LEASE_ID_RE = re.compile(r"^[a-z]+--[A-Za-z0-9._-]+--\d{3,}\Z")
+_UDID_RE = re.compile(r"^[A-Fa-f0-9][A-Fa-f0-9-]{7,63}\Z")
+
+
+def _simctl():
+    return shlex.split(os.environ.get("FLEET_SIMCTL", "xcrun simctl"))
+
+
+def _host() -> str:
+    return socket.gethostname().split(".")[0].lower()
+
+
+def _booted():
+    """UDIDs currently booted, from `simctl list devices booted -j` (one seam
+    for the stub). JSON, not the freetext listing (1522 #12 r10 L2): device
+    NAMES are user-chosen and a name embedding "(hex) (Booted)" would fool a
+    line regex into counting a fake UDID — miscounted capacity, wrong
+    adopt/idempotence decisions. None on failure — boot then refuses rather
+    than guessing."""
+    try:
+        res = subprocess.run(_simctl() + ["list", "devices", "booted", "-j"],
+                             capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    try:
+        devices = json.loads(res.stdout)["devices"]
+        out = []
+        for runtime_devs in devices.values():
+            for d in runtime_devs:
+                if d.get("state") == "Booted" and d.get("udid"):
+                    out.append(d["udid"])
+        return out
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _foreign_binding(sid: str, udid: str):
+    """(holder, lease_id) of another session's ACTIVE sim lease binding this
+    UDID, else None. Boot AND shutdown both refuse on it (1522 #12 r8 M1: the
+    adopt path could silently double-bind an OWNED sim, after which each
+    session's shutdown refused on the other's binding — a mutual wedge)."""
+    for rec in lib.all_leases():
+        res = lib.resource_of(rec)
+        if (rec.get("state") == "active" and res.get("type") == "sim"
+                and res.get("udid") == udid and rec.get("holder")
+                and rec.get("holder") != sid):
+            return rec.get("holder"), rec.get("id")
+    return None
+
+
+def _my_sim_leases(sid: str):
+    """[(lease_id, bound_udid_or_None)] for this holder+host — selection happens
+    BY BINDING at the call sites (1522 #12 r3 M2: first-match made two-lease
+    behavior depend on lease-file iteration order, refusing boots the second
+    lease could serve and clearing the wrong lease on shutdown)."""
+    host = _host()
+    out = []
+    for rec in lib.all_leases():
+        if rec.get("state") != "active" or rec.get("holder") != sid:
+            continue
+        res = lib.resource_of(rec)
+        if res.get("type") == "sim" and str(res.get("host", "")).lower() == host:
+            if isinstance(rec.get("id"), str) and _LEASE_ID_RE.match(rec["id"]):
+                out.append((rec["id"], res.get("udid")))
+    return out
+
+
+def _bind(lease_id: str, sid: str, udid: str) -> bool:
+    """Bind under the lease lock, re-verifying holder and current binding
+    (r4 L5: same-session racing boots must not silently rebind)."""
+    with lib.held_lock(lib.lock_path(lease_id)):
+        rec = lib.read_lease_checked(lease_id)
+        if rec is not None and rec.get("holder") == sid:
+            rec.setdefault("resource", {})
+            if isinstance(rec["resource"], dict) \
+                    and lib.resource_of(rec).get("udid") in (None, udid):
+                rec["resource"]["udid"] = udid
+                lib.write_lease(rec)
+                return True
+    return False
+
+
+def cmd_boot(udid: str) -> int:
+    sid = lib.session_id()
+    # EVERYTHING — foreign scan, lease selection, capacity, boot, bind — runs
+    # under one host lock (1522 #12 r9 MEDIUM: with the foreign scan outside
+    # it, two sessions racing boot for one UDID both passed the scan, and the
+    # loser's adopt path WROTE the double-bind wedge r8 M1 exists to prevent).
+    with lib.held_lock(lib.locks_dir() / f"sim-{_host()}.lock"):
+        return _boot_locked(udid, sid)
+
+
+def _boot_locked(udid: str, sid: str) -> int:
+    leases = _my_sim_leases(sid)
+    if not leases:
+        sys.exit(f"fleet-sim: no ACTIVE sim lease for host {_host()!r} held by "
+                 f"{sid!r} — get one (fleet-claim) before booting")
+    foreign = _foreign_binding(sid, udid)
+    if foreign:
+        sys.exit(f"fleet-sim: {udid} is bound to session {foreign[0]!r} "
+                 f"(lease {foreign[1]}) — booting or adopting it would "
+                 "double-bind an owned sim (r8 M1); pick another UDID or ask "
+                 "the holder")
+    # by binding: same-udid lease first (re-boot), else an unbound one
+    lease_id = next((lid for lid, u in leases if u == udid), None) \
+        or next((lid for lid, u in leases if not u), None)
+    if lease_id is None:
+        bound = ", ".join(f"{lid}->{u}" for lid, u in leases)
+        sys.exit(f"fleet-sim: every sim lease you hold is already bound "
+                 f"({bound}) — shut one down first, or claim another lease; "
+                 "silently rebinding would orphan its attribution")
+    booted = _booted()
+    if booted is None:
+        sys.exit("fleet-sim: cannot enumerate booted simulators — refusing to "
+                 "boot blind")
+    if udid in booted:
+        # idempotent — but ADOPT the binding too (r7 L3): a sim booted via raw
+        # simctl then claimed through this tool must end up attributed, or
+        # "whose sim is that" stays unanswerable while we report success.
+        _bind(lease_id, sid, udid)
+        print(udid)
+        return 0
+    if len(booted) >= MAX_BOOTED:
+        holders = []
+        for rec in lib.all_leases():
+            res = lib.resource_of(rec)
+            if (rec.get("state") == "active" and res.get("type") == "sim"
+                    and res.get("udid") in booted):
+                holders.append(f"{res.get('udid')}={rec.get('holder')}")
+        sys.exit(f"fleet-sim: {len(booted)} simulators already booted on "
+                 f"{_host()} (cap {MAX_BOOTED}): {booted}"
+                 + (f" — held: {', '.join(holders)}" if holders else "")
+                 + ". This tool refuses, never reaps — ask a holder to "
+                 "shut one down.")
+    res = subprocess.run(_simctl() + ["boot", udid],
+                         capture_output=True, text=True, timeout=120)
+    if res.returncode != 0:
+        sys.exit(f"fleet-sim: boot failed: {res.stderr.strip()[:200]}")
+    # Bind the UDID onto the lease UNDER ITS LOCK — a legal transition (SPEC:
+    # `udid` is "filled at activation"); re-verify the holder under the lock.
+    if not _bind(lease_id, sid, udid):
+        # the sim IS up but attribution failed — loud, not silent (r2 low)
+        print(f"fleet-sim: WARN {udid} booted but NOT bound — the lease "
+              "changed hands or acquired another binding under the lock; "
+              "shut the sim down or re-claim", file=sys.stderr)
+    print(udid)
+    return 0
+
+
+def cmd_shutdown(udid: str) -> int:
+    sid = lib.session_id()
+    # The never-reaps boundary applies to the DESTRUCTIVE verb too (1522 #12
+    # H2): if another session's active lease binds this UDID, refuse with the
+    # holder named. Raw `simctl shutdown` stays the human escape hatch.
+    # (Unlocked scan: a binding written inside this window is shut down
+    # anyway — acknowledged r6 L4; the window is one scan wide and the
+    # escape hatch exists regardless.)
+    foreign = _foreign_binding(sid, udid)
+    if foreign:
+        sys.exit(f"fleet-sim: {udid} is bound to session {foreign[0]!r} "
+                 f"(lease {foreign[1]}) — this tool refuses, never reaps. Ask "
+                 "the holder; raw `xcrun simctl shutdown` is the human escape "
+                 "hatch.")
+    booted = _booted()
+    if booted is None or udid in booted:
+        res = subprocess.run(_simctl() + ["shutdown", udid],
+                             capture_output=True, text=True, timeout=120)
+        if res.returncode != 0 and "current state: Shutdown" not in res.stderr:
+            sys.exit(f"fleet-sim: shutdown failed: {res.stderr.strip()[:200]}")
+    # already-shut-down (the raw-simctl escape hatch the docs bless) is the
+    # goal state, however reached (1522 #12 r4 M1) — fall through and clear
+    # the binding, or the lease wedges with no tool-level recovery.
+    # clear the lease bound to THIS udid — not whichever lease iterates first
+    lease_id = next((lid for lid, u in _my_sim_leases(sid) if u == udid), None)
+    if lease_id:
+        with lib.held_lock(lib.lock_path(lease_id)):
+            rec = lib.read_lease_checked(lease_id)
+            if (rec is not None and rec.get("holder") == sid
+                    and lib.resource_of(rec).get("udid") == udid):
+                rec["resource"].pop("udid", None)
+                lib.write_lease(rec)
+    print(udid)
+    return 0
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 2 or argv[0] not in ("boot", "shutdown"):
+        sys.exit("usage: fleet-sim boot|shutdown <udid>")
+    udid = argv[1]
+    if not _UDID_RE.match(udid):
+        sys.exit(f"fleet-sim: {udid!r} is not a simulator UDID")
+    return cmd_boot(udid) if argv[0] == "boot" else cmd_shutdown(udid)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-watch — merge-is-ignition. Polls allowlisted, branch-protected repos for
+  `status: ready` plans on main with no work PR, and spawns one orchestrator each.
+
+  RESIDENT (SPEC.md Revisions, 2026-09-10 "a scheduler may be resident"): this
+  unit passes the resident flag and cycles internally rather than exiting each
+  time, so `KeepAlive` (not `StartInterval`) is what keeps it running. That is not an
+  implementation detail here: a `StartInterval` job exits every cycle and
+  reparents every orchestrator it spawned to launchd as an ORPHAN, and an
+  orphan cannot open a local-network connection from a newly-launched binary
+  (six of six autonomous dispatches died at their first `git fetch` under that
+  shape). It also SELF-RESTARTS (plan 0040, SPEC.md Revisions 2026-09-11): once
+  its own pin advances to a clean, reviewed commit and nothing it launched is
+  still running, it ends its loop between cycles and `KeepAlive` relaunches it
+  on the merged code — nobody needs to run `launchctl kickstart` by hand for
+  this unit to pick up a merged change to itself.
+
+  Install (opshost only — the ledger host, and the 2026-09-01 decision to run as the
+  logged-in user, not root: a root daemon makes every lease and lockfile
+  root:wheel, and the user's own fleet-status/prepush/release then hit
+  PermissionError and skip with a warning).
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-watch.plist ~/Library/LaunchAgents/
+    # fill FLEET_WATCH_REPOS, FLEET_NTFY_URL, FLEET_OPERATOR_UID and
+    # FLEET_IMPLEMENTER_UIDS first — see below
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-watch.plist
+  Reload after editing (a frozen job needs bootout+bootstrap, not kickstart):
+    launchctl bootout gui/$(id -u)/org.eunomia.fleet-watch
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-watch.plist
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the same rule fleet-collect
+  states: the shared clone was observed on three different branches in one
+  afternoon, and a scheduled job is the worst place for that because nobody is
+  watching when it fires. This unit's own pin is checked by
+  org.eunomia.fleet-pin-watch, which checks that same worktree — so a fix to
+  this file does not reach this unit until someone re-points, and until then
+  pin-watch says so.
+
+  ENVIRONMENT, and the two mistakes worth naming.
+
+  FLEET_WATCH_REPOS is the allowlist and there is no default: an unconfigured
+  watcher reads nothing at all. `config/repos.conf` is NOT consulted — plan 0013's
+  main-via-contents-API read is unbuilt, and `fleet-repo` says so to the operator's
+  face. Enrolment there is a record, not a dispatch.
+
+  Do NOT set FLEET_ADMIN_TOKEN_CMD. It is retired. The branch-protection verdict
+  now comes from keyvault's forgejo-broker (infra ADR-0003 §2) — the watcher asks a
+  question and receives an answer, holding nothing it could leak. Reintroducing an
+  admin-token recipe here would hand a scheduled process the ability to PATCH a
+  protection rule, which is precisely the ignition forgery this whole mechanism
+  exists to prevent.
+
+  FLEET_BROKER_SOCKET must actually reach the broker — org.eunomia.fleet-broker-tunnel
+  provides it. With no verdict the watcher pages once and scans NOTHING — it does
+  not refuse each repo, because an unreachable broker says nothing about any repo,
+  and collapsing UNDETERMINED into refusal is the Watcher blind misdiagnosis with
+  the alarm inverted. That is fail-closed and correct; it is also indistinguishable
+  from "nothing to do" if you are not reading watch.log.
+
+  FLEET_OPERATOR_UID gates the `respawn` comment path, bound to a numeric id so a
+  rename cannot grant it. Unset = respawn disabled, which is a safe default.
+  Find it with:
+    curl -sS -H @<(printf 'Authorization: token '; ~/bin/fetch-forgejo-token.sh) \
+      "http://forge.example:3000/api/v1/users/operator" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])'
+  The URL is written out because FLEET_FORGEJO_URL is set BELOW, inside this file:
+  it is not in the shell you paste that line into.
+
+  Cadence: 120s between cycles (`watch_interval()`'s default), not a launchd
+  interval — resident mode holds the process's own cycle lock for its whole
+  lifetime, which is a STRONGER singleton than a `StartInterval` job re-taking
+  the lock each time: there is no window between cycles for a second scheduler
+  to slip in.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.eunomia.fleet-watch</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-watch</string>
+    <string>--resident</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- no default: an unconfigured watcher scans nothing. comma-separated owner/repo -->
+    <key>FLEET_WATCH_REPOS</key><string></string>
+
+    <!-- replace with the real Fleet-ops push URL at install; empty = print-only,
+         and the runbook treats pushes as THE failure channel -->
+    <key>FLEET_NTFY_URL</key><string></string>
+
+    <!-- numeric Forgejo user id; empty disables the respawn comment path -->
+    <key>FLEET_OPERATOR_UID</key><string></string>
+
+    <!-- numeric ids of the implementer accounts. Dedupe gates SPEND, and the
+         login fallback (`implbot`) is not rename-proof: a rename makes every
+         historically marked PR invisible and re-dispatches every merged plan.
+         Find them the same way as FLEET_OPERATOR_UID above. -->
+    <key>FLEET_IMPLEMENTER_UIDS</key><string></string>
+
+    <key>FLEET_FORGEJO_URL</key><string>http://forge.example:3000</string>
+
+    <!-- the ssh forward from org.eunomia.fleet-broker-tunnel lands here -->
+    <key>FLEET_BROKER_SOCKET</key><string>/Users/operator/run/forgejo-broker.sock</string>
+
+    <!-- FLEET_PINS is ABSENT ON PURPOSE; org.eunomia.fleet-pin-watch owns the
+         pin check. Setting it here would check the same pins every 120s rather
+         than every 1800s, INSIDE the cycle lock and across two network fetches:
+         the exact cost that pin-watch's pins-only mode was moved out of the
+         lock to avoid, re-entered from the other side. It would also give both
+         units RunAtLoad plus a shared state file, so at login two `git fetch`
+         race in the same worktree and one transition pages twice or more. -->
+  </dict>
+
+  <!-- No StartInterval: resident mode cycles internally (watch_interval(),
+       default 120s) instead of exiting each time. KeepAlive is what relaunches
+       it, on a crash and on the self-restart plan 0040 added: the watcher ends
+       its own loop once it sees its own pin has moved to a clean, reviewed
+       commit, and this is what picks it back up on the merged code. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- NO ProcessType, LowPriorityIO or Nice, deliberately, and this unit is the
+       one place in launchd/ where that is the right call. The sibling watchers
+       keep them; this one SPAWNS.
+
+       All three are inherited by the orchestrators spawn() starts, and an
+       unprivileged child cannot undo any of them: measured on opshost, a real
+       launchd job with ProcessType Background reports darwinbg 0 and sits at
+       priority 4, so the clamp is the process TYPE rather than the darwinbg
+       flag, and setpriority cannot clear it; nice cannot be lowered by an
+       unprivileged process at all. Once part 2 wires the hop, every implementer
+       session dispatched from here would run in the background band and
+       I/O-throttled, invisibly, because `nice` still reports 0.
+
+       What the keys were bought for was "polling a forge must never delay a
+       login". The poll is one HTTP round per 120s against a LAN forge; it was
+       never the expensive thing here. The expensive thing is the child, and the
+       child must not be throttled. -->
+
+  <key>StandardOutPath</key>
+  <string>/Users/operator/dev/.fleet/watch.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/operator/dev/.fleet/watch.log</string>
+</dict>
+</plist>

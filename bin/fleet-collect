@@ -1,0 +1,1183 @@
+#!/usr/bin/env python3
+"""fleet-collect — derive fleet history from Claude Code transcripts, the event
+ledger and orchestrator run logs.
+
+The point being proved: every code session is ALREADY instrumented. Transcripts
+carry per-turn model, token counts, timestamps, tool calls and subagent lineage,
+so fleet state can be derived passively — no opt-in, no per-session cooperation,
+and retroactively over history that already exists.
+
+Four sources, one DB:
+  passive  — ~/.claude/projects/**/*.jsonl        (universal, no opt-in)
+  active   — ~/dev/.fleet/events*.jsonl            (the ledger: leases/CRs/PRs/plan-*)
+  active   — ~/dev/.fleet/work/logs/<lease>.log    (orchestrator RunLog phase stream)
+  remote   — Forgejo's task list + cihost's actions_log   (CI results; bin/fleet-ci)
+
+The fourth is the only one that is not a file on this host, and it is a source
+INSIDE this collector rather than a writer of its own: `bin/fleet-ci` supplies
+the fetching, the redaction and the queries, but the tables it fills are created
+here, by this file's SCHEMA, so there is exactly one owner of the schema and of
+`PRAGMA user_version` (plan 0045).
+
+Counting note (the trap): a transcript writes ONE LINE PER CONTENT BLOCK, and every
+line of the same assistant message repeats that message's `id` and its `usage`.
+Summing per line over-counts (measured 2.54x on a real transcript). A turn is a
+unique `message.id`. Within one message, `usage.iterations` holds per-API-call
+usage and the top-level fields mirror only the LAST iteration, so a multi-iteration
+message must be summed across iterations or it is under-counted.
+
+Idempotent: re-reads only files whose (size, mtime) changed; a grown file has its
+rows replaced, never appended. Failures are per-file — one malformed transcript,
+event file or run log can never halt the sweep. All three sources share the
+`ingest` table for this, keyed by a namespaced path so a transcript's PROJECTS-
+relative sid can never collide with an `events/<name>` or `logs/<name>` key.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import sqlite3
+import sys
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROJECTS = Path.home() / ".claude" / "projects"
+# SPEC.md puts the runtime tree at ~/dev/.fleet/
+DB = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "dev" / ".fleet" / "fleet.db"
+
+# The ledger and the run logs live under the same tree fleetlib.py names —
+# EUNOMIA_FLEET_DIR / FLEET_WORK_ROOT are the same overrides fleet-emit and the
+# orchestrator honor, so a test or an alternate host configuration moves all
+# three sources together.
+DEFAULT_FLEET_DIR = Path.home() / "dev" / ".fleet"
+FLEET_DIR = Path(os.environ.get("EUNOMIA_FLEET_DIR") or DEFAULT_FLEET_DIR)
+WORK_ROOT = Path(os.environ.get("FLEET_WORK_ROOT") or FLEET_DIR / "work")
+
+# Not agent transcripts: workflow journals share the .jsonl extension and the
+# subagents/ directory but carry an unrelated schema.
+SKIP_NAMES = {"journal.jsonl"}
+
+# Bump when the schema changes: an older DB is dropped and rebuilt from transcripts.
+SCHEMA_VERSION = 3
+
+# Every table in fleet.db is in exactly one of these two sets (plan 0063 D4b).
+# The completeness test asserts `tables == DERIVED_TABLES | DURABLE_TABLES`,
+# disjoint, so a table added anywhere fails the suite until somebody decides
+# which it is. Two named sets rather than `durable = schema - derived`: that
+# would make every new table durable by construction and the test a tautology.
+#
+# DERIVED: re-read from a source that survives (transcripts, the ledger, run
+# logs) -- or, for the ci_* three, from the forge's task list. The first six are
+# what a SCHEMA_VERSION bump drops in main(); the ci_* three are derived too but
+# deliberately outlive a bump, because their source can prune.
+# DURABLE: a decision or a forge fact written by another tool, that no source on
+# this host can re-derive. `fleet-collect` never drops these.
+# Views (dispatch, ci_task_dispatch, dispatch_session, dispatch_cost) are
+# neither: they hold no data, and `type='table'` never selects them.
+DERIVED_TABLES = frozenset({
+    "session", "turn", "tool_use", "ingest", "event", "dispatch_phase",
+    "ci_task", "ci_log", "ci_sync",
+})
+DURABLE_TABLES = frozenset({
+    "review", "model_price", "repo_model", "repo_model_change",
+    "fleet_setting", "fleet_setting_change",
+})
+
+
+def fleet_slug(path):
+    """The project-directory slug the Claude CLI derives from a working
+    directory: every character outside [A-Za-z0-9] becomes `-`. So `/`, `.` AND
+    `_` all fold -- the worktree `.../.fleet/work/operator_s_eunomia/...` is the
+    project `-...-dev--fleet-work-operator-s-eunomia-...`. Registered on the
+    connection as a SQL function (see `register_functions`), so the
+    `dispatch_session` view and the tests share this one definition."""
+    if path is None:
+        return None
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def register_functions(con):
+    """The SQL functions the views need. Anything that queries `dispatch_session`
+    or `dispatch_cost` must call this first on its connection."""
+    con.create_function("fleet_slug", 1, fleet_slug, deterministic=True)
+    return con
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS session (
+  id TEXT PRIMARY KEY,           -- transcript path relative to PROJECTS (collision-proof)
+  session_uuid TEXT,             -- the session/agent id (= EUNOMIA_SESSION where it applies)
+  project TEXT,                  -- project dir slug (encodes cwd)
+  parent_uuid TEXT,              -- for subagents: the spawning session's uuid
+  kind TEXT,                     -- 'session' | 'subagent'
+  first_ts TEXT, last_ts TEXT,
+  turns INTEGER, tool_calls INTEGER,
+  in_tok INTEGER, out_tok INTEGER, cache_read_tok INTEGER, cache_write_tok INTEGER,
+  models TEXT,                   -- json list
+  title TEXT,
+  first_prompt TEXT
+);
+CREATE TABLE IF NOT EXISTS turn (
+  session_id TEXT, seq INTEGER, message_id TEXT, ts TEXT, model TEXT,
+  in_tok INTEGER, out_tok INTEGER, cache_read_tok INTEGER, cache_write_tok INTEGER,
+  PRIMARY KEY (session_id, seq)
+);
+CREATE TABLE IF NOT EXISTS tool_use (
+  session_id TEXT, ts TEXT, name TEXT, target TEXT
+);
+CREATE TABLE IF NOT EXISTS ingest (
+  path TEXT PRIMARY KEY, size INTEGER, mtime REAL, ingested_at TEXT, error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_turn_ts ON turn(ts);
+CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_use(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_last ON session(last_ts);
+CREATE INDEX IF NOT EXISTS idx_session_uuid ON session(session_uuid);
+
+-- D1: the event ledger (SPEC.md "Event record", v0.2 closed set). `lease` is
+-- the top-level column SPEC requires null on plan-* events -- their lease id
+-- rides in detail_json instead, per fleet-watch/orchestrator's own emit().
+CREATE TABLE IF NOT EXISTS event (
+  ts TEXT, actor TEXT, type TEXT, repo TEXT, pr INTEGER, sha TEXT, lease TEXT,
+  detail_json TEXT,
+  source TEXT,                   -- events.jsonl or an events-<stamp>.jsonl archive
+  line INTEGER,
+  PRIMARY KEY (source, line)
+);
+CREATE INDEX IF NOT EXISTS idx_event_type ON event(type);
+CREATE INDEX IF NOT EXISTS idx_event_lease ON event(lease);
+CREATE INDEX IF NOT EXISTS idx_event_repo ON event(repo);
+
+-- D2/D4: the orchestrator's RunLog phase stream, one row per `log.note()`
+-- call. rc/timed_out/seconds/peak_rss_mb/orch_rss_mb/rss_samples are lifted
+-- out of the facts blob into columns ONLY for the implementer-exit phase that
+-- carries them (D4); every phase's full fact set still lands in detail_json.
+CREATE TABLE IF NOT EXISTS dispatch_phase (
+  lease TEXT, seq INTEGER, ts TEXT, phase TEXT, pr INTEGER,
+  rc INTEGER, timed_out INTEGER, seconds INTEGER,
+  peak_rss_mb INTEGER, orch_rss_mb INTEGER, rss_samples INTEGER,
+  detail_json TEXT,
+  source TEXT,                   -- the log's filename, `<lease-id>.log`
+  line INTEGER,
+  PRIMARY KEY (source, line)
+);
+CREATE INDEX IF NOT EXISTS idx_phase_lease ON dispatch_phase(lease, seq);
+CREATE INDEX IF NOT EXISTS idx_phase_phase ON dispatch_phase(phase);
+
+-- Plan 0045: what the fleet's CI did. Filled by bin/fleet-ci, from Forgejo's task
+-- list (metadata, every task) and cihost's actions_log (a body, failures only).
+--
+-- These three tables are deliberately NOT in the rebuild-drop list in main():
+-- they are derived from a source that can PRUNE (Forgejo expires task logs), so
+-- a rebuild "from source" could come back with less than was dropped. Changing
+-- their shape therefore needs a migration, not a SCHEMA_VERSION bump. Adding
+-- them needed no bump either: CREATE IF NOT EXISTS gives an existing v3 DB the
+-- tables on its next sweep, and an older collector simply never names them.
+--
+-- ci_task carries every column the tasks API returns, plus `repo` (in the
+-- request path, not the response) and the log_* columns, which say what became
+-- of the body. They are what keeps "no ci_log row" from being ambiguous.
+--   log_state: not-failed   success/skipped: no body by design
+--              in-progress  not finished, so its log is not final
+--              pending      failed, body not fetched yet (or the last try failed)
+--              stored       a ci_log row exists
+--              over-cap     read, but larger than the cap: NOT stored, size in log_detail
+--              absent       no file at the path named in log_detail
+--              unreadable   file exists, could not be fully read; reason in log_detail
+CREATE TABLE IF NOT EXISTS ci_task (
+  repo TEXT NOT NULL,
+  id INTEGER NOT NULL,           -- the task id (= the log file's name on cihost)
+  name TEXT, run_number INTEGER, head_branch TEXT, head_sha TEXT, event TEXT,
+  display_title TEXT, status TEXT, workflow_id TEXT, url TEXT,
+  created_at TEXT, updated_at TEXT, run_started_at TEXT,
+  log_state TEXT NOT NULL DEFAULT 'pending',
+  log_detail TEXT,
+  log_zbytes INTEGER,            -- size on disk on cihost, when it could be stat'ed
+  log_checked_at TEXT,
+  fetched_at TEXT,
+  PRIMARY KEY (repo, id)
+);
+CREATE INDEX IF NOT EXISTS idx_ci_task_repo ON ci_task(repo, created_at);
+CREATE INDEX IF NOT EXISTS idx_ci_task_state ON ci_task(log_state);
+
+-- A body, for a failed task only. body_z is zlib over the REDACTED text; the
+-- original is never stored. Anything over cap_bytes is not truncated into here
+-- -- it is recorded as over-cap on ci_task -- so a row here is a complete log.
+CREATE TABLE IF NOT EXISTS ci_log (
+  repo TEXT NOT NULL,
+  task_id INTEGER NOT NULL,
+  body_z BLOB NOT NULL,
+  raw_bytes INTEGER NOT NULL,    -- decompressed size, before redaction
+  cap_bytes INTEGER NOT NULL,    -- the cap in force when this was captured
+  redactions TEXT,               -- json {rule name: count}; never the matched text
+  captured_at TEXT,
+  PRIMARY KEY (repo, task_id)
+);
+
+-- One row per repo: when it was last tried and what the last try said. This is
+-- what lets a reader tell "no failing tasks" from "the collector could not ask".
+CREATE TABLE IF NOT EXISTS ci_sync (
+  repo TEXT PRIMARY KEY,
+  attempted_at TEXT, succeeded_at TEXT, error TEXT
+);
+"""
+
+# D3: `dispatch`, one row per lease. A VIEW, not a table: every column it
+# reports is already fully derivable from `event` and `dispatch_phase`, so a
+# table would be a second copy of the same facts that a collector bug could
+# let drift from its source rows. Recreated unconditionally (not gated on
+# SCHEMA_VERSION) because a view carries no data of its own to migrate — only
+# its definition can go stale, and DROP+CREATE every run is what keeps a
+# revised query live without forcing a full transcript rebuild.
+#
+# Terminal-phase rule (Handoff): a lease is terminal iff (a) the ledger carries
+# a plan-failed or plan-done event naming it, (b) its phase stream reached
+# steward-end, or (c) the ledger carries a lease-released event naming it —
+# every dispatch ends by releasing, and (c) is what catches a run that ended
+# without (a) or (b) at all (see the `released` CTE for why that happens).
+# review-approved is deliberately NOT terminal: that gap is where
+# an approved PR waits on a human merge, and reading it as stuck would be
+# exactly the false alarm Boundary 3 (awareness, not authority) warns against
+# producing for a human reader, even though nothing here gates on it.
+DISPATCH_VIEW = """
+DROP VIEW IF EXISTS dispatch;
+CREATE VIEW dispatch AS
+WITH leases AS (
+  SELECT DISTINCT lease FROM dispatch_phase
+  UNION
+  SELECT DISTINCT json_extract(detail_json, '$.lease') FROM event
+  WHERE type IN ('plan-dispatched', 'plan-done', 'plan-failed')
+    AND json_extract(detail_json, '$.lease') IS NOT NULL
+),
+-- Every CTE below is written to yield AT MOST ONE row per lease, even though
+-- most facts are one-shot by construction (`start` and `steward-end` are each
+-- written once in bin/orchestrator's control flow). A real log proved this
+-- matters: a review loop with fix rounds calls run_implementer more than
+-- once, so `implementer-exit` is NOT one-shot — a naive `WHERE phase=...`
+-- join fans out into one dispatch row per exit, duplicating the lease. Each
+-- CTE here instead picks a single extreme row (earliest `start`, latest of
+-- everything else) via a correlated subquery, the same pattern `latest` and
+-- `last_pr` already use.
+started AS (
+  SELECT dp.lease,
+         json_extract(dp.detail_json, '$.repo') AS repo,
+         json_extract(dp.detail_json, '$.plan') AS plan_id,
+         json_extract(dp.detail_json, '$.session') AS session,
+         dp.ts AS started_ts, dp.source AS log_path
+  FROM dispatch_phase dp
+  WHERE dp.phase = 'start'
+    AND dp.seq = (SELECT MIN(seq) FROM dispatch_phase
+                  WHERE lease = dp.lease AND phase = 'start')
+),
+latest AS (
+  SELECT dp.lease, dp.phase AS current_phase, dp.ts AS current_phase_ts
+  FROM dispatch_phase dp
+  WHERE dp.seq = (SELECT MAX(seq) FROM dispatch_phase WHERE lease = dp.lease)
+),
+last_pr AS (
+  SELECT dp.lease, dp.pr
+  FROM dispatch_phase dp
+  WHERE dp.pr IS NOT NULL
+    AND dp.seq = (SELECT MAX(seq) FROM dispatch_phase
+                  WHERE lease = dp.lease AND pr IS NOT NULL)
+),
+stewarded AS (
+  SELECT dp.lease, json_extract(dp.detail_json, '$.state') AS state,
+         json_extract(dp.detail_json, '$.released') AS released
+  FROM dispatch_phase dp
+  WHERE dp.phase = 'steward-end'
+    AND dp.seq = (SELECT MAX(seq) FROM dispatch_phase
+                  WHERE lease = dp.lease AND phase = 'steward-end')
+),
+failed AS (
+  SELECT e.lease, e.reason, e.log_path, e.transcript_path, e.failed_ts
+  FROM (
+    SELECT rowid AS rid, json_extract(detail_json, '$.lease') AS lease,
+           json_extract(detail_json, '$.reason') AS reason,
+           json_extract(detail_json, '$.log') AS log_path,
+           json_extract(detail_json, '$.transcript') AS transcript_path,
+           ts AS failed_ts
+    FROM event WHERE type = 'plan-failed'
+  ) e
+  WHERE e.rid = (SELECT MAX(rowid) FROM event
+                 WHERE type = 'plan-failed'
+                   AND json_extract(detail_json, '$.lease') = e.lease)
+),
+done AS (
+  SELECT e.lease, e.done_ts
+  FROM (
+    SELECT rowid AS rid, json_extract(detail_json, '$.lease') AS lease,
+           ts AS done_ts
+    FROM event WHERE type = 'plan-done'
+  ) e
+  WHERE e.rid = (SELECT MAX(rowid) FROM event
+                 WHERE type = 'plan-done'
+                   AND json_extract(detail_json, '$.lease') = e.lease)
+),
+-- A lease can be known from the EVENT LEDGER alone: the `leases` CTE admits
+-- one from `plan-dispatched`, but every field above reads `dispatch_phase`,
+-- which is empty when the orchestrator died before writing a run log (or ran
+-- before run-log ingestion existed). The result was an all-NULL row that is
+-- `terminal = 0` forever.
+--
+-- Measured 2026-09-16: three `operator/pr-proxy` leases from 2026-09-10 rendered
+-- in `operator/lynceus` as "3 running now" with no repo, no plan and no way to
+-- open them — and NULL `current_phase_ts` is what did it, because a consumer
+-- computing "stuck" from idle time gets NULL and falls through to "running".
+-- The events carry `repo` and `$.plan`; nothing was reaching for them.
+dispatched AS (
+  SELECT e.lease, e.repo, e.plan_id, e.session, e.dispatched_ts
+  FROM (
+    SELECT rowid AS rid,
+           json_extract(detail_json, '$.lease') AS lease,
+           repo AS repo,
+           json_extract(detail_json, '$.plan') AS plan_id,
+           json_extract(detail_json, '$.session') AS session,
+           ts AS dispatched_ts
+    FROM event WHERE type = 'plan-dispatched'
+  ) e
+  -- MIN, matching `started`'s earliest-`start` rule: a respawn emits a second
+  -- `plan-dispatched` for the same lease, and the dispatch began at the first.
+  WHERE e.rid = (SELECT MIN(rowid) FROM event
+                 WHERE type = 'plan-dispatched'
+                   AND json_extract(detail_json, '$.lease') = e.lease)
+),
+-- A lease the orchestrator RELEASED is over, whatever else was recorded. The
+-- `terminal` expression below reads only failed/done/stewarded, so a run that
+-- was released without one of those — a hand release of a dead orchestrator's
+-- lease, or an older code path that released and emitted nothing else — stayed
+-- non-terminal forever and was counted as running.
+--
+-- Measured 2026-09-20: three `operator/pr-proxy` leases released on 2026-09-10
+-- still read as live ten days later, and three released by hand that day joined
+-- them. `fleet-release` does emit `lease-released`; nothing consumed it.
+--
+-- THE LEASE ID IS IN THE COLUMN HERE, NOT IN detail_json, AND THE `dispatched`
+-- CTE ABOVE IS THE OTHER WAY ROUND. That is not drift to be smoothed over with
+-- a COALESCE: `bin/fleet-emit` enforces it. A `lease-*` event REQUIRES --lease
+-- and exits without it; anything else REQUIRES lease=null ("SPEC requires
+-- lease=null") and must carry the id in its detail. So `lease-released` fills
+-- the column and leaves detail `{}`, while `plan-dispatched` — not a lease-*
+-- event — does the opposite. Measured on the live ledger 2026-09-23:
+--
+--     lease-released    152 rows   column set 152   detail_json.$.lease   0
+--     plan-dispatched    91 rows   column set   0   detail_json.$.lease  91
+--
+-- Reading detail_json here matched nothing at all, so this CTE was empty and
+-- the release clause below was dead code that looked like a fix (review 3232).
+released AS (
+  SELECT e.lease, e.released_ts
+  FROM (
+    SELECT rowid AS rid, lease AS lease, ts AS released_ts
+    FROM event WHERE type = 'lease-released' AND lease IS NOT NULL
+  ) e
+  WHERE e.rid = (SELECT MAX(rowid) FROM event
+                 WHERE type = 'lease-released' AND lease = e.lease)
+),
+exited AS (
+  SELECT dp.lease, dp.rc, dp.timed_out, dp.seconds, dp.peak_rss_mb,
+         dp.orch_rss_mb, dp.rss_samples
+  FROM dispatch_phase dp
+  WHERE dp.phase = 'implementer-exit'
+    AND dp.seq = (SELECT MAX(seq) FROM dispatch_phase
+                  WHERE lease = dp.lease AND phase = 'implementer-exit')
+)
+SELECT
+  le.lease AS lease,
+  COALESCE(st.repo, dsp.repo) AS repo,
+  COALESCE(st.plan_id, dsp.plan_id) AS plan_id,
+  COALESCE(st.session, dsp.session) AS session,
+  COALESCE(st.started_ts, dsp.dispatched_ts) AS started_ts,
+  st.log_path AS log_path,
+  COALESCE(l.current_phase,
+           CASE WHEN dsp.lease IS NOT NULL THEN 'dispatched' END) AS current_phase,
+  -- The load-bearing one. A consumer reading NULL here cannot compute idle
+  -- time, so a six-day-dead lease reads as running rather than stuck.
+  COALESCE(l.current_phase_ts, f.failed_ts, d.done_ts, rl.released_ts,
+           dsp.dispatched_ts) AS current_phase_ts,
+  p.pr AS pr,
+  -- `released` is LAST in this chain on purpose: it says the run is over, not
+  -- how it went, so any recorded outcome wins over it.
+  CASE WHEN f.lease IS NOT NULL THEN 'failed'
+       WHEN d.lease IS NOT NULL THEN 'done'
+       WHEN sw.lease IS NOT NULL THEN sw.state
+       WHEN rl.lease IS NOT NULL THEN 'released'
+       ELSE NULL END AS outcome,
+  (f.lease IS NOT NULL OR d.lease IS NOT NULL OR sw.lease IS NOT NULL
+   OR rl.lease IS NOT NULL) AS terminal,
+  f.reason AS failure_reason, f.log_path AS failure_log, f.transcript_path AS failure_transcript,
+  ex.rc AS rc, ex.timed_out AS timed_out, ex.seconds AS seconds,
+  ex.peak_rss_mb AS peak_rss_mb, ex.orch_rss_mb AS orch_rss_mb, ex.rss_samples AS rss_samples
+FROM leases le
+LEFT JOIN started st ON st.lease = le.lease
+LEFT JOIN latest l ON l.lease = le.lease
+LEFT JOIN last_pr p ON p.lease = le.lease
+LEFT JOIN stewarded sw ON sw.lease = le.lease
+LEFT JOIN failed f ON f.lease = le.lease
+LEFT JOIN done d ON d.lease = le.lease
+LEFT JOIN exited ex ON ex.lease = le.lease
+LEFT JOIN dispatched dsp ON dsp.lease = le.lease
+LEFT JOIN released rl ON rl.lease = le.lease;
+"""
+
+# Plan 0045 D4: CI task -> dispatch. `dispatch` has no sha column and `event.sha`
+# is only ever filled by hand, but the orchestrator writes the 8-character head
+# sha into the run-log facts of every phase that is about CI or review, so that is
+# the key that exists. A task with no matching dispatch is still a row (LEFT
+# JOIN). Qualified by repo: two repos can share an 8-character prefix. One row per
+# (task, lease) -- two leases that both looked at one sha are both listed, not
+# silently one. A view for the same reason `dispatch` is: nothing here is data.
+CI_VIEW = """
+DROP VIEW IF EXISTS ci_task_dispatch;
+CREATE VIEW ci_task_dispatch AS
+SELECT t.repo, t.id AS task_id, t.name, t.run_number, t.head_branch, t.head_sha,
+       t.status, t.created_at, t.log_state,
+       m.lease, m.plan_id, m.pr AS dispatch_pr, m.outcome AS dispatch_outcome
+FROM ci_task t
+LEFT JOIN (
+  SELECT DISTINCT d.repo AS repo, s.sha8 AS sha8, d.lease AS lease,
+         d.plan_id AS plan_id, d.pr AS pr, d.outcome AS outcome
+  FROM (SELECT DISTINCT lease, json_extract(detail_json, '$.sha') AS sha8
+        FROM dispatch_phase
+        WHERE json_extract(detail_json, '$.sha') IS NOT NULL) s
+  JOIN dispatch d ON d.lease = s.lease
+) m ON m.repo = t.repo AND m.sha8 = substr(t.head_sha, 1, 8);
+"""
+
+# Plan 0076 D1: the implementer-run pairs of a dispatch. Each `implementer-start`
+# is paired with the first `implementer-exit` after it and before the next start
+# (the initial run and every `-r<n>` fix round is one pair). A start with no exit
+# is still a pair -- its window is unknown, so it can never link, and that is
+# counted rather than hidden. Shared as a fragment so the views, the ingest
+# report and `fleet-plan ledger` count the same pairs.
+DISPATCH_PAIRS_SQL = """
+SELECT s.lease AS lease, s.seq AS start_seq, s.ts AS start_ts,
+       json_extract(s.detail_json, '$.cwd') AS cwd,
+       x.seq AS exit_seq, x.ts AS exit_ts
+FROM dispatch_phase s
+LEFT JOIN dispatch_phase x
+  ON x.lease = s.lease AND x.phase = 'implementer-exit'
+ AND x.seq = (SELECT MIN(seq) FROM dispatch_phase
+              WHERE lease = s.lease AND phase = 'implementer-exit' AND seq > s.seq
+                AND seq < COALESCE((SELECT MIN(seq) FROM dispatch_phase
+                                    WHERE lease = s.lease
+                                      AND phase = 'implementer-start'
+                                      AND seq > s.seq), 1000000000))
+WHERE s.phase = 'implementer-start'
+"""
+
+# Plan 0076 D1: `dispatch_session` -- which implementer session ran a pair. A
+# VIEW, computed at query time from rows that already exist, so it links every
+# run already on disk without a re-ingest (a stored column would fill only for
+# logs ingested after the change). The match is on the project slug of the
+# pair's `cwd=` and on the transcript's first timestamp lying in the pair's
+# window widened by one second; only a TOP-LEVEL session counts (a subagent
+# transcript in the same project is not a competing match). Exactly one match
+# yields a row; none or many yield none -- a join is unique or it is absent, and
+# never a guess. `seq` is the exit line's. Needs `fleet_slug` registered.
+DISPATCH_SESSION_VIEW = """
+DROP VIEW IF EXISTS dispatch_session;
+CREATE VIEW dispatch_session AS
+WITH pairs AS (""" + DISPATCH_PAIRS_SQL + """),
+matches AS (
+  SELECT p.lease AS lease, p.start_seq AS start_seq, p.exit_seq AS exit_seq,
+         se.session_uuid AS session_uuid
+  FROM pairs p
+  JOIN session se
+    ON se.parent_uuid IS NULL
+   AND se.project = fleet_slug(p.cwd)
+   AND julianday(se.first_ts) >= julianday(p.start_ts) - 1.0 / 86400
+   AND julianday(se.first_ts) <= julianday(p.exit_ts) + 1.0 / 86400
+  WHERE p.exit_seq IS NOT NULL
+)
+SELECT lease, exit_seq AS seq, MIN(session_uuid) AS session_uuid
+FROM matches
+GROUP BY lease, start_seq
+HAVING COUNT(*) = 1;
+"""
+
+# Plan 0076 D3: `dispatch_cost` -- what a linked implementer session and a linked
+# review round processed and produced. `processed` is every input token
+# (fresh, cache read, cache write); `output` is what the model wrote. Tokens are
+# the unit, never dollars. `minutes` is a julianday difference -- never a text
+# subtraction. One row per linked implementer session (`kind='implementer'`,
+# keyed by lease and the exit `seq`) and per linked review round
+# (`kind='review'`, keyed by repo, pr and round); an unlinked one has no row.
+# `review` is written by bin/fleet-reviews, so this view can only be QUERIED
+# once that table exists.
+DISPATCH_COST_VIEW = """
+DROP VIEW IF EXISTS dispatch_cost;
+CREATE VIEW dispatch_cost AS
+SELECT 'implementer' AS kind, ds.lease AS lease, ds.seq AS seq,
+       NULL AS repo, NULL AS pr, NULL AS round, ds.session_uuid AS session_uuid,
+       COALESCE(se.in_tok, 0) + COALESCE(se.cache_read_tok, 0)
+         + COALESCE(se.cache_write_tok, 0) AS processed,
+       COALESCE(se.out_tok, 0) AS output, se.turns AS turns,
+       ROUND((julianday(se.last_ts) - julianday(se.first_ts)) * 1440, 1) AS minutes
+FROM dispatch_session ds
+JOIN session se ON se.session_uuid = ds.session_uuid AND se.parent_uuid IS NULL
+UNION ALL
+SELECT 'review', NULL, NULL, r.repo, r.pr, r.round, r.session_uuid,
+       COALESCE(se.in_tok, 0) + COALESCE(se.cache_read_tok, 0)
+         + COALESCE(se.cache_write_tok, 0),
+       COALESCE(se.out_tok, 0), se.turns,
+       ROUND((julianday(se.last_ts) - julianday(se.first_ts)) * 1440, 1)
+FROM review r
+JOIN session se ON se.session_uuid = r.session_uuid AND se.parent_uuid IS NULL
+WHERE r.session_uuid IS NOT NULL;
+"""
+
+
+def unlinked_pairs(con):
+    """(pairs, unlinked): implementer pairs in the run logs, and how many of
+    them `dispatch_session` could not link to exactly one session."""
+    pairs = con.execute(f"SELECT COUNT(*) FROM ({DISPATCH_PAIRS_SQL})").fetchone()[0]
+    linked = con.execute("SELECT COUNT(*) FROM dispatch_session").fetchone()[0]
+    return pairs, pairs - linked
+
+
+# A leading `VAR=value` assignment is part of the command line, and is exactly where
+# a credential appears (`RESTIC_PASSWORD=… restic backup`). Never record one.
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Obvious credential shapes, redacted out of free text before it is stored.
+_SECRETISH = re.compile(
+    r"""(?xi)
+    ( (?:gh[pousr]|github_pat)_[A-Za-z0-9_]{10,}
+    | xox[abprs]-[A-Za-z0-9-]{10,}
+    | sk-[A-Za-z0-9_-]{16,}
+    | eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}
+    | (?:bearer|token|password|passwd|secret|api[_-]?key)\s*[:=]\s*\S+
+    | [A-Fa-f0-9]{40,}
+    )"""
+)
+
+
+def _redact(text: str) -> str:
+    return _SECRETISH.sub("[redacted]", text)
+
+
+def _text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            c.get("text", "") for c in content
+            if isinstance(c, dict) and c.get("type") == "text"
+        )
+    return ""
+
+
+def _bash_verb(command: str) -> str:
+    """The command's verb, with leading VAR=… assignments dropped. Never an argument.
+
+    Split with shlex, not whitespace: `PASS="two words" cmd` whitespace-splits into
+    a token that is *half the secret*. shlex understands the quoting, so the whole
+    assignment is recognised and dropped.
+    """
+    text = str(command).strip()
+    try:
+        toks = shlex.split(text)
+    except ValueError:
+        # Unbalanced quotes: whitespace-splitting here is exactly the leak this
+        # function exists to prevent (`PASS="hunter two secret cmd` -> `two`). Such a
+        # command never ran, so its verb has no value worth the risk.
+        return "?"
+    for tok in toks:
+        if _ASSIGN.match(tok):
+            continue          # an assignment: skip it, and never record it
+        if "=" in tok:
+            return "?"        # unexpected shape — record nothing rather than guess
+        return tok[:24]
+    return ""
+
+
+def _target(name: str, inp) -> str:
+    """A short, non-secret label for what a tool call touched. Must never raise."""
+    try:
+        if not isinstance(inp, dict):
+            return ""
+        for k in ("file_path", "notebook_path", "path"):
+            if inp.get(k):
+                return _redact(str(inp[k]))[:200]
+        if name == "Bash":
+            return _redact(_bash_verb(inp.get("command", "")))
+        if name in ("Task", "Agent"):
+            return _redact(str(inp.get("subagent_type") or inp.get("description", "")))[:80]
+        return ""
+    except Exception:
+        return ""
+
+
+def _usage_of(u: dict) -> tuple:
+    """(in, out, cache_read, cache_write) for one message.
+
+    Top-level fields mirror the LAST iteration only, so sum iterations when present.
+    """
+    iters = u.get("iterations")
+    if isinstance(iters, list) and len(iters) > 1:
+        src = iters
+    else:
+        src = [u]
+    tot = [0, 0, 0, 0]
+    for it in src:
+        if not isinstance(it, dict):
+            continue
+        tot[0] += int(it.get("input_tokens") or 0)
+        tot[1] += int(it.get("output_tokens") or 0)
+        tot[2] += int(it.get("cache_read_input_tokens") or 0)
+        tot[3] += int(it.get("cache_creation_input_tokens") or 0)
+    return tuple(tot)
+
+
+def scan_file(path: Path, sid: str, project: str, parent: "str|None", kind: str):
+    """Parse one transcript into (session_row, turns, tools). Never raises on content."""
+    turns, tools, models = [], [], []
+    seen_msgs = {}          # message.id -> seq, so a repeated message counts once
+    first_ts = last_ts = None
+    title = first_prompt = None
+    session_uuid = None
+    tot = [0, 0, 0, 0]
+
+    with path.open(errors="replace") as fh:
+        for line in fh:
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue        # a torn last line on a live file: skip it, keep going
+            if not isinstance(o, dict):
+                continue
+
+            ts = o.get("timestamp")
+            if ts:
+                first_ts = first_ts or ts
+                last_ts = ts
+            # A subagent transcript's records carry the PARENT's sessionId, so it is
+            # only a valid identity for a top-level session. Verified on real data.
+            if kind == "session":
+                session_uuid = session_uuid or o.get("sessionId")
+
+            t = o.get("type")
+            if t == "custom-title":
+                title = o.get("customTitle") or title
+            elif t == "ai-title" and not title:
+                title = o.get("aiTitle")
+
+            m = o.get("message")
+            if not isinstance(m, dict):
+                continue
+
+            if t == "user" and first_prompt is None:
+                txt = _text(m.get("content")).strip()
+                if txt and not txt.startswith("<"):
+                    first_prompt = _redact(txt)[:300]
+
+            if t != "assistant":
+                continue
+
+            u = m.get("usage") or {}
+            mid = m.get("id")
+            if u and mid not in seen_msgs:
+                # first line of this message: count it once
+                seq = len(seen_msgs) + 1
+                seen_msgs[mid] = seq
+                model = m.get("model") or ""
+                if model and model not in models:
+                    models.append(model)
+                iu, ou, cr, cw = _usage_of(u)
+                turns.append((sid, seq, mid, ts, model, iu, ou, cr, cw))
+                tot[0] += iu; tot[1] += ou; tot[2] += cr; tot[3] += cw
+
+            for c in (m.get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "tool_use":
+                    nm = c.get("name", "")
+                    tools.append((sid, ts, nm, _target(nm, c.get("input"))))
+
+    if not turns and not tools:
+        return None, [], []
+    session = (
+        sid, session_uuid or path.stem, project, parent, kind, first_ts, last_ts,
+        len(turns), len(tools), tot[0], tot[1], tot[2], tot[3],
+        json.dumps(models), title, first_prompt,
+    )
+    return session, turns, tools
+
+
+def _complete_lines(text: str) -> list:
+    """Every WHOLE line in `text`, dropping the final element unconditionally.
+
+    `str.split("\\n")` always leaves a last element that is not a complete
+    line: if `text` ends in `\\n` that element is the empty string the split
+    manufactures; if it doesn't, that element is a write caught mid-append. In
+    both cases dropping it is correct, and a torn final line is naturally
+    picked up on a later run once the file has grown to include its newline —
+    the (size, mtime) check in main() re-scans it then."""
+    return text.split("\n")[:-1]
+
+
+def _redact_strings(obj):
+    """Walk a JSON-shaped value, redacting every string leaf.
+
+    Applied to BOTH sources below, though the plan calls it out only for run
+    logs (whose lines already pass `redact_transcript` once, in the
+    orchestrator — "the redactor is a control", and a collector that trusts a
+    control it does not own inherits every future bug in it). Event details
+    are Principle-5 cooperative content with no such prior pass, so an
+    independent, differently-implemented regex here is add-on caution, not
+    redundant with anything upstream."""
+    if isinstance(obj, str):
+        return _redact(obj)
+    if isinstance(obj, list):
+        return [_redact_strings(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _redact_strings(v) for k, v in obj.items()}
+    return obj
+
+
+def scan_event_file(path: Path):
+    """One events.jsonl-shaped file -> (rows, error). Never raises.
+
+    A malformed line (a torn write, or content nothing here recognizes) is
+    skipped, not fatal — fleet-emit's own writer already repairs a torn tail
+    on its NEXT append, so this collector will see the completed line then."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as e:
+        return [], f"{e.__class__.__name__}: {e}"
+    rows = []
+    for i, raw in enumerate(_complete_lines(text), start=1):
+        if not raw.strip():
+            continue
+        try:
+            o = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(o, dict):
+            continue
+        detail = o.get("detail")
+        detail = detail if isinstance(detail, dict) else {}
+        rows.append((
+            o.get("ts"), o.get("actor"), o.get("type"), o.get("repo"),
+            o.get("pr"), o.get("sha"), o.get("lease"),
+            json.dumps(_redact_strings(detail)),
+            path.name, i,
+        ))
+    return rows, None
+
+
+# `RunLog.note()` writes `<ts> <phase> k1=v1 k2=v2 ...`, space-joined
+# (bin/orchestrator `note()`). Keys are always identifier-shaped, so each
+# `key=` marks where the previous value ends and grounds parsing even though
+# values themselves are not quoted or escaped.
+_LOG_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(\S+)(?:\s+(.*))?$")
+_KV_RE = re.compile(r"(\w+)=(.*?)(?=(?:\s+\w+=)|\Z)", re.S)
+
+
+def _parse_facts(blob: str) -> dict:
+    return {m.group(1): m.group(2) for m in _KV_RE.finditer(blob or "")}
+
+
+def _int_or_none(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bool_or_none(v):
+    if v == "True":
+        return 1
+    if v == "False":
+        return 0
+    return None
+
+
+def scan_run_log(path: Path):
+    """One `<lease-id>.log` -> (rows, error). Never raises.
+
+    A line not shaped like `<ts> <phase> ...` is skipped rather than crashing
+    the sweep — `branch-cleared`'s `detail` field is stderr text trimmed but
+    not newline-stripped, so an embedded newline can occasionally produce a
+    continuation line with no timestamp; skipping it loses only that
+    continuation, never the run."""
+    lease = path.stem
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as e:
+        return [], f"{e.__class__.__name__}: {e}"
+    rows = []
+    seq = 0
+    for i, raw in enumerate(_complete_lines(text), start=1):
+        if not raw.strip():
+            continue
+        m = _LOG_LINE_RE.match(raw)
+        if not m:
+            continue
+        ts, phase, blob = m.group(1), m.group(2), m.group(3) or ""
+        facts = _redact_strings(_parse_facts(blob))
+        seq += 1
+        pr_raw = facts.get("pr")
+        pr = _int_or_none(pr_raw) if pr_raw not in (None, "-") else None
+        rc = timed_out = seconds = peak = orch = samples = None
+        if phase == "implementer-exit":
+            rc = _int_or_none(facts.get("rc"))
+            timed_out = _bool_or_none(facts.get("timed_out"))
+            seconds = _int_or_none(facts.get("seconds"))
+            peak = _int_or_none(facts.get("peak_rss_mb"))
+            orch = _int_or_none(facts.get("orch_rss_mb"))
+            samples = _int_or_none(facts.get("rss_samples"))
+        rows.append((
+            lease, seq, ts, phase, pr, rc, timed_out, seconds, peak, orch, samples,
+            json.dumps(facts), path.name, i,
+        ))
+    return rows, None
+
+
+def _sync_source(con, seen, key, path, scan_fn, delete_sql, insert_sql, counts):
+    """Shared re-ingest-on-change skeleton for the event and run-log sources.
+
+    Mirrors the transcript loop in main(): unchanged (size, mtime) skips a
+    file entirely; a changed file gets its old rows for this key deleted and
+    replaced whole, which is what makes replaying an already-ingested archive,
+    or re-running against a file that grew, produce no duplicates. Failures
+    are per-file and recorded in `ingest.error` rather than raised, so one
+    unreadable log never halts the sweep — Boundary: absent must not look like
+    zero, so the failure is a row saying so, not silence."""
+    try:
+        st = path.stat()
+    except OSError:
+        return
+    if seen.get(key) == (st.st_size, st.st_mtime):
+        return
+    try:
+        rows, err = scan_fn(path)
+        con.execute(delete_sql, (path.name,))
+        if err:
+            raise RuntimeError(err)
+        if rows:
+            con.executemany(insert_sql, rows)
+        con.execute(
+            "INSERT OR REPLACE INTO ingest VALUES (?,?,?,?,NULL)",
+            (key, st.st_size, st.st_mtime, datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+        counts["ok"] += 1
+    except Exception:
+        con.rollback()
+        counts["failed"] += 1
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO ingest VALUES (?,?,?,?,?)",
+                (key, st.st_size, st.st_mtime, datetime.now(timezone.utc).isoformat(),
+                 traceback.format_exc()[-500:]),
+            )
+            con.commit()
+        except Exception:
+            pass
+        print(f"WARN: {key}: ingest failed (recorded, continuing)", file=sys.stderr)
+
+
+def _ci_enabled() -> bool:
+    """Whether this sweep runs the CI source (plan 0045).
+
+    Every other source reads a tree this collector was pointed at, so a test or
+    an alternate host configuration that moves EUNOMIA_FLEET_DIR moves them all
+    together. This one reads PRODUCTION systems -- Forgejo's API and cihost over
+    ssh -- which no relocated tree can redirect. So it runs by default only for
+    the real tree, and a relocated one has to ask (FLEET_CI_SOURCE=1); otherwise
+    a sweep of a scratch directory would call the real forge. FLEET_CI_SOURCE=0
+    turns it off on the real tree, e.g. on a host that cannot reach cihost."""
+    v = os.environ.get("FLEET_CI_SOURCE", "").strip().lower()
+    if v in ("0", "off", "no", "false"):
+        return False
+    if v in ("1", "on", "yes", "true"):
+        return True
+    return FLEET_DIR == DEFAULT_FLEET_DIR
+
+
+def _load_ci():
+    """bin/fleet-ci, by path from this file's own directory -- the same loader
+    idiom fleet-reviews uses for fleetforge, and for the same reason: the
+    collector runs from a pinned worktree and the module is not importable by
+    name from launchd."""
+    path = Path(__file__).resolve().parent / "fleet-ci"
+    loader = importlib.machinery.SourceFileLoader("fleet_ci", str(path))
+    spec = importlib.util.spec_from_loader("fleet_ci", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _sync_ci(con) -> int:
+    """D-CI: run the CI source, return how many things failed. Never raises.
+
+    A failure here -- fleet-ci missing from the pin, Forgejo down, cihost
+    unreachable -- is recorded and reported and costs the OTHER three sources
+    nothing: they have already run by the time this is called. It also gates
+    nothing (SPEC Principle 3): a collector that is behind must not become an
+    input to control flow, so the result is a printed line and an exit code."""
+    if not _ci_enabled():
+        return 0
+    try:
+        report = _load_ci().sync(con)
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        print("WARN: ci source failed (recorded, continuing):\n" +
+              traceback.format_exc()[-500:], file=sys.stderr)
+        return 1
+    print("ci: " + report["summary"])
+    for line in report["failures"][:10]:
+        print(f"WARN: ci: {line}", file=sys.stderr)
+    return len(report["failures"])
+
+
+def _load_config():
+    """bin/fleet-config, by path -- same loader idiom as _load_ci above."""
+    path = Path(__file__).resolve().parent / "fleet-config"
+    loader = importlib.machinery.SourceFileLoader("fleet_config", str(path))
+    spec = importlib.util.spec_from_loader("fleet_config", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _reconstruct_fleet_setting(con, ledger_complete) -> int:
+    """D2/D4 (plan 0068): replay `fleet-setting-changed` events -- already in
+    `con`'s `event` table from the D1 sync above -- into an absent or empty
+    `fleet_setting`, or report disagreement against a surviving one. Never
+    raises: a torn or foreign event is skipped by the replay itself, and any
+    OTHER failure here must not cost the sources that already committed by
+    the time this runs (same shape as `_sync_ci`)."""
+    try:
+        cfg = _load_config()
+        report = cfg.reconstruct_fleet_setting(con, ledger_complete=ledger_complete)
+        for line in cfg.describe_reconstruction(report):
+            print(line)
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        print("WARN: fleet_setting reconstruction failed (recorded, continuing):\n" +
+              traceback.format_exc()[-500:], file=sys.stderr)
+        return 1
+    return 0
+
+
+def _load_models():
+    """bin/fleet-models, by path -- same loader idiom as _load_config above."""
+    path = Path(__file__).resolve().parent / "fleet-models"
+    loader = importlib.machinery.SourceFileLoader("fleet_models", str(path))
+    spec = importlib.util.spec_from_loader("fleet_models", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _reconstruct_repo_model(con, ledger_complete) -> int:
+    """Plan 0063 D2: replay `repo-model-changed` events into an absent or empty
+    `repo_model`, or report disagreement against a surviving one. Never raises;
+    same shape, and same reasons, as `_reconstruct_fleet_setting`."""
+    try:
+        models = _load_models()
+        report = models.reconstruct_repo_model(con, ledger_complete=ledger_complete)
+        for line in models.describe_reconstruction(report):
+            print(line)
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        print("WARN: repo_model reconstruction failed (recorded, continuing):\n" +
+              traceback.format_exc()[-500:], file=sys.stderr)
+        return 1
+    return 0
+
+
+def _enable_wal(con):
+    """Plan 0063 D3: WAL, set at every open by every writer, so a database
+    restored in `delete` mode is corrected by the next sweep rather than by a
+    pragma someone once ran on the live file. A refusal (another connection
+    holds the file) is a warning: the tick must not fail over a journal mode,
+    and the next open retries."""
+    try:
+        con.execute("PRAGMA journal_mode=WAL").fetchone()
+    except sqlite3.OperationalError as e:
+        print(f"WARN: could not switch to WAL ({e}) -- continuing", file=sys.stderr)
+
+
+def main() -> int:
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB)
+    _enable_wal(con)
+    register_functions(con)
+    # The pre-review schema lacked session_uuid/message_id/error. Rather than crash
+    # on every launchd tick against such a DB, rebuild it: the content is derived
+    # from transcripts, so a rebuild is free and always correct.
+    ver = con.execute("PRAGMA user_version").fetchone()[0]
+    has_session = con.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session'"
+    ).fetchone()[0]
+    if ver > SCHEMA_VERSION:
+        # Written by a NEWER collector. Stamping it down would mask the mismatch and
+        # mis-ingest against a schema this code does not understand. Refuse loudly.
+        sys.exit(
+            f"fleet-collect: {DB} is schema v{ver}, this collector understands "
+            f"v{SCHEMA_VERSION} — refusing to run against a newer database"
+        )
+    if has_session and ver < SCHEMA_VERSION:
+        print(f"schema v{ver} < v{SCHEMA_VERSION}: rebuilding from transcripts", file=sys.stderr)
+        con.execute("DROP VIEW IF EXISTS dispatch")
+        for t in ("session", "turn", "tool_use", "ingest", "event", "dispatch_phase"):
+            con.execute(f"DROP TABLE IF EXISTS {t}")
+        con.commit()
+    con.executescript(SCHEMA)
+    con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    con.executescript(DISPATCH_VIEW)
+    con.executescript(CI_VIEW)
+    con.executescript(DISPATCH_SESSION_VIEW)
+    con.executescript(DISPATCH_COST_VIEW)
+
+    # Rows that previously FAILED are deliberately excluded: a transient error
+    # (e.g. `database is locked` while a snapshot holds a read lock) must be retried
+    # next sweep. Keyed on success only, a completed transcript never changes again,
+    # so one transient failure would mean it is never ingested at all.
+    seen = {
+        r[0]: (r[1], r[2])
+        for r in con.execute("SELECT path,size,mtime FROM ingest WHERE error IS NULL")
+    }
+    files = []
+    if PROJECTS.is_dir():
+        for proj_dir in sorted(PROJECTS.iterdir()):
+            if not proj_dir.is_dir():
+                continue
+            for f in proj_dir.glob("*.jsonl"):
+                if f.name not in SKIP_NAMES:
+                    files.append((f, proj_dir.name, None, "session"))
+            for f in proj_dir.glob("*/subagents/*.jsonl"):
+                if f.name not in SKIP_NAMES:
+                    files.append((f, proj_dir.name, f.parent.parent.name, "subagent"))
+
+    new = changed = failed = 0
+    for path, project, parent, kind in files:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        # Key on the path relative to PROJECTS: filename stems are NOT unique across
+        # projects, and a collision would delete another transcript's rows.
+        try:
+            sid = str(path.relative_to(PROJECTS))
+        except ValueError:
+            sid = str(path)
+        if seen.get(sid) == (st.st_size, st.st_mtime):
+            continue
+
+        try:
+            session, turns, tools = scan_file(path, sid, project, parent, kind)
+            # Always clear prior rows for this key, even when the file now scans to
+            # nothing, so a truncated transcript cannot leave stale rows behind.
+            con.execute("DELETE FROM turn WHERE session_id=?", (sid,))
+            con.execute("DELETE FROM tool_use WHERE session_id=?", (sid,))
+            if session is not None:
+                con.execute(
+                    "INSERT OR REPLACE INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    session,
+                )
+                con.executemany(
+                    "INSERT OR REPLACE INTO turn VALUES (?,?,?,?,?,?,?,?,?)", turns
+                )
+                con.executemany("INSERT INTO tool_use VALUES (?,?,?,?)", tools)
+            con.execute(
+                "INSERT OR REPLACE INTO ingest VALUES (?,?,?,?,NULL)",
+                (sid, st.st_size, st.st_mtime, datetime.now(timezone.utc).isoformat()),
+            )
+            con.commit()        # per file: a later failure never discards earlier work
+            changed += 1 if sid in seen else 0
+            new += 0 if sid in seen else 1
+        except Exception:
+            con.rollback()
+            failed += 1
+            # Record the failure and move on — one bad transcript must not stop the
+            # sweep, or launchd relaunches into the same crash every interval forever.
+            try:
+                con.execute(
+                    "INSERT OR REPLACE INTO ingest VALUES (?,?,?,?,?)",
+                    (sid, st.st_size, st.st_mtime,
+                     datetime.now(timezone.utc).isoformat(),
+                     traceback.format_exc()[-500:]),
+                )
+                con.commit()
+            except Exception:
+                pass
+            print(f"WARN: {sid}: ingest failed (recorded, continuing)", file=sys.stderr)
+
+    # D1: the event ledger — the live events.jsonl plus every rotated archive.
+    # `seen` above already spans the whole ingest table, so an archive scanned
+    # on a prior run (its (size, mtime) now permanently fixed) is skipped here
+    # exactly like an unchanged transcript.
+    ev_counts = {"ok": 0, "failed": 0}
+    if FLEET_DIR.is_dir():
+        for path in sorted(FLEET_DIR.glob("events*.jsonl")):
+            _sync_source(
+                con, seen, f"events/{path.name}", path, scan_event_file,
+                "DELETE FROM event WHERE source=?",
+                "INSERT INTO event VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ev_counts,
+            )
+
+    # D2: the orchestrator's per-lease run logs.
+    lg_counts = {"ok": 0, "failed": 0}
+    logs_dir = WORK_ROOT / "logs"
+    if logs_dir.is_dir():
+        for path in sorted(logs_dir.glob("*.log")):
+            _sync_source(
+                con, seen, f"logs/{path.name}", path, scan_run_log,
+                "DELETE FROM dispatch_phase WHERE source=?",
+                "INSERT INTO dispatch_phase VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                lg_counts,
+            )
+
+    failed += ev_counts["failed"] + lg_counts["failed"]
+
+    # plan 0068 D4: reconstruct fleet_setting from the events just ingested
+    # above. ledger_complete is False the moment ANY events file failed to
+    # ingest -- a plausible-looking table built from a partial ledger is
+    # worse than none (same refusal `reconstruct_fleet_setting` itself makes
+    # on an absent table).
+    failed += _reconstruct_fleet_setting(con, ledger_complete=ev_counts["failed"] == 0)
+
+    # plan 0063 D2: the same for repo_model, into an ABSENT (or empty) table only;
+    # a surviving table is compared and reported, never changed.
+    failed += _reconstruct_repo_model(con, ledger_complete=ev_counts["failed"] == 0)
+
+    # D-CI: the fourth source, last -- it is the only one that waits on a network,
+    # so the three that cannot are already committed if it hangs or dies.
+    failed += _sync_ci(con)
+
+    n_s, n_t, n_tool, n_ev, n_ph = (
+        con.execute("SELECT COUNT(*) FROM session").fetchone()[0],
+        con.execute("SELECT COUNT(*) FROM turn").fetchone()[0],
+        con.execute("SELECT COUNT(*) FROM tool_use").fetchone()[0],
+        con.execute("SELECT COUNT(*) FROM event").fetchone()[0],
+        con.execute("SELECT COUNT(*) FROM dispatch_phase").fetchone()[0],
+    )
+    print(f"ingested: {new} new, {changed} changed, {failed} failed  |  "
+          f"db: {n_s} sessions, {n_t} turns, {n_tool} tool calls, "
+          f"{n_ev} events, {n_ph} phases")
+    # plan 0076 D1: how many implementer pairs the dispatch_session view could not
+    # tie to exactly one session (no cwd, a session never seen, two in a window).
+    # Awareness only: it does not count as a failure.
+    pairs, unlinked = unlinked_pairs(con)
+    print(f"dispatch_session: {pairs - unlinked} of {pairs} implementer pair(s) linked, "
+          f"{unlinked} unlinked")
+    print(f"db: {DB} ({DB.stat().st_size/1e6:.1f} MB)")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

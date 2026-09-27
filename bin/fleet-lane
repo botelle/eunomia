@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""fleet-lane — a test lane runs once, from a bundle (plan 0070).
+
+    fleet-lane <repo> <plan-id> --sha <commit> [--runner <name>]
+               [--schema <file>] [--dry-run]
+
+One command hands a model the generated bundle for a plan at a pinned
+commit, granting it nothing (ADR-0006 §6), and turns what comes back into a
+`Tests-for: <plan>` pull request opened by this credentialed wrapper. This
+program spawns ONE lane, ONCE, standalone: no orchestrator integration, no
+loop, no retry (Boundaries — these runners spend the owner's own personal
+subscriptions, issue #483).
+
+The lane holds nothing; the wrapper holds everything. The vendor process
+gets an empty working directory outside every repository, an explicit
+environment, and the prompt on stdin. It gets no `--add-dir`, no token, no
+path into `~/dev`. This program alone clones, commits, pushes and opens the
+pull request.
+
+Gates, in order, each a hard refusal:
+  1. the plan file at `--sha` must say `zone: public` (ADR-0006 §7)
+  2. `--runner` must be one of `<repo>`'s resolved `tester` rows in
+     `fleet-models` (repo row, then the `'default'` row — ADR-0013 §2). Omitted,
+     the lane runs ordinal 1; with no ordinal 1 it refuses. There is no
+     consent flag: every repository has a tester, and the gate asks whether
+     THIS runner is one the repository named, not whether the list is empty
+  3. the runner must be an entry in ADAPTERS below (an adapter this program
+     has not measured is refused whatever position the runner holds,
+     ADR-0009 §3 notwithstanding)
+  4. the runner's own registry entry must not be `unwired`, and its
+     `settings_must_not_grant` precondition must hold
+  5. the built bundle's `gaps` must not carry `docs/declared-behaviour.md`
+     (plan 0019's mandatory gap — without it the lane could only test the
+     contract)
+
+A vendor CLI is granted nothing by its flags' names: the Claude adapter's
+argv is a pinned literal below, measured on the installed CLI (see
+docs/test-lane.md), not inferred from what its flags appear to say.
+
+Everything this program writes to a durable log or a page passes through
+`redact_transcript` (plan 0058's shared recorder), the same control every
+other unit on this fleet writes through.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import posixpath
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+ROOT = BIN.parent
+
+# ------------------------------------------------------------------ loading
+# fleetlib and fleetforge are loaded the same way bin/fleet-watch loads them
+# (SourceFileLoader, never `import`) even though this program, unlike
+# fleet-watch, is not deployed anywhere outside bin/ — one loading idiom
+# across the repository beats two, and it is what lets a test point either
+# module at a double without touching sys.path.
+_lib_loader = importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py"))
+lib = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleetlib", _lib_loader))
+_lib_loader.exec_module(lib)
+
+_forge_loader = importlib.machinery.SourceFileLoader("fleetforge", str(BIN / "fleetforge.py"))
+fleetforge = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleetforge", _forge_loader))
+_forge_loader.exec_module(fleetforge)
+
+
+def _orchestrator_module():
+    """`bin/orchestrator`, loaded on demand — the same shape as
+    `bin/fleet-watch:_orchestrator_module`. This program imports it for the
+    `RUNNERS` registry, `harness_argv`, `check_settings_precondition`, the
+    antigravity adapter functions plan 0066 pinned, `redact_transcript`, and
+    the shared page recorder (`notify`/`record_page`, plan 0058) — one
+    declaration for each, never restated here.
+
+    A fresh load per call, not cached at module scope: a test that wants a
+    fake registry entry replaces this function on the loaded fleet-lane
+    module (`mod._orchestrator_module = lambda: fake`) rather than reaching
+    into a shared global."""
+    loader = importlib.machinery.SourceFileLoader("orchestrator", str(BIN / "orchestrator"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("orchestrator", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def _models_module():
+    """`bin/fleet-models`, loaded on demand, for `resolve_repo` and
+    `active_ordinals` — the one reader of `repo_model`, reused rather than
+    restated. A fresh load per call so it sees `FLEET_DB` and
+    `EUNOMIA_FLEET_DIR` as they are now."""
+    loader = importlib.machinery.SourceFileLoader("fleet_models", str(BIN / "fleet-models"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleet_models", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+class Stop(Exception):
+    """A refusal, with the reason as its message. Every gate raises this;
+    `main` is the one place that catches it, logs it, pages it and exits
+    non-zero. Never a bare `sys.exit` mid-function — a refusal must always
+    reach the run log and the page."""
+
+
+# ------------------------------------------------------------------ constants
+DEFAULT_SCHEMA_PATH = ROOT / "config" / "lane-result.schema.json"
+
+DECLARED_BEHAVIOUR_PATH = "docs/declared-behaviour.md"
+
+# A constant IN THIS PROGRAM, not a per-repo setting. 30 minutes — long enough
+# for a real headless run against a real bundle, short enough that a hung CLI
+# does not spend the operator's whole session.
+SPAWN_TIMEOUT_SECONDS = 1800
+
+# The one directory a lane result may write under (Boundaries: "a repo with
+# another test layout is a later amendment, not a field nobody has defined").
+CONFINE_ROOT = "tests"
+
+# Directories a forge or a hook executes from — refused even though every
+# one of them also fails the CONFINE_ROOT check above; stated explicitly
+# rather than relying only on that check to close the door.
+_EXECUTABLE_ROOTS = (".forgejo", ".github", ".claude", ".git", ".githooks")
+
+_ADR_PATH_RE = re.compile(r"docs/adr/\d{4}-[A-Za-z0-9-]+\.md")
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _slug(s):
+    return _SLUG_RE.sub("-", s or "").strip("-") or "x"
+
+
+# ---------------------------------------------------------------- the prompt
+LANE_PREAMBLE = """\
+You are a blackbox integration tester, not an implementer (ADR-0006).
+
+You have been handed, in this order: this repository's feature plan, the
+text of every architecture decision record the plan cites in its Resources
+section, and a GENERATED CONTRACT — the externally observable surface of
+this repository (routes, CLI arguments, declared event names, configuration
+keys, harness entry points) plus a hand-written declared-behaviour document
+describing exit codes and output shapes. You have NOT been handed this
+repository's source code. You hold no tool, no shell, and no filesystem
+beyond your own scratch directory: everything you need is in the text below.
+
+Write BLACKBOX INTEGRATION TESTS against the generated contract and the
+declared-behaviour document — tests that invoke the harness the contract
+names and observe its externally visible behaviour, never tests that assume
+an implementation you have not seen. Where the plan, an ADR and the contract
+disagree, or the contract does not say what to observe, record that as a gap
+rather than guessing.
+
+Reply with exactly one JSON document matching this shape, and no other top
+level keys:
+
+  {"files": [{"path": "tests/...", "content": "..."}, ...],
+   "gaps": ["...", ...],
+   "notes": "..."}
+
+Every "path" must be a relative path under tests/. Nothing outside this one
+JSON document is read; anything you say outside it is discarded.
+"""
+
+
+def _find_adr_paths(plan_text):
+    """Every unique `docs/adr/NNNN-*.md` path the plan text names, in the
+    order first seen. A bare mention of "ADR-0006" is not a path and is not
+    matched — Resources' own words, "a name without a path is not an ADR
+    reference"."""
+    seen = []
+    for m in _ADR_PATH_RE.finditer(plan_text or ""):
+        if m.group(0) not in seen:
+            seen.append(m.group(0))
+    return seen
+
+
+def build_prompt(plan_text, worktree, bundle_text):
+    """Preamble, then the plan verbatim, then every referenced ADR's text,
+    then the bundle JSON — the fixed order D1.3 names. A missing referenced
+    ADR is skipped, not a refusal: the plan text is copied verbatim and this
+    program does not validate the plan's own claims about its Resources."""
+    parts = [LANE_PREAMBLE, "\n--- PLAN ---\n", plan_text]
+    for rel in _find_adr_paths(plan_text):
+        p = worktree / rel
+        if p.is_file():
+            parts.append(f"\n--- {rel} ---\n")
+            parts.append(p.read_text(encoding="utf-8", errors="replace"))
+    parts.append("\n--- GENERATED CONTRACT (bundle) ---\n")
+    parts.append(bundle_text)
+    return "".join(parts)
+
+
+# --------------------------------------------------------------- the adapters
+# The Claude tester's argv: a PINNED LITERAL, asserted by equality in
+# tests/test_fleet_lane.py, and deliberately NOT `RUNNERS["sub-opus"].argv` —
+# that one is the implementer's and carries `--allowedTools` and a permission
+# mode (ADR-0006 §6 forbids exactly that here). Every flag below was measured
+# on the installed CLI (2.1.282), not read off its name:
+#   --tools ""            no tool exists for the model; a Read it "calls" comes
+#                         back as text and nothing runs. `--allowedTools Read`
+#                         added to it still reads nothing.
+#   --strict-mcp-config   with no --mcp-config: no MCP server
+#   --setting-sources ""  without it the operator's ~/.claude/CLAUDE.md reached
+#                         the model (measured: it quoted it back)
+#   --disable-slash-commands, --no-session-persistence
+#                         no skills; no transcript left behind
+# The model is the literal alias for the `sub-opus` row this adapter serves.
+CLAUDE_TESTER_ARGV = ("claude", "-p", "--output-format", "json", "--model", "opus",
+                      "--tools", "", "--strict-mcp-config", "--setting-sources", "",
+                      "--disable-slash-commands", "--no-session-persistence")
+
+# What the `claude` process needs to find its own login, and no credential:
+# measured — with only PATH and HOME it answers "Not logged in".
+CLAUDE_TESTER_ENV = ("USER", "LOGNAME", "TMPDIR")
+
+def build_adapters(orch_mod):
+    """One entry per vendor runner, naming the functions plan 0066 pinned in
+    the orchestrator module — never re-declared here (D2). A runner absent
+    from this table is refused, whatever position it holds and whatever
+    `RUNNERS` says about it: this is the "this program cannot feed it" gate,
+    distinct from `unwired` (that gate is "no isolation exists yet" and is
+    checked by `harness_argv`/`check_settings_precondition` at spawn time).
+
+    Each entry is `{"stdin_bytes": fn(prompt) -> bytes,
+                     "parse": fn(stdout_text, out_path) -> (doc_or_None, usage)}`,
+    and may add `"argv"` (a pinned literal tuple this program owns, used
+    instead of the registry's), `"env"` (the extra environment names the
+    child may see) and `"scratch_cwd"` (run from an empty system temporary
+    directory rather than under the work root).
+    `out_path` is unused by the antigravity adapter (its result rides
+    stdout); `stdout_text` is unused by the codex adapter (its result rides
+    the `-o` file) — both parameters are always passed so callers do not
+    need to know which shape a given runner uses."""
+
+    def _antigravity_parse(stdout_text, out_path):
+        rec = orch_mod.read_antigravity_result(stdout_text)
+        if not isinstance(rec, dict):
+            return None, None
+        return rec.get("response"), rec.get("usage")
+
+    def _codex_parse(stdout_text, out_path):
+        try:
+            text = Path(out_path).read_text(encoding="utf-8")
+        except OSError:
+            return None, None
+        try:
+            return json.loads(text), None
+        except ValueError:
+            return None, None
+
+    def _claude_parse(stdout_text, out_path):
+        """`--output-format json` prints one object whose `result` is the
+        model's reply text. The reply is the lane document, possibly inside a
+        code fence. stderr rides the same pipe, so the object is looked for on
+        its own line when the whole text is not one."""
+        rec = None
+        for cand in [stdout_text] + [l for l in stdout_text.splitlines()
+                                     if l.startswith("{")][::-1]:
+            try:
+                rec = json.loads(cand)
+                break
+            except ValueError:
+                continue
+        if not isinstance(rec, dict) or rec.get("is_error") or not isinstance(rec.get("result"), str):
+            return None, None
+        text = rec["result"].strip()
+        m = re.match(r"^```(?:json)?\s*\n(.*)\n```$", text, re.S)
+        if m:
+            text = m.group(1)
+        try:
+            return json.loads(text), rec.get("usage")
+        except ValueError:
+            return None, None
+
+    return {
+        "sub-opus": {
+            "stdin_bytes": lambda prompt: prompt.encode("utf-8"),
+            "parse": _claude_parse,
+            "argv": CLAUDE_TESTER_ARGV,
+            "env": CLAUDE_TESTER_ENV,
+            "scratch_cwd": True,
+        },
+        "sub-antigravity": {
+            "stdin_bytes": lambda prompt: (orch_mod.antigravity_stdin_line(prompt) + "\n").encode("utf-8"),
+            "parse": _antigravity_parse,
+        },
+        "sub-codex": {
+            "stdin_bytes": lambda prompt: prompt.encode("utf-8"),
+            "parse": _codex_parse,
+        },
+    }
+
+
+# ------------------------------------------------------------------- schema
+def _validate_type(value, type_spec):
+    types = type_spec if isinstance(type_spec, list) else [type_spec]
+    checks = {
+        "object": lambda v: isinstance(v, dict),
+        "array": lambda v: isinstance(v, list),
+        "string": lambda v: isinstance(v, str),
+        "boolean": lambda v: isinstance(v, bool),
+        "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+        "null": lambda v: v is None,
+    }
+    return any(checks.get(t, lambda v: False)(value) for t in types)
+
+
+def validate_schema(doc, schema, path="$"):
+    """A minimal, recursive subset of JSON Schema draft-07: `type`,
+    `required`, `properties`, `items`, `additionalProperties` (boolean only).
+    Not a general engine — this program has exactly one schema to check a
+    vendor's result against, and a hand-rolled validator sized to that shape
+    is less surface than a dependency this repository does not otherwise
+    carry (the same call `bin/fleet-bundle` makes about PyYAML).
+
+    Returns a list of error strings; empty means valid."""
+    errors = []
+    if "type" in schema and not _validate_type(doc, schema["type"]):
+        errors.append(f"{path}: expected type {schema['type']!r}, got {type(doc).__name__}")
+        return errors
+    if isinstance(doc, dict):
+        for key in schema.get("required", []):
+            if key not in doc:
+                errors.append(f"{path}: missing required key {key!r}")
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            extra = sorted(set(doc) - set(props))
+            if extra:
+                errors.append(f"{path}: unexpected key(s) {extra}")
+        for key, sub in props.items():
+            if key in doc:
+                errors.extend(validate_schema(doc[key], sub, f"{path}.{key}"))
+    elif isinstance(doc, list):
+        items = schema.get("items")
+        if items is not None:
+            for i, item in enumerate(doc):
+                errors.extend(validate_schema(item, items, f"{path}[{i}]"))
+    return errors
+
+
+# -------------------------------------------------------------- confinement
+def confine_path(rel_path, worktree):
+    """`rel_path` normalised to a location under `tests/` inside `worktree`,
+    or a `Stop` naming why not. Every check here refuses the WHOLE result —
+    callers must not write any file before every path in a result has passed
+    this function (Definition of done: "one offending path refuses the whole
+    result and leaves no branch behind")."""
+    if not isinstance(rel_path, str) or not rel_path or rel_path.startswith("/"):
+        raise Stop(f"result path {rel_path!r} is not a non-empty relative path")
+    parts = rel_path.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise Stop(f"result path {rel_path!r} carries an empty, '.' or '..' segment")
+    normalised = posixpath.normpath(rel_path)
+    if normalised != rel_path:
+        raise Stop(f"result path {rel_path!r} is not already normalised ({normalised!r})")
+    if parts[0] != CONFINE_ROOT:
+        raise Stop(f"result path {rel_path!r} does not resolve under {CONFINE_ROOT}/")
+    if parts[0] in _EXECUTABLE_ROOTS:
+        raise Stop(f"result path {rel_path!r} resolves under {parts[0]}/ — refused")
+    # symlink check: no ancestor directory already on disk may be a symlink —
+    # a vendor path through one could land content anywhere the link points.
+    # Built from ONE resolve of the worktree root (which exists), not a
+    # resolve of the target's own parent (which may not exist yet) — mixing
+    # a resolved and an unresolved path in the same comparison is exactly
+    # how a worktree living under a symlinked temp root (macOS: /tmp ->
+    # /private/tmp) would refuse an ordinary, non-malicious new file.
+    resolved_root = worktree.resolve()
+    cur = resolved_root
+    for part in parts[:-1]:
+        cur = cur / part
+        if cur.exists() and cur.is_symlink():
+            raise Stop(f"{rel_path!r} passes through symlink {cur} — refused")
+    tests_root = resolved_root / CONFINE_ROOT
+    resolved_parent = resolved_root / Path(normalised).parent
+    if resolved_parent != tests_root and not str(resolved_parent).startswith(str(tests_root) + os.sep):
+        raise Stop(f"{rel_path!r} resolves outside {CONFINE_ROOT}/ once symlinks are followed")
+    return normalised
+
+
+def check_result_files(files, worktree, landing_base_paths):
+    """Every file entry, checked BEFORE any is written (see `confine_path`).
+    `landing_base_paths` is the set of paths that already exist at the
+    landing base's tip — a returned path in that set refuses the whole
+    result, because a vendor may add tests and may not rewrite the ones that
+    gate the repo."""
+    normalised = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise Stop(f"result file entry {entry!r} is not an object")
+        if entry.get("executable"):
+            raise Stop(f"result path {entry.get('path')!r} is marked executable — refused")
+        rel = confine_path(entry.get("path"), worktree)
+        if rel in landing_base_paths:
+            raise Stop(f"result path {rel!r} already exists at the landing base — refused")
+        if not isinstance(entry.get("content"), str):
+            raise Stop(f"result path {rel!r} carries non-string content")
+        normalised.append((rel, entry["content"]))
+    return normalised
+
+
+# ------------------------------------------------------------------- run log
+class RunLog:
+    """`~/dev/.fleet/work/logs/lane--<plan>--<runner>.log`, the orchestrator's
+    own `key=value` phase style. Every line passes through
+    `redact_transcript` before it is written (plan 0058's shared control)."""
+
+    def __init__(self, plan_id, runner_name, orch_mod):
+        self.path = lib.work_root() / "logs" / f"lane--{plan_id}--{runner_name}.log"
+        self._orch = orch_mod
+        self._fh = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "a", encoding="utf-8")
+        except OSError:
+            pass
+
+    def note(self, phase, **facts):
+        parts = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), phase]
+        parts += [f"{k}={v}" for k, v in facts.items()]
+        line = " ".join(str(x) for x in parts)
+        clean, _ = self._orch.redact_transcript(line)
+        if self._fh is None:
+            return
+        try:
+            self._fh.write(clean + "\n")
+            self._fh.flush()
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except OSError:
+            pass
+
+
+# -------------------------------------------------------------------- gates
+def check_zone(worktree, plan_path, orch_mod):
+    try:
+        fm, plan_text = orch_mod.read_plan(worktree, plan_path)
+    except (OSError, ValueError) as e:
+        raise Stop(f"could not read {plan_path} at the pinned sha "
+                   f"({e.__class__.__name__}: {e})")
+    zone = (fm.get("zone") or "").strip()
+    if zone != "public":
+        raise Stop(f"plan zone {zone!r} is not 'public' (ADR-0006 §7 is an "
+                   "allowlist) — refusing to send this plan's text to a vendor")
+    return fm, plan_text
+
+
+def resolve_testers(repo):
+    """[(ordinal, runner)] — `repo`'s enabled `tester` rows, each resolved
+    repo row first and then the `'default'` row (ADR-0013 §2). An unwritten
+    `repo_model` is an empty list; a row that will not resolve or a database
+    that will not open is a refusal — this program never invents a tester."""
+    models = _models_module()
+    try:
+        # No db file, or one that never had `repo_model` written: nothing has
+        # named a tester, which is the ordinal-1 refusal, not an I/O fault.
+        if not os.path.exists(models.DB):
+            return []
+        con = sqlite3.connect(f"file:{models.DB}?mode=ro", uri=True)
+        try:
+            ordinals = models.active_ordinals(con, repo, "tester")
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):
+                return []
+            raise
+        finally:
+            con.close()
+        rows = []
+        for o in ordinals:
+            runner, _layer = models.resolve_repo(repo, "tester", o)
+            if runner is not None:
+                rows.append((o, runner))
+        return rows
+    except (models.NotConfigured, models.UnknownRunner, sqlite3.Error) as e:
+        raise Stop(f"could not read {repo!r}'s tester rows ({e.__class__.__name__}: {e}) "
+                   "— refusing without a tester record")
+
+
+def _no_tester(repo):
+    return Stop(f"{repo!r} resolves no tester at ordinal 1 (ADR-0013 §2: every "
+                "repository is tested, and its tester is a row the owner wrote) — "
+                "set the default with: fleet-models set default tester sub-opus")
+
+
+def default_tester(repo):
+    """The runner an omitted `--runner` means: ordinal 1."""
+    for ordinal, runner in resolve_testers(repo):
+        if ordinal == 1:
+            return runner
+    raise _no_tester(repo)
+
+
+def check_tester(repo, runner_name):
+    """Gate 2. Passes only when `runner_name` is one of `repo`'s resolved
+    tester rows. A non-empty list is not enough: the question is whether THIS
+    runner is one the repository named, or a bundle could go to a vendor it
+    never chose."""
+    rows = resolve_testers(repo)
+    if not any(o == 1 for o, _ in rows):
+        raise _no_tester(repo)
+    if runner_name not in {r for _, r in rows}:
+        raise Stop(f"{runner_name!r} is not one of {repo!r}'s tester rows "
+                   f"({', '.join(f'{o}:{r}' for o, r in rows)}) — refusing to "
+                   "send its contract to a runner it did not name "
+                   f"(add one with: fleet-models set {repo} tester {runner_name})")
+
+
+def check_runner(runner_name, orch_mod, adapters):
+    runner = orch_mod.RUNNERS.get(runner_name)
+    if runner is None:
+        raise Stop(f"{runner_name!r} names no runner in the registry")
+    if runner_name not in adapters:
+        raise Stop(f"{runner_name!r} has no entry in this program's adapter "
+                   "table — refusing to feed a runner this program has not "
+                   "measured")
+    return runner
+
+
+def check_bundle_gaps(bundle):
+    for gap in bundle.get("gaps") or []:
+        if gap.get("target") == DECLARED_BEHAVIOUR_PATH:
+            raise Stop(f"the bundle carries the mandatory gap for "
+                       f"{DECLARED_BEHAVIOUR_PATH} — the lane could only test "
+                       "the contract (plan 0019); refusing to send it")
+
+
+# ------------------------------------------------------------------- bundle
+def build_bundle(worktree, out_path):
+    r = subprocess.run([sys.executable, str(BIN / "fleet-bundle"), str(worktree),
+                        "--format", "json", "--out", str(out_path)],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise Stop(f"fleet-bundle failed (rc={r.returncode}): "
+                   f"{(r.stderr or '').strip()[:300]}")
+    try:
+        return json.loads(Path(out_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise Stop(f"fleet-bundle's output is unreadable ({e.__class__.__name__}: {e})")
+
+
+# -------------------------------------------------------------------- spawn
+def _kill_group(proc):
+    """SIGTERM then SIGKILL to the process group — the same shape as
+    `bin/orchestrator._kill_group`, restated locally rather than reached into
+    (that function is private to orchestrator and this program's Boundaries
+    name only RUNNERS/harness_argv/redact_transcript as the reason it loads
+    that module at all)."""
+    import signal
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        return
+    if pgid == os.getpgrp():
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def spawn_lane(argv, cwd, env, stdin_bytes, timeout=SPAWN_TIMEOUT_SECONDS):
+    """Spawn the vendor CLI. Returns (rc, timed_out, stdout_text).
+
+    `cwd` is a fresh empty directory outside every repository; `env` is
+    built explicitly by the caller — never `os.environ`. `start_new_session`
+    puts the child in its own process group so a timeout can kill
+    grandchildren, the same reasoning `bin/orchestrator.run_implementer`
+    documents.
+
+    Reads stdout on a background thread rather than `proc.communicate()`:
+    this function already owns writing and closing stdin itself (the prompt
+    is written before anything might block on output), and `communicate()`
+    tries to flush/close stdin again on the caller's behalf — a `ValueError:
+    flush of closed file` the moment stdin was already closed, which is
+    always, here. The same reader-thread shape `run_implementer` uses."""
+    proc = subprocess.Popen(argv, cwd=str(cwd), env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    chunks = []
+
+    def _drain():
+        try:
+            for chunk in iter(lambda: proc.stdout.read1(65536), b""):
+                chunks.append(chunk)
+        except (OSError, ValueError):
+            pass
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    try:
+        proc.stdin.write(stdin_bytes)
+        proc.stdin.close()
+    except (OSError, ValueError):
+        pass
+    timed_out = False
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_group(proc)
+        rc = proc.returncode if proc.returncode is not None else -1
+    else:
+        _kill_group(proc)
+    reader.join(timeout=30)
+    return rc, timed_out, b"".join(chunks).decode("utf-8", "replace")
+
+
+# --------------------------------------------------------------- the PR body
+def build_pr_body(plan_id, runner_name, sha, prompt_sha256, usage, gaps, notes):
+    fenced_gaps = "\n".join(f"> {line}" for line in (gaps or [])) or "> (none)"
+    return (
+        f"Tests-for: {plan_id}\n\n"
+        f"runner: {runner_name}\n"
+        f"sha: {sha}\n"
+        f"prompt sha256: {prompt_sha256}\n"
+        f"usage: {usage if usage is not None else '-'}\n\n"
+        f"gaps:\n```\n{fenced_gaps}\n```\n\n"
+        f"notes:\n{notes or '(none)'}\n"
+    )
+
+
+# ------------------------------------------------------------------- main
+def _write_files(worktree, normalised_files):
+    for rel, content in normalised_files:
+        dest = worktree / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+        os.chmod(dest, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)  # 0644
+
+
+def _git(args, cwd, timeout=120):
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
+       orch_mod=None):
+    orch_mod = orch_mod or _orchestrator_module()
+    adapters = build_adapters(orch_mod)
+    if runner_name is None:
+        try:
+            runner_name = default_tester(repo)
+        except Stop as e:
+            print(f"fleet-lane: refused: {e}", file=sys.stderr)
+            return 1
+    # orch_mod.Stop is a DIFFERENT class object than this module's own Stop
+    # (each SourceFileLoader load builds its own): check_settings_precondition,
+    # harness_argv and _implbot_token all raise the orchestrator's own, so
+    # both must be caught below or a gate refusal from inside that module
+    # would crash this run instead of logging a clean refusal.
+    refusal_excs = (Stop, orch_mod.Stop)
+    log = RunLog(plan_id, runner_name, orch_mod)
+    read_key = f"lane-read-{_slug(plan_id)}-{_slug(runner_name)}"
+    land_key = f"lane-land-{_slug(plan_id)}-{_slug(runner_name)}"
+    read_wt = None
+    land_wt = None
+    try:
+        log.note("gate-start", repo=repo, plan=plan_id, sha=sha, runner=runner_name)
+
+        runner = check_runner(runner_name, orch_mod, adapters)
+        log.note("gate-adapter", runner=runner_name)
+        if runner.unwired:
+            raise Stop(f"runner {runner_name!r} is declared but not wired: "
+                       f"{runner.unwired}")
+
+        read_wt = lib.add_worktree(repo, read_key, sha, refspecs=[sha])
+        plan_path = f"plans/{plan_id}.md"
+        fm, plan_text = check_zone(read_wt, plan_path, orch_mod)
+        log.note("gate-zone", zone=fm.get("zone"))
+
+        check_tester(repo, runner_name)
+        log.note("gate-tester", repo=repo, runner=runner_name)
+        token = orch_mod._implbot_token()
+
+        orch_mod.check_settings_precondition(runner)
+        log.note("gate-settings-precondition", runner=runner_name)
+
+        lane_dir = lib.work_root() / "lanes" / _slug(plan_id) / _slug(runner_name)
+        lane_dir.mkdir(parents=True, exist_ok=True)
+        bundle_path = lane_dir / "bundle.json"
+        bundle = build_bundle(read_wt, bundle_path)
+        check_bundle_gaps(bundle)
+        log.note("bundle", gaps=len(bundle.get("gaps") or []))
+
+        prompt = build_prompt(plan_text, read_wt, json.dumps(bundle, indent=2))
+        prompt_path = lane_dir / "prompt.txt"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        log.note("prompt", bytes=len(prompt.encode("utf-8")), sha256=prompt_sha256)
+
+        if dry_run:
+            log.note("dry-run", gaps=[g.get("target") for g in (bundle.get("gaps") or [])])
+            print(f"prompt bytes: {len(prompt.encode('utf-8'))}")
+            print(f"prompt sha256: {prompt_sha256}")
+            print(f"bundle gaps: {[g.get('target') for g in (bundle.get('gaps') or [])]}")
+            return 0
+
+        schema_file = Path(schema_path) if schema_path else DEFAULT_SCHEMA_PATH
+        try:
+            schema = json.loads(schema_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise Stop(f"schema {schema_file} unreadable ({e.__class__.__name__}: {e})")
+
+        adapter = adapters[runner_name]
+        cwd = lane_dir / "cwd"
+        if cwd.exists():
+            shutil.rmtree(cwd, ignore_errors=True)
+        if adapter.get("scratch_cwd"):
+            # An empty directory under the system temp root, not under the
+            # work root: the CLI loads project instructions from every
+            # ancestor of its working directory, and a lane started under
+            # ~/dev/<repo> would carry that repository's instructions — and
+            # its paths — into a model that must see only the bundle.
+            cwd = Path(tempfile.mkdtemp(prefix="fleet-lane-")).resolve()
+        else:
+            cwd.mkdir(parents=True)
+        schema_dest = cwd / "schema.json"
+        if not adapter.get("scratch_cwd"):
+            # The Claude adapter is handed nothing but its prompt: the schema
+            # is validated here, on the way back, not shipped into its directory.
+            schema_dest.write_text(schema_file.read_text(encoding="utf-8"), encoding="utf-8")
+        out_dest = cwd / "result.json"
+
+        if adapter.get("argv"):
+            exe = shutil.which(adapter["argv"][0], path=os.environ.get("PATH", os.defpath))
+            if not exe:
+                raise Stop(f"{runner_name!r} needs {adapter['argv'][0]!r}, which is "
+                           "not on PATH on this host — refusing to spawn")
+            argv = (exe,) + tuple(adapter["argv"][1:])
+        else:
+            argv = orch_mod.harness_argv(runner)
+        argv = tuple(str(schema_dest) if a == "<schema>"
+                    else str(out_dest) if a == "<out>"
+                    else a for a in argv)
+
+        env = {}
+        for k in ("PATH", "HOME"):
+            if k in os.environ:
+                env[k] = os.environ[k]
+        for k in tuple(runner.extra_env) + tuple(adapter.get("env", ())):
+            if k in os.environ:
+                env[k] = os.environ[k]
+
+        stdin_bytes = adapter["stdin_bytes"](prompt)
+        (lane_dir / "stdin.bin").write_bytes(stdin_bytes)
+
+        log.note("spawn", argv=" ".join(argv), cwd=str(cwd))
+        rc, timed_out, stdout_text = spawn_lane(argv, cwd, env, stdin_bytes)
+        clean_stdout, shapes = orch_mod.redact_transcript(stdout_text)
+        log.note("spawn-exit", rc=rc, timed_out=timed_out,
+                 shapes=",".join(shapes) or "-")
+
+        doc, usage = adapter["parse"](stdout_text, str(out_dest))
+        if doc is None:
+            raise Stop("the vendor's result did not parse into a document")
+        errors = validate_schema(doc, schema)
+        if errors:
+            raise Stop(f"the vendor's result failed schema validation: {errors[:5]}")
+        log.note("result", files=len(doc.get("files") or []),
+                 gaps=len(doc.get("gaps") or []))
+
+        branch = f"agent/tests/{plan_id}/{runner_name}"
+        land_wt = lib.add_worktree(repo, land_key, "origin/main", refspecs=["main"])
+        existing_paths = {
+            p.relative_to(land_wt).as_posix()
+            for p in (land_wt / CONFINE_ROOT).rglob("*") if p.is_file()
+        } if (land_wt / CONFINE_ROOT).is_dir() else set()
+
+        normalised = check_result_files(doc.get("files") or [], land_wt, existing_paths)
+
+        r = _git(["checkout", "-B", branch], land_wt)
+        if r.returncode != 0:
+            raise Stop(f"could not create landing branch {branch}: "
+                       f"{r.stderr.strip()[:200]}")
+        orch_mod.set_commit_identity(land_wt)
+
+        _write_files(land_wt, normalised)
+        r = _git(["add", "--"] + [rel for rel, _ in normalised], land_wt)
+        if r.returncode != 0:
+            raise Stop(f"git add failed: {r.stderr.strip()[:200]}")
+        commit_msg = f"tests: {plan_id} via {runner_name} (plan 0070)\n"
+        r = _git(["commit", "-m", commit_msg], land_wt)
+        if r.returncode != 0:
+            raise Stop(f"git commit failed: {r.stderr.strip()[:200]}")
+
+        r = subprocess.run(["git", "push", "-u", "origin", f"HEAD:{branch}"],
+                           cwd=str(land_wt), capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise Stop(f"git push failed: {r.stderr.strip()[:200]}")
+
+        body = build_pr_body(plan_id, runner_name, sha, prompt_sha256, usage,
+                             doc.get("gaps") or [], doc.get("notes"))
+        assert not re.search(rf"^Plan: {re.escape(plan_id)}\s*$", body, re.M), \
+            "PR body must never match marked_pr()'s regex"
+        title = f"WIP: tests: {plan_id} via {runner_name}"
+        status, pr = fleetforge.Forge(orch_mod._forgejo_base_url(), token,
+                                      timeout=orch_mod.forge_timeout()).create_pull(
+            repo, title, branch, "main", body)
+        if status not in (200, 201) or not isinstance(pr, dict):
+            raise Stop(f"create_pull failed (HTTP {status}) after pushing "
+                       f"{branch} — the branch is on origin; a human must open "
+                       "the pull request by hand")
+        log.note("pr", number=pr.get("number"), branch=branch)
+        orch_mod.notify(f"test lane: {plan_id} ({runner_name})",
+                        f"{repo}#{pr.get('number')} — a human read is next",
+                        )
+        return 0
+    except refusal_excs as e:
+        log.note("refused", reason=str(e))
+        orch_mod.notify(f"test lane refused: {plan_id} ({runner_name})", str(e))
+        print(f"fleet-lane: refused: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if read_wt is not None:
+            lib.remove_worktree(repo, read_key)
+        if land_wt is not None:
+            lib.remove_worktree(repo, land_key)
+        log.close()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-lane")
+    ap.add_argument("repo")
+    ap.add_argument("plan_id")
+    ap.add_argument("--sha", required=True)
+    ap.add_argument("--runner", default=None,
+                    help="a tester row of the repo; default: ordinal 1")
+    ap.add_argument("--schema", default=None)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args(argv)
+    if "/" in args.plan_id or args.plan_id in (".", ".."):
+        print(f"fleet-lane: {args.plan_id!r} is not a plan id", file=sys.stderr)
+        return 2
+    return run(args.repo, args.plan_id, args.sha, args.runner,
+              schema_path=args.schema, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

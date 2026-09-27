@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""fleet-release — release a lease you hold (SPEC.md §Lease record).
+
+  fleet-release LEASE_ID [--force]
+
+Releasing a lease held by another session refuses, because a release you didn't
+own is a takeover wearing politer clothes. --force is the human override; the
+identity mismatch is recorded in the event detail rather than papered over.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import sys
+from pathlib import Path
+
+_lib_loader = importlib.machinery.SourceFileLoader(
+    "fleetlib", str(Path(__file__).resolve().parent / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="fleet-release", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("lease_id")
+    ap.add_argument("--force", action="store_true",
+                    help="release a lease held by another session (recorded in the event)")
+    args = ap.parse_args(argv)
+
+    sid = lib.session_id()
+    lib.validate_lease_id(args.lease_id)
+    detail = None
+    with lib.held_lock(lib.lock_path(args.lease_id)):
+        rec = lib.read_lease_checked(args.lease_id)
+        if rec is None:
+            sys.exit(f"fleet-release: no lease {args.lease_id}")
+        if rec.get("state") == "released":
+            print(args.lease_id)   # idempotent: releasing twice is not an error
+            return 0
+        holder = rec.get("holder")
+        if holder != sid:
+            if not args.force:
+                sys.exit(f"fleet-release: {args.lease_id} is held by {holder!r}, "
+                         f"not {sid!r} — refusing (use --force to override)")
+            detail = {"forced": True, "holder_was": holder}
+        rec["state"] = "released"
+        lib.write_lease(rec)
+        try:
+            lib.marker_path(args.lease_id).unlink()
+        except FileNotFoundError:
+            pass
+    lib.emit("lease-released", args.lease_id, sid, detail=detail)
+    print(args.lease_id)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-pin-advance — fast-forward a stale pin without a human typing
+  `git checkout` (plan 0034, SPEC.md Revisions 2026-09-10).
+
+  org.eunomia.fleet-pin-watch REPORTS when a pinned worktree falls behind its
+  origin/main; this unit is the mover that closes the gap it reports on. Same
+  FLEET_PINS, same repos, deliberately: advancing a pin nobody is watching for
+  drift would be a mover with no report to check it against.
+
+  IT DOES NOT RESTART fleet-watch, or anything else that reads a pin. A
+  resident scheduler holds the code it loaded at start, so advancing the pin
+  underneath it changes nothing until it restarts — and restarting is a
+  supervised operation gated by `bin/fleet-svc` under a `service` lease (plan
+  0029), never a bare `launchctl kickstart` this scheduled unit could reach
+  for on its own. Every advance notifies that a restart is due; nothing here
+  performs one. See the docstring in bin/fleet-pin-advance for the full
+  reasoning, and SPEC.md's 2026-09-10 Revisions entry for the boundary this
+  exists inside.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the same rule
+  fleet-watch and fleet-pin-watch both follow, for the same reason: a
+  scheduled job is the worst place to discover the shared clone was left on
+  someone else's branch.
+
+  Install (opshost only):
+    cp launchd/org.eunomia.fleet-pin-advance.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-pin-advance.plist
+  Reload after editing (a frozen job needs bootout+bootstrap, not kickstart):
+    launchctl bootout gui/$(id -u)/org.eunomia.fleet-pin-advance
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-pin-advance.plist
+
+  No Forgejo token anywhere in this unit. Advancing asks the broker (a local
+  unix socket, per `FLEET_BROKER_SOCKET`) whether the pin's own repo is
+  protected; it never calls the Forgejo API directly, so it never needs
+  `FLEET_TOKEN_CMD` or FLEET_FORGEJO_URL. The broker connection is the same
+  ssh forward org.eunomia.fleet-broker-tunnel provides for fleet-watch.
+
+  Cadence: 1800s, matching fleet-pin-watch's report side — advancing faster
+  than the report that motivates it would not close the gap any sooner, only
+  spend more fetches doing it. Overlap is safe: fleet-pin-advance takes its
+  own non-blocking flock (locks/fleet-pin-advance.lock, distinct from
+  fleet-watch's dispatch-cycle lock), so a slow run degrades to fewer runs,
+  never to two racing one pin.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-pin-advance</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-pin-advance</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- same pins fleet-pin-watch reports on; no default, so an unconfigured
+         run advances nothing -->
+    <key>FLEET_PINS</key>
+    <string>/Users/operator/.local/share/pins/eunomia,/Users/operator/.local/share/pins/techne</string>
+    <!-- the ssh forward from org.eunomia.fleet-broker-tunnel lands here -->
+    <key>FLEET_BROKER_SOCKET</key><string>/Users/operator/run/forgejo-broker.sock</string>
+    <!-- replace with the real Fleet-ops push URL at install; empty = log-only,
+         and every advance (or refusal worth naming) notifies -->
+    <key>FLEET_NTFY_URL</key><string></string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>1800</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/operator/dev/.fleet/pin-advance.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/operator/dev/.fleet/pin-advance.log</string>
+</dict>
+</plist>

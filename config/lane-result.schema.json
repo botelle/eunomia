@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "plan 0070 D1.5 — the shape a test lane's result must hold. files carries content the wrapper commits (ADR-0006 §2); gaps is an output, not a failure (ADR-0006 §4); notes is free-form commentary the wrapper folds into the PR body. additionalProperties is false at every level on purpose: a vendor field this schema does not name is not silently forwarded into a commit or a PR body.",
+  "type": "object",
+  "required": ["files", "gaps", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "content"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "$comment": "relative, confined under tests/ — bin/fleet-lane enforces this; the schema only asks for a non-empty string"
+          },
+          "content": {"type": "string"},
+          "executable": {
+            "type": "boolean",
+            "$comment": "true refuses the whole result (plan 0070 D1.6) — content always lands mode 0644"
+          }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "notes": {
+      "type": ["string", "null"]
+    }
+  }
+}

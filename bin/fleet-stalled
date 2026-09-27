@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""fleet-stalled — a pull request waiting on nobody is named once a day (plan 0060).
+
+  fleet-stalled [--dry-run] [--conf PATH] [--repos-conf PATH]
+
+Two real cases motivated this, both found by the owner rather than by the
+fleet (measured 2026-09-16 on operator/eunomia):
+
+  #414  round-1 review returned COMMENT, every finding was fixed and pushed,
+        and no second review was ever dispatched — one stale COMMENT, no
+        approval, nothing watching for the second round that never came.
+  #415  one line of docs/diagrams/README.md, red on one CI lane and green on
+        the other — 28 commits behind a main that is green on both.
+
+Neither is a dispatch failure: `bin/orchestrator`'s own pull requests are
+reviewed automatically (it calls the review dispatcher after CI resolves), so
+a hand-opened pull request simply gets nothing, and nothing notices a branch
+gone stale.
+
+For every open pull request in every repository `config/repos.conf` lists,
+one of four states, or nothing:
+
+  unreviewed    CI green at head, and no review at that head SHA — a round
+                that was never dispatched
+  stale-review  a review exists, but the newest one is older than the head —
+                a round whose fixes were never re-reviewed
+  stale-base    CI red at head, the merge-base has fallen behind the base
+                branch's current tip, and that tip's own CI is green
+  red           CI red at head against a current base — genuinely failing
+
+A pull request whose newest review IS at the head SHA, or whose CI has not
+yet resolved, is not reported at all — there is nothing stalled about it.
+
+Dispatches nothing, rebases nothing, comments on nothing. It pages once per
+(repo, PR, head SHA) — a new push is a new head and pages again; a cycle over
+an unchanged head is silent — and the page names the command that would fix
+it: the review dispatcher for `unreviewed`/`stale-review`, a by-hand rebase
+for `stale-base`.
+
+A pull request whose head branch is covered by a live (non-orphaned) branch
+lease is skipped outright — the orchestrator is still stewarding it and its
+review is coming.
+
+Config:
+  config/stalled.conf   per-repo mode: off | report (default) | dispatch
+                         (named, refused — "not built yet", never silently
+                         treated as report)
+
+Config (env):
+  FLEET_FORGEJO_URL     default http://forge.example:3000
+  FLEET_TOKEN_CMD       command printing a Forgejo token (default
+                        ~/bin/fetch-forgejo-token.sh) — read-only use.
+  FLEET_REVIEWER        whose reviews count (default revbot)
+  FLEET_REVIEW_CMD      the review dispatcher, named in a page's action line
+                        (default matches bin/orchestrator's own default)
+  FLEET_FORGE_TIMEOUT   seconds per forge request (default 60 — see
+                        docs/forge.md; below that, this fleet's own pull
+                        listings fail deterministically, not transiently)
+  FLEET_NTFY_URL, FLEET_ANGELIA_URL/APP/USER, FLEET_ANGELIA_TOKEN_CMD
+                        the page channel — reused from bin/orchestrator's own
+                        notify(), never reimplemented, so every page this
+                        fleet sends lands in the one durable pages.jsonl.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+# `read_conf` is fleet-repo's, reused so "every repository config/repos.conf
+# lists" means exactly what `fleet-repo list` means (fleet-orphans' own
+# reasoning, plan 0013).
+repo_mod = _load("fleet_repo", BIN / "fleet-repo")
+# notify()/record_page() and review_command() are bin/orchestrator's, reused
+# rather than restated: every page this fleet sends (the watcher's, mopsus's,
+# and this tool's) lands in the one pages.jsonl, and the action line this
+# tool prints for `unreviewed`/`stale-review` must name the SAME command the
+# orchestrator itself would run, not a second copy of that default that can
+# drift from it.
+orch = _load("orchestrator", BIN / "orchestrator")
+
+FORGEJO_URL = os.environ.get("FLEET_FORGEJO_URL", "http://forge.example:3000")
+TOKEN_CMD = os.environ.get("FLEET_TOKEN_CMD",
+                           str(Path.home() / "bin" / "fetch-forgejo-token.sh"))
+REVIEWER = os.environ.get("FLEET_REVIEWER", "revbot")
+
+CONF = BIN.parent / "config" / "stalled.conf"
+REPOS_CONF = BIN.parent / "config" / "repos.conf"
+
+VALID_MODES = ("off", "report", "dispatch")
+BUILT_MODES = ("off", "report")
+
+STATES = ("unreviewed", "stale-review", "stale-base", "red")
+
+EXIT_OK, EXIT_STALLED, EXIT_UNKNOWN = 0, 1, 2
+
+PAGE_MAX_CHARS = 180
+
+
+class ConfigError(Exception):
+    pass
+
+
+# --- config/stalled.conf ------------------------------------------------------
+
+
+def load_conf(path=None):
+    """{repo|"default": mode} from config/stalled.conf.
+
+    An unreadable file degrades to "every repo gets 'report'" — `report`
+    guards nothing, it only composes a page, so the safe default is also the
+    one an absent file produces (mopsus's own reasoning for `escalate`). An
+    unparseable line, or a mode name outside the three that exist, is a hard
+    stop: a typo silently reverting to `report` would hide the refusal an
+    operator meant to configure."""
+    path = Path(path) if path else CONF
+    values = {}
+    try:
+        text = path.read_text()
+    except OSError as e:
+        sys.stderr.write(f"fleet-stalled: {path} unreadable ({e.__class__.__name__}) "
+                         "— treating every repo as 'report'\n")
+        return values
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ConfigError(f"unparseable line in {path}: {line!r} — expected "
+                              "'<owner/repo|default> = off|report|dispatch'")
+        key, _, raw = line.partition("=")
+        mode = raw.strip()
+        if mode not in VALID_MODES:
+            raise ConfigError(f"unknown mode {mode!r} in {path} for "
+                              f"{key.strip()!r} — expected one of {VALID_MODES}")
+        values[key.strip()] = mode
+    return values
+
+
+def mode_for(repo, values):
+    return values.get(repo, values.get("default", "report"))
+
+
+# --- repos to scan -------------------------------------------------------------
+
+
+def repos_from_conf(path=None):
+    """(names, troubles) from config/repos.conf, read the way `fleet-repo
+    list` reads it — a row it rejects is a trouble, named by position, never a
+    repository silently dropped from the scanned set."""
+    path = Path(path) if path else REPOS_CONF
+    repos, errs, _kept = repo_mod.read_conf(path)
+    troubles = [("conf", e) for e in errs]
+    return sorted(repos), troubles
+
+
+# --- the forge -------------------------------------------------------------
+
+
+def forge_timeout(env=None):
+    """Seconds per forge request. 60 by default — see docs/forge.md: below
+    that, this fleet's own pull-request listings fail every time, not
+    occasionally, because Forgejo does real per-PR work on that endpoint. Each
+    module that opens its own door to the forge carries its own copy of this
+    (bin/orchestrator's and bin/fleet-watch's both do), because a shared
+    default that only one of them reads is the bug that shipped twice
+    already."""
+    env = os.environ if env is None else env
+    raw = (env.get("FLEET_FORGE_TIMEOUT") or "").strip()
+    if not raw:
+        return 60
+    try:
+        n = int(raw)
+    except ValueError:
+        raise ConfigError(f"FLEET_FORGE_TIMEOUT={raw!r} is not an integer")
+    if n < 1:
+        raise ConfigError(f"FLEET_FORGE_TIMEOUT={n} — a forge read needs some patience")
+    return n
+
+
+def _token():
+    """(token, error) — the sanctioned helper only, never logged/echoed."""
+    import subprocess
+    try:
+        r = subprocess.run(["sh", "-c", TOKEN_CMD], capture_output=True,
+                           text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"token helper failed ({e.__class__.__name__})"
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, "token helper produced no token"
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    return (lines[-1].strip(), "") if lines else (None, "token helper produced no token")
+
+
+def _forge(token):
+    return fleetforge.Forge(FORGEJO_URL, token, timeout=forge_timeout())
+
+
+def _drain(pages):
+    """([item, ...], "") on a clean, fully-paged read; (None, detail) on
+    anything else. A short final page ending the scan is not distinguished
+    from a truncated one by this tool — `paged()`'s own EXHAUSTED/CAP_HIT/
+    FAILED trichotomy already makes that distinction, and this just reports
+    which one happened rather than guessing (mirrors fleet-reviews'
+    _paged_all)."""
+    out = []
+    for page in pages:
+        out.extend(page)
+    if pages.outcome != fleetforge.EXHAUSTED:
+        detail = pages.outcome or "unreadable"
+        if pages.outcome == fleetforge.FAILED and pages.failed_status:
+            detail = f"HTTP {pages.failed_status}"
+        return None, detail
+    return out, ""
+
+
+# --- CI -------------------------------------------------------------------
+
+
+def commit_state(forge, repo, sha):
+    """("green"|"red"|"unknown", ok). `ok` is False only when the read itself
+    failed (not HTTP 200, or a non-JSON body) — "unknown" for a state Forgejo
+    genuinely reports (pending, warning, or no statuses at all yet) is a
+    legitimate readable answer, not a trouble to log."""
+    if not sha:
+        return "unknown", False
+    status, body = forge.get_commit_status(repo, sha)
+    if status != 200 or not isinstance(body, dict):
+        return "unknown", False
+    state = (body.get("state") or "").lower()
+    if state == "success":
+        return "green", True
+    if state in ("failure", "error"):
+        return "red", True
+    return "unknown", True
+
+
+# --- stewardship: a branch an active lease already covers -------------------
+
+
+def stewarded_branches():
+    """{(repo, branch), ...} for every branch lease that is live — assigned
+    or active, and not orphaned. A pull request on one of these is still
+    mid-flight for the orchestrator; its review is coming, and reporting it
+    here would just teach the operator to ignore the report."""
+    out = set()
+    for rec in lib.all_leases():
+        if rec.get("state") not in ("assigned", "active"):
+            continue
+        if lib.is_orphaned(rec):
+            continue
+        res = lib.resource_of(rec)
+        if res.get("type") != "branch":
+            continue
+        repo, branch = res.get("repo"), res.get("branch")
+        if repo and branch:
+            out.add((repo, branch))
+    return out
+
+
+# --- classifying one pull request -------------------------------------------
+
+
+def classify_pr(forge, repo, pr, troubles):
+    """(state, detail) — `state` is one of STATES or None (nothing to
+    report, or unreadable — the two are told apart by whether `troubles`
+    grew)."""
+    num = pr.get("number")
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    head_sha = head.get("sha")
+    base_sha = base.get("sha")
+    merge_base = pr.get("merge_base")
+
+    ci_head, ok = commit_state(forge, repo, head_sha)
+    if not ok:
+        troubles.append(("status", f"{repo}#{num}: commit status for "
+                         f"{str(head_sha)[:8]} unreadable"))
+        return None, ""
+
+    if ci_head == "green":
+        revs, detail = _drain(fleetforge.paged(forge.list_reviews, repo, num))
+        if revs is None:
+            troubles.append(("reviews", f"{repo}#{num}: review list unreadable "
+                             f"or truncated ({detail})"))
+            return None, ""
+        mine = sorted(
+            (r for r in revs
+             if ((r.get("user") or {}).get("login") or "").lower() == REVIEWER.lower()),
+            key=lambda r: r.get("submitted_at") or "")
+        if not mine:
+            return "unreviewed", "CI green at head, no review has ever run"
+        newest = mine[-1]
+        if newest.get("commit_id") != head_sha:
+            return "stale-review", (f"newest review at {str(newest.get('commit_id'))[:8]} "
+                                    f"is older than head {str(head_sha)[:8]}")
+        return None, ""              # reviewed at head — healthy, not reported
+
+    if ci_head == "red":
+        if not (isinstance(merge_base, str) and merge_base
+               and isinstance(base_sha, str) and base_sha):
+            # Can't tell whether the base has moved at all — fail toward
+            # `red`, the same safe direction the boundary names for an
+            # unreadable base status below.
+            return "red", "CI red at head; base could not be compared"
+        if merge_base != base_sha:
+            ci_main, ok2 = commit_state(forge, repo, base_sha)
+            if ok2 and ci_main == "green":
+                return "stale-base", (f"CI red at head; {base.get('ref') or 'the base'} "
+                                      "has moved on and is green there")
+            return "red", (f"CI red at head; {base.get('ref') or 'the base'} has moved "
+                           "but is not confirmed green")
+        return "red", "CI red at head against a current base"
+
+    return None, ""                  # pending/no CI yet — not classifiable
+
+
+def process_repo(forge, repo, stewarded, troubles):
+    pulls, detail = _drain(fleetforge.paged(forge.list_pulls, repo, state="open"))
+    if pulls is None:
+        troubles.append(("pulls", f"{repo}: pull list unreadable or truncated ({detail})"))
+        return []
+    findings = []
+    for pr in pulls:
+        num = pr.get("number")
+        head = pr.get("head") or {}
+        branch = head.get("ref")
+        head_sha = head.get("sha")
+        if not (isinstance(num, int) and isinstance(branch, str) and branch
+               and isinstance(head_sha, str) and head_sha):
+            troubles.append(("pulls", f"{repo}: an open pull request is missing "
+                             "its number, head ref or head sha — skipped"))
+            continue
+        if (repo, branch) in stewarded:
+            continue
+        state, detail = classify_pr(forge, repo, pr, troubles)
+        if state is None:
+            continue
+        findings.append({"repo": repo, "pr": num, "head_sha": head_sha,
+                         "branch": branch, "state": state, "detail": detail})
+    return findings
+
+
+# --- the action a page names -------------------------------------------------
+
+
+def action_for(state, repo, num, branch):
+    if state in ("unreviewed", "stale-review"):
+        return " ".join(orch.review_command() + [repo, str(num), "--post", "--no-followups"])
+    if state == "stale-base":
+        return f"rebase {branch} onto its base by hand, where someone can see what else is going on"
+    return "investigate — CI is failing against a current base"
+
+
+def compose_page(finding):
+    action = action_for(finding["state"], finding["repo"], finding["pr"], finding["branch"])
+    suffix = f"\n{action}"
+    budget = PAGE_MAX_CHARS - len(suffix)
+    head = f"{finding['repo']}#{finding['pr']} {finding['state']}: {finding['detail']}"
+    if len(head) > budget:
+        head = head[:max(budget - 1, 0)].rstrip() + "…"
+    return head + suffix
+
+
+# --- state file: one page per (repo, pr, head sha) --------------------------
+
+
+def _state_path():
+    return lib.fleet_dir() / "stalled.state.json"
+
+
+def _empty_state():
+    return {"pages": [], "troubles": []}
+
+
+def _load_state():
+    try:
+        data = json.loads(_state_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return _empty_state()
+    if not isinstance(data, dict):
+        return _empty_state()
+    out = _empty_state()
+    for key in out:
+        if isinstance(data.get(key), list):
+            out[key] = data[key]
+    return out
+
+
+def _save_state(state):
+    p = _state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lock = p.with_suffix(p.suffix + ".lock")
+    with lib.held_lock(lock):
+        tmp = p.with_suffix(p.suffix + f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
+        os.replace(tmp, p)
+
+
+def _page_finding(state, finding):
+    if any(p.get("repo") == finding["repo"] and p.get("pr") == finding["pr"]
+          and p.get("head_sha") == finding["head_sha"] for p in state["pages"]):
+        return
+    title = f"fleet-stalled: {finding['state']}"
+    delivered = orch.notify(title, compose_page(finding))
+    state["pages"].append({"repo": finding["repo"], "pr": finding["pr"],
+                           "head_sha": finding["head_sha"], "state": finding["state"],
+                           "delivered": bool(delivered),
+                           "first_seen": lib.ts(lib.now_utc())})
+
+
+def _page_trouble(state, reason, detail, today):
+    if any(t.get("reason") == reason and t.get("detail") == detail and t.get("day") == today
+          for t in state["troubles"]):
+        return
+    orch.notify(f"fleet-stalled: {reason}", detail)
+    state["troubles"].append({"reason": reason, "detail": detail, "day": today})
+
+
+# --- main --------------------------------------------------------------------
+
+
+def run(args):
+    troubles = []                      # [(reason, detail)]
+
+    try:
+        conf_values = load_conf(args.conf)
+    except ConfigError as e:
+        sys.stderr.write(f"fleet-stalled: {e}\n")
+        return EXIT_UNKNOWN
+
+    names, conf_troubles = repos_from_conf(args.repos_conf)
+    troubles += conf_troubles
+
+    token, terr = _token()
+    if token is None:
+        troubles.append(("token", terr))
+        names = []
+
+    print(f"fleet-stalled: scanning {len(names)} repositor"
+         f"{'y' if len(names) == 1 else 'ies'}"
+         + (f": {', '.join(names)}" if names else ""))
+
+    stewarded = stewarded_branches()
+
+    all_findings = []
+    if token is not None:
+        forge = _forge(token)
+        for repo in names:
+            mode = mode_for(repo, conf_values)
+            if mode == "off":
+                continue
+            if mode not in BUILT_MODES:
+                sys.stderr.write(
+                    f"fleet-stalled: {repo} set to mode {mode!r} — not built "
+                    "yet, refusing rather than treating it as 'report' "
+                    "(config/stalled.conf)\n")
+                troubles.append(("mode", f"{repo}: mode {mode!r} is not built yet"))
+                continue
+            all_findings += process_repo(forge, repo, stewarded, troubles)
+
+    for f in all_findings:
+        print(f"{f['repo']}#{f['pr']} {f['state']} {f['head_sha']} branch={f['branch']}")
+
+    state = _load_state()
+    if not args.dry_run:
+        for f in all_findings:
+            _page_finding(state, f)
+
+    today = lib.now_utc().strftime("%Y-%m-%d")
+    for reason, detail in troubles:
+        print(f"fleet-stalled: EXIT2 {reason}: {detail}", file=sys.stderr)
+        if not args.dry_run:
+            _page_trouble(state, reason, detail, today)
+
+    if not args.dry_run:
+        _save_state(state)
+
+    if troubles:
+        return EXIT_UNKNOWN
+    if all_findings:
+        return EXIT_STALLED
+    return EXIT_OK
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-stalled", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report only — send nothing, write no state")
+    ap.add_argument("--conf", help="config/stalled.conf path (test seam)")
+    ap.add_argument("--repos-conf", help="config/repos.conf path (test seam)")
+    args = ap.parse_args(argv)
+    return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

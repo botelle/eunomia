@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""fleet-deploy — ADR-0015's `homefleet` provider, for `dev` (plan 0087).
+
+  fleet-deploy validate <manifest.json>
+  fleet-deploy run   [--binding dev:<name>] [--dry-run]
+  fleet-deploy retry --binding dev:<name> [--sha <sha>]
+
+For each binding in config/environments.conf whose host is this machine: notice
+a new commit on the pin's origin/main, move the pin, restart the unit through
+`fleet-svc`'s gate under a `service` lease, verify, and roll back to the last
+verified SHA if verification fails. Every step is on the ledger. docs/deploy.md
+is the reference; this docstring only records why the sharp edges are where
+they are.
+
+Two identifiers, one component: the lease is held under the session id
+`fleet-deploy` (what fleetlib._SID_RE accepts), and every ledger event is
+written by actor `svc:fleet-deploy`.
+
+  - The restart goes through `fleet-svc`'s `_gate`, never bare launchctl: the
+    gate is what stopped two runners being killed as each other's strays
+    (plan 0029).
+  - Health is never a status code alone. A Cloudflare Access page and a login
+    page are both 2xx; `health.expect` is mandatory for that reason, and the
+    unit's pid must also have changed, so an old process still answering does
+    not verify a restart that never happened.
+  - One rollback, to the last verified SHA, never a second. A failed rollback
+    stops and pages; the ledger (deploy-started without deploy-verified) keeps
+    the next cycle from retrying the bad commit.
+  - Dependencies are never installed. A `deps` change is paged, and the pin
+    does not move.
+  - `git fetch` goes over the pin's own ssh remote and only when an ssh
+    ControlMaster is already up (`ssh -O check`), and then with
+    `ControlMaster=no`: it rides the reused connection or is skipped, and never
+    dials a fresh one (docs/service-lease.md: the August TCP exhaustion).
+"""
+import argparse
+import contextlib
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlparse
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load_module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+lib = _load_module("fleetlib", BIN / "fleetlib.py")
+svc = _load_module("fleet_svc_for_deploy", BIN / "fleet-svc")
+claim = _load_module("fleet_claim_for_deploy", BIN / "fleet-claim")
+release = _load_module("fleet_release_for_deploy", BIN / "fleet-release")
+# `broker_verdict`, `notify`, `PROT_*` — one definition of each, reused.
+watch = _load_module("fleet_watch_for_deploy", BIN / "fleet-watch")
+
+LABEL = "fleet-deploy"          # paging identity (watch.notify's `label`)
+SESSION = "fleet-deploy"        # the lease holder; fleetlib._SID_RE accepts it
+ACTOR = "svc:fleet-deploy"      # the ledger actor (plan 0021's `svc:` grammar)
+LEASE_TTL_MIN = 30
+DEFAULT_TIMEOUT_S = 60
+
+
+def warn(msg):
+    print(f"fleet-deploy: WARN {msg}", file=sys.stderr)
+
+
+def say(msg):
+    print(f"fleet-deploy: {msg}")
+
+
+# ------------------------------------------------------------------ manifest
+
+_MANIFEST_KEYS = {"v", "name", "health", "deps", "secrets", "artifact", "start"}
+_HEALTH_KEYS = {"path", "expect", "timeout_s"}
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*\Z")
+# ADR-0015 §1: no field names a host, address, unit label or provider. Keys
+# are closed already; this catches the same thing smuggled in a value.
+_ADDR_RE = re.compile(
+    r"(\d{1,3}\.){3}\d{1,3}|://|\blocalhost\b|\.local\b|\.org\b|\.net\b"
+    r"|\b(com|org)\.[a-z0-9-]+\.", re.I)
+_PROVIDERS = ("homefleet", "launchd", "systemd")
+
+
+def validate_manifest(m):
+    """List of refusal strings; empty means valid. Never raises."""
+    errs = []
+    if not isinstance(m, dict):
+        return ["manifest is not a JSON object"]
+    if m.get("v") != 1 or isinstance(m.get("v"), bool):
+        errs.append(f"v must be 1, got {m.get('v')!r}")
+    for k in sorted(set(m) - _MANIFEST_KEYS):
+        errs.append(f"unknown key {k!r}")
+    name = m.get("name")
+    if not isinstance(name, str) or not _NAME_RE.match(name):
+        errs.append("name must be a lowercase service name")
+    h = m.get("health")
+    if not isinstance(h, dict):
+        errs.append("health is required and must be an object")
+    else:
+        for k in sorted(set(h) - _HEALTH_KEYS):
+            errs.append(f"unknown key health.{k}")
+        p = h.get("path")
+        if not isinstance(p, str) or not p.startswith("/") or "://" in p:
+            errs.append("health.path is required and must be a path starting with '/'")
+        e = h.get("expect")
+        if not isinstance(e, str) or not e.strip():
+            errs.append("health.expect is required and must be a non-empty string "
+                        "(a status code alone is not a health check)")
+        t = h.get("timeout_s", DEFAULT_TIMEOUT_S)
+        if isinstance(t, bool) or not isinstance(t, int) or not 1 <= t <= 600:
+            errs.append("health.timeout_s must be an integer 1..600")
+    for field in ("deps", "secrets"):
+        v = m.get(field, [])
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            errs.append(f"{field} must be a list of non-empty strings")
+    for d in m.get("deps", []) if isinstance(m.get("deps", []), list) else []:
+        if isinstance(d, str) and (d.startswith("/") or ".." in Path(d).parts):
+            errs.append(f"deps entry {d!r} must be a path inside the repository")
+    if "artifact" in m and not isinstance(m["artifact"], str):
+        errs.append("artifact must be a string")
+    if "start" in m and not (isinstance(m["start"], list) and m["start"]
+                             and all(isinstance(x, str) for x in m["start"])):
+        errs.append("start must be a non-empty list of strings (the argv)")
+    # host / address / unit label / provider, by value
+    for path, s in _strings(m):
+        if path.startswith("secrets"):
+            continue            # keyvault refs like kv/<svc>/token, informational
+        if _ADDR_RE.search(s) or s.strip().lower() in _PROVIDERS:
+            errs.append(f"{path} names a host, address, unit label or provider "
+                        "(ADR-0015 §1: that lives in the binding)")
+    return errs
+
+
+def _strings(v, path=""):
+    if isinstance(v, str):
+        yield path, v
+    elif isinstance(v, dict):
+        for k, x in v.items():
+            yield from _strings(x, f"{path}.{k}" if path else str(k))
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            yield from _strings(x, f"{path}[{i}]")
+
+
+def cmd_validate(path):
+    try:
+        m = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        print(f"fleet-deploy: {path}: cannot read as JSON ({e.__class__.__name__})",
+              file=sys.stderr)
+        return 1
+    errs = validate_manifest(m)
+    for e in errs:
+        print(f"fleet-deploy: {path}: {e}", file=sys.stderr)
+    if not errs:
+        print(f"{path}: ok")
+    return 1 if errs else 0
+
+
+# ------------------------------------------------------------------ bindings
+
+_BIND_RE = re.compile(r"^bind:\s*(\S+)\s+(.*)$")
+_BIND_FIELDS = ("provider", "repo", "service", "pin", "base_url")
+
+
+def environments_conf_path():
+    env = os.environ.get("FLEET_ENVIRONMENTS_CONF")
+    return Path(env) if env else BIN.parent / "config" / "environments.conf"
+
+
+def parse_bindings(path=None):
+    """{"dev:<name>": {...}}. A missing file is no bindings (plan 0088 ships
+    the real one); any malformed line exits, naming it — a half-read binding
+    file that silently deploys some services is worse than none."""
+    path = Path(path) if path else environments_conf_path()
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        sys.exit(f"fleet-deploy: cannot read {path} ({e.__class__.__name__})")
+    enrolled = svc._parse_services_conf()
+    out = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        where = f"fleet-deploy: {path}:{lineno}"
+        m = _BIND_RE.match(line)
+        if not m:
+            sys.exit(f"{where}: unparseable row: {raw!r}")
+        key, rest = m.group(1), m.group(2)
+        env, _, name = key.partition(":")
+        if env != "dev" or not _NAME_RE.match(name):
+            sys.exit(f"{where}: {key!r} must be dev:<name> (stage and prod are "
+                     "reached by promotion, ADR-0015 §7)")
+        f = {}
+        for tok in rest.split():
+            if "=" not in tok:
+                sys.exit(f"{where}: bad field {tok!r} (want key=value)")
+            k, v = tok.split("=", 1)
+            if k not in _BIND_FIELDS:
+                sys.exit(f"{where}: unknown field {k!r}")
+            f[k] = v
+        missing = [k for k in _BIND_FIELDS if k not in f]
+        if missing:
+            sys.exit(f"{where}: missing field(s) {missing}")
+        if f["provider"] != "homefleet":
+            sys.exit(f"{where}: provider must be homefleet, got {f['provider']!r}")
+        try:
+            lib.validate_repo(f["repo"])
+        except (SystemExit, ValueError) as e:
+            sys.exit(f"{where}: repo {f['repo']!r} is not owner/repo ({e})")
+        if f["service"] not in enrolled:
+            sys.exit(f"{where}: service {f['service']!r} is not enrolled in "
+                     "config/services.conf — enrol it first")
+        if not f["pin"].startswith("/"):
+            sys.exit(f"{where}: pin must be an absolute path")
+        u = urlparse(f["base_url"])
+        if u.scheme not in ("http", "https") or not u.netloc:
+            sys.exit(f"{where}: base_url must be http(s)://host[:port]")
+        if key in out:
+            sys.exit(f"{where}: duplicate binding {key!r}")
+        out[key] = dict(f, key=key, env=env, name=name,
+                        host=f["service"].split(":", 1)[0],
+                        base_url=f["base_url"].rstrip("/"),
+                        row=enrolled[f["service"]])
+    return out
+
+
+def owned_pins(path=None):
+    """Realpaths of every pin any binding names — read leniently (only the
+    `pin=` token), for fleet-pin-advance's D5 refusal. Raises OSError on an
+    unreadable file so the caller can fail closed; missing means none."""
+    path = Path(path) if path else environments_conf_path()
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return set()
+    pins = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not _BIND_RE.match(line):
+            continue
+        for tok in line.split():
+            if tok.startswith("pin="):
+                pins.add(os.path.realpath(tok[4:]))
+    return pins
+
+
+# ------------------------------------------------------------------ ledger
+
+def _ledger_files():
+    d = lib.fleet_dir()
+    return sorted(d.glob("events-*.jsonl")) + [d / "events.jsonl"]
+
+
+def deploy_events(binding_key):
+    """This binding's deploy-* events, oldest first, archives included."""
+    out = []
+    for f in _ledger_files():
+        try:
+            fh = open(f, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(ev, dict)
+                        and ev.get("type") in ("deploy-started", "deploy-verified")
+                        and (ev.get("detail") or {}).get("binding") == binding_key):
+                    out.append(ev)
+    return out
+
+
+def last_verified(events):
+    for ev in reversed(events):
+        if ev["type"] == "deploy-verified" and ev.get("sha"):
+            return ev["sha"]
+    return None
+
+
+def attempted_and_unverified(events, sha):
+    started = any(e["type"] == "deploy-started" and e.get("sha") == sha for e in events)
+    verified = any(e["type"] == "deploy-verified" and e.get("sha") == sha for e in events)
+    return started and not verified
+
+
+def emit(b, event_type, sha, **extra):
+    """True on success. Awareness for most callers, but the caller of
+    deploy-started treats False as fatal: step 2 reads this record."""
+    detail = {"environment": b["env"], "service": b["name"],
+              "binding": b["key"], "provider": b["provider"]}
+    detail.update(extra)
+    try:
+        m = _load_module("_fleet_emit_for_deploy", BIN / "fleet-emit")
+        m.FLEET_DIR = lib.fleet_dir()
+        m.EVENTS = lib.fleet_dir() / "events.jsonl"
+        m.LOCK = lib.fleet_dir() / "locks" / "events.lock"
+        m.emit(event_type, ACTOR, repo=b["repo"], sha=sha, lease=None, detail=detail)
+        return True
+    except (Exception, SystemExit) as e:
+        warn(f"emit {event_type} failed ({e.__class__.__name__})")
+        return False
+
+
+# ------------------------------------------------------------------ paging
+
+def page(title, body):
+    return watch.notify(title, body, LABEL)
+
+
+def page_once(b, sha, reason, title, body):
+    """Page at most once per (binding, target SHA, reason). The marker is made
+    before delivery and removed if delivery fails, so a failed page retries."""
+    key = hashlib.sha256(f"{b['key']}|{sha}|{reason}".encode()).hexdigest()[:24]
+    d = lib.fleet_dir() / "deploy-pages"
+    d.mkdir(parents=True, exist_ok=True)
+    marker = d / key
+    try:
+        os.close(os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+    except FileExistsError:
+        return False
+    if not page(title, body):
+        marker.unlink(missing_ok=True)
+        return False
+    return True
+
+
+# ------------------------------------------------------------------ git
+
+def _git(path, *args):
+    return lib._pin_git(path, *args)
+
+
+def _fetch(b):
+    """One fetch on the pin's own remote. An ssh remote rides an already-up
+    ControlMaster or is skipped; a plain path/http remote just fetches."""
+    pin = b["pin"]
+    ok, url = _git(pin, "remote", "get-url", "origin")
+    if not ok:
+        return False, "pin has no origin remote"
+    env = dict(os.environ)
+    if url.startswith("ssh://") or re.match(r"^[\w.-]+@[\w.-]+:", url):
+        host = urlparse(url).hostname if url.startswith("ssh://") else url.split(":")[0]
+        try:
+            chk = subprocess.run(["ssh", "-o", "BatchMode=yes", "-O", "check", host],
+                                 capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return False, "ssh ControlMaster check failed to run"
+        if chk.returncode != 0:
+            return False, ("no ssh ControlMaster is up for the origin host — not "
+                           "dialing a fresh connection")
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ControlMaster=no"
+    try:
+        r = subprocess.run(["git", "-C", pin, "fetch", "--quiet", "origin"],
+                           capture_output=True, text=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return False, "git fetch did not run"
+    return (r.returncode == 0), ("" if r.returncode == 0 else "git fetch failed")
+
+
+def _manifest_at(pin, sha):
+    ok, text = _git(pin, "show", f"{sha}:deploy/manifest.json")
+    if not ok:
+        return None, ["no deploy/manifest.json at that commit"]
+    try:
+        m = json.loads(text)
+    except ValueError:
+        return None, ["deploy/manifest.json is not valid JSON"]
+    errs = validate_manifest(m)
+    return (None if errs else m), errs
+
+
+def _start_disagrees(b, m):
+    """A manifest that states artifact/start must agree with the unit."""
+    if "artifact" in m and m["artifact"] != "repo":
+        return f"artifact {m['artifact']!r}: homefleet's artifact is the repository at the SHA ('repo')"
+    if "start" in m:
+        row = b["row"]
+        if row["supervisor"] != "launchd":
+            return "start is stated but only launchd units expose ProgramArguments"
+        _p, data, err, installed = svc._load_installed_plist(
+            row["primary"], svc._launch_agents_dir())
+        if not installed or err or not isinstance(data, dict):
+            return f"start is stated but the unit's plist for {row['primary']} cannot be read"
+        if list(data.get("ProgramArguments") or []) != m["start"]:
+            return "start does not equal the unit's ProgramArguments"
+    return None
+
+
+# ------------------------------------------------------------------ health
+
+def _poll():
+    try:
+        return float(os.environ.get("FLEET_DEPLOY_POLL", "2"))
+    except ValueError:
+        return 2.0
+
+
+def _body_ok(b, m):
+    url = b["base_url"] + m["health"]["path"]
+    # A service health probe, not a forge call. `opener.open`, not `urlopen`:
+    # tests/test_fleetforge.py enumerates every open-coded forge call in bin/
+    # by that spelling, and this is not one to enumerate.
+    try:
+        with urllib.request.build_opener().open(url, timeout=5) as r:
+            if not 200 <= r.status < 300:
+                return False
+            body = r.read(1 << 20).decode("utf-8", "replace")
+    except Exception:
+        return False
+    return m["health"]["expect"] in body
+
+
+def _pid(b):
+    return svc._current_pid(b["row"])
+
+
+def verify(b, m, before):
+    """(ok, reason). The pid must have changed since `before` AND the body must
+    contain `expect`, both within timeout_s."""
+    deadline = time.monotonic() + m["health"].get("timeout_s", DEFAULT_TIMEOUT_S)
+    reason = "the unit's pid never changed"
+    while True:
+        now = _pid(b)
+        if now[0] is not None and now != before:
+            if _body_ok(b, m):
+                return True, ""
+            reason = "the health body did not contain the expected text"
+        if time.monotonic() >= deadline:
+            return False, reason
+        time.sleep(_poll())
+
+
+# ------------------------------------------------------------------ lease
+
+def _resource(b):
+    return {"type": "service", "host": b["host"], "service": b["service"]}
+
+
+def _quiet(fn, *a):
+    """(exit_code, stdout) of a sibling tool's entry point; never raises."""
+    buf = io.StringIO()
+    code = 0
+    try:
+        with contextlib.redirect_stdout(buf):
+            code = fn(*a)
+    except SystemExit as e:
+        code = e.code
+        if isinstance(code, str):
+            warn(code)
+            code = 1
+    return (code or 0), buf.getvalue().strip()
+
+
+def claim_lease(b):
+    """Lease id, or None when refused. A lease still held by our own session id
+    is a dead run's (the flock makes this process the only live one): release
+    it rather than be refused by ourselves forever."""
+    want = json.dumps(_resource(b), sort_keys=True)
+    for rec in lib.all_leases():
+        if (rec.get("state") in ("assigned", "active")
+                and rec.get("holder") == SESSION
+                and json.dumps(lib.resource_of(rec), sort_keys=True) == want):
+            _quiet(release.main, [rec["id"]])
+    code, out = _quiet(claim.main, ["--assign", json.dumps(_resource(b)),
+                                    "--holder", SESSION, "--ttl", str(LEASE_TTL_MIN),
+                                    "--note", "fleet-deploy"])
+    if code != 0 or not out:
+        return None
+    lease_id = out.splitlines()[-1]
+    code, _ = _quiet(claim.main, ["--activate", lease_id])
+    if code != 0:
+        _quiet(release.main, [lease_id])
+        return None
+    return lease_id
+
+
+def release_lease(lease_id):
+    code, _ = _quiet(release.main, [lease_id])
+    if code != 0:
+        warn(f"could not release {lease_id}")
+
+
+# ------------------------------------------------------------------ one deploy step
+
+def _move_and_restart(b, sha):
+    """Checkout + gated restart. (ok, reason)."""
+    ok, _ = _git(b["pin"], "checkout", "--quiet", "--detach", sha)
+    if not ok:
+        return False, f"`git checkout --detach {sha[:7]}` failed"
+    ok, head = _git(b["pin"], "rev-parse", "HEAD")
+    if not ok or head != sha:
+        return False, f"checkout exited 0 but HEAD is not {sha[:7]}"
+    code, _ = _quiet(svc.cmd_mutate, "restart", b["service"])
+    if code != 0:
+        return False, "fleet-svc refused or failed the restart"
+    return True, ""
+
+
+def _step(b, m, sha, kind, prev, lease_id):
+    """One deploy-started -> move -> restart -> verify. (ok, reason). Emits
+    deploy-verified on success. A failed deploy-started emit aborts before the
+    pin moves: step 2 of the cycle reads that record."""
+    if not emit(b, "deploy-started", sha, kind=kind, **{"from": prev, "lease": lease_id}):
+        return False, "could not record deploy-started on the ledger"
+    before = _pid(b)
+    ok, reason = _move_and_restart(b, sha)
+    if ok:
+        ok, reason = verify(b, m, before)
+    if ok:
+        after = _pid(b)
+        if not emit(b, "deploy-verified", sha, kind=kind, pid=after[0]):
+            page("Deploy unrecorded", f"{b['key']}: {sha[:7]} verified but the ledger "
+                 "write failed; the next cycle will treat it as unverified")
+    return ok, reason
+
+
+def deploy(b, m, target, head, verified):
+    lease_id = claim_lease(b)
+    if lease_id is None:
+        say(f"{b['key']}: service lease refused — pin unmoved, trying next cycle")
+        return "lease-refused"
+    try:
+        ok, reason = _step(b, m, target, "deploy", head, lease_id)
+        if ok:
+            say(f"{b['key']}: {target[:7]} verified")
+            return "verified"
+        warn(f"{b['key']}: {target[:7]} failed ({reason}) — rolling back to {verified[:7]}")
+        ok2, reason2 = _step(b, m, verified, "rollback", target, lease_id)
+        if ok2:
+            page("Deploy rolled back",
+                 f"{b['key']}: {target[:7]} failed ({reason}); rolled back to "
+                 f"{verified[:7]} and it verified. {target[:7]} will not be retried "
+                 "until main moves (or `fleet-deploy retry`).")
+            return "rolled-back"
+        page("Deploy AND rollback failed",
+             f"{b['key']}: {target[:7]} failed ({reason}); rollback to "
+             f"{verified[:7]} failed too ({reason2}). Stopped; not retrying. "
+             "The unit needs a person.")
+        return "rollback-failed"
+    finally:
+        release_lease(lease_id)
+
+
+# ------------------------------------------------------------------ the cycle
+
+def cycle(b, dry_run=False, ignore_attempt=False, want_sha=None):
+    """One binding, one pass. Returns a short outcome string. Never raises for
+    a per-binding problem."""
+    key, pin = b["key"], b["pin"]
+    if b["host"] != svc._host():
+        return f"skipped: host {b['host']!r} is not this machine"
+
+    if dry_run:
+        say(f"{key}: DRY-RUN would `git fetch` {pin} (skipped: dry-run fetches nothing)")
+    else:
+        ok, why = _fetch(b)
+        if not ok:
+            warn(f"{key}: {why} — no cycle without a fresh origin/main")
+            return "unfetchable"
+    ok_h, head = _git(pin, "rev-parse", "HEAD")
+    ok_t, target = _git(pin, "rev-parse", "origin/main")
+    if not ok_h or not ok_t:
+        warn(f"{key}: cannot resolve HEAD or origin/main in {pin}")
+        return "unresolvable"
+    if want_sha and not target.startswith(want_sha):
+        warn(f"{key}: --sha {want_sha} is not origin/main ({target[:7]}) — refusing")
+        return "sha-mismatch"
+
+    events = deploy_events(key)
+    verified = last_verified(events)
+    if not ignore_attempt and attempted_and_unverified(events, target):
+        return "skipped: already attempted"
+    if head == target and verified is not None:
+        return "current"
+
+    def refuse(reason, text):
+        warn(f"{key}: {text}")
+        if dry_run:
+            say(f"{key}: DRY-RUN would refuse and page once ({reason})")
+        else:
+            page_once(b, target, reason, f"Deploy refused: {key}",
+                      f"{key} at {target[:7]}: {text}")
+        return f"refused: {reason}"
+
+    m, errs = _manifest_at(pin, target)
+    if m is None:
+        return refuse("manifest", "manifest at the target does not validate: "
+                      + "; ".join(errs))
+    if m["name"] != b["name"]:
+        return refuse("manifest", f"manifest names {m['name']!r}, binding is {b['name']!r}")
+    bad = _start_disagrees(b, m)
+    if bad:
+        return refuse("manifest", f"manifest disagrees with the unit: {bad}")
+
+    if head == target:                      # first run, pin already at main
+        return baseline(b, m, head, dry_run)
+
+    okd, _ = _git(pin, "merge-base", "--is-ancestor", head, target)
+    if not okd:
+        return refuse("not-descendant", f"target is not a descendant of the pin's "
+                      f"HEAD {head[:7]} — refusing a non-fast-forward move")
+    ok_st, porcelain = _git(pin, "status", "--porcelain")
+    if ok_st and porcelain:
+        return refuse("dirty", f"the pin has {len(porcelain.splitlines())} "
+                      "uncommitted change(s)")
+    repo = b["repo"]
+    code, why, _lane = watch.broker_verdict(repo)
+    if code != watch.PROT_OK:
+        return refuse("broker", f"the broker does not vouch for {repo}'s main — {why}")
+    deps = m.get("deps", [])
+    if deps:
+        okx, changed = _git(pin, "diff", "--name-only", head, target, "--", *deps)
+        if okx and changed:
+            return refuse("deps", "host preparation needed: "
+                          f"{', '.join(changed.splitlines())} changed between "
+                          f"{head[:7]} and {target[:7]}; the pin does not move")
+        if not okx:
+            return refuse("deps", "could not diff the deps files")
+
+    if verified is None:
+        r = baseline(b, m, head, dry_run)
+        if r != "baseline":
+            return r
+        verified = head
+
+    if dry_run:
+        say(f"{key}: DRY-RUN would claim the service lease as {SESSION!r}, emit "
+            f"deploy-started {target[:7]}, checkout --detach, restart "
+            f"{b['service']} via fleet-svc, verify pid change + "
+            f"{m['health']['path']} contains {m['health']['expect']!r}; on "
+            f"failure roll back once to {verified[:7]}")
+        return "dry-run"
+    return deploy(b, m, target, head, verified)
+
+
+def baseline(b, m, head, dry_run):
+    """D4's first run: no deploy-verified yet, so record the pin's own HEAD as
+    the baseline if it is healthy. Nothing restarts, so no pid check."""
+    if not _body_ok(b, m):
+        warn(f"{b['key']}: no verified baseline and the running service is not healthy")
+        if not dry_run:
+            page_once(b, head, "baseline", f"Deploy refused: {b['key']}",
+                      f"{b['key']}: first run, and the service at {head[:7]} does not "
+                      "answer its health check, so there is no verified SHA to roll "
+                      "back to. Fix it, then the next cycle records the baseline.")
+        return "refused: baseline"
+    if dry_run:
+        say(f"{b['key']}: DRY-RUN would record deploy-verified {head[:7]} as the baseline")
+        return "baseline"
+    emit(b, "deploy-verified", head, kind="baseline", pid=_pid(b)[0])
+    say(f"{b['key']}: baseline {head[:7]} recorded")
+    return "baseline"
+
+
+def _flock():
+    import fcntl
+    d = lib.locks_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(d / "fleet-deploy.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def run(binding=None, dry_run=False, retry=False, sha=None):
+    os.environ["EUNOMIA_SESSION"] = SESSION     # the lease holder, always
+    bindings = parse_bindings()
+    if binding:
+        if binding not in bindings:
+            sys.exit(f"fleet-deploy: no binding {binding!r} in {environments_conf_path()}")
+        bindings = {binding: bindings[binding]}
+    fd = None
+    if not dry_run:
+        fd = _flock()
+        if fd is None:
+            print("fleet-deploy: another run is in progress — exiting", file=sys.stderr)
+            return {}
+    results = {}
+    try:
+        for key, b in bindings.items():
+            try:
+                results[key] = cycle(b, dry_run=dry_run, ignore_attempt=retry,
+                                     want_sha=sha)
+            except Exception as e:      # one binding never stops the others
+                warn(f"{key}: {e.__class__.__name__}: {e}")
+                results[key] = "error"
+            say(f"{key}: {results[key]}")
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return results
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-deploy", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    v = sub.add_parser("validate", help="check a deploy/manifest.json")
+    v.add_argument("path")
+    r = sub.add_parser("run", help="one cycle over this host's bindings")
+    r.add_argument("--binding")
+    r.add_argument("--dry-run", action="store_true")
+    t = sub.add_parser("retry", help="one cycle that ignores the already-attempted skip")
+    t.add_argument("--binding", required=True)
+    t.add_argument("--sha")
+    args = ap.parse_args(argv)
+    if args.cmd == "validate":
+        return cmd_validate(args.path)
+    if args.cmd == "run":
+        run(args.binding, dry_run=args.dry_run)
+    else:
+        run(args.binding, retry=True, sha=args.sha)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

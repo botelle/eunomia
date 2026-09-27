@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""fleet-leak-watch — the detection backstop for secrets that reach a transcript.
+
+Prevention (fleet-secret-guard) is never perfect: a secret can arrive in tool
+OUTPUT the guard could not predict (an API response body, a command the deny list
+doesn't cover). So the honest second layer is detection-in-minutes plus rotation,
+not a promise of zero leaks. Failwatch-shaped: scan NEW transcript bytes on an
+interval, ntfy on first sight of each finding.
+
+Contract (plan 0006 §3):
+  * Incremental: per-file byte offset in a state file; re-scan only growth.
+  * Idempotent: dedupe by (file, finding-hash) so one leak pages ONCE. The
+    dedupe ledger is content-derived, so losing state re-scans without re-paging.
+  * Never quotes a transcript into the alert, the log, or the state — offsets and
+    hashes only (Principle 6 on every byte it writes).
+
+Usage:
+  fleet-leak-watch            scan new bytes, alert on new findings
+  fleet-leak-watch --dry-run  scan EVERYTHING, print counts, alert nothing, write
+                              no state (the baseline sweep + CI corpus check)
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+PROJECTS = Path.home() / ".claude" / "projects"
+NTFY_URL = os.environ.get("FLEET_NTFY_URL", "")   # e.g. http://vaulthost:3001/api/push/<id> or an ntfy topic URL
+
+UNIT = "fleet-leak-watch"
+TITLE = "fleet-leak-watch: secret shape"
+
+# Credential SHAPES in free text. Kept close to the collector's _SECRETISH plus
+# the token families the incidents actually involved.
+# High-signal shapes — structured credentials that are almost never anything else.
+# A dry-run over 855 real transcripts hit these ~10 times total; that is the whole
+# point of picking shapes with a prefix/structure rather than raw entropy.
+FINDINGS = [
+    ("github-pat", re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}")),
+    ("slack-token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{20,}")),
+    ("openai-key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
+    ("jwt-or-tunnel", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}")),
+    ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----")),
+    ("aws-key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+]
+# Noisy shapes — real credentials wear these too, but so does every git SHA
+# (long-hex) and every sentence about a token (assignment). Same 855-file dry-run:
+# ~3000 hits, essentially all false. Behind --paranoid so the always-on watcher
+# stays trusted: a monitor that pages 3000 times gets muted, and a muted monitor
+# is the un-validated check §8.3 forbids relying on.
+PARANOID_FINDINGS = [
+    ("assignment", re.compile(
+        r"(?i)\b(?:bearer|api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*\S{8,}")),
+    # Bounded on the HEX CLASS, not on \b. `\b` asks "is the neighbour a word
+    # character", and a non-hex word character abutting the run then HIDES it —
+    # which is not an edge case once anything JSON-encoded is scanned, because a
+    # newline becomes backslash-n and the character before the token is `n`.
+    #
+    # Measured 2026-09-10 while moving the implementer transcript to
+    # `--output-format stream-json`: the same 40-hex Forgejo PAT was redacted as
+    # plain text and NOT redacted inside a tool_result record. The move would
+    # otherwise have put redaction onto a stream these patterns match less well —
+    # a control that reads as strengthened while doing less.
+    #
+    # Strictly a superset: identical on a space, a quote, a longer hex run and a
+    # bare git SHA; it only adds the case `\b` was never able to see.
+    ("long-hex", re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{40,}(?![A-Fa-f0-9])")),
+]
+
+
+def _synthetic(matched: str) -> bool:
+    """True when a shape match is a placeholder rather than a credential.
+
+    This repository's own suite carries `ghp_` followed by 36 identical
+    characters, to prove `redact()` strips a credential shape
+    (tests/test_orchestrator.py). Every session that runs the suite echoes it
+    into a transcript, and this watcher — matching on structure, which is the
+    whole point — pages for it every time. A monitor that pages for its own
+    fixtures gets muted, and a muted monitor is the un-validated check the SPEC
+    forbids relying on.
+
+    Two rules, both about repetition rather than entropy in the
+    information-theoretic sense. A real credential of this length has neither
+    property; a placeholder usually has both.
+
+    What is deliberately NOT a rule: "the value also appears in a committed
+    file." That is the obvious test and it is exactly backwards — it would
+    silence the one case most worth paging for, a real credential that reached
+    the repository. This looks only at the shape of the value.
+    """
+    if len(matched) < 16:
+        return False                       # too short to judge; stay loud
+    if len(set(matched)) <= 5:
+        return True                        # ghp_AAAA... -> {g,h,p,_,A}
+    top = max(matched.count(c) for c in set(matched))
+    return top / len(matched) >= 0.6
+
+
+def _fleet_dir() -> Path:
+    return Path(os.environ.get("EUNOMIA_FLEET_DIR", str(Path.home() / "dev" / ".fleet")))
+
+
+def _state_path() -> Path:
+    return _fleet_dir() / "leak-watch.state.json"
+
+
+def _load_state():
+    try:
+        return json.loads(_state_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"offsets": {}, "alerted": []}
+
+
+def _save_state(state):
+    p = _state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, p)
+
+
+def _finding_key(rel, finding, matched):
+    # content-derived so it survives state loss without re-paging; the matched
+    # text is HASHED, never stored in the clear.
+    h = hashlib.sha256(matched.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{rel}:{finding}:{h}"
+
+
+def _record_page(title, body, delivered, detail=""):
+    """Append one row to pages.jsonl via bin/orchestrator's `record_page`
+    (plan 0058) -- reused, not restated, so this page lands in the same
+    ledger every other pager writes.
+
+    Loaded LAZILY, inside the call, never at module import: bin/orchestrator
+    already loads THIS module for its redaction patterns
+    (orchestrator:_redaction_patterns, :_transcript_patterns), and a
+    module-level load back here would close that into an import cycle.
+
+    Never raises -- record_page already promises that for itself, but the
+    SourceFileLoader here is new surface, and a failed record must not fail
+    the alert it is trying to log."""
+    try:
+        loader = importlib.machinery.SourceFileLoader("orchestrator", str(BIN / "orchestrator"))
+        orch = importlib.util.module_from_spec(importlib.util.spec_from_loader("orchestrator", loader))
+        loader.exec_module(orch)
+        orch.record_page(title, body, delivered, detail, extra={"unit": UNIT})
+    except Exception:
+        pass
+
+
+def _alert(rel, lineno, finding):
+    # rule + location only. NEVER the matched text.
+    msg = f"secret-shape '{finding}' in transcript {rel} line {lineno}"
+    # The RECORDED body: path, shape and line only -- never the prose above
+    # and never anything the matched text touches (Boundaries: plan 0058).
+    # This is the one pager whose subject matter is secrets, so the rule that
+    # binds it is narrower than every other pager's.
+    record_body = f"{rel} line {lineno}: {finding}"
+    if not NTFY_URL:
+        print("ALERT " + msg)
+        _record_page(TITLE, record_body, False, "no channel configured")
+        return
+    try:
+        req = urllib.request.Request(NTFY_URL, data=msg.encode(), method="POST")
+        urllib.request.urlopen(req, timeout=5).read()
+        _record_page(TITLE, record_body, True)
+    except Exception as e:
+        print(f"ALERT(ntfy-failed:{e.__class__.__name__}) " + msg, file=sys.stderr)
+        _record_page(TITLE, record_body, False, e.__class__.__name__)
+
+
+def _result_text(line):
+    """The tool_result text from one JSONL line, or \"\" — leaked OUTPUT lives here."""
+    try:
+        o = json.loads(line)
+    except Exception:
+        return ""
+    m = o.get("message")
+    if not isinstance(m, dict):
+        return ""
+    out = []
+    for c in (m.get("content") or []):
+        if isinstance(c, dict) and c.get("type") == "tool_result":
+            r = c.get("content")
+            if isinstance(r, str):
+                out.append(r)
+            elif isinstance(r, list):
+                out += [b.get("text", "") for b in r if isinstance(b, dict)]
+    return "\n".join(out)
+
+
+def _scan_file(path: Path, start: int, paranoid=False):
+    """Yield (lineno, finding, matched) for content from byte `start`. Returns the
+    new end offset. A partial final line is not consumed (re-read next pass)."""
+    hits = []
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return hits, start
+    if size <= start:
+        return hits, start
+    with path.open("rb") as fh:
+        fh.seek(start)
+        data = fh.read()
+    text = data.decode("utf-8", "replace")
+    # don't consume a partial final line
+    consumed = len(data)
+    if not text.endswith("\n"):
+        cut = text.rfind("\n")
+        if cut == -1:
+            return hits, start
+        text = text[:cut + 1]
+        consumed = len(text.encode("utf-8", "replace"))
+    findings = FINDINGS + (PARANOID_FINDINGS if paranoid else [])
+    for i, line in enumerate(text.splitlines()):
+        # Only the tool_result content — that is where leaked OUTPUT lands (a
+        # `cat` of a secret, an API response body). Scanning prompt/assistant
+        # prose too was ~15x slower and all the false positives lived there.
+        blob = _result_text(line)
+        if not blob:
+            continue
+        for name, rx in findings:
+            m = rx.search(blob)
+            if m:
+                hits.append((i, name, m.group(0)))
+    return hits, start + consumed
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="fleet-leak-watch", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="scan everything, count only, no alerts, no state written")
+    ap.add_argument("--paranoid", action="store_true",
+                    help="also match the noisy shapes (long-hex, assignment) — audit use")
+    args = ap.parse_args(argv)
+
+    state = {"offsets": {}, "alerted": []} if args.dry_run else _load_state()
+    alerted = set(state.get("alerted", []))
+    files = sorted(PROJECTS.glob("*/*.jsonl")) + sorted(PROJECTS.glob("*/*/subagents/*.jsonl"))
+    total_hits = new_alerts = suppressed = 0
+
+    for path in files:
+        try:
+            rel = str(path.relative_to(PROJECTS))
+        except ValueError:
+            rel = str(path)
+        start = 0 if args.dry_run else state["offsets"].get(rel, 0)
+        hits, end = _scan_file(path, start, paranoid=args.paranoid)
+        if not args.dry_run:
+            state["offsets"][rel] = end
+        for lineno, finding, matched in hits:
+            if _synthetic(matched):
+                # counted, never silent: a suppression nobody can see is a
+                # second un-validated check hiding behind the first.
+                suppressed += 1
+                continue
+            total_hits += 1
+            key = _finding_key(rel, finding, matched)
+            if args.dry_run or key in alerted:
+                continue
+            _alert(rel, lineno, finding)
+            alerted.add(key)
+            new_alerts += 1
+
+    if not args.dry_run:
+        state["alerted"] = sorted(alerted)
+        _save_state(state)
+        print(f"leak-watch: {len(files)} files, {new_alerts} new alert(s), "
+              f"{suppressed} synthetic suppressed")
+    else:
+        print(f"leak-watch --dry-run: {len(files)} files, {total_hits} shape hit(s), "
+              f"{suppressed} synthetic suppressed "
+              "(counts only; nothing alerted, no state written)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

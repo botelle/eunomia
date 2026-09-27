@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""fleet-cr — the change-request queue for integrator-owned files (SPEC.md §CR).
+
+  fleet-cr file   --repo R --lane L --target PATH [--intent TEXT]
+                  [--patch-file F] [--for-pr N]
+  fleet-cr apply  REPO CR-ID --commit SHA
+  fleet-cr reject REPO CR-ID
+  fleet-cr list   [--repo R] [--lane L] [--state S] [--json]
+
+A lane that needs a change to a file it does not own FILES a request instead of
+editing it; the integrator — the session holding an active branch/paths lease on
+the repo whose resource carries `"role": "integrator"` (granted one-per-repo by
+the coordinator) — APPLIES requests serially. `apply` marks and emits; it never makes
+the commit (the integrator's own PR does — the ledger observes, Forgejo state is
+authority, Principle 3). A PR body's `needs: CR-<lane>-<nnn>` line becomes a
+merge-queue condition in row 7; nothing here reads it. `reject` is the §3-implied
+human verb for a stale filed CR (no auto-expiry, Principle 4); the closed event
+set has no cr-rejected, so the record itself is where a rejection is recorded.
+
+Nothing secret-shaped may ride intent or patch: this tree is rendered by atlas
+(Principle 6). validate_cr enforces it from the shared secret-patterns.conf at
+file time AND apply time.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+_lib_loader = importlib.machinery.SourceFileLoader(
+    "fleetlib", str(Path(__file__).resolve().parent / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+
+def _integrator_lease(sid: str, repo: str):
+    """The gate on apply/reject: an ACTIVE branch/paths lease on this repo, held
+    by this session, whose resource carries `"role": "integrator"`. The role
+    field is the discriminator (1522 #11 H1): a worker lane IS a branch lease on
+    the repo in this fleet's model, so repo-match alone would grant apply to
+    exactly the population the queue exists to constrain — any filer could
+    self-apply. The coordinator grants ONE integrator-role lease per repo; a
+    plain working lease never passes."""
+    for rec in lib.all_leases():
+        if rec.get("state") != "active" or rec.get("holder") != sid:
+            continue
+        res = lib.resource_of(rec)
+        if (res.get("type") in ("branch", "paths") and res.get("repo") == repo
+                and res.get("role") == "integrator"):
+            return rec.get("id")
+    return None
+
+
+def cmd_file(args) -> int:
+    actor = lib.session_id()
+    repo = lib.validate_repo(args.repo)
+    lane = lib.validate_lane(args.lane)
+    patch = None
+    if args.patch_file:
+        try:
+            if Path(args.patch_file).stat().st_size > 524288:
+                # stat first (1522 #11 r4 low): refuse a huge file BEFORE
+                # read_text pulls it into memory
+                sys.exit(f"fleet-cr: {args.patch_file} exceeds the 512KB "
+                         "patch cap — reference the material instead")
+            patch = Path(args.patch_file).read_text()
+        except OSError as e:
+            sys.exit(f"fleet-cr: cannot read patch file: {e}")
+        except UnicodeDecodeError:
+            sys.exit(f"fleet-cr: {args.patch_file} is not UTF-8 text — a patch "
+                     "is a text diff, not a binary")
+    record = {
+        "id": "CR-PLACEHOLDER",          # real id allocated under the lock
+        "repo": repo,
+        "lane": lane,
+        "target": args.target,
+        "state": "filed",
+        "filed": lib.ts(lib.now_utc()),
+    }
+    if args.intent:
+        record["intent"] = args.intent
+    if patch is not None:
+        record["patch"] = patch
+    if args.for_pr is not None:
+        record["for_pr"] = args.for_pr
+
+    with lib.held_lock(lib.cr_lock_path(repo)):
+        taken = set()
+        d = lib.cr_dir() / repo
+        if d.is_dir():
+            for p in d.glob(f"{lane}-*.json"):
+                # start-anchored with the lane escaped: lane w1 must not count
+                # lane w1-2's files (#11 L2)
+                m = re.match(re.escape(lane) + r"-(\d{3,})\.json\Z", p.name)
+                if m:
+                    taken.add(int(m.group(1)))
+        # Monotonic per lane, FOREVER (1522 #11 r5 M1): the poisoned-CR remedy
+        # is a sanctioned `rm`, and a recycled id would let a PR's `needs:`
+        # line be satisfied by a DIFFERENT request than the one it named once
+        # row 7 consumes these as merge conditions. The directory scan alone
+        # cannot deliver that (rm erases the number), so a per-lane counter
+        # dotfile — written under this same lock, skipped by list's dot-filter,
+        # holding no secret — is the durable floor; the scan max is the backstop
+        # if the counter is ever lost. (The lease allocator may gap-fill only
+        # because leases are never deleted; CRs need the opposite property.)
+        counter = d / f".{lane}-next"
+        try:
+            floor = int(counter.read_text())
+        except FileNotFoundError:
+            floor = 1           # the ONLY legitimate absence: a lane's first filing
+        except (OSError, ValueError):
+            # A torn/unreadable counter is the silent-guard-degrade class this
+            # PR already refuses twice for the conf (1522 #11 r6 M): with the
+            # floor gone AND an rm'd file, the scan alone can re-mint a number.
+            # Loud, before anything is written.
+            sys.exit(f"fleet-cr: {counter} is torn or unreadable — the "
+                     "never-reuse floor is at risk. Repair it (last minted "
+                     "number + 1) before filing.")
+        n = max(floor, (max(taken) + 1) if taken else 1)
+        record["id"] = f"CR-{lane}-{n:03d}"
+        # RESERVATION FIRST (1522 #11 r7 L1): the counter records n+1 BEFORE
+        # write_cr, so by the time a record exists its number is already
+        # spent — neither a crash mid-filing nor the sanctioned `rm` of that
+        # exact CR can ever re-mint it. The old order (write, print,
+        # best-effort bump) left a window: die between write_cr's rename and
+        # the bump and the floor never learns of n. The cost: any refusal
+        # inside write_cr (secret shape, conf failure, disk error) burns the
+        # reserved number — a gap in the lane's sequence, harmless for CRs;
+        # reuse is what the design forbids. And a failed reservation is LOUD:
+        # nothing has been written yet, so refusing outright is free — the
+        # WARN-and-continue the old order needed (the record already existed)
+        # has no reason to exist here. Temp + os.replace as everywhere
+        # (write_text truncates first — a crash mid-write left an EMPTY
+        # floor, r6 M); still under the lock.
+        #
+        # The reservation is FSYNC'd — data, then the directory that carries
+        # the rename — before write_cr runs (#15 r8 L2). Process-crash
+        # ordering is free (the syscalls are ordered), but an OS/power loss
+        # is not: two renames in two inodes can reach disk in either order,
+        # which would resurrect the exact record-without-reservation window
+        # this design closes. The record itself needs no fsync — losing it
+        # while keeping the bump is a gap, and gaps are harmless. (On macOS
+        # fsync is not F_FULLFSYNC, so a drive-cache power loss can still
+        # lie; that residue lands in the loud torn-counter refusal.)
+        # mkdir sits inside the try so a read-only parent refuses cleanly
+        # instead of raising through (r8 nit).
+        tmp = None
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".tmp-", suffix="-next")
+            with os.fdopen(fd, "w") as fh:
+                fh.write(str(n + 1))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, str(counter))
+            dfd = os.open(str(d), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+            sys.exit(f"fleet-cr: counter reservation failed "
+                     f"({e.__class__.__name__}) — filing refused before any "
+                     "record write; the never-reuse floor is intact")
+        # write_cr runs validate_cr — the secret check happens BEFORE the
+        # record touches disk, so a refused CR leaves no record behind (the
+        # burned counter number is the only trace, and it carries no content).
+        lib.write_cr(record)
+        # The queue write IS the filing: id to stdout the moment it is durable
+        # (1493) — only the emit, fallible, comes after (1522 #11 r6 low).
+        print(record["id"])
+        sys.stdout.flush()
+    lib.emit("cr-filed", None, actor,
+             detail={"cr": record["id"], "repo": repo, "lane": lane,
+                     "target": args.target})
+    return 0
+
+
+def _transition(args, new_state: str, verb: str) -> int:
+    sid = lib.session_id()
+    repo = lib.validate_repo(args.repo)
+    cr_id = lib.validate_cr_id(args.cr_id)
+    lease = _integrator_lease(sid, repo)
+    if lease is None:
+        sys.exit(f"fleet-cr: {verb} is the integrator's act — {sid!r} holds no "
+                 f"active integrator-role lease on {repo}. A plain working lease "
+                 "does not qualify (any filer could self-apply); ask the "
+                 "integrator, or have the coordinator grant the role lease.")
+    with lib.held_lock(lib.cr_lock_path(repo)):
+        rec = lib.read_cr_checked(repo, cr_id)
+        if rec is None:
+            sys.exit(f"fleet-cr: no CR {cr_id} in {repo}")
+        if rec.get("state") != "filed":
+            sys.exit(f"fleet-cr: {cr_id} is {rec.get('state')!r}, not 'filed' — "
+                     f"{verb} refused (transitions are once-only)")
+        rec["state"] = new_state
+        if new_state == "applied":
+            rec["applied_commit"] = lib.validate_sha(args.commit)
+            rec["applied_at"] = lib.ts(lib.now_utc())
+        # re-validate: nothing (a hand-edit between filing and now included)
+        # can launder a secret or a malformed field through the transition
+        lib.write_cr(rec)
+    print(cr_id)
+    sys.stdout.flush()
+    if new_state == "applied":
+        lib.emit("cr-applied", None, sid,
+                 detail={"cr": cr_id, "repo": repo,
+                         "commit": rec["applied_commit"], "lease": lease})
+    # rejected: no event — the closed set has none; the record is the record.
+    return 0
+
+
+def cmd_list(args) -> int:
+    if args.repo:
+        lib.validate_repo(args.repo)
+    if args.lane:
+        lib.validate_lane(args.lane)
+    if args.state and args.state not in lib.CR_STATES:
+        sys.exit(f"fleet-cr: state {args.state!r} not in {lib.CR_STATES}")
+    out = []
+    d = lib.cr_dir()
+    for p in sorted(d.glob("*/*/*.json")) if d.is_dir() else []:
+        if p.name.startswith("."):
+            continue            # crash-orphaned write_cr temp (#11 L3)
+        try:
+            rec = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            print(f"fleet: WARN unreadable CR file {p} — skipped", file=sys.stderr)
+            continue
+        if not isinstance(rec, dict):
+            print(f"fleet: WARN non-record CR file {p} — skipped", file=sys.stderr)
+            continue
+        if args.repo and rec.get("repo") != args.repo:
+            continue
+        if args.lane and rec.get("lane") != args.lane:
+            continue
+        if args.state and rec.get("state") != args.state:
+            continue
+        out.append(rec)
+    out.sort(key=lambda r: str(r.get("filed") or ""))
+    if args.json:
+        print(json.dumps({"crs": out}, indent=1, sort_keys=True))
+        return 0
+    if not out:
+        print("no change-requests")
+    for r in out:
+        pr = f" for_pr={r['for_pr']}" if r.get("for_pr") is not None else ""
+        # control chars stripped from the WHOLE assembled line (1522 #11 r4
+        # low, widened r7 L2): list deliberately renders unvalidated records
+        # (degrade-don't-die), so a hand-written file can carry ANSI or raw
+        # newlines in ANY field — repo or id would forge listing rows just as
+        # target did. One sub over the line covers every field uniformly.
+        # The class includes C1 (U+0080-U+009F, #15 r8 L1): a JSON record can
+        # carry a bare U+009B, which xterm-family terminals honor as CSI with
+        # no ESC byte at all — the same forgery through a code point an
+        # ESC-only strip never sees.
+        line = (f"{str(r.get('state') or '?'):8} {str(r.get('repo') or '?'):24} "
+                f"{str(r.get('id') or '?'):16} "
+                f"target={str(r.get('target') or '?')}{pr}")
+        print(re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", line))
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="fleet-cr", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    f = sub.add_parser("file", help="file a change-request")
+    f.add_argument("--repo", required=True)
+    f.add_argument("--lane", required=True)
+    f.add_argument("--target", required=True)
+    f.add_argument("--intent")
+    f.add_argument("--patch-file")
+    f.add_argument("--for-pr", type=int, default=None)
+
+    a = sub.add_parser("apply", help="mark a CR applied (integrator only)")
+    a.add_argument("repo")
+    a.add_argument("cr_id")
+    a.add_argument("--commit", required=True)
+
+    r = sub.add_parser("reject", help="reject a stale CR (integrator only)")
+    r.add_argument("repo")
+    r.add_argument("cr_id")
+
+    l = sub.add_parser("list", help="read the queue (no lock)")
+    l.add_argument("--repo")
+    l.add_argument("--lane")
+    l.add_argument("--state")
+    l.add_argument("--json", action="store_true")
+
+    args = ap.parse_args(argv)
+    if args.cmd == "file":
+        return cmd_file(args)
+    if args.cmd == "apply":
+        return _transition(args, "applied", "apply")
+    if args.cmd == "reject":
+        return _transition(args, "rejected", "reject")
+    return cmd_list(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

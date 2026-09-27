@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""fleet-db-snapshot — a consistent, dated copy of fleet.db, for the offline tier
+to collect (plan 0063).
+
+Why this exists. `repo_model` (which runner serves which position, per repo) lives
+only in `fleet.db`; history is rebuilt from transcripts and the ledger, but a
+configuration row is a decision and is derivable from nothing else the machine
+keeps except the `repo-model-changed` events. A copy of the file is the cheaper
+half of that guarantee, and it is the half the offline tier can hold.
+
+THE ONLINE BACKUP API, NEVER A FILE COPY. `fleet-collect` writes every 120
+seconds, so `cp` has a real chance of catching a write mid-flight and producing a
+file that opens fine and is missing rows — a torn backup that restores is worse
+than one that fails, because nothing reports it. `sqlite3.Connection.backup` is
+SQLite's own online backup: it reads a consistent snapshot under the database's
+locking, whatever a writer is doing. (`bin/fleet-snapshot` uses `VACUUM INTO`,
+which is also consistent; this is a separate unit on its own schedule and its own
+file names, and the two do not prune each other.)
+
+The copy is built under a `.partial` name, converted to a single self-contained
+file (`journal_mode=DELETE`, so there is no -wal sidecar to lose in transit),
+integrity-checked, and only then renamed to its final name — a file matching the
+snapshot glob is always a complete, verified one. Rotation runs after that, so a
+failed snapshot never costs the copies already held.
+
+This is NOT called from `fleet-collect`: the collector is the writer, and a
+backup verb inside the writer runs while it holds the database — the first failure
+mode is the collector blocking on itself.
+
+THE LOGICAL DUMP (plan 0063 D4a). Beside each snapshot, `fleetdb-<stamp>.dump/`
+holds one JSON-lines file per DURABLE table (`DURABLE_TABLES`, named in
+`fleet-collect`): one row per line, keys sorted, rows in primary-key order, so a
+durable row that changed between two runs is a one-line diff between two dumps.
+It is small, readable when you want to know what the configuration used to say,
+and independent of SQLite. It is NOT the restore path: it holds the durable tier
+only, and a database rebuilt from it alone has configuration and no history. The
+physical snapshot restores; the dump is for reading, diffing and porting.
+
+  fleet-db-snapshot [--db PATH] [--out DIR] [--keep N]
+
+Defaults: the database is `$FLEET_DB` or `<fleet dir>/fleet.db`; the snapshots go
+to `<fleet dir>/snapshots/fleetdb-<UTC stamp>.db`; `--keep 7`.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+_lib_loader = importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+_collect_loader = importlib.machinery.SourceFileLoader(
+    "fleet_collect_for_dump", str(BIN / "fleet-collect"))
+_collect_spec = importlib.util.spec_from_loader("fleet_collect_for_dump", _collect_loader)
+collect = importlib.util.module_from_spec(_collect_spec)
+_collect_loader.exec_module(collect)
+
+# `fleetdb-`, not `fleet-`: bin/fleet-snapshot prunes `fleet-*.db` in this same
+# directory, and a name that glob matches would be deleted by the other tool's
+# retention.
+PREFIX = "fleetdb-"
+SUFFIX = ".db"
+
+
+def default_db():
+    return Path(os.path.expanduser(
+        os.environ.get("FLEET_DB", str(lib.fleet_dir() / "fleet.db"))))
+
+
+def default_out():
+    return lib.fleet_dir() / "snapshots"
+
+
+def existing(out_dir):
+    """Finished snapshots, oldest first. Names embed a fixed-width UTC stamp, so
+    lexical order is chronological and needs no mtime (which a restore or a
+    copy elsewhere would reset)."""
+    return sorted(out_dir.glob(f"{PREFIX}*{SUFFIX}"))
+
+
+def dump_dir_for(db_path):
+    """`fleetdb-<stamp>.db` -> `fleetdb-<stamp>.dump`."""
+    db_path = Path(db_path)
+    return db_path.with_name(db_path.name[:-len(SUFFIX)] + ".dump")
+
+
+def _json_value(v):
+    if isinstance(v, bytes):
+        return {"$blob": v.hex()}
+    return v
+
+
+def dump_logical(snapshot_path, dest):
+    """Write one `<table>.jsonl` per durable table present in the finished
+    snapshot into `dest` (created). Read from the snapshot, not the live file, so
+    the dump and the snapshot say the same thing. Returns {table: rows}."""
+    con = sqlite3.connect(f"file:{snapshot_path}?mode=ro", uri=True)
+    counts = {}
+    try:
+        dest.mkdir(parents=True)
+        for table in sorted(collect.DURABLE_TABLES):
+            info = con.execute(f'PRAGMA table_info("{table}")').fetchall()
+            if not info:
+                continue                    # never created on this host
+            cols = [c[1] for c in info]
+            pk = [c[1] for c in sorted((c for c in info if c[5]), key=lambda c: c[5])]
+            order = ", ".join(f'"{c}"' for c in pk) if pk else "rowid"
+            n = 0
+            with open(dest / f"{table}.jsonl", "w") as f:
+                for row in con.execute(f'SELECT * FROM "{table}" ORDER BY {order}'):
+                    f.write(json.dumps({c: _json_value(v) for c, v in zip(cols, row)},
+                                       sort_keys=True, ensure_ascii=False) + "\n")
+                    n += 1
+            counts[table] = n
+    finally:
+        con.close()
+    return counts
+
+
+def _clear(partial):
+    """Remove a partial snapshot and every sidecar SQLite may have made for it."""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        Path(f"{partial}{suffix}").unlink(missing_ok=True)
+
+
+def _drop_wal_index(partial):
+    """Leave `partial` as ONE file. Switching out of WAL removes the -wal but the
+    backup leaves a -shm (a rebuildable index) behind. Only the -shm is ever
+    deleted here: a -wal that still holds frames is data, and deleting it would
+    make the snapshot silently lose rows — the very failure this verb exists to
+    avoid — so that case is an error, not a cleanup."""
+    wal = Path(f"{partial}-wal")
+    if wal.exists() and wal.stat().st_size > 0:
+        raise RuntimeError(f"{wal.name} still holds frames after the journal mode "
+                           f"was flattened")
+    wal.unlink(missing_ok=True)
+    Path(f"{partial}-shm").unlink(missing_ok=True)
+
+
+def _verify(path):
+    """Open the finished copy on its own and check it. Returns the repo_model
+    row count (None if the table is absent). Raises RuntimeError if the file
+    is not sound — a snapshot that cannot be opened is worse than none, because
+    it looks like one."""
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        result = con.execute("PRAGMA integrity_check").fetchone()[0]
+        if result != "ok":
+            raise RuntimeError(f"integrity_check failed: {result}")
+        try:
+            return con.execute("SELECT COUNT(*) FROM repo_model").fetchone()[0]
+        except sqlite3.OperationalError:
+            return None
+    finally:
+        con.close()
+
+
+def snapshot(db, out_dir, keep=7, now=None):
+    """Take one snapshot and rotate. Returns the path of the new file."""
+    db, out_dir = Path(db), Path(out_dir)
+    if not db.exists():
+        sys.exit(f"fleet-db-snapshot: no database at {db}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    dest = out_dir / f"{PREFIX}{stamp}{SUFFIX}"
+    if dest.exists():
+        sys.exit(f"fleet-db-snapshot: {dest} already exists — refusing to overwrite")
+    partial = out_dir / f".{dest.name}.partial"
+    _clear(partial)                        # a crashed earlier run's leftovers
+
+    # Read-only source: this verb has no business writing the live database, and
+    # `mode=ro` makes that a property of the connection rather than of the code.
+    src = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
+    dst = sqlite3.connect(str(partial))
+    try:
+        src.backup(dst)                    # pages=-1: one consistent pass
+        # The backup carries the source's WAL flag. A snapshot with a -wal
+        # sidecar is a snapshot that is missing rows if the sidecar is lost, so
+        # flatten it to one file.
+        dst.execute("PRAGMA journal_mode=DELETE").fetchone()
+        dst.commit()
+    except BaseException:
+        dst.close()
+        _clear(partial)
+        raise
+    finally:
+        src.close()
+    dst.close()
+
+    try:
+        _drop_wal_index(partial)
+        n_models = _verify(partial)
+    except (RuntimeError, sqlite3.DatabaseError) as e:
+        _clear(partial)
+        sys.exit(f"fleet-db-snapshot: {e} — snapshot discarded")
+
+    dump_partial = out_dir / f".{dump_dir_for(dest).name}.partial"
+    shutil.rmtree(dump_partial, ignore_errors=True)
+    try:
+        counts = dump_logical(partial, dump_partial)
+    except (OSError, sqlite3.DatabaseError) as e:
+        _clear(partial)
+        shutil.rmtree(dump_partial, ignore_errors=True)
+        sys.exit(f"fleet-db-snapshot: logical dump failed ({e}) — snapshot discarded")
+    dump_partial.rename(dump_dir_for(dest))
+    partial.rename(dest)                   # atomic: the final name is always whole
+    rows = "no repo_model table" if n_models is None else f"{n_models} repo_model row(s)"
+    print(f"snapshot: {dest} ({dest.stat().st_size/1e6:.1f} MB, {rows}, integrity ok)")
+    print(f"dump: {dump_dir_for(dest)} ({len(counts)} durable table(s), "
+          f"{sum(counts.values())} row(s))")
+
+    if keep > 0:
+        for old in existing(out_dir)[:-keep]:
+            old.unlink()
+            shutil.rmtree(dump_dir_for(old), ignore_errors=True)
+            print(f"  pruned {old.name}")
+    return dest
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", type=Path, default=None)
+    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--keep", type=int, default=7,
+                    help="snapshots to retain (default 7; must be >= 1)")
+    args = ap.parse_args(argv)
+    if args.keep < 1:
+        # 0 meaning "keep everything" would make a typo an unbounded disk fill
+        # on a daily unit nobody watches.
+        ap.error("--keep must be at least 1")
+    snapshot(args.db or default_db(), args.out or default_out(), args.keep)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""fleet-candidate — build and test base ⊕ head, so `candidate-green` means something.
+
+ADR-0002. PROVENANCE §5 defines the admission condition `candidate-green` as
+"CI passed on the base ⊕ PR candidate", and §2.2 says the candidate is built
+"in a scratch ref" — never by pushing an update onto the reviewed branch, which
+would dismiss an approval for a reason the reviewer never saw (§4.6).
+
+Nothing satisfied that condition before this tool. Forgejo publishes only
+refs/pull/N/head — there is no merge ref — so CI, on either trigger, tests the
+branch as written and says nothing about what `main` becomes.
+
+THIS TOOL NEVER PUSHES — meaning its own git surface cannot. There is no push
+code path, and `_git` refuses a `push` argv, which is the form of the guarantee
+that survives a future edit (plan 0004's wrapper/prompt rule, applied to a
+smaller thing). It merges into a throwaway worktree, runs a command, posts a
+status, and removes the worktree.
+
+The honest limit of that claim: `FLEET_CANDIDATE_CMD` is arbitrary shell running
+inside the merged worktree, so a command configured to push would push, and no
+guard here would see it. That command is operator-configured and trusted exactly
+as a CI job is trusted — the guarantee is about this tool, not about everything
+it can be told to run.
+
+The status carries the base SHA it merged, because a commit status attaches to
+the HEAD sha and cannot otherwise say which merge it proved. A green candidate
+whose base has moved describes a merge that no longer exists; the queue is
+required to compare and treat a mismatch as unsatisfied (ADR-0002 §3).
+
+Config (env):
+  FLEET_WORK_ROOT       worktree root (default <fleet-dir>/work; see fleetlib)
+  FLEET_CANDIDATE_CMD   test command, run in the merged worktree. No default:
+                        see _test_command() for why guessing is refused.
+  FLEET_FORGEJO_URL     default http://forge.example:3000
+  FLEET_TOKEN_CMD       command printing a Forgejo token
+  FLEET_GIT_SSH_BASE    ssh base for clones (default ssh://implbot@forge.example:2222)
+
+Usage:
+  fleet-candidate <owner/repo> <pr> [--post] [--verbose]
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+_lib_loader = importlib.machinery.SourceFileLoader(
+    "fleetlib", str(Path(__file__).resolve().parent / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+_forge_loader = importlib.machinery.SourceFileLoader(
+    "fleetforge", str(Path(__file__).resolve().parent / "fleetforge.py"))
+_forge_spec = importlib.util.spec_from_loader("fleetforge", _forge_loader)
+fleetforge = importlib.util.module_from_spec(_forge_spec)
+_forge_loader.exec_module(fleetforge)
+
+FORGEJO_URL = os.environ.get("FLEET_FORGEJO_URL", "http://forge.example:3000").rstrip("/")
+TOKEN_CMD = os.environ.get("FLEET_TOKEN_CMD", str(Path.home() / "bin/fetch-forgejo-token.sh"))
+STATUS_CONTEXT = "candidate"
+
+
+def warn(msg):
+    print(f"fleet-candidate: {msg}", file=sys.stderr)
+
+
+def _token():
+    """The token, via the sanctioned helper. Never logged, never in argv."""
+    try:
+        r = subprocess.run(["sh", "-c", TOKEN_CMD], capture_output=True,
+                           text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"token helper failed ({e.__class__.__name__})"
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, "token helper produced no token"
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    return (lines[-1].strip(), "") if lines else (None, "token helper produced no token")
+
+
+def _git(args, cwd, check=True, timeout=600):
+    """The merge-side git calls (fleetlib owns the workspace side). `push` is
+    refused here too — the guarantee is that no reachable path can push, so
+    every wrapper carries it, not just the shared one."""
+    if "push" in args:
+        raise AssertionError("fleet-candidate never pushes (ADR-0002); refusing")
+    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                       text=True, timeout=timeout)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:2])} failed: {r.stderr.strip()[:200]}")
+    return r
+
+
+# The command runs UNREVIEWED code from the PR under test, so this is an
+# allowlist, not fleet-watch's denylist. _child_env() pops FLEET_TOKEN_CMD
+# because its child is our own orchestrator; here the child is whatever the
+# branch contains, and enumerating what to withhold from that is the wrong way
+# round — anything not named below is simply absent.
+#
+# It matters most for FLEET_TOKEN_CMD, which on this fleet names the ADMIN token
+# helper: an admin token can PATCH a branch protection, push a `status: ready`
+# plan and restore the rule, forging the ignition the fleet exists to make
+# unforgeable. Verified leaking before this existed.
+_ENV_ALLOW = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ",
+              "USER", "LOGNAME", "SHELL", "TERM")
+
+
+def _candidate_env():
+    env = {k: os.environ[k] for k in _ENV_ALLOW if k in os.environ}
+    env["FLEET_CANDIDATE"] = "1"        # so a suite can tell where it is running
+    return env
+
+
+def _test_command():
+    """No default, deliberately.
+
+    A guessed command that happens to exit 0 — because the repo has no tests,
+    or because the guess named a target that does not exist — produces a green
+    `candidate` status that attests to nothing. Absent evidence must read as
+    absent, not as pass; this is the one place the fleet must not degrade open,
+    for the same reason fleet-watch refuses an unprotected main."""
+    cmd = os.environ.get("FLEET_CANDIDATE_CMD", "").strip()
+    return cmd or None
+
+
+def build(repo, pr, forge, post=False, verbose=False):
+    st, pull = forge.get_pull(repo, pr)
+    if st != 200 or not pull:
+        return 2, f"cannot read {repo}#{pr} (HTTP {st})"
+    if pull.get("state") != "open":
+        return 2, f"{repo}#{pr} is {pull.get('state')}, not open — nothing to admit"
+
+    head_sha = (pull.get("head") or {}).get("sha") or ""
+    base_ref = (pull.get("base") or {}).get("ref") or "main"
+    if not head_sha:
+        return 2, "PR carries no head sha"
+
+    # The base tip is read LIVE, not taken from the PR object: `base.sha` is the
+    # base as of the PR's own record, and merging that would prove a candidate
+    # against a base that may be many commits old — the exact staleness this
+    # tool exists to make visible.
+    st, br = forge.get_branch(repo, base_ref)
+    if st != 200 or not br:
+        return 2, f"cannot read base branch {base_ref} (HTTP {st})"
+    base_sha = ((br.get("commit") or {}).get("id") or "")
+    if not base_sha:
+        return 2, f"base branch {base_ref} carries no commit id"
+
+    cmd = _test_command()
+    if not cmd:
+        return 2, ("FLEET_CANDIDATE_CMD is unset — refusing to post a candidate "
+                   "status with no command to back it (see _test_command)")
+
+    # pid-suffixed: add_worktree REPLACES an existing tree for a key, so two
+    # concurrent builds of the same head would yank each other's worktree
+    # mid-run and post a false red. The key must be unique per run, not per PR.
+    key = f"cand-{pr}-{head_sha[:7]}-{os.getpid()}"
+    state, desc = "failure", ""
+    try:
+        wt = lib.add_worktree(repo, key, head_sha, refspecs=[
+            f"+refs/pull/{pr}/head:refs/fleet/pr/{pr}",
+            f"+refs/heads/{base_ref}:refs/fleet/base/{base_ref}"])
+        merged = _git(["merge", "--no-ff", "--no-commit", base_sha], cwd=wt, check=False)
+        if merged.returncode != 0:
+            paths = [l for l in _git(["diff", "--name-only", "--diff-filter=U"],
+                                     cwd=wt, check=False).stdout.splitlines() if l]
+            if not paths:
+                # A non-zero merge with no unmerged paths is not a conflict; it
+                # is a broken build environment, and calling it "conflict" would
+                # send the author to rewrite a branch that is fine.
+                return 2, (f"merge of {base_sha[:7]} failed with no conflicting "
+                           f"paths: {merged.stderr.strip()[:160]}")
+            shown = ", ".join(paths[:3]) + (f" (+{len(paths)-3} more)" if len(paths) > 3 else "")
+            desc = f"base={base_sha[:7]} conflict in {len(paths)}: {shown}"
+            # NOT `return 1, desc if not post else _post(...)`: that binds as
+            # `return 1, (...)`, discarding _post's rc — a REJECTED status post
+            # would report as a candidate failure, and msg would be a tuple.
+            if post:
+                return _post(repo, head_sha, "failure", desc, forge, verbose)
+            print(f"[dry-run] would post {STATUS_CONTEXT}=failure on {head_sha[:7]}: {desc}")
+            return 1, desc
+
+        r = subprocess.run(["sh", "-c", cmd], cwd=str(wt), capture_output=True,
+                           text=True, timeout=1800, env=_candidate_env())
+        if verbose or r.returncode != 0:
+            # a failure discarded its own output, so the status said "exit 3"
+            # and nothing anywhere said why. stderr, never the thread: §6 keeps
+            # transcripts local and structured facts on the forge.
+            sys.stderr.write((r.stdout or "")[-4000:])
+            sys.stderr.write((r.stderr or "")[-2000:])
+        if r.returncode == 0:
+            state = "success"
+            desc = f"base={base_sha[:7]} merged clean, tests passed"
+        else:
+            state = "failure"
+            # The status carries the exit code and no output: PROVENANCE §6 /
+            # plan 0004 — structured facts on the forge, transcripts stay local.
+            desc = f"base={base_sha[:7]} merged clean, tests failed (exit {r.returncode})"
+    except subprocess.TimeoutExpired as e:
+        # name the command that actually timed out: this try block also contains
+        # the merge and the diff, and reporting a git hang as a test-suite hang
+        # sends the reader to the wrong file.
+        what = "the candidate test command" if getattr(e, "cmd", None) and "sh" in str(e.cmd) else "a git operation"
+        return 2, f"{what} timed out after {e.timeout}s"
+    finally:
+        # a candidate worktree is not lease-keyed, so the orphan sweep will not
+        # report it — this caller cleans up its own (fleetlib.orphan_worktrees)
+        lib.remove_worktree(repo, key)
+
+    if post:
+        return _post(repo, head_sha, state, desc, forge, verbose)
+    print(f"[dry-run] would post {STATUS_CONTEXT}={state} on {head_sha[:7]}: {desc}")
+    return (0 if state == "success" else 1), desc
+
+
+def _post(repo, sha, state, desc, forge, verbose=False):
+    st, _ = forge.post_status(repo, sha, state, desc[:255], STATUS_CONTEXT)
+    if st not in (200, 201):
+        return 2, f"status post rejected (HTTP {st}): {desc}"
+    print(f"{STATUS_CONTEXT}={state} on {sha[:7]}: {desc}")
+    return (0 if state == "success" else 1), desc
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("repo", help="owner/repo")
+    ap.add_argument("pr", type=int)
+    ap.add_argument("--post", action="store_true",
+                    help="post the commit status (default: report only)")
+    ap.add_argument("--verbose", action="store_true")
+    a = ap.parse_args(argv)
+
+    # fleetlib.validate_repo, not a second regex (plan 0022 §3) — but it
+    # calls sys.exit, and this CLI's own convention is warn()+return 2, not
+    # a bare process exit with validate_repo's generic message. Catch it here,
+    # at the CLI edge, which is the one place plan 0022 allows the exit to
+    # happen at all; a verb never calls it (see fleetforge's module docstring).
+    try:
+        lib.validate_repo(a.repo)
+    except SystemExit:
+        warn("repo must be owner/repo")
+        return 2
+    token, err = _token()
+    if not token:
+        warn(err)
+        return 2
+    forge = fleetforge.Forge(FORGEJO_URL, token)
+    try:
+        rc, msg = build(a.repo, a.pr, forge, post=a.post, verbose=a.verbose)
+    except (RuntimeError, AssertionError) as e:
+        warn(str(e))
+        return 2
+    if rc != 0:
+        warn(msg)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

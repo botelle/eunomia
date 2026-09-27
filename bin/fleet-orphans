@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""fleet-orphans — a branch carrying work with no pull request is named daily.
+
+  fleet-orphans [--all] [--age HOURS] [--dry-run]
+
+A plan or ADR that never gets a pull request opened for it sits unapprovable
+while later work can still cite it as authority — that is the 2026-09-07
+failure this tool exists to surface. It never deletes, closes, or comments; it
+reports, pages once, and stops (plan 0020).
+
+For every repository — by default every repository with a row in
+`config/repos.conf` (whatever its flags, read the way `fleet-repo list`
+reads it), or under `--all` every repository `/repos/search` returns for the
+token — every branch other than the default is classified:
+
+  orphan  not landed on the default branch, not covered by a pull request,
+          tip older than --age (default 24h). Paged once per (repo, sha).
+  stale   landed already (its content reached the default branch some other
+          way, most commonly: its own PR merged and the branch was never
+          deleted). Printed every run; never paged — nothing to approve.
+  quiet   not landed, not covered, tip younger than --age. Not reported.
+  (covered by an open PR, or a closed-unmerged PR with no push since the
+  close, is neither, and is not reported either.)
+
+"landed" is a content question, not a commit-count one: `compare.total_commits`
+counts commits absent from the default branch, not content, and a rebase or a
+squash-merge lands a branch's content while leaving that count nonzero. The
+test here is whether every path the branch touched (since its merge-base with
+the default branch) has that same content reachable in the default branch's
+history of that path — walked by hand, since there is no merge-base endpoint.
+
+Config (env):
+  FLEET_FORGEJO_URL   default http://forge.example:3000
+  FLEET_TOKEN_CMD     command printing a Forgejo token (default
+                      ~/bin/fetch-forgejo-token.sh) — GET-only, see below.
+  FLEET_NTFY_URL      push endpoint for first-sight orphans and exit-2 alerts
+
+This tool issues GET only: every read goes through `fleetforge.Forge`, and
+none of the six verbs it calls (`search_repos`, `get_repo`, `list_branches`,
+`list_pulls`, `list_commits`, `get_contents`) is a write. It holds more scope
+than that (a write-capable implbot PAT, per docs/plan-dispatch.md), and the
+excess is deliberate rather than closed here: there is no read-only token
+variable on this fleet (`FLEET_ADMIN_TOKEN_CMD` was retired by infra #97) and
+its replacement, keyvault's forgejo-broker, can answer "is main protected" but
+not "list this repo's branches" — so it is not a substitute for what this tool
+actually needs to do.
+
+This tool's own pagination is stricter than `fleetforge.paged()`'s: it reads
+to a CONFIRMED empty page and never stops on a short one (see `_paginate` and
+`_commit_pages` below), where `paged()` treats a page shorter than the
+requested limit as the end. That is plan 0020 §3's boundary — a truncated scan
+must never be read as "no orphans" — so this tool keeps its own loop over the
+`Forge` verbs rather than using `paged()` (plan 0057 D3; see docs/forge.md).
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+# `read_conf` is fleet-repo's, not fleetlib's — reused so "every repository
+# with a row" means exactly what `fleet-repo list` means, never a second
+# reader of the same file drifting from the first (plan 0013's own lesson).
+repo_mod = _load("fleet_repo", BIN / "fleet-repo")
+# Same loader as fleetlib/repo_mod above, for the same reason: this script
+# runs standalone (from cron/launchd or a bare invocation), never with bin/
+# on sys.path, so a plain `import fleetforge` would not resolve.
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+# `record_page` is bin/orchestrator's, reused rather than restated so this
+# page lands in the same pages.jsonl every other pager writes (plan 0058).
+orch = _load("orchestrator", BIN / "orchestrator")
+
+UNIT = "fleet-orphans"
+
+FORGEJO_URL = os.environ.get("FLEET_FORGEJO_URL", "http://forge.example:3000")
+TOKEN_CMD = os.environ.get("FLEET_TOKEN_CMD",
+                           str(Path.home() / "bin" / "fetch-forgejo-token.sh"))
+CONF = BIN.parent / "config" / "repos.conf"
+PAGE_SIZE = 50
+
+EXIT_OK, EXIT_ORPHANS, EXIT_UNKNOWN = 0, 1, 2
+
+# The fixed enum §2 requires: never an HTTP body, never an exception message.
+REASONS = ("token", "search", "branches", "pulls", "compare", "default-branch",
+          "visibility", "conf")
+
+# Model of `_SID_RE` (fleetlib), not a reuse of it: `_SID_RE` has no `/`, and
+# every real branch on this fleet does (`feat/fleet-bundle`), so reusing it
+# would render the whole report as `<unprintable>`. Gates both rendering AND
+# URL interpolation of a branch name or a touched path (§3): a value that
+# fails this is never substituted into a request path either.
+_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
+
+_DOC_PREFIXES = ("plans/", "docs/adr/", "adr/", "runbooks/")
+
+UNPRINTABLE = "<unprintable>"
+
+
+def _ref_ok(value):
+    if not isinstance(value, str) or not _REF_RE.match(value):
+        return False
+    return ".." not in value.split("/")
+
+
+def _repo_ok(full_name):
+    parts = full_name.split("/") if isinstance(full_name, str) else []
+    return len(parts) == 2 and all(lib._REPO_COMP_RE.match(p) for p in parts)
+
+
+def _is_document(path):
+    return any(path.startswith(p) for p in _DOC_PREFIXES)
+
+
+def _parse_ts(value):
+    """RFC3339 -> aware UTC datetime, or None.
+
+    Not `lib.parse_ts`: that helper's Z-only strptime is built for this
+    fleet's OWN timestamps, which `lib.ts()` always writes as Z. Forgejo
+    serialises API timestamps in the SERVER's offset instead (the swagger
+    examples show `2015-10-24T19:32:49-04:00`, and fleet-watch's `_ts_utc`
+    hit this first) -- fed through the Z-only parser every commit and PR
+    date came back None, which reads every tip as ageless and silently
+    downgrades every real orphan to `quiet` (r2 finding). Same approach as
+    fleet-watch's `_ts_utc`."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    v = value.strip()
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    try:
+        d = datetime.fromisoformat(v)
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+
+# --- token ------------------------------------------------------------------
+
+
+def _token():
+    """(token, error) — the sanctioned helper only, never logged/echoed."""
+    try:
+        r = subprocess.run(["sh", "-c", TOKEN_CMD], capture_output=True,
+                           text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"token helper failed ({e.__class__.__name__})"
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, "token helper produced no token"
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    return (lines[-1].strip(), "") if lines else (None, "token helper produced no token")
+
+
+# --- transport ---------------------------------------------------------------
+
+
+def _forge(token):
+    """The one door to the forge (plan 0057, following plan 0051's shape for
+    `bin/fleet-watch`). `fleetforge.Forge`'s own default timeout (20s) is
+    what `_api`'s hardcoded `timeout=20` used to be, so no override is
+    needed here."""
+    return fleetforge.Forge(FORGEJO_URL, token)
+
+
+def _paginate(page_fn):
+    """[items] over every page to a confirmed-empty page, or None on a page
+    that fails to parse. Never stops on a short page alone — a short page is
+    also what a truncated response looks like, and treating it as the end is
+    the 2026-09-07 defect (an open PR read as no PR because one page was
+    taken for the set). The cost is one extra, confirming request per list."""
+    out = []
+    page = 1
+    while True:
+        status, body = page_fn(page)
+        if status != 200 or not isinstance(body, list):
+            return None
+        if not body:
+            return out
+        out.extend(body)
+        page += 1
+
+
+# --- repository discovery ----------------------------------------------------
+
+
+def repos_from_conf(conf_path):
+    """(names, troubles) from config/repos.conf, read the way `fleet-repo
+    list` reads it. A row `read_conf` rejects is `conf`, naming the position —
+    never a repository silently dropped from the scanned set."""
+    repos, errs, _kept = repo_mod.read_conf(conf_path)
+    troubles = [("conf", e) for e in errs]
+    return sorted(repos), troubles
+
+
+def repos_from_search(forge):
+    """[full_name, ...] from `search_repos`, paginated to the end, or None.
+
+    A `full_name` whose components don't both match fleetlib's
+    `_REPO_COMP_RE` is skipped and counted `search` — one hostile name must
+    not end the run (`validate_repo` would `sys.exit` on the first one).
+
+    Reads `body["data"]` — the shape Forgejo's `/repos/search` wraps its rows
+    in, and the one shape this function is written against (plan 0057
+    boundary: not normalised with the `github` backend's `items`, which no
+    caller here reads since this fleet runs Forgejo only)."""
+    def page(n):
+        return forge.search_repos(page=n, limit=PAGE_SIZE)
+    out = []
+    p = 1
+    while True:
+        status, body = page(p)
+        if status != 200 or not isinstance(body, dict) or not isinstance(body.get("data"), list):
+            return None
+        data = body["data"]
+        if not data:
+            return out
+        out.extend(data)
+        p += 1
+
+
+def _search_names(forge, troubles):
+    raw = repos_from_search(forge)
+    if raw is None:
+        troubles.append(("search", "GET /repos/search unreadable or truncated"))
+        return []
+    names = []
+    for entry in raw:
+        full = entry.get("full_name") if isinstance(entry, dict) else None
+        if not _repo_ok(full):
+            troubles.append(("search", f"unusable repository name {full!r} skipped"))
+            continue
+        names.append(full)
+    return sorted(set(names))
+
+
+# --- per-repo reads -----------------------------------------------------------
+
+
+def default_branch(repo, forge):
+    status, body = forge.get_repo(repo)
+    if status != 200 or not isinstance(body, dict):
+        return None, f"{repo}: GET /repos/{repo} -> HTTP {status}"
+    db = body.get("default_branch")
+    if not _ref_ok(db):
+        return None, f"{repo}: default_branch missing or unusable"
+    return db, None
+
+
+def branches(repo, forge):
+    def page(n):
+        return forge.list_branches(repo, page=n, limit=PAGE_SIZE)
+    return _paginate(page)
+
+
+def pulls_map(repo, forge):
+    """{(head_repo_full_name, head_ref): [pr, ...]} from /pulls?state=all,
+    paginated to the end, or None.
+
+    Keyed on the head repo's `full_name`, never on `head.sha` — Forgejo
+    reports that from the live branch ref, so it equals the tip by
+    construction and proves nothing about coverage. A PR whose `head.repo` is
+    null (fork deleted) is an unknown repository and masks nothing, so it is
+    dropped rather than guessed into this repo's own keyspace."""
+    def page(n):
+        return forge.list_pulls(repo, state="all", page=n, limit=PAGE_SIZE, sort="oldest")
+    prs = _paginate(page)
+    if prs is None:
+        return None
+    m = {}
+    for pr in prs:
+        head = pr.get("head") if isinstance(pr, dict) else None
+        head = head if isinstance(head, dict) else {}
+        head_repo = head.get("repo")
+        if not isinstance(head_repo, dict):
+            continue
+        full = head_repo.get("full_name")
+        ref = head.get("ref")
+        if not full or not ref:
+            continue
+        m.setdefault((full, ref), []).append(pr)
+    return m
+
+
+def _commit_pages(repo, forge, sha=None, path=None):
+    """Yields each page (a list) to a confirmed-empty page; yields None once
+    (and stops) on a page that fails to parse."""
+    page = 1
+    while True:
+        status, body = forge.list_commits(repo, sha=sha, path=path, page=page, limit=PAGE_SIZE)
+        if status != 200 or not isinstance(body, list):
+            yield None
+            return
+        if not body:
+            return
+        yield body
+        page += 1
+
+
+def _full_commits(repo, forge, sha):
+    out = []
+    for page in _commit_pages(repo, forge, sha=sha):
+        if page is None:
+            return None
+        out.extend(page)
+    return out
+
+
+def contents_sha(repo, path, ref, forge):
+    """("present", blob_sha) | ("absent", None) | ("error", None)."""
+    status, body = forge.get_contents(repo, path, ref=ref)
+    if status == 404:
+        return "absent", None
+    if status == 200 and isinstance(body, dict) and isinstance(body.get("sha"), str):
+        return "present", body["sha"]
+    return "error", None
+
+
+# --- the landed test ----------------------------------------------------------
+
+
+def merge_base(repo, forge, branch, default):
+    """("ok", sha, date, branch_commits) | ("unrelated", None, None, commits)
+    | ("error", None, None, None).
+
+    Walked, not asked for: there is no merge-base endpoint to trust. The
+    branch's own commit list is paged fully (it is needed again below, for
+    the touched-path diff), then the default branch's history is paged one
+    page at a time, checking each commit against the branch's set, so the
+    walk can stop the instant a shared SHA turns up — the first one either
+    walk would find."""
+    branch_commits = _full_commits(repo, forge, branch)
+    if branch_commits is None:
+        return "error", None, None, None
+    branch_shas = {c.get("sha") for c in branch_commits}
+    for page in _commit_pages(repo, forge, sha=default):
+        if page is None:
+            return "error", None, None, branch_commits
+        for c in page:
+            if c.get("sha") in branch_shas:
+                return "ok", c.get("sha"), _parse_ts(c.get("created")), branch_commits
+    return "unrelated", None, None, branch_commits
+
+
+def touched_paths(branch_commits, tip_sha, base_sha):
+    """Every path a branch's own commits (strictly newer than the merge-base)
+    added, modified, removed or renamed. A rename contributes both names —
+    the delete of the old path and the add of the new, each tested as itself
+    by the caller.
+
+    Walked from the tip through each commit's own `parents`, stopping a path
+    of the walk the instant it reaches the merge-base — NOT by position in
+    `branch_commits`, which is date-ordered rather than topological. A
+    branch that merges the default branch back into itself pulls the
+    default branch's own commits into its ancestry, and the default
+    branch keeps moving while the branch's own commits sit still, so a
+    later default-branch commit can sort ahead of the branch's own earlier
+    ones. Breaking on the first list position equal to the merge-base then
+    stops after only the merge commit itself — most often filesless — and
+    the branch's real commits are never reached: an empty path set, so the
+    branch reports `stale` while its content never landed (r2 finding)."""
+    by_sha = {c.get("sha"): c for c in branch_commits if isinstance(c, dict)}
+    paths = set()
+    seen = set()
+    stack = [tip_sha]
+    while stack:
+        sha = stack.pop()
+        if not sha or sha in seen or sha == base_sha:
+            continue
+        seen.add(sha)
+        c = by_sha.get(sha)
+        if c is None:
+            continue
+        for f in (c.get("files") or []):
+            if not isinstance(f, dict):
+                continue
+            for key in ("filename", "previous_filename"):
+                v = f.get(key)
+                if v:
+                    paths.add(v)
+        for p in (c.get("parents") or []):
+            if isinstance(p, dict):
+                psha = p.get("sha")
+                if psha:
+                    stack.append(psha)
+    return paths
+
+
+def _blob_reached_default(repo, forge, path, target_blob, default, base_date):
+    """Does `target_blob` appear anywhere in `default`'s history of `path`,
+    no further back than the merge-base? None on a page that fails to parse."""
+    for page in _commit_pages(repo, forge, sha=default, path=path):
+        if page is None:
+            return None
+        for c in page:
+            sha = c.get("sha")
+            state, blob = contents_sha(repo, path, sha, forge)
+            if state == "error":
+                return None
+            if state == "present" and blob == target_blob:
+                return True
+            cdate = _parse_ts(c.get("created"))
+            if cdate is not None and base_date is not None and cdate <= base_date:
+                return False
+    return False
+
+
+def landed(repo, forge, branch_tip, default, base_sha, base_date, paths):
+    """(True|False|None, documents). None means a page failed to parse
+    somewhere in here — not determinable, never "nothing landed"."""
+    if branch_tip == base_sha:
+        return True, []          # the tip-reachable shortcut: nothing to check
+    documents = []
+    for path in sorted(paths):
+        if not _ref_ok(path):
+            return None, documents + [UNPRINTABLE]
+        if _is_document(path):
+            documents.append(path)
+        state, blob = contents_sha(repo, path, branch_tip, forge)
+        if state == "error":
+            return None, documents
+        if state == "absent":
+            # deleted (or the old half of a rename): landed iff also absent
+            # from the default branch's CURRENT tip — a blob search finds
+            # nothing to find for a path with no content.
+            dstate, _ = contents_sha(repo, path, default, forge)
+            if dstate == "error":
+                return None, documents
+            if dstate != "absent":
+                return False, documents
+        else:
+            reached = _blob_reached_default(repo, forge, path, blob, default, base_date)
+            if reached is None:
+                return None, documents
+            if not reached:
+                return False, documents
+    return True, documents
+
+
+# --- coverage ------------------------------------------------------------------
+
+
+def _after(created, closed_at):
+    dt = _parse_ts(created)
+    return dt is None or dt > closed_at        # unparseable -> assume after (fail loud)
+
+
+def is_covered(prs, branch_commits):
+    """An open PR covers outright. A merged PR covers nothing by itself — the
+    landed test decides that. A closed-unmerged PR covers unless some commit
+    on the branch is dated after its `closed_at` — a push after the close is
+    classified like any other tip, not shielded by the old decision."""
+    for pr in (prs or []):
+        state = (pr.get("state") or "").lower()
+        if state == "open":
+            return True
+        if state == "closed" and not pr.get("merged"):
+            closed_at = _parse_ts(pr.get("closed_at"))
+            if closed_at is None:
+                continue
+            if not any(_after(c.get("created"), closed_at) for c in branch_commits):
+                return True
+    return False
+
+
+# --- one repository ------------------------------------------------------------
+
+
+def process_repo(repo, forge, age_hours, now):
+    """(lines, orphan_findings, troubles) for one repository.
+
+    `troubles` is [(reason, detail)]; `orphan_findings` is
+    [(branch_or_UNPRINTABLE, sha)] — the paging unit."""
+    db, err = default_branch(repo, forge)
+    if db is None:
+        return [], [], [("default-branch", err)]
+
+    brs = branches(repo, forge)
+    if brs is None:
+        return [], [], [("branches", f"{repo}: branch list unreadable or truncated")]
+
+    pmap = pulls_map(repo, forge)
+    if pmap is None:
+        return [], [], [("pulls", f"{repo}: pull list unreadable or truncated")]
+
+    lines, findings, troubles = [], [], []
+    for br in brs:
+        name = br.get("name") if isinstance(br, dict) else None
+        tip = ((br.get("commit") or {}) if isinstance(br, dict) else {}).get("id") or ""
+        if name == db:
+            continue
+        if not _ref_ok(name):
+            troubles.append(("branches", f"{repo}: unprintable branch name skipped"))
+            lines.append(f"{repo} {UNPRINTABLE} {tip or UNPRINTABLE}")
+            findings.append((UNPRINTABLE, tip))
+            continue
+
+        status, base_sha, base_date, branch_commits = merge_base(repo, forge, name, db)
+        if status == "error":
+            troubles.append(("compare", f"{repo}/{name}: commit walk failed"))
+            continue
+        if status == "unrelated":
+            troubles.append(("compare", f"{repo}/{name}: no shared history with {db}"))
+            continue
+
+        paths = touched_paths(branch_commits, tip, base_sha)
+        is_landed, documents = landed(repo, forge, tip, db, base_sha, base_date, paths)
+        if is_landed is None:
+            troubles.append(("compare", f"{repo}/{name}: path history walk failed"))
+            continue
+
+        tip_date = _parse_ts(branch_commits[0].get("created")) if branch_commits else None
+        age_h = ((now - tip_date).total_seconds() / 3600) if tip_date else None
+
+        if is_landed:
+            cls = "stale"
+        elif is_covered(pmap.get((repo, name)), branch_commits):
+            cls = None
+        elif age_h is None or age_h < age_hours:
+            cls = "quiet"
+        else:
+            cls = "orphan"
+
+        if cls in ("stale", "orphan"):
+            doc_part = f" documents={','.join(documents)}" if documents else ""
+            lines.append(f"{repo} {name} {cls} {tip}{doc_part}")
+        if cls == "orphan":
+            findings.append((name, tip))
+    return lines, findings, troubles
+
+
+# --- state file ----------------------------------------------------------------
+
+
+def _state_path():
+    return lib.fleet_dir() / "orphans.state.json"
+
+
+def _empty_state():
+    return {"findings": [], "visible": [], "exit2": []}
+
+
+def _load_state():
+    try:
+        data = json.loads(_state_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return _empty_state()
+    if not isinstance(data, dict):
+        return _empty_state()
+    out = _empty_state()
+    for key in out:
+        if isinstance(data.get(key), list):
+            out[key] = data[key]
+    return out
+
+
+def _save_state(state):
+    p = _state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lock = p.with_suffix(p.suffix + ".lock")
+    with lib.held_lock(lock):
+        tmp = p.with_suffix(p.suffix + f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
+        os.replace(tmp, p)
+
+
+def _record_page(title, body, delivered, detail=""):
+    """orch.record_page, with its own guard on top of record_page's own (plan
+    0058 Boundaries): "a failed record must not fail the page"."""
+    try:
+        orch.record_page(title, body, delivered, detail, extra={"unit": UNIT})
+    except Exception:
+        pass
+
+
+def _notify(title, body):
+    """True when the page was delivered (or stderr is the configured channel).
+
+    Records the attempt either way via bin/orchestrator's `record_page` (plan
+    0058), the same as every other pager in this fleet -- the stderr-only
+    fallback below still returns True (an unconfigured watcher must keep
+    consuming its one-shot the way it always has) but the RECORD reflects the
+    truth, matching bin/orchestrator's own reading of a blank channel."""
+    url = os.environ.get("FLEET_NTFY_URL", "")
+    if not url:
+        print(f"fleet-orphans: NOTIFY {title} — {body}", file=sys.stderr)
+        _record_page(title, body, False, "no channel configured")
+        return True
+    try:
+        req = urllib.request.Request(url, data=f"{title}: {body}".encode(), method="POST")
+        urllib.request.urlopen(req, timeout=5).read()
+        _record_page(title, body, True)
+        return True
+    except Exception as e:
+        print(f"fleet-orphans: NOTIFY(failed) {title} — {body}", file=sys.stderr)
+        # exception CLASS NAME only (plan 0058) -- never str(e), which can
+        # echo a host or a token-bearing query string into this durable file.
+        _record_page(title, body, False, e.__class__.__name__)
+        return False
+
+
+def _page_finding(state, repo, branch, sha):
+    if any(f.get("repo") == repo and f.get("sha") == sha for f in state["findings"]):
+        return
+    if _notify("fleet-orphans: orphan", f"{repo} {branch} {sha}"):
+        state["findings"].append({"repo": repo, "branch": branch, "sha": sha,
+                                  "first_seen": lib.ts(lib.now_utc())})
+
+
+def _page_reason(state, reason, detail, today):
+    if any(e.get("reason") == reason and e.get("day") == today for e in state["exit2"]):
+        return
+    if _notify(f"fleet-orphans: {reason}", detail):
+        state["exit2"].append({"reason": reason, "day": today})
+
+
+# --- main ------------------------------------------------------------------
+
+
+def run(args):
+    now = lib.now_utc()
+    troubles = []          # [(reason, detail)]
+
+    token, terr = _token()
+    if token is None:
+        troubles.append(("token", terr))
+        names = []
+        forge = None
+    else:
+        forge = _forge(token)
+        if args.all:
+            names = _search_names(forge, troubles)
+        else:
+            names, conf_troubles = repos_from_conf(args.conf)
+            troubles += conf_troubles
+
+    print(f"fleet-orphans: scanning {len(names)} repositor"
+         f"{'y' if len(names) == 1 else 'ies'}"
+         + (f": {', '.join(names)}" if names else ""))
+
+    # Read-only even under --dry-run: a dry run must see the REAL previous
+    # visible set (so it reports what a real run would), it just must never
+    # write any of the three collections back (state == byte-identical after).
+    state = _load_state()
+
+    if args.all and token is not None:
+        search_failed = any(r == "search" and "unreadable or truncated" in d
+                            for r, d in troubles)
+        if not search_failed:
+            previous = set(state.get("visible", []))
+            current = set(names)
+            for gone in sorted(previous - current):
+                troubles.append(("visibility",
+                                f"{gone}: was visible in a previous run, now absent"))
+            if not args.dry_run:
+                state["visible"] = sorted(current)
+
+    all_lines = []
+    any_orphan = False
+    for repo in names:
+        lines, findings, repo_troubles = process_repo(repo, forge, args.age, now)
+        all_lines += lines
+        troubles += repo_troubles
+        if findings:
+            any_orphan = True
+        if not args.dry_run:
+            for branch, sha in findings:
+                _page_finding(state, repo, branch, sha)
+
+    for line in all_lines:
+        print(line)
+
+    today = now.strftime("%Y-%m-%d")
+    for reason, detail in troubles:
+        print(f"fleet-orphans: EXIT2 {reason}: {detail}", file=sys.stderr)
+        if not args.dry_run:
+            _page_reason(state, reason, detail, today)
+
+    if not args.dry_run:
+        _save_state(state)
+
+    if troubles:
+        return EXIT_UNKNOWN
+    if any_orphan:
+        return EXIT_ORPHANS
+    return EXIT_OK
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-orphans", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--all", action="store_true",
+                    help="scan every repository /repos/search returns, not just "
+                         "config/repos.conf's rows")
+    ap.add_argument("--age", type=float, default=24.0,
+                    help="hours a tip must be idle before it is reported (default 24)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report only — send nothing, write no state")
+    ap.add_argument("--conf", help="config path (test seam)")
+    args = ap.parse_args(argv)
+    return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
