@@ -9,7 +9,22 @@ every failure was between lanes, not inside them. Two sessions editing the same
 file, a reviewer reading another session's branch, a push landing after an
 approval. eunomia is the set of controls that closed those gaps, one at a time.
 
-- `SPEC.md` — the ledger, lease, and event contracts
+## Start here
+
+There is a lot in this repo. Three files will tell you whether the rest is worth
+your time:
+
+1. **`plans/0000-template.md`** — the plan template. Every piece of work starts as
+   one of these, and merging it is the go signal. If the idea of writing down
+   what *not* to touch before an agent starts doesn't appeal, stop here.
+2. **`SPEC.md`** — the ledger, lease and event contracts: how sessions claim work
+   and what gets recorded when they do.
+3. **`docs/adr/0006-blackbox-test-lanes.md`** — why the tests are written by a
+   model that never sees the code. The other ADRs read the same way: the
+   decision, then the reasons.
+
+## What's in it
+
 - `docs/feature-plans.md` — the unit of delegated work: a plan states what to build
   **and which local patterns don't apply**, which is what makes one session per
   feature safe (`bin/fleet-plan`)
