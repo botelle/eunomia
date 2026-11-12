@@ -201,3 +201,23 @@ def test_a_malformed_heartbeat_knob_falls_back_instead_of_raising(tmp_path):
     os.environ["FLEET_HEARTBEAT_SECS"] = "120"
     assert lib.heartbeat_secs() == 120
     os.environ.pop("FLEET_HEARTBEAT_SECS")
+
+
+def test_git_ssh_base_default_is_the_merger_account(tmp_path):
+    """Plan 0075: the unset default names the account the fleet pushes as,
+    derived from the role table rather than a second copy of the literal."""
+    lib = _load(tmp_path / "fleet")
+    merger = lib._ROLE_ACCOUNT_DEFAULTS["merger"][1]
+    assert lib.git_ssh_base() == f"ssh://{merger}@forge.example:2222"
+    assert not lib.git_ssh_base().startswith("ssh://implbot@")
+
+
+def test_git_ssh_base_override_wins_and_ensure_store_clones_from_it(tmp_path):
+    ssh = _forge(tmp_path)
+    lib = _load(tmp_path / "fleet", FLEET_WORK_ROOT=str(tmp_path / "work"),
+                FLEET_GIT_SSH_BASE=ssh + "/")
+    assert lib.git_ssh_base() == ssh
+    store = lib.ensure_store("operator/demo")
+    origin = _git(["remote", "get-url", "origin"], store)
+    assert origin == f"{ssh}/operator/demo.git"
+    assert "forge.example" not in origin

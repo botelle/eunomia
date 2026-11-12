@@ -1,0 +1,17 @@
+// `include` is the ratchet. A file joins it only once it checks clean under
+// pyright, and nothing leaves it except by deletion from bin/. Do not silence
+// a file to get it in; fix it first, in its own plan.
+{
+  "typeCheckingMode": "basic",
+  "include": [
+    "bin/fleet-emit",
+    "bin/fleet-heartbeat",
+    "bin/fleet-install-hooks",
+    "bin/fleet-prepush",
+    "bin/fleet-secret-guard",
+    "bin/fleet-snapshot",
+    "bin/fleetforge.py",
+    "bin/fleetjob.py",
+    "bin/fleetlib.py"
+  ]
+}

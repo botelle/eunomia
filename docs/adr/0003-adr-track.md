@@ -5,6 +5,8 @@
 - **Deciders:** the operator (owner/merger)
 - **Amended by:** [ADR-0014](0014-a-pull-request-changes-one-kind-of-thing.md), 2026-09-25 — §2: the ADR pull request no longer
   carries the flow-spec edit; the spec change is its own following pull request.
+- **Amended by:** [ADR-0024](0024-no-review-requires-a-named-model.md), 2026-10-21 — §5: the
+  mediator's model is configuration, not Fable.
 - **Relates:** `plans/0004-plan-dispatcher.md` (the orchestrator loop this hangs off),
   `plans/0011-review-loop.md` (the reviewer contract, whose independence argument this
   extends from review to tests), **[ADR-0002](0002-candidate-green.md)** (candidate
@@ -121,11 +123,15 @@ token and opens its own PR; that pattern is available to a first-party model and
 this one.
 
 **5. Divergence is adjudicated against the ADR, and the adjudicator arms nothing.**
-When the tests and the code disagree, a **mediator** (Fable) is spawned. It reads the
+When the tests and the code disagree, a **mediator** is spawned. It reads the
 ADR and returns two things as **content**: an adjudication saying which side is wrong and
 why, and a follow-up plan at `status: draft`. The credentialed wrapper posts the
 adjudication as a pull request comment and opens the plan PR. The mediator writes nothing
 and holds no token at all.
+
+*(Amended by [ADR-0024](0024-no-review-requires-a-named-model.md), 2026-10-21. This read
+"a **mediator** (Fable)". The mediator's runner is configuration in `bin/fleet-models`;
+what it may do and hold is unchanged.)*
 
 *Who spawns it is deliberately not named.* `fleet-watch` dispatches `status: ready` plans
 reachable on `main`; it has no divergence detection, and divergence surfaces after both

@@ -35,6 +35,12 @@ def _load(name, mod_name=None):
     return mod
 
 
+def _local_cli(orch):
+    """The operator now resolves to `oauth_token` (plan 0116); the vendor runners
+    still spend a `local_cli` login, so they are routed with one named outright."""
+    return orch.Credential("local_cli", "operator", "a vendor login on this host")
+
+
 @pytest.fixture
 def orch(tmp_path, monkeypatch):
     monkeypatch.setenv("EUNOMIA_FLEET_DIR", str(tmp_path / "fleet"))
@@ -50,7 +56,9 @@ def test_sub_antigravity_and_sub_codex_are_registered(orch):
 
 def test_their_argv0_is_absolute(orch):
     assert orch.RUNNERS["sub-antigravity"].argv[0] == orch.ANTIGRAVITY_BIN
-    assert orch.RUNNERS["sub-codex"].argv[0] == orch.CODEX_BIN
+    # sub-codex starts with the sandbox, then the codex it confines (plan 0101)
+    assert orch.RUNNERS["sub-codex"].argv[0] == "/usr/bin/sandbox-exec"
+    assert orch.CODEX_BIN in orch.RUNNERS["sub-codex"].argv
     assert os.path.isabs(orch.ANTIGRAVITY_BIN)
     assert os.path.isabs(orch.CODEX_BIN)
 
@@ -80,7 +88,7 @@ def test_their_family_is_the_vendor_not_a_shared_claude_family(orch):
 
 def test_they_are_not_local_so_the_zone_allowlist_still_gates_them(orch):
     local = {n for n, r in orch.RUNNERS.items() if r.local}
-    assert local == {"local-qwen"}
+    assert all(n.startswith("local-") for n in local)
     assert orch.RUNNERS["sub-antigravity"].local is False
     assert orch.RUNNERS["sub-codex"].local is False
 
@@ -98,16 +106,29 @@ def test_sub_antigravity_argv_equals_its_pinned_literal_tuple(orch):
     assert r.argv == (
         orch.ANTIGRAVITY_BIN, "--print=", "--input-format", "stream-json",
         "--output-format", "stream-json", "--mode", "plan", "--sandbox",
-        "--json-schema", "<schema>",
+        "--json-schema", "<schema>", "--model", "gemini-4-argon-high",
     )
 
 
 def test_sub_codex_argv_equals_its_pinned_literal_tuple(orch):
     r = orch.RUNNERS["sub-codex"]
     assert r.argv == (
+        "/usr/bin/sandbox-exec", "-f", "<profile>",
+        "-D", "LANE=<lane>", "-D", "CODEX_HOME=<codex-home>",
         orch.CODEX_BIN, "exec", "-s", "read-only", "--skip-git-repo-check",
-        "--ignore-user-config", "--output-schema", "<schema>", "-o", "<out>",
+        "--ignore-user-config", "--ephemeral", "--ignore-rules", "--json",
+        "-c", 'sqlite_home="<lane>"',
+        "--output-schema", "<schema>", "-o", "<out>",
+        "-m", "gpt-6-astra",
     )
+
+
+def test_sub_codex_confinement_is_in_the_argv_itself_not_in_a_wrapper(orch):
+    """Plan 0101 D2: every spawn path that reaches this runner gets the
+    confined form or a failure, including one that does not exist yet."""
+    argv = orch.RUNNERS["sub-codex"].argv
+    assert argv[0] == "/usr/bin/sandbox-exec"          # absolute: no PATH lookup, no fallback
+    assert argv.index(orch.CODEX_BIN) > argv.index("<profile>")
 
 
 def test_sub_antigravity_carries_no_add_dir(orch):
@@ -116,7 +137,14 @@ def test_sub_antigravity_carries_no_add_dir(orch):
 
 @pytest.mark.parametrize("name", ["sub-antigravity", "sub-codex"])
 def test_neither_vendor_runner_may_skip_permissions(orch, name):
-    assert "--dangerously-skip-permissions" not in orch.RUNNERS[name].argv
+    argv = orch.RUNNERS[name].argv
+    assert "--dangerously-skip-permissions" not in argv
+    # codex's own spellings (plan 0101): the obvious "fix" when its inner
+    # sandbox fails to apply inside the profile, and it would make the posture
+    # depend on the profile never having a hole
+    assert not [a for a in argv if a.startswith("--dangerously-")]
+    for flag in ("--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust"):
+        assert flag not in argv
 
 
 def test_sub_fable_declares_no_constraint_flags_and_is_unaffected(orch):
@@ -135,14 +163,14 @@ def test_sub_fable_declares_no_constraint_flags_and_is_unaffected(orch):
 # ------------------------------------------------------------- unwired / D5
 
 
-def test_sub_codex_is_unwired_and_names_the_outside_cli_isolation(orch):
+def test_sub_codex_is_wired_only_inside_its_sandbox_profile(orch):
+    """Plan 0101 D5: wired, and the confinement is the argv's own first word,
+    so no spawn path can reach codex without it."""
     r = orch.RUNNERS["sub-codex"]
-    assert r.unwired
-    assert "ADR-0006" in r.unwired
-    with pytest.raises(orch.Stop) as e:
-        orch.harness_argv(r)
-    assert "declared but not wired" in e.value.reason
-    assert "ADR-0006" in e.value.reason
+    assert r.unwired == ""
+    assert r.argv[0] == "/usr/bin/sandbox-exec"
+    assert r.argv.index("<profile>") < r.argv.index(orch.CODEX_BIN)
+    assert not any(a.startswith("--dangerously") for a in r.argv)
 
 
 def test_sub_antigravity_is_wired(orch):
@@ -178,7 +206,7 @@ def test_argv0_resolves_under_the_launchd_path_without_spawning(orch, monkeypatc
 
 @pytest.mark.parametrize("name", ["sub-antigravity", "sub-codex"])
 def test_a_private_zone_plan_cannot_resolve_a_vendor_runner(orch, name):
-    cred = orch.resolve_credential()
+    cred = _local_cli(orch)
     with pytest.raises(orch.Stop) as e:
         orch.route_implementer({"zone": "private"}, cred,
                                env={"EUNOMIA_IMPL_RUNNER": name})
@@ -187,7 +215,7 @@ def test_a_private_zone_plan_cannot_resolve_a_vendor_runner(orch, name):
 
 @pytest.mark.parametrize("name", ["sub-antigravity", "sub-codex"])
 def test_a_public_zone_plan_routes_to_the_vendor_runner(orch, name):
-    cred = orch.resolve_credential()
+    cred = _local_cli(orch)
     route = orch.route_implementer({"zone": "public"}, cred,
                                    env={"EUNOMIA_IMPL_RUNNER": name})
     assert route.name == name
@@ -196,9 +224,14 @@ def test_a_public_zone_plan_routes_to_the_vendor_runner(orch, name):
 # --------------------------------------------------------- settings_must_not_grant
 
 
-def test_only_sub_antigravity_declares_settings_must_not_grant(orch):
+def test_every_antigravity_runner_declares_settings_must_not_grant(orch):
+    # plan 0202: every antigravity model variant inherits the precondition
+    # from its template, and no other runner declares one.
+    antigravity = {n for n, r in orch.RUNNERS.items()
+                   if r.argv and r.argv[0] == orch.ANTIGRAVITY_BIN}
+    assert antigravity == {"sub-antigravity", "sub-antigravity-flash"}
     for name, r in orch.RUNNERS.items():
-        if name == "sub-antigravity":
+        if name in antigravity:
             assert r.settings_must_not_grant == (
                 "~/.gemini/antigravity-cli/settings.json",)
         else:
@@ -279,20 +312,47 @@ def test_antigravity_stdin_line_matches_the_measured_shape(orch):
     assert "\n" not in line
 
 
+# The stream shape of antigravity 1.3.3, measured 2026-10-12: the fields ride
+# inside `result`, and a non-JSON line from the CLI sits between events.
 SAMPLE_STREAM = (
     'Warning: some deprecation notice antigravity writes to the same stream\n'
-    '{"event":"system","subtype":"init"}\n'
-    '{"event":"result","status":"ok","response":"42","num_turns":3,'
-    '"usage":{"input_tokens":10,"output_tokens":5}}\n'
+    '{"event":"init","init":{"permission_mode":"request-review"}}\n'
+    '{"event":"result","result":{"status":"SUCCESS","response":"42","num_turns":3,'
+    '"usage":{"input_tokens":10,"output_tokens":5}}}\n'
+)
+
+DENIED_THEN_ANSWERED = (
+    '{"event":"result","result":{"status":"SUCCESS","response":"","num_turns":1,'
+    '"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}\n'
+    'jetski: no output produced\n'
+    '{"event":"result","result":{"status":"SUCCESS","response":"{}","num_turns":3}}\n'
 )
 
 
 def test_read_antigravity_result_skips_the_interleaved_non_json_line(orch):
     result = orch.read_antigravity_result(SAMPLE_STREAM)
     assert result == {
-        "event": "result", "status": "ok", "response": "42", "num_turns": 3,
+        "status": "SUCCESS", "response": "42", "num_turns": 3,
         "usage": {"input_tokens": 10, "output_tokens": 5},
     }
+
+
+def test_read_antigravity_result_takes_the_first_turn_that_answered(orch):
+    assert orch.read_antigravity_result(DENIED_THEN_ANSWERED)["num_turns"] == 3
+    both = SAMPLE_STREAM + DENIED_THEN_ANSWERED
+    assert orch.read_antigravity_result(both)["response"] == "42"
+
+
+def test_read_antigravity_result_is_the_last_turn_when_none_answered(orch):
+    denied = DENIED_THEN_ANSWERED.splitlines()[0] + "\n"
+    result = orch.read_antigravity_result(denied + denied.replace('"num_turns":1', '"num_turns":2'))
+    assert result["response"] == "" and result["num_turns"] == 2
+    assert result["denied_actions"] == [{"action": "command", "display_name": "RunCommand"}]
+
+
+def test_read_antigravity_result_keeps_a_result_line_with_no_inner_object(orch):
+    flat = '{"event":"result","status":"ok","response":"42"}\n'
+    assert orch.read_antigravity_result(flat)["response"] == "42"
 
 
 def test_read_antigravity_result_is_none_with_no_result_event(orch):

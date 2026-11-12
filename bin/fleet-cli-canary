@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""fleet-cli-canary — a codex-cli upgrade passes a canary before it is linked
+(plan 0208).
+
+    fleet-cli-canary codex --candidate <path> [--startup-only]
+
+`<path>` is an executable codex binary that is not the one `CODEX_BIN`
+(bin/orchestrator) resolves to — for example
+`/opt/homebrew/Caskroom/codex/0.166.0/bin/codex`. Four steps, in order,
+stopping at the first failure: the candidate's `--version` differs from the
+linked CLI's; every flag the fleet's codex runners pass is present in
+`<candidate> exec --help`; the candidate starts and answers a one-line
+prompt under the tester profile, the installed reviewer profile, and with
+no outer profile at all; and one real test lane, built from the fixed plan
+and sha in config/cli-canary.json, is run against the candidate and its
+usage compared against the recorded baseline.
+
+`--startup-only` runs the flag and start-up steps alone (never step 1's
+version refusal, never step 4's lane) and is allowed on the LINKED CLI
+itself — the positive control that proves a known-good CLI passes.
+
+This program never relinks, installs, upgrades or downloads a CLI: choosing
+the fleet's codex is the owner's call (ADR — see plans/0208). It never
+posts, pushes or opens a pull request, and it never runs a review through
+`dispatch-review.py`.
+
+A report is written to `<work root>/canary/codex/<version>.json`; a one-line
+summary goes to stdout. Exit 0 on a full pass, 1 if any step fails (including
+step 4's own `git archive`/extraction failing), 2 on a usage error (the
+candidate is the linked CLI or reports its version, or `config/cli-canary.json`
+is unreadable — checked up front, before step 1). A pass or a fail pages
+through the orchestrator's `notify`, naming any startup probe left `skipped`
+even on a pass.
+
+The linked CLI is read from `CODEX_BIN` (bin/orchestrator). Tests point it
+elsewhere with `FLEET_CANARY_LINKED_CODEX`, an override this program honours
+and nothing else reads.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+ROOT = BIN.parent
+
+CODEX_TESTER_PROFILE = ROOT / "config" / "codex-tester.sb"
+CLI_CANARY_CONFIG = ROOT / "config" / "cli-canary.json"
+
+# talos reviewer-uid/codex-review.sb, the profile `dispatch-review.py`
+# REVIEWER_UID_PROFILES installs for a codex review run as the reviewer uid
+# (operator/talos). Read on disk, never cloned here: eunomia has no business
+# reading talos's source, only the one file its own dispatcher installs
+# root-owned. Confirmed byte-identical to operator/talos reviewer-uid/
+# codex-review.sb at commit d3783ec ("codex review profile admits codex-cli
+# 0.166", plan 0052), 2026-11-10. A module-level variable, not a constant, so
+# a test can point it at a fixture file.
+REVIEWER_PROFILE_PATH = "/usr/local/libexec/fleet/share/codex-review.sb"
+
+STARTUP_PROMPT = "Reply with the single word ok."
+STARTUP_TIMEOUT_SECONDS = 120
+LANE_TIMEOUT_SECONDS = 1800
+HELP_TIMEOUT_SECONDS = 30
+VERSION_TIMEOUT_SECONDS = 30
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _slug(s):
+    return _SLUG_RE.sub("-", s or "").strip("-") or "unknown"
+
+
+class Stop(Exception):
+    """A refusal — exit 2, a usage error, never a step's own fail/skip."""
+
+
+def _lib_module():
+    loader = importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleetlib", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def _orchestrator_module():
+    """`bin/orchestrator`, loaded on demand, the same idiom `bin/fleet-lane`
+    uses — for `RUNNERS`, `CODEX_BIN`, `notify` and `redact_transcript`,
+    never a copied list (D1 item 2)."""
+    loader = importlib.machinery.SourceFileLoader("orchestrator", str(BIN / "orchestrator"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("orchestrator", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def _lane_module():
+    """`bin/fleet-lane`, loaded on demand — for `build_bundle`, `build_prompt`,
+    `spawn_lane`, `build_adapters`, and the schema/profile constants it
+    already pins (`DEFAULT_SCHEMA_PATH`, `CODEX_NEVER_ENV`), rather than a
+    second copy of either."""
+    loader = importlib.machinery.SourceFileLoader("fleet_lane", str(BIN / "fleet-lane"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleet_lane", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def _iso_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ------------------------------------------------------------- step 1: version
+def codex_version(path, timeout=VERSION_TIMEOUT_SECONDS):
+    if not Path(path).is_file() or not os.access(path, os.X_OK):
+        raise Stop(f"{path!r} is not an executable file")
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True,
+                           timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Stop(f"{path!r} --version failed: {e.__class__.__name__}: {e}")
+    out = (r.stdout or r.stderr or "").strip()
+    if r.returncode != 0 or not out:
+        raise Stop(f"{path!r} --version exited {r.returncode}: {out[:200]!r}")
+    return out
+
+
+def linked_codex(orch_mod):
+    return os.environ.get("FLEET_CANARY_LINKED_CODEX") or orch_mod.CODEX_BIN
+
+
+# --------------------------------------------------------------- step 2: flags
+def codex_tester_flags(orch_mod):
+    """Every token that follows `CODEX_BIN` in a codex runner's `argv` or
+    `writer_argv` and starts with `-` (D1 item 2) — read fresh from
+    `orch_mod.RUNNERS` on every call, never a copied list. A bare `-` is
+    stdin, not a flag, and is excluded; sandbox-exec's own `-f`/`-D` are
+    never seen because they sit BEFORE `CODEX_BIN` in the tuple."""
+    flags = set()
+    for runner in orch_mod.RUNNERS.values():
+        for argv in (runner.argv, runner.writer_argv):
+            if not argv or orch_mod.CODEX_BIN not in argv:
+                continue
+            idx = argv.index(orch_mod.CODEX_BIN)
+            for tok in argv[idx + 1:]:
+                if tok != "-" and tok.startswith("-"):
+                    flags.add(tok)
+    return sorted(flags)
+
+
+def _token_present(text, flag):
+    pat = r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])"
+    return re.search(pat, text) is not None
+
+
+def check_codex_flags(candidate, flags, timeout=HELP_TIMEOUT_SECONDS):
+    try:
+        r = subprocess.run([candidate, "exec", "--help"], capture_output=True,
+                           text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Stop(f"{candidate!r} exec --help failed: {e.__class__.__name__}: {e}")
+    help_text = (r.stdout or "") + (r.stderr or "")
+    missing = [f for f in flags if not _token_present(help_text, f)]
+    return missing
+
+
+# ------------------------------------------------------------- step 3: start-up
+def tester_argv_tail(orch_mod):
+    """`RUNNERS["sub-codex"].argv`'s tokens after `CODEX_BIN`, unfilled, minus
+    `--output-schema <schema>` and `-o <out>` (D1 item 3): with a schema,
+    codex's final message is a JSON document, never the bare `ok` this step
+    asks for. `exec` itself stays — it is not a flag, but it IS part of the
+    command. Used for the tester and reviewer probes, both run under a
+    sandbox-exec profile that expects the tester argv's `LANE`/`CODEX_HOME`
+    params."""
+    argv = orch_mod.RUNNERS["sub-codex"].argv
+    idx = argv.index(orch_mod.CODEX_BIN)
+    tail = list(argv[idx + 1:])
+    out, i = [], 0
+    while i < len(tail):
+        if tail[i] in ("--output-schema", "-o"):
+            i += 2
+            continue
+        out.append(tail[i])
+        i += 1
+    return out
+
+
+def writer_argv_tail(orch_mod):
+    """`RUNNERS["sub-codex"].writer_argv`'s tokens after `CODEX_BIN`, unfilled.
+    The writer probe runs with no outer sandbox profile (D1 item 3, "no outer
+    profile, as the writer runs") — it must also use the writer's own flags
+    (`-s workspace-write`, no `--ignore-user-config`, no `-c sqlite_home=...`),
+    never the tester argv's, or it never actually start-up-tests the real
+    unconfined writer invocation. `writer_argv` carries no `--output-schema`/
+    `-o` to strip."""
+    argv = orch_mod.RUNNERS["sub-codex"].writer_argv
+    idx = argv.index(orch_mod.CODEX_BIN)
+    return list(argv[idx + 1:])
+
+
+def _codex_home():
+    return Path(os.path.realpath(os.path.expanduser("~"))) / ".codex"
+
+
+def _startup_argv(candidate, tail, profile, lane_dir, codex_home):
+    filled = [t.replace("<lane>", str(lane_dir)) for t in tail]
+    if profile is None:
+        return (candidate, *filled)
+    return ("/usr/bin/sandbox-exec", "-f", str(profile),
+            "-D", f"LANE={lane_dir}", "-D", f"CODEX_HOME={codex_home}",
+            candidate, *filled)
+
+
+def codex_startup_outcome(stdout_text, orch_mod):
+    """(passed, detail). Pass: the stream has an `item.completed` `agent_message`
+    whose text, stripped, is `ok`, and no `error`/`turn.failed` event follows
+    it. Fail: the first `error`/`turn.failed` line (redacted, cut to 240
+    chars), or — when the stream carries no JSON at all, e.g. a sandbox denial
+    before codex emits its first event — the stream's own last non-empty
+    line, redacted the same way."""
+    lines = (stdout_text or "").splitlines()
+    ok_idx, fail_line = None, None
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            rec = json.loads(s)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if fail_line is None and rec.get("type") in ("error", "turn.failed"):
+            fail_line = s
+        item = rec.get("item")
+        if (ok_idx is None and rec.get("type") == "item.completed"
+                and isinstance(item, dict) and item.get("type") == "agent_message"
+                and isinstance(item.get("text"), str)
+                and item["text"].strip() == "ok"):
+            ok_idx = i
+    if ok_idx is not None:
+        for raw in lines[ok_idx + 1:]:
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                rec = json.loads(s)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("type") in ("error", "turn.failed"):
+                clean, _ = orch_mod.redact_transcript(s)
+                return False, clean[:240]
+        return True, None
+    if fail_line is None:
+        nonempty = [l.strip() for l in lines if l.strip()]
+        fail_line = nonempty[-1] if nonempty else "the candidate produced no output"
+    clean, _ = orch_mod.redact_transcript(fail_line)
+    return False, clean[:240]
+
+
+def _run_startup(candidate, tail, profile, lane_mod, orch_mod, codex_home, label):
+    # .resolve(): `/tmp`/`/var/folders` are themselves symlinks on macOS, and
+    # the sandbox profile's `(subpath (param "LANE"))` rules are checked
+    # against the resolved path the kernel sees — `fleet-lane`'s own LANE
+    # (bin/fleet-lane, the `cwd = ...resolve()` line) does the same.
+    lane_dir = Path(tempfile.mkdtemp(prefix=f"fleet-cli-canary-{label}-")).resolve()
+    try:
+        argv = _startup_argv(candidate, tail, profile, lane_dir, codex_home)
+        env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
+        rc, timed_out, out = lane_mod.spawn_lane(
+            argv, lane_dir, env, STARTUP_PROMPT.encode("utf-8"),
+            timeout=STARTUP_TIMEOUT_SECONDS)
+        ok, detail = codex_startup_outcome(out, orch_mod)
+        if timed_out and not ok:
+            detail = "timed out waiting for the one-line reply"
+        return {"status": "pass" if ok else "fail", "detail": detail, "rc": rc,
+                "timed_out": timed_out}
+    finally:
+        shutil.rmtree(lane_dir, ignore_errors=True)
+
+
+def _balanced_block(text, open_idx):
+    depth, i = 0, open_idx
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx:i + 1]
+        i += 1
+    return text[open_idx:]
+
+
+def _write_blocks(text):
+    return [_balanced_block(text, m.start())
+            for m in re.finditer(r"\(allow\s+file-write\*", text)]
+
+
+def profile_takes_param(text, name):
+    return f'(param "{name}")' in text
+
+
+def profile_grants_auth_write(text):
+    """Whether any `(allow file-write* ...)` block in the profile names both
+    `CODEX_HOME` and `auth.json` — a textual check, not an SBPL evaluator, and
+    deliberately conservative: a profile this cannot confirm grants the write
+    is reported `skipped`, never run (D1 item 3's reviewer-profile refusal)."""
+    return any("CODEX_HOME" in b and "auth.json" in b for b in _write_blocks(text))
+
+
+def _run_reviewer_startup(candidate, tail, lane_mod, orch_mod, codex_home):
+    """The installed reviewer profile, run as the OPERATOR with the operator's
+    own `~/.codex` — never as the reviewer uid, and never switching uid: this
+    proves the profile's rules admit the candidate, not that a review as the
+    reviewer uid starts (that stays the owner's step, operator/talos
+    reviewer-uid/README.md §8)."""
+    path = REVIEWER_PROFILE_PATH
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        return {"status": "skipped",
+                "detail": f"{path} unreadable ({e.__class__.__name__}) — not installed?"}
+    if not (profile_takes_param(text, "LANE") and profile_takes_param(text, "CODEX_HOME")):
+        return {"status": "skipped",
+                "detail": f"{path} does not take both LANE and CODEX_HOME params"}
+    if not profile_grants_auth_write(text):
+        return {"status": "skipped",
+                "detail": f"{path} does not allow writing CODEX_HOME/auth.json — "
+                          "running a confined codex against the real login with the "
+                          "network open and auth.json read-only strands the owner's "
+                          "refresh token"}
+    return _run_startup(candidate, tail, Path(path), lane_mod, orch_mod, codex_home, "reviewer")
+
+
+def run_startup_steps(candidate, orch_mod, lane_mod):
+    tester_tail = tester_argv_tail(orch_mod)
+    writer_tail = writer_argv_tail(orch_mod)
+    codex_home = _codex_home()
+    return {
+        "tester": _run_startup(candidate, tester_tail, CODEX_TESTER_PROFILE, lane_mod,
+                               orch_mod, codex_home, "tester"),
+        "reviewer": _run_reviewer_startup(candidate, tester_tail, lane_mod, orch_mod, codex_home),
+        "writer": _run_startup(candidate, writer_tail, None, lane_mod, orch_mod, codex_home, "writer"),
+    }
+
+
+# -------------------------------------------------------------------- step 4
+def _lane_config():
+    try:
+        data = json.loads(CLI_CANARY_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise Stop(f"{CLI_CANARY_CONFIG} unreadable: {e.__class__.__name__}: {e}")
+    try:
+        return data["plan"], data["sha"], data["baseline"]
+    except KeyError as e:
+        raise Stop(f"{CLI_CANARY_CONFIG} is missing {e}")
+
+
+def run_lane_step(plan_id, sha, baseline, candidate, orch_mod, lane_mod):
+    """The fixed lane (D1 item 4): `git archive` the pinned sha into a fresh
+    `mkdtemp` (never a worktree), build the same bundle and prompt
+    `fleet-lane` would, and spawn the candidate through the sub-codex
+    adapter — opening no branch, no pull request, no lease, and writing no
+    `fleet.db` row.
+
+    `plan_id`/`sha`/`baseline` come from `config/cli-canary.json`, already
+    validated by the caller before step 1 ran (declared-behaviour's exit-2
+    refusals are "before any step ran" — a broken *config* file is a usage
+    error, but a `git archive` or extraction failure here is a failure of
+    THIS step's own work, reported and paged like any other step fail, never
+    a Stop that would discard the version/flags/startup steps' real spend)."""
+    work = Path(tempfile.mkdtemp(prefix="fleet-cli-canary-lane-src-"))
+    try:
+        archive = subprocess.run(["git", "archive", sha], cwd=str(ROOT),
+                                 capture_output=True, timeout=120)
+        if archive.returncode != 0:
+            return {"status": "fail", "detail": f"git archive {sha} failed: "
+                    f"{(archive.stderr or b'').decode(errors='replace')[:200]}"}
+        untar = subprocess.run(["tar", "-x", "-C", str(work)], input=archive.stdout,
+                               capture_output=True, timeout=120)
+        if untar.returncode != 0:
+            return {"status": "fail", "detail": f"could not extract the {sha} archive: "
+                    f"{(untar.stderr or b'').decode(errors='replace')[:200]}"}
+        plan_path = work / "plans" / f"{plan_id}.md"
+        try:
+            plan_text = plan_path.read_text(encoding="utf-8")
+        except OSError as e:
+            return {"status": "fail",
+                    "detail": f"{plan_path} unreadable at {sha}: {e.__class__.__name__}: {e}"}
+
+        bundle = lane_mod.build_bundle(work, work / "bundle.json")
+        prompt = lane_mod.build_prompt(plan_text, work, json.dumps(bundle, indent=2))
+
+        runner = orch_mod.RUNNERS["sub-codex"]
+        adapter = lane_mod.build_adapters(orch_mod)["sub-codex"]
+        argv = tuple(candidate if a == orch_mod.CODEX_BIN else a for a in runner.argv)
+
+        cwd = Path(tempfile.mkdtemp(prefix="fleet-cli-canary-lane-cwd-")).resolve()
+        try:
+            schema_dest = cwd / "schema.json"
+            schema_text = lane_mod.DEFAULT_SCHEMA_PATH.read_text(encoding="utf-8")
+            schema_dest.write_text(adapter["schema_text"](schema_text), encoding="utf-8")
+            out_dest = cwd / "result.json"
+            codex_home = _codex_home()
+            fills = {"<profile>": str(CODEX_TESTER_PROFILE), "<lane>": str(cwd),
+                     "<codex-home>": str(codex_home), "<schema>": str(schema_dest),
+                     "<out>": str(out_dest)}
+
+            def _fill(a):
+                for token, value in fills.items():
+                    a = a.replace(token, value)
+                return a
+
+            argv = tuple(_fill(a) for a in argv)
+            env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
+            for k in runner.extra_env:
+                if k in os.environ:
+                    env[k] = os.environ[k]
+            for k in getattr(lane_mod, "CODEX_NEVER_ENV", ()):
+                env.pop(k, None)
+            stdin_bytes = adapter["stdin_bytes"](prompt)
+            rc, timed_out, stdout_text = lane_mod.spawn_lane(
+                argv, cwd, env, stdin_bytes, timeout=LANE_TIMEOUT_SECONDS)
+            clean_stdout, _ = orch_mod.redact_transcript(stdout_text)
+            doc, _ = adapter["parse"](stdout_text, str(out_dest))
+            usage_obj, _ = adapter["usage"](stdout_text)
+            if doc is None:
+                return {"status": "fail", "usage": usage_obj, "timed_out": timed_out,
+                       "detail": clean_stdout.strip()[-240:] or "no document"}
+            files = [f.get("path") for f in (doc.get("files") or [])
+                    if isinstance(f, dict) and f.get("path")]
+            if not files:
+                return {"status": "fail", "usage": usage_obj,
+                       "detail": "the lane named no test file"}
+            input_tokens = (usage_obj or {}).get("input_tokens")
+            baseline_input = baseline.get("input_tokens")
+            within_range = (isinstance(input_tokens, int)
+                            and isinstance(baseline_input, (int, float)) and baseline_input
+                            and 0.5 * baseline_input <= input_tokens <= 1.5 * baseline_input)
+            return {"status": "pass" if within_range else "fail", "files": files,
+                   "usage": usage_obj, "baseline": baseline, "input_tokens": input_tokens}
+        finally:
+            shutil.rmtree(cwd, ignore_errors=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------- brew warning
+def brew_cask_warning():
+    """D3's upgrade procedure assumes codex is OUT of brew; if it is back,
+    the next `brew upgrade` relinks it with no canary (docs/cli-upgrades.md).
+    Best-effort and never fatal: a missing `brew`, or one that fails, is
+    reported and never blocks a step."""
+    exe = shutil.which("brew")
+    if not exe:
+        return {"present": None, "detail": "brew not found on PATH"}
+    try:
+        r = subprocess.run([exe, "list", "--cask"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"present": None, "detail": f"brew list --cask failed: {e.__class__.__name__}"}
+    if r.returncode != 0:
+        return {"present": None, "detail": f"brew list --cask exited {r.returncode}"}
+    casks = {l.strip() for l in r.stdout.splitlines() if l.strip()}
+    present = "codex" in casks
+    detail = ("brew still lists the codex cask — the next `brew upgrade` will "
+              "relink it with no canary" if present else None)
+    return {"present": present, "detail": detail}
+
+
+# ------------------------------------------------------------------- the report
+def _report_path(lib_mod, version):
+    return lib_mod.work_root() / "canary" / "codex" / f"{_slug(version)}.json"
+
+
+def _first_failed_step(report):
+    steps = report.get("steps", {})
+    if (steps.get("version") or {}).get("status") == "fail":
+        return "version"
+    if (steps.get("flags") or {}).get("status") == "fail":
+        return "flags"
+    startup = steps.get("startup") or {}
+    for name in ("tester", "reviewer", "writer"):
+        if (startup.get(name) or {}).get("status") == "fail":
+            return f"startup:{name}"
+    if (steps.get("lane") or {}).get("status") == "fail":
+        return "lane"
+    return None
+
+
+def _skipped_steps(report):
+    """Every startup probe reported `skipped` (today, only `reviewer` can
+    be) — named on a pass too, so a clean pass can never read as "every
+    check ran" when one of them did not."""
+    startup = (report.get("steps") or {}).get("startup") or {}
+    return [f"startup:{name}" for name in ("tester", "reviewer", "writer")
+            if (startup.get(name) or {}).get("status") == "skipped"]
+
+
+def run_codex_canary(candidate, startup_only, orch_mod=None, lane_mod=None, lib_mod=None):
+    orch_mod = orch_mod or _orchestrator_module()
+    lane_mod = lane_mod or _lane_module()
+    lib_mod = lib_mod or _lib_module()
+    candidate = str(Path(candidate))
+
+    # Pre-flight, before any step runs or spends a vendor turn: a broken
+    # config/cli-canary.json is a usage error about THIS program, not about
+    # the candidate, so it belongs with the other exit-2 refusals
+    # (declared-behaviour.md) rather than surfacing only once step 4 is
+    # reached — after steps 1-3 (three real codex turns) already ran.
+    plan_id, sha, baseline = (None, None, None) if startup_only else _lane_config()
+
+    started = time.time()
+    report = {"cli": "codex", "candidate": candidate, "startup_only": bool(startup_only),
+              "started_at": _iso_now(), "steps": {}}
+
+    version = codex_version(candidate)
+    report["version"] = version
+    report["brew"] = brew_cask_warning()
+
+    if not startup_only:
+        linked = linked_codex(orch_mod)
+        linked_version = codex_version(linked)
+        same_file = os.path.realpath(candidate) == os.path.realpath(linked)
+        same_version = version == linked_version
+        if same_file or same_version:
+            # D1 item 1: "Refuse with exit 2" — a usage error about the
+            # invocation (candidate == linked CLI), not a step's own fail,
+            # so no report is written and no page sent, same as every other
+            # exit-2 refusal.
+            raise Stop("the candidate is the linked CLI" if same_file else
+                       "the candidate reports the same version as the linked CLI")
+        report["steps"]["version"] = {"status": "pass", "linked": linked,
+                                      "linked_version": linked_version}
+    else:
+        report["steps"]["version"] = {"status": "skip"}
+
+    flags = codex_tester_flags(orch_mod)
+    missing = check_codex_flags(candidate, flags)
+    report["steps"]["flags"] = {"status": "fail" if missing else "pass",
+                                "checked": flags, "missing": missing}
+    if missing:
+        return _finish(report, "fail", 1, orch_mod, lib_mod, started)
+
+    startup = run_startup_steps(candidate, orch_mod, lane_mod)
+    report["steps"]["startup"] = startup
+    if any(v["status"] == "fail" for v in startup.values()):
+        return _finish(report, "fail", 1, orch_mod, lib_mod, started)
+
+    if startup_only:
+        return _finish(report, "pass", 0, orch_mod, lib_mod, started)
+
+    lane = run_lane_step(plan_id, sha, baseline, candidate, orch_mod, lane_mod)
+    report["steps"]["lane"] = lane
+    if lane["status"] != "pass":
+        return _finish(report, "fail", 1, orch_mod, lib_mod, started)
+    return _finish(report, "pass", 0, orch_mod, lib_mod, started)
+
+
+def _finish(report, outcome, rc, orch_mod, lib_mod, started):
+    report["outcome"] = outcome
+    report["ended_at"] = _iso_now()
+    report["elapsed_seconds"] = round(time.time() - started, 3)
+    path = _report_path(lib_mod, report["version"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    failed_step = _first_failed_step(report) if outcome == "fail" else None
+    skipped = _skipped_steps(report)
+    skipped_note = f" (skipped: {', '.join(skipped)})" if skipped else ""
+    summary = (f"codex {report['version']}: {outcome}"
+              + (f" (failed at {failed_step})" if failed_step else "")
+              + skipped_note
+              + f" — {path}")
+    print(summary)
+    orch_mod.notify(f"codex canary: {report['version']} {outcome}",
+                    (f"candidate {report['candidate']}"
+                     + (f" — failed at {failed_step}" if failed_step else "")
+                     + (f"\nskipped: {', '.join(skipped)}" if skipped else "")
+                     + f"\nreport: {path}"))
+    return rc
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-cli-canary", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cli", choices=["codex"],
+                    help="which vendor CLI to canary (only codex is wired today)")
+    ap.add_argument("--candidate", required=True,
+                    help="an executable codex binary that is not the linked CLI")
+    ap.add_argument("--startup-only", action="store_true",
+                    help="run the flag and start-up checks alone; allowed on the "
+                         "linked CLI itself, as the positive control")
+    args = ap.parse_args(argv)
+    try:
+        return run_codex_canary(args.candidate, args.startup_only)
+    except Stop as e:
+        print(f"fleet-cli-canary: refused: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

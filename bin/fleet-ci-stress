@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""fleet-ci-stress — plan 0113 D3's concurrency rounds, run from a script.
+
+  fleet-ci-stress round   --kind iso|ctl --tree SHA --n K [--bound MIN]
+  fleet-ci-stress rebuild --kind iso|ctl --round K --runs A,B,C
+  fleet-ci-stress gate
+
+`round` is steps 2-6 of 0113 D3 and nothing else: refuse unless the queue is
+empty, note the run and task ids already on those branches+sha (a rerun of the
+same round number finds the earlier attempt's; they are never this attempt's,
+and an unreadable baseline refuses before the push), push SHA to ci-stress/0113-r<K>-{a,b,c} in one push, wait for every job
+of the three runs, apply step 4's overlap rule to the tasks API, delete the
+three branches whatever happens, and write docs/ci-evidence/0113/round-<kind>-<K>.json.
+`--tree` names the scratch COMMIT (its sha); the record stores the commit, its
+tree, and the commit it was built on.
+
+`rebuild` writes the same record for a round that already ran, from the tasks
+API alone. No push. It refuses if a named run is not in the API.
+
+`gate` reads the records and prints 0113's Gate verdict. It never edits a plan.
+
+A person starts this. A round puts three full CI runs on the cihost runner and
+needs an empty queue; whether that is acceptable now is the operator's call.
+
+Exit codes
+  round    0 recorded and counted, all jobs green
+           1 recorded, but a job is not green or the round does not count
+           2 refused or failed before a record could be written
+           3 the wall-clock bound expired (no record)
+           130/143 interrupted (SIGINT / SIGTERM, SIGHUP); no record
+  rebuild  0 record written, 2 refused
+  gate     0 the Gate passes, 1 it does not, 2 the records are unreadable
+
+Every exit path of `round` deletes the three branches. SIGKILL cannot be
+caught by any process; for that case `fleet-orphans` pages on what is left.
+
+Config (env)
+  FLEET_FORGEJO_URL          default http://forge.example:3000
+  FLEET_CI_STRESS_TOKEN_CMD  command printing a Forgejo token on its last line
+                             (default ~/bin/fetch-forgejo-token.sh; a command
+                             naming an admin helper is refused)
+
+The token is held in memory by `fleetforge.Forge` and sent as an
+Authorization header. It is never in argv, never in a file, and never printed.
+Git goes over the checkout's own remote (ssh) and needs no token.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.parse
+from datetime import datetime, timezone
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+
+FORGEJO_URL = (os.environ.get("FLEET_FORGEJO_URL", "").strip().rstrip("/")
+               or "http://forge.example:3000")
+REPO = "operator/eunomia"
+PLAN = "0113"
+PAGE = 50
+QUEUE_DEPTH = 10                     # 0113 D3 step 5: the last 10 commits
+OVERLAP_MARGIN = 60                  # 0113 D3 step 4, seconds
+EXPECTED_WORKFLOWS = ("ci.yml", "plans.yml")
+TERMINAL = {"success", "failure", "cancelled", "skipped", "completed"}
+SUFFIXES = ("a", "b", "c")
+DEFAULT_DIR = BIN.parent / "docs" / "ci-evidence" / PLAN
+GATE_ROUNDS = 3
+
+
+class Refusal(Exception):
+    """The command will not run, or could not finish, and says why."""
+
+
+class Interrupted(BaseException):
+    """SIGTERM / SIGHUP turned into an exception so `finally` runs."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+# ------------------------------------------------------------------ the forge
+class _Forge(fleetforge.Forge):
+    """fleetforge.Forge plus the two verbs it lacks. Same request path, same
+    never-raises contract, same token handling (compare bin/fleet-ci)."""
+    __slots__ = ()
+
+    def list_actions_tasks(self, repo, page=1, limit=PAGE):
+        owner, name = fleetforge._split_repo(repo)
+        return self._request(
+            "GET", f"/repos/{fleetforge._quote(owner)}/{fleetforge._quote(name)}"
+                   "/actions/tasks", query={"page": page, "limit": limit})
+
+    def delete_branch(self, repo, branch):
+        owner, name = fleetforge._split_repo(repo)
+        return self._request(
+            "DELETE", f"/repos/{fleetforge._quote(owner)}/{fleetforge._quote(name)}"
+                      f"/branches/{fleetforge._quote_path(branch)}")
+
+
+def _token():
+    """The implbot PAT, from the host tool ~/bin/fetch-forgejo-token.sh.
+
+    Provider: that tool lives in ~/bin on the operator host, which is not a git
+    checkout, so there is no repository, path-in-repo or commit to cite; its
+    own header names ~/agent/IMPLBOT-PRS.md. bin/fleet-ci, bin/fleet-stalled
+    and bin/orchestrator default to the same helper.
+    Contract relied on: takes no arguments, prints the token as the LAST line
+    of stdout, exits 0 on success and non-zero on failure.
+    FLEET_CI_STRESS_TOKEN_CMD overrides it."""
+    cmd = (os.environ.get("FLEET_CI_STRESS_TOKEN_CMD", "").strip()
+           or os.path.expanduser("~/bin/fetch-forgejo-token.sh"))
+    if "admin" in cmd.lower():
+        raise Refusal("FLEET_CI_STRESS_TOKEN_CMD names an admin helper; refusing "
+                      "(the admin token is operator, and a PR it authors cannot merge)")
+    try:
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True,
+                           timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise Refusal(f"token helper did not run ({e.__class__.__name__})")
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not lines:
+        raise Refusal("token helper produced no token")
+    return lines[-1]
+
+
+def make_forge():
+    return _Forge(FORGEJO_URL, _token(), timeout=20)
+
+
+def _pages(verb, *args, cap=200, **kw):
+    """Every item of a paged verb, read to a confirmed-empty page. A failed
+    page raises: a half-read list must never pass for the whole of it."""
+    out = []
+    for page in range(1, cap + 1):
+        status, body = verb(*args, page=page, limit=PAGE, **kw)
+        if status != 200 or not isinstance(body, list):
+            raise Refusal(f"forge read failed (HTTP {status or 'unreachable'})")
+        if not body:
+            return out
+        out.extend(body)
+    raise Refusal("forge list did not end within the page cap")
+
+
+# ----------------------------------------------------------------- the queue
+def queue_state(forge, repo=REPO):
+    """The `pending` statuses among the last 10 commits of every branch
+    (0113 D3 step 5): `[(branch, sha)]`, empty when the queue is empty. A
+    superseded head stays queued, so branch heads alone are not enough. Any
+    read that fails raises: an unreadable queue is not an empty one."""
+    branches = [b.get("name") for b in _pages(forge.list_branches, repo)
+                if isinstance(b, dict) and b.get("name")]
+    if "main" not in branches:
+        branches.append("main")
+    pending, seen = [], {}
+    for br in branches:
+        status, commits = forge.list_commits(repo, sha=br, limit=QUEUE_DEPTH)
+        if status != 200 or not isinstance(commits, list):
+            raise Refusal(f"commit list for {br} unreadable "
+                          f"(HTTP {status or 'unreachable'})")
+        for c in commits[:QUEUE_DEPTH]:
+            sha = c.get("sha") if isinstance(c, dict) else None
+            if not sha:
+                continue
+            if sha not in seen:
+                st, body = forge.get_commit_status(repo, sha)
+                if st != 200 or not isinstance(body, dict):
+                    raise Refusal(f"status of {sha[:8]} unreadable "
+                                  f"(HTTP {st or 'unreachable'})")
+                states = [body.get("state")] + [
+                    (s.get("status") or s.get("state"))
+                    for s in body.get("statuses") or [] if isinstance(s, dict)]
+                seen[sha] = "pending" in states
+            if seen[sha]:
+                pending.append((br, sha))
+    return pending, branches
+
+
+def require_empty_queue(forge):
+    pending, branches = queue_state(forge)
+    if pending:
+        raise Refusal("the queue is not empty: pending status on "
+                      + ", ".join(f"{b}@{s[:8]}" for b, s in pending[:5]))
+    return branches
+
+
+# ------------------------------------------------------------- tasks, overlap
+def _ts(s):
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _norm_workflow(t):
+    wf = t.get("workflow_id") or t.get("path") or ""
+    return str(wf).split("@")[0].split("/")[-1]
+
+
+def task_record(t):
+    return {"id": t.get("id"), "run_number": t.get("run_number"),
+            "workflow": _norm_workflow(t), "name": t.get("name"),
+            "branch": t.get("head_branch"),
+            "result": t.get("conclusion") or t.get("status"),
+            "run_started_at": t.get("run_started_at"),
+            "updated_at": t.get("updated_at")}
+
+
+def is_full_suite(rec):
+    """`tests (cihost)`, `tests (cihost-linux)` and plans.yml's `lint`."""
+    name = re.sub(r"^.*? / ", "", str(rec.get("name") or ""))
+    if rec.get("workflow") == "plans.yml":
+        return name == "lint"
+    return name.startswith("tests (")
+
+
+def find_overlap(tasks):
+    """The first pair of full-suite jobs on DIFFERENT branches that overlap by
+    0113 D3 step 4's rule, or None. Two-sided and strict:
+        A.start + 60 s < B.updated_at  and  B.start + 60 s < A.updated_at.
+    A same-run matrix pair is the same branch, so it never counts."""
+    jobs = []
+    for t in tasks:
+        if not is_full_suite(t):
+            continue
+        s, e = _ts(t.get("run_started_at")), _ts(t.get("updated_at"))
+        if s is not None and e is not None:
+            jobs.append((t, s.timestamp(), e.timestamp()))
+    for i, (a, a0, a1) in enumerate(jobs):
+        for b, b0, b1 in jobs[i + 1:]:
+            if a.get("branch") == b.get("branch"):
+                continue
+            if a0 + OVERLAP_MARGIN < b1 and b0 + OVERLAP_MARGIN < a1:
+                return {"a": {k: a[k] for k in ("id", "branch", "name")},
+                        "b": {k: b[k] for k in ("id", "branch", "name")}}
+    return None
+
+
+def read_raw(forge, repo, want):
+    """Task rows for which `want(row)` is true. Newest first, so once a
+    matching row has been seen and a whole page holds none, stop. A failed
+    page raises: a half-read list must never pass for the whole of it."""
+    out, seen = [], False
+    for page in range(1, 201):
+        status, body = forge.list_actions_tasks(repo, page=page, limit=PAGE)
+        rows = body.get("workflow_runs") if isinstance(body, dict) else None
+        if status != 200 or not isinstance(rows, list):
+            raise Refusal(f"task list unreadable (HTTP {status or 'unreachable'})")
+        if not rows:
+            break
+        hit = [r for r in rows if isinstance(r, dict) and want(r)]
+        out.extend(hit)
+        if hit:
+            seen = True
+        elif seen:
+            break
+    return out
+
+
+def read_tasks(forge, repo, want):
+    return [task_record(r) for r in read_raw(forge, repo, want)]
+
+
+def build_record(kind, k, sha, tree, base, branches, tasks, source, excluded=None):
+    tasks = sorted(tasks, key=lambda t: (str(t["branch"]), str(t["workflow"]),
+                                         str(t["name"]), t["id"] or 0))
+    overlap = find_overlap(tasks)
+    rec = {"plan": PLAN, "kind": kind, "round": k, "source": source,
+           "scratch_sha": sha, "tree": tree, "base_commit": base,
+           "branches": sorted(branches), "tasks": tasks,
+           "overlap": overlap, "counts": overlap is not None}
+    if excluded is not None:         # `round` only: `rebuild` has no baseline
+        rec["excluded_prior_runs"] = excluded
+    return rec
+
+
+def write_record(rec, out_dir, replace=False):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"round-{rec['kind']}-{rec['round']}.json"
+    if path.exists() and not replace:
+        raise Refusal(f"{path} exists; --replace to overwrite it (a red or "
+                      "uncounted record is evidence, so it is not clobbered quietly)")
+    path.write_text(json.dumps(rec, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def all_green(rec):
+    return bool(rec["tasks"]) and all(t.get("result") == "success"
+                                      for t in rec["tasks"])
+
+
+# --------------------------------------------------------------------- git
+def _git(repo_dir, *args, check=True):
+    r = subprocess.run(["git", "-C", str(repo_dir), *args], capture_output=True,
+                       text=True, timeout=300,
+                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    if check and r.returncode != 0:
+        raise Refusal(f"git {args[0]} failed: {r.stderr.strip()[:200]}")
+    return r
+
+
+def branch_names(k):
+    return [f"ci-stress/{PLAN}-r{k}-{s}" for s in SUFFIXES]
+
+
+def delete_branches(forge, repo_dir, remote, branches):
+    """Delete every branch, on every exit path. A branch the forge no longer
+    has counts as deleted. Falls back to `git push --delete` if the API cannot."""
+    left = []
+    for b in branches:
+        status, _ = forge.delete_branch(REPO, b)
+        if status in (200, 204, 404):
+            continue
+        r = _git(repo_dir, "push", remote, "--delete", b, check=False)
+        if r.returncode != 0:
+            left.append(b)
+    for b in left:
+        print(f"fleet-ci-stress: COULD NOT DELETE {b}; delete it by hand",
+              file=sys.stderr)
+    return left
+
+
+# ------------------------------------------------------------------ the wait
+class Baseline:
+    """What already matched this round's branches+sha BEFORE the push: run ids
+    (from /actions/runs) and task ids (from /actions/tasks). A rerun of the same
+    round number pushes the same branch names at the same commit, so the earlier
+    attempt's finished runs match every filter below; only an id taken before the
+    push tells them from this attempt's. Ids, not a timestamp: both row kinds
+    carry `id` (bin/fleet-ci stores the task id; the run id is the one
+    `GET /actions/runs/<id>` takes), and a clock compared across the forge and
+    this host would be a second thing to get wrong."""
+
+    def __init__(self, runs=(), tasks=(), per_branch=None):
+        self.runs = frozenset(runs)
+        self.tasks = frozenset(tasks)
+        self.per_branch = dict(per_branch or {})
+
+
+NO_BASELINE = Baseline()
+
+
+def _ids(rows, what):
+    ids = []
+    for r in rows:
+        i = r.get("id")
+        if not isinstance(i, int) or isinstance(i, bool):
+            raise Refusal(f"an earlier {what} on these branches has no id; "
+                          "cannot tell this attempt's from it")
+        ids.append(i)
+    return ids
+
+
+def read_baseline(forge, repo, branches, sha):
+    """Raises Refusal if any read fails: a round never starts without one."""
+    wanted = set(branches)
+    runs = runs_for(forge, repo, wanted, sha)
+    if runs is None:
+        raise Refusal("could not read the existing runs before the push; "
+                      "not starting without a baseline")
+    run_ids = _ids(runs, "run")
+    tasks = read_raw(forge, repo, lambda r: r.get("head_branch") in wanted
+                     and r.get("head_sha") == sha)
+    return Baseline(run_ids, _ids(tasks, "task"),
+                    {b: sum(1 for r in runs if r.get("prettyref") == b)
+                     for b in branches})
+
+
+def runs_for(forge, repo, branches, sha, exclude=frozenset()):
+    """Runs on those branches at `sha`, minus run ids in `exclude`.
+    /actions/runs rows name the branch as
+    `prettyref` and the commit as `commit_sha` (as bin/orchestrator's
+    _ci_bound_read reads them); only /actions/tasks rows carry head_branch and
+    head_sha."""
+    runs = []
+    for page in (1, 2, 3):
+        status, body = forge.list_action_runs(repo, page=page, limit=PAGE)
+        rows = body.get("workflow_runs") if isinstance(body, dict) else None
+        if status != 200 or not isinstance(rows, list):
+            return None
+        if not rows:
+            break
+        runs.extend(r for r in rows if isinstance(r, dict)
+                    and r.get("prettyref") in branches
+                    and r.get("commit_sha") == sha
+                    and r.get("id") not in exclude)
+    return runs
+
+
+def finished(forge, repo, branches, sha, workflows, base=NO_BASELINE):
+    """True once every expected workflow has a run on every branch and every
+    run, then every task, is terminal. Runs and tasks that existed before the
+    push (`base`) are not this attempt's and are not looked at."""
+    runs = runs_for(forge, repo, set(branches), sha, base.runs)
+    if runs is None:
+        return False
+    for b in branches:
+        mine = [r for r in runs if r.get("prettyref") == b]
+        have = {_norm_workflow(r) for r in mine}
+        if not set(workflows) <= have:
+            return False
+    if not all((r.get("conclusion") or r.get("status")) in TERMINAL for r in runs):
+        return False
+    tasks = read_tasks(forge, repo, lambda r: r.get("head_branch") in branches
+                       and r.get("head_sha") == sha and r.get("id") not in base.tasks)
+    return bool(tasks) and all(t["result"] in TERMINAL for t in tasks)
+
+
+# ------------------------------------------------------------------- commands
+def _install_signal_handlers():
+    def handler(signum, _frame):
+        raise Interrupted(128 + signum)
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, handler)
+
+
+def _shield():
+    """Cleanup is not interruptible: a second signal must not skip a delete."""
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, signal.SIG_IGN)
+
+
+def cmd_round(a):
+    repo_dir = Path(a.repo_dir).resolve()
+    k = a.n
+    sha = _git(repo_dir, "rev-parse", "--verify", f"{a.tree}^{{commit}}").stdout.strip()
+    tree = _git(repo_dir, "rev-parse", f"{sha}^{{tree}}").stdout.strip()
+    parent = _git(repo_dir, "rev-parse", "--verify", "--quiet", f"{sha}^", check=False)
+    base = parent.stdout.strip() or None
+    branches = branch_names(k)
+    out = Path(a.out_dir) / f"round-{a.kind}-{k}.json"
+    if out.exists() and not a.replace:
+        raise Refusal(f"{out} exists; --replace to overwrite it")
+    forge = make_forge()
+    _install_signal_handlers()
+
+    pushed = False
+    try:
+        existing = require_empty_queue(forge)
+        stale = [b for b in branches if b in existing]
+        if stale:
+            raise Refusal(f"{', '.join(stale)} already on the forge; delete them first")
+        # Re-check immediately before the push (step 5).
+        require_empty_queue(forge)
+        # The baseline, last thing before the push. A failed read refuses here,
+        # with nothing pushed (`pushed` is still False, so nothing is deleted).
+        base_runs = read_baseline(forge, REPO, branches, sha)
+        pushed = True            # from here a branch may exist, even if push errors
+        r = _git(repo_dir, "push", "--atomic", a.remote,
+                 *[f"{sha}:refs/heads/{b}" for b in branches], check=False)
+        if r.returncode != 0:
+            raise Refusal(f"push failed: {r.stderr.strip()[:200]}")
+        print(f"pushed {sha[:12]} to {', '.join(branches)}", file=sys.stderr)
+
+        deadline = time.monotonic() + a.bound * 60
+        while not finished(forge, REPO, branches, sha, a.workflows, base_runs):
+            if time.monotonic() > deadline:
+                print(f"fleet-ci-stress: bound of {a.bound} min expired; "
+                      "no record written", file=sys.stderr)
+                return 3
+            time.sleep(a.poll)
+
+        tasks = read_tasks(forge, REPO, lambda r: r.get("head_branch") in branches
+                           and r.get("head_sha") == sha
+                           and r.get("id") not in base_runs.tasks)
+        rec = build_record(a.kind, k, sha, tree, base, branches, tasks, "round",
+                           excluded=base_runs.per_branch)
+        path = write_record(rec, a.out_dir, replace=a.replace)
+        print(path)
+        if not rec["counts"]:
+            print("fleet-ci-stress: round did NOT count (no cross-branch "
+                  "overlap); rerun it", file=sys.stderr)
+        return 0 if rec["counts"] and all_green(rec) else 1
+    except Interrupted as e:
+        print("fleet-ci-stress: interrupted; deleting the branches",
+              file=sys.stderr)
+        return e.code
+    except KeyboardInterrupt:
+        print("fleet-ci-stress: interrupted; deleting the branches",
+              file=sys.stderr)
+        return 130
+    finally:
+        _shield()
+        if pushed:
+            delete_branches(forge, repo_dir, a.remote, branches)
+
+
+def cmd_rebuild(a):
+    k = a.round
+    try:
+        runs = {int(x) for x in a.runs.split(",") if x.strip()}
+    except ValueError:
+        raise Refusal("--runs is a comma-separated list of run numbers")
+    if len(runs) != 3:
+        raise Refusal("--runs names exactly three runs, one per branch")
+    forge = make_forge()
+    named = read_raw(forge, REPO, lambda r: r.get("run_number") in runs)
+    missing = sorted(runs - {r.get("run_number") for r in named})
+    if missing:
+        raise Refusal(f"run(s) {missing} are not in the tasks API")
+    branches = {r.get("head_branch") for r in named}
+    want_re = re.compile(rf"^ci-stress/{PLAN}-r{k}-[abc]$")
+    if len(branches) != 3 or not all(want_re.match(str(b)) for b in branches):
+        raise Refusal(f"runs {sorted(runs)} are on {sorted(map(str, branches))}, "
+                      f"not the three ci-stress/{PLAN}-r{k}-{{a,b,c}} branches")
+    shas = {r.get("head_sha") for r in named}
+    if len(shas) != 1:
+        raise Refusal(f"the named runs disagree on the commit: {sorted(map(str, shas))}")
+    sha = shas.pop()
+    # Every task of those branches at that commit, whatever workflow and run
+    # number it ran under: plans.yml has a run number of its own.
+    tasks = read_tasks(forge, REPO, lambda r: r.get("head_branch") in branches
+                       and r.get("head_sha") == sha)
+    tree, base = resolve_tree_base(forge, Path(a.repo_dir).resolve(), sha)
+    if tree is None:
+        print("fleet-ci-stress: tree/base of the scratch commit not resolvable "
+              "here; recorded as null", file=sys.stderr)
+    rec = build_record(a.kind, k, sha, tree, base, sorted(branches), tasks, "rebuild")
+    path = write_record(rec, a.out_dir, replace=a.replace)
+    print(path)
+    print(f"counts: {str(rec['counts']).lower()}", file=sys.stderr)
+    return 0
+
+
+def resolve_tree_base(forge, repo_dir, sha):
+    """The commit's tree and its first parent: from the local checkout if it
+    has the object, else from the forge's git-commit endpoint."""
+    r = _git(repo_dir, "rev-parse", f"{sha}^{{tree}}", check=False)
+    if r.returncode == 0:
+        p = _git(repo_dir, "rev-parse", "--verify", "--quiet", f"{sha}^", check=False)
+        return r.stdout.strip(), p.stdout.strip() or None
+    owner, name = fleetforge._split_repo(REPO)
+    status, body = forge._request(
+        "GET", f"/repos/{owner}/{name}/git/commits/{urllib.parse.quote(sha)}")
+    if status == 200 and isinstance(body, dict):
+        tree = ((body.get("commit") or {}).get("tree") or {}).get("sha")
+        parents = body.get("parents") or []
+        return tree, (parents[0].get("sha") if parents else None)
+    return None, None
+
+
+# ----------------------------------------------------------------------- gate
+def load_records(directory):
+    recs = []
+    for p in sorted(Path(directory).glob("round-*.json")):
+        try:
+            rec = json.loads(p.read_text())
+            assert rec["kind"] in ("iso", "ctl") and isinstance(rec["tasks"], list)
+            assert isinstance(rec["counts"], bool)
+        except (OSError, ValueError, KeyError, AssertionError):
+            raise Refusal(f"{p} is not a readable round record")
+        recs.append(rec)
+    return recs
+
+
+def gate_verdict(recs):
+    """(passed, [lines]). 0113's Gate: 3 counted isolated rounds, every job of
+    every isolated record green with `Plans / lint` included, and 3 control
+    rounds recorded (the control rounds do not gate their result)."""
+    lines, ok = [], True
+    iso = [r for r in recs if r["kind"] == "iso"]
+    ctl = {r["round"] for r in recs if r["kind"] == "ctl"}
+    counted = set()
+    for r in sorted(iso, key=lambda r: r["round"]):
+        red = [t for t in r["tasks"] if t.get("result") != "success"]
+        branches = {t["branch"] for t in r["tasks"]}
+        lint = {t["branch"] for t in r["tasks"]
+                if t.get("workflow") == "plans.yml" and t.get("name", "").endswith("lint")
+                and t.get("result") == "success"}
+        problems = []
+        if not r["tasks"]:
+            problems.append("no jobs")
+        if red:
+            problems.append("red/unfinished: " + ", ".join(
+                f"{t['branch']}:{t['name']}={t['result']}" for t in red[:4]))
+        if r["tasks"] and not branches <= lint:
+            problems.append("Plans / lint not green on every branch")
+        if not r["counts"]:
+            problems.append("no cross-branch overlap: round does not count")
+        if red or not r["tasks"]:
+            ok = False
+        if not problems:
+            counted.add(r["round"])
+        lines.append(f"iso round {r['round']}: "
+                     + ("counted, green" if not problems else "; ".join(problems)))
+    if len(counted) < GATE_ROUNDS:
+        ok = False
+        lines.append(f"FAIL: {len(counted)} of {GATE_ROUNDS} isolated rounds counted and green")
+    if len(ctl) < GATE_ROUNDS:
+        ok = False
+        lines.append(f"FAIL: {len(ctl)} of {GATE_ROUNDS} control rounds recorded")
+    else:
+        lines.append(f"control rounds recorded: {sorted(ctl)}")
+    lines.append("GATE: " + ("PASS" if ok else "FAIL"))
+    return ok, lines
+
+
+def cmd_gate(a):
+    ok, lines = gate_verdict(load_records(a.out_dir))
+    print("\n".join(lines))
+    return 0 if ok else 1
+
+
+# ----------------------------------------------------------------------- main
+def parser():
+    ap = argparse.ArgumentParser(prog="fleet-ci-stress", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--out-dir", default=str(DEFAULT_DIR))
+        p.add_argument("--repo-dir", default=".", help="git checkout (default: cwd)")
+        p.add_argument("--replace", action="store_true",
+                       help="overwrite an existing record")
+
+    r = sub.add_parser("round", help="run one round")
+    r.add_argument("--kind", required=True, choices=("iso", "ctl"))
+    r.add_argument("--tree", required=True, help="the scratch commit to push")
+    r.add_argument("--n", required=True, type=int, help="round number")
+    r.add_argument("--bound", type=float, default=60.0, help="minutes (default 60)")
+    r.add_argument("--poll", type=float, default=30.0, help="seconds between polls")
+    r.add_argument("--remote", default="origin")
+    r.add_argument("--workflows", type=lambda s: [x for x in s.split(",") if x],
+                   default=list(EXPECTED_WORKFLOWS))
+    common(r)
+
+    b = sub.add_parser("rebuild", help="record a round that already ran")
+    b.add_argument("--kind", required=True, choices=("iso", "ctl"))
+    b.add_argument("--round", required=True, type=int)
+    b.add_argument("--runs", required=True, help="three run numbers, comma-separated")
+    common(b)
+
+    g = sub.add_parser("gate", help="print 0113's Gate verdict")
+    g.add_argument("--out-dir", default=str(DEFAULT_DIR))
+    return ap
+
+
+def main(argv=None):
+    a = parser().parse_args(argv)
+    try:
+        return {"round": cmd_round, "rebuild": cmd_rebuild, "gate": cmd_gate}[a.cmd](a)
+    except Refusal as e:
+        print(f"fleet-ci-stress: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

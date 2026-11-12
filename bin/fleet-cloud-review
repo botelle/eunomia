@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""fleet-cloud-review — send one pull request to a Claude cloud session for review (plan 0130).
+
+  fleet-cloud-review request <owner/repo> <pr> --session <session-id>
+  fleet-cloud-review collect <owner/repo> <pr>
+  fleet-cloud-review prune <req-id>
+
+`request` pushes the pull request's base and head commits to a private GitHub
+mirror and messages a cloud session the owner created by hand, so the review is
+billed to the cloud-session credit. `collect` fetches the branch the session
+pushed back and saves it as a file under `<fleet dir>/cloud-review/`. `prune`
+removes a request's branches from the mirror. docs/cloud-review.md has the
+account and what is not proven.
+
+The review is never written to the forge, in any form (plan 0130 §3): every
+place it could be posted is read by something that acts. The forge is read
+through fleetforge and never written. Nothing here is called by an unattended
+caller, and the text of a review is never parsed, followed or run.
+
+Config: config/cloud-review.conf (FLEET_CLOUD_REVIEW_CONF overrides the path).
+Env (all optional; they exist so the tests reach no network):
+  FLEET_GIT_SSH_BASE            the forge's git transport (fleetlib.git_ssh_base)
+  FLEET_CLOUD_MIRROR_GIT_BASE   the mirror's git transport (default https://github.com)
+  FLEET_CLOUD_MIRROR_API_BASE   the privacy check's host (default https://api.github.com)
+  FLEET_AUTHOR_TOKEN_CMD        command printing the implbot forge token (write-scoped PAT; used read-only here)
+  FLEET_FORGEJO_URL, FLEET_FORGE_TIMEOUT   as fleet-watch
+
+Exit: 0 ok, 1 refused, 2 usage or config, 3 `collect`: not ready.
+"""
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+
+EXIT_OK, EXIT_REFUSED, EXIT_CONFIG, EXIT_NOT_READY = 0, 1, 2, 3
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_REQ_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*-\d+-[0-9a-f]{12}\Z")
+_STDERR_MAX = 1500
+_INT_KEYS = ("max_requests", "reviews_per_session")
+
+
+class Refusal(Exception):
+    """A check failed. The message is what the owner reads."""
+
+
+# --- config ----------------------------------------------------------------
+
+
+def _conf_path():
+    return Path(os.environ.get("FLEET_CLOUD_REVIEW_CONF")
+                or BIN.parent / "config" / "cloud-review.conf")
+
+
+def load_conf():
+    """Parse the conf. Absent, unreadable, empty or incomplete REFUSES: a check
+    written as "refuse if denied" lets an unlisted repository through when the
+    list cannot be read (ADR-0006 §7)."""
+    path = _conf_path()
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise Refusal(f"cannot read {path}: {e.strerror or e}") from None
+    conf = {"repos": []}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or not val:
+            raise Refusal(f"{path}: malformed line {raw!r}")
+        if key == "repo":
+            conf["repos"].append(val)
+        elif key in ("mirror", "credit_expires", *_INT_KEYS):
+            conf[key] = val
+        else:
+            raise Refusal(f"{path}: unknown key {key!r}")
+    for key in ("mirror", "credit_expires", *_INT_KEYS):
+        if key not in conf:
+            raise Refusal(f"{path}: `{key}` is not set")
+    if not conf["repos"]:
+        raise Refusal(f"{path} lists no repository")
+    try:
+        conf["credit_expires"] = datetime.date.fromisoformat(conf["credit_expires"])
+        for key in _INT_KEYS:
+            conf[key] = int(conf[key])
+    except ValueError as e:
+        raise Refusal(f"{path}: {e}") from None
+    try:
+        lib.validate_repo(conf["mirror"])
+    except SystemExit:
+        raise Refusal(f"{path}: mirror {conf['mirror']!r} is not owner/repo") from None
+    return conf
+
+
+def _today():
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+# --- the request log ---------------------------------------------------------
+
+
+def _state_dir():
+    return lib.fleet_dir() / "cloud-review"
+
+
+def _log_path():
+    return _state_dir() / "requests.jsonl"
+
+
+def read_requests():
+    try:
+        text = _log_path().read_text()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        raise Refusal(f"cannot read {_log_path()}: {e.strerror or e}") from None
+    out = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            # An unreadable line still counts toward the ceiling: dropping it
+            # would let the cap be passed by corrupting the file.
+            out.append({"unreadable": True})
+    return out
+
+
+def append_request(rec):
+    _state_dir().mkdir(parents=True, exist_ok=True)
+    with open(_log_path(), "a") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
+
+
+# --- git ---------------------------------------------------------------------
+
+
+def _git(cwd, *args, check=True):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    r = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=cwd,
+                       env=env, capture_output=True, text=True, timeout=900)
+    if check and r.returncode != 0:
+        raise Refusal(f"git {args[0]} failed: "
+                      f"{(r.stderr or r.stdout).strip()[-_STDERR_MAX:]}")
+    return r
+
+
+def _forge_url(repo):
+    return f"{lib.git_ssh_base()}/{repo}.git"
+
+
+def _mirror_url(mirror):
+    base = os.environ.get("FLEET_CLOUD_MIRROR_GIT_BASE", "https://github.com").rstrip("/")
+    return f"{base}/{mirror}.git"
+
+
+def _mirror_status(mirror):
+    """HTTP status of an UNAUTHENTICATED read of the mirror. 404 is how GitHub
+    answers for a private repository; an authenticated request could not tell
+    private from public. 0 means could not tell, and is not 404."""
+    base = os.environ.get("FLEET_CLOUD_MIRROR_API_BASE", "https://api.github.com").rstrip("/")
+    req = urllib.request.Request(f"{base}/repos/{mirror}",
+                                 headers={"Accept": "application/vnd.github+json",
+                                          "User-Agent": "fleet-cloud-review"})
+    # Not a forge call: the forge-call ledger in docs/forge.md is for those, and
+    # a GitHub read does not belong in it.
+    try:
+        with urllib.request.build_opener().open(req, timeout=20) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (OSError, ValueError):
+        return 0
+
+
+def _forge(token_cmd=None):
+    """A read-only fleetforge client; nothing in this tool writes to the forge.
+
+    Provider: ~/bin/fetch-forgejo-token.sh on the host. ~/bin is not a git
+    checkout, so there is no providing repo or commit to cite; the tool's own
+    header names ~/agent/IMPLBOT-PRS.md as its documentation. fleet-rebase
+    (_token) uses the same helper.
+    Contract relied on: takes NO arguments, prints the implbot PAT (which is
+    write-scoped) on stdout and nothing else, exits non-zero with empty stdout
+    on failure. watch._run_token_helper keeps the value out of argv and error
+    text. FLEET_AUTHOR_TOKEN_CMD overrides it."""
+    cmd = (os.environ.get("FLEET_AUTHOR_TOKEN_CMD", "").strip()
+           or os.path.expanduser("~/bin/fetch-forgejo-token.sh"))
+    watch = _load("fleet_watch", BIN / "fleet-watch")
+    token, err = watch._run_token_helper(cmd)
+    if not token:
+        raise Refusal(f"no forge token: {err}")
+    return fleetforge.Forge(watch.FORGEJO_URL, token, timeout=watch.forge_timeout())
+
+
+def req_id(repo, pr, head):
+    return f"{repo.split('/')[1]}-{pr}-{head[:12]}"
+
+
+def _read_pull(forge, repo, pr):
+    status, body = forge.get_pull(repo, pr)
+    if status != 200 or not isinstance(body, dict):
+        raise Refusal(f"cannot read {repo}#{pr} from the forge (status {status})")
+    try:
+        base, head = body["base"]["sha"], body["head"]["sha"]
+        refs = [body["base"]["ref"], body["head"]["ref"]]
+    except (KeyError, TypeError):
+        raise Refusal(f"{repo}#{pr}: the forge answered without base/head") from None
+    if not (_SHA_RE.match(str(base)) and _SHA_RE.match(str(head))):
+        raise Refusal(f"{repo}#{pr}: base or head is not a full sha")
+    return base, head, refs
+
+
+# --- request -----------------------------------------------------------------
+
+
+def _message(rid, base, head):
+    return (
+        f"Review request {rid}. Review the change `{base}...{head}` in this repository "
+        f"(branches req/{rid}/base and req/{rid}/head). Report findings as HIGH, MEDIUM "
+        "and LOW; for each give the file and line and the failure it causes. Write the "
+        "review to `review.md`, and make the first line of it exactly:\n"
+        f"Reviewed: {rid} base={base} head={head}\n"
+        f"Then commit `review.md` alone on top of req/{rid}/head and push it as the "
+        f"branch rev/{rid}. Change nothing else."
+    )
+
+
+def request(repo, pr, session, forge=None):
+    conf = load_conf()
+    try:
+        lib.validate_repo(repo)
+    except SystemExit:
+        raise Refusal(f"{repo!r} is not owner/repo") from None
+    if repo not in conf["repos"]:
+        raise Refusal(f"{repo} is not listed in {_conf_path()}: mirroring it would "
+                      "place its history on GitHub")
+    if not _SESSION_RE.match(session):
+        raise Refusal(f"{session!r} is not a session id")
+    today = _today()
+    if today >= conf["credit_expires"]:
+        raise Refusal(f"the cloud credit expires {conf['credit_expires']} (UTC) and today "
+                      f"is {today}: from the expiry day a cloud session bills the "
+                      "subscription, and nothing in the output says so")
+    log = read_requests()
+    if len(log) >= conf["max_requests"]:
+        raise Refusal(f"{len(log)} requests already logged; max_requests is "
+                      f"{conf['max_requests']} (a ceiling on count, not a reading of the "
+                      "balance — raise it in the conf, as a reviewed change)")
+    used = sum(1 for r in log if r.get("session") == session)
+    if used >= conf["reviews_per_session"]:
+        raise Refusal(f"session {session} already has {used} reviews; "
+                      f"reviews_per_session is {conf['reviews_per_session']} — create a "
+                      "new session, because each message resends the session's history")
+    st = _mirror_status(conf["mirror"])
+    if st != 404:
+        raise Refusal(f"the privacy check on {conf['mirror']} answered {st}, not 404 — "
+                      "it is public or unreachable; nothing was pushed")
+
+    forge = forge or _forge()
+    base, head, refs = _read_pull(forge, repo, pr)
+    rid = req_id(repo, pr, head)
+
+    tmp = tempfile.mkdtemp(prefix="fleet-cloud-review-")
+    try:
+        clone = os.path.join(tmp, "clone")
+        os.mkdir(clone)
+        _git(clone, "init", "--quiet", "--bare")
+        # One fetch per ref: a ref the forge lacks (a deleted branch, a forge
+        # without refs/pull) fails its whole fetch, and the sha check below is
+        # the judge of whether enough arrived.
+        for ref in (*refs, f"refs/pull/{pr}/head"):
+            _git(clone, "fetch", "--quiet", _forge_url(repo), ref, check=False)
+        for sha in (base, head):
+            if _git(clone, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode:
+                raise Refusal(f"{sha[:12]} is not in the fetch from {repo} — the "
+                              "branch moved since the forge was read; try again")
+        _git(clone, "push", "--quiet", _mirror_url(conf["mirror"]),
+             f"{base}:refs/heads/req/{rid}/base", f"{head}:refs/heads/req/{rid}/head")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    r = subprocess.run(["claude", "-p", _message(rid, base, head), "--cloud", session],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise Refusal(f"claude exited {r.returncode}: {(r.stderr or r.stdout).strip()[-_STDERR_MAX:]}"
+                      f" — the branches are on the mirror; `prune {rid}` removes them")
+    append_request({"id": rid, "repo": repo, "pr": pr, "base": base, "head": head,
+                    "session": session,
+                    "at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    print(f"requested {rid} in session {session}")
+    print(f"later: fleet-cloud-review collect {repo} {pr}")
+    return EXIT_OK
+
+
+# --- collect -----------------------------------------------------------------
+
+
+def collect(repo, pr, forge=None):
+    conf = load_conf()
+    mine = [r for r in read_requests() if r.get("repo") == repo and r.get("pr") == pr]
+    if not mine:
+        raise Refusal(f"no request for {repo}#{pr} in {_log_path()}")
+    rec = mine[-1]
+    rid, base, head = rec["id"], rec["base"], rec["head"]
+    if not _REQ_RE.match(rid):
+        raise Refusal(f"request id {rid!r} in the log is malformed")
+
+    tmp = tempfile.mkdtemp(prefix="fleet-cloud-review-")
+    try:
+        clone = os.path.join(tmp, "clone")
+        os.mkdir(clone)
+        _git(clone, "init", "--quiet", "--bare")
+        url = _mirror_url(conf["mirror"])
+        ls = _git(clone, "ls-remote", url, f"refs/heads/rev/{rid}")
+        if not ls.stdout.strip():
+            print(f"not ready: no rev/{rid} on the mirror yet")
+            return EXIT_NOT_READY
+        _git(clone, "fetch", "--quiet", url, f"refs/heads/rev/{rid}:refs/review/rev",
+             f"refs/heads/req/{rid}/head:refs/review/head")
+        names = _git(clone, "diff", "--name-status", "--no-renames", "-z",
+                     "refs/review/head", "refs/review/rev").stdout.split("\0")
+        names = [n for n in names if n]
+        if names != ["A", "review.md"]:
+            raise Refusal(f"rev/{rid} does not add review.md and nothing else "
+                          f"(diff: {names!r}); nothing was saved")
+        text = _git(clone, "show", "refs/review/rev:review.md").stdout
+        want = f"Reviewed: {rid} base={base} head={head}"
+        if text.split("\n", 1)[0].rstrip("\r") != want:
+            raise Refusal(f"the first line of review.md is not `{want}`; nothing was saved")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    out = _state_dir() / f"{rid}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text)
+    print(out)
+
+    try:
+        forge = forge or _forge()
+        status, body = forge.get_pull(repo, pr)
+        cur = body["head"]["sha"] if status == 200 and isinstance(body, dict) else None
+    except (Refusal, KeyError, TypeError):
+        cur = None
+    if cur is None:
+        print("note: could not read the pull request's current head to compare")
+    elif cur != head:
+        print(f"note: this review is of an older head ({head[:12]}); "
+              f"the pull request is now at {cur[:12]}")
+    return EXIT_OK
+
+
+# --- prune -------------------------------------------------------------------
+
+
+def prune(rid):
+    conf = load_conf()
+    if not _REQ_RE.match(rid):
+        raise Refusal(f"{rid!r} is not a request id")
+    tmp = tempfile.mkdtemp(prefix="fleet-cloud-review-")
+    try:
+        _git(tmp, "init", "--quiet", "--bare")
+        url = _mirror_url(conf["mirror"])
+        out = _git(tmp, "ls-remote", url, f"refs/heads/req/{rid}/*",
+                   f"refs/heads/rev/{rid}").stdout
+        refs = [ln.split("\t")[1] for ln in out.splitlines() if "\t" in ln]
+        if refs:
+            _git(tmp, "push", "--quiet", url, "--delete", *refs)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"pruned {len(refs)} branch(es) of {rid}")
+    return EXIT_OK
+
+
+def main(argv=None, forge=None):
+    ap = argparse.ArgumentParser(prog="fleet-cloud-review",
+                                 description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("request")
+    p.add_argument("repo")
+    p.add_argument("pr", type=int)
+    p.add_argument("--session", required=True)
+    p = sub.add_parser("collect")
+    p.add_argument("repo")
+    p.add_argument("pr", type=int)
+    p = sub.add_parser("prune")
+    p.add_argument("req_id")
+    args = ap.parse_args(argv)
+    try:
+        if args.cmd == "request":
+            return request(args.repo, args.pr, args.session, forge)
+        if args.cmd == "collect":
+            return collect(args.repo, args.pr, forge)
+        return prune(args.req_id)
+    except Refusal as e:
+        print(f"fleet-cloud-review: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

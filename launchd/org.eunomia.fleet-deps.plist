@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-deps — keeps the `eunomia/deps` commit status on every open PR
+  (plan 0107, ADR-0019 §5). Once a minute it reads each watched repository's
+  open PRs and posts, as mergebot, whether the plan a PR names is on main and
+  its dependencies are met. See docs/deps-status.md.
+
+  Install (opshost): set FLEET_NTFY_URL to the Fleet-ops push URL, then
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-deps.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-deps.plist
+  Verify (PROVENANCE §8.3 — see it work before trusting it): run
+  `fleet-deps once` by hand and confirm mergebot's `eunomia/deps` appears on an
+  open PR. Do NOT make the context required until it has appeared on every
+  open PR (docs/deps-status.md).
+
+  The token is mergebot's, from FLEET_DEPS_TOKEN_CMD (default
+  ~/bin/fetch-forgejo-mergebot-token.sh). There is deliberately no fallback to
+  the implbot token.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the shared clone sits on
+  whatever branch a session last left it on (fleet-orphans' own plist carries
+  the same note, and the same postmortem).
+
+  PIN PROVENANCE: ~/.local/share/pins/eunomia/bin/fleet-deps below is provided
+  by operator/eunomia commit 2a2be19 ("fleet-deps: eunomia/deps holds a PR on
+  what its plan depends on", plan 0107, PR #957) or its merge on main. The
+  unit must not be bootstrapped until the pin contains that file:
+    test -x ~/.local/share/pins/eunomia/bin/fleet-deps   # must succeed
+  fleet-pin-advance moves the pin; confirm it before install.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-deps</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-deps</string>
+    <string>once</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- replace with the real Fleet-ops push URL at install; empty = print-only -->
+    <key>FLEET_NTFY_URL</key><string></string>
+    <key>FLEET_FORGEJO_URL</key><string>http://forge.example:3000</string>
+  </dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/deps.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/deps.log</string>
+</dict>
+</plist>

@@ -18,7 +18,7 @@ a hand-opened pull request simply gets nothing, and nothing notices a branch
 gone stale.
 
 For every open pull request in every repository `config/repos.conf` lists,
-one of four states, or nothing:
+one of five states, or nothing:
 
   unreviewed    CI green at head, and no review at that head SHA — a round
                 that was never dispatched
@@ -27,6 +27,16 @@ one of four states, or nothing:
   stale-base    CI red at head, the merge-base has fallen behind the base
                 branch's current tip, and that tip's own CI is green
   red           CI red at head against a current base — genuinely failing
+  held          an implementation PR whose only failing context is
+                eunomia/deps, for an unmet plan dependency — reported, never
+                paged (plan 0170)
+
+A sixth state is per PLAN, not per pull request (plan 0194):
+
+  failed-plan   a `status: ready` plan on main whose newest dispatch is
+                terminal with a non-`merged` outcome, has no live dispatch
+                lease, and has no open pull request a live steward still
+                owns — named every day (not once) until it is settled
 
 A pull request whose newest review IS at the head SHA, or whose CI has not
 yet resolved, is not reported at all — there is nothing stalled about it.
@@ -35,7 +45,8 @@ Dispatches nothing, rebases nothing, comments on nothing. It pages once per
 (repo, PR, head SHA) — a new push is a new head and pages again; a cycle over
 an unchanged head is silent — and the page names the command that would fix
 it: the review dispatcher for `unreviewed`/`stale-review`, a by-hand rebase
-for `stale-base`.
+for `stale-base`, `fleet-requeue`/`respawn`/a status decision for
+`failed-plan` (which pages at most once per UTC day instead, see docs/stalled.md).
 
 A pull request whose head branch is covered by a live (non-orphaned) branch
 lease is skipped outright — the orchestrator is still stewarding it and its
@@ -56,6 +67,12 @@ Config (env):
   FLEET_FORGE_TIMEOUT   seconds per forge request (default 60 — see
                         docs/forge.md; below that, this fleet's own pull
                         listings fail deterministically, not transiently)
+  FLEET_DB              fleet.db, read for `failed-plan` only (default
+                        $EUNOMIA_FLEET_DIR/fleet.db) — absent, or lacking the
+                        `dispatch` view (eunomia plan 0036), is a normal
+                        state on a host whose pin has not advanced, not a
+                        scan trouble, so `failed-plan` simply finds nothing
+                        there.
   FLEET_NTFY_URL, FLEET_ANGELIA_URL/APP/USER, FLEET_ANGELIA_TOKEN_CMD
                         the page channel — reused from bin/orchestrator's own
                         notify(), never reimplemented, so every page this
@@ -66,6 +83,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -92,6 +110,13 @@ repo_mod = _load("fleet_repo", BIN / "fleet-repo")
 # orchestrator itself would run, not a second copy of that default that can
 # drift from it.
 orch = _load("orchestrator", BIN / "orchestrator")
+# `pr_hold` is fleet-deps's, reused so "held" has one definition (plan 0170).
+deps_mod = _load("fleet_deps_for_stalled", BIN / "fleet-deps")
+# `plan_files`, `marked_pr` and `dispatch_leases` are fleet-watch's, reused so
+# "what plans exist on main, ready, with what marked PR and what live lease"
+# has one definition — the same one the watcher itself dispatches against
+# (plan 0194). Mirrors fleet-requeue's own load of this exact module.
+fwatch = _load("fleet_watch", BIN / "fleet-watch")
 
 FORGEJO_URL = os.environ.get("FLEET_FORGEJO_URL", "http://forge.example:3000")
 TOKEN_CMD = os.environ.get("FLEET_TOKEN_CMD",
@@ -104,7 +129,9 @@ REPOS_CONF = BIN.parent / "config" / "repos.conf"
 VALID_MODES = ("off", "report", "dispatch")
 BUILT_MODES = ("off", "report")
 
-STATES = ("unreviewed", "stale-review", "stale-base", "red")
+FAILED_PLAN = "failed-plan"
+STATES = ("unreviewed", "stale-review", "stale-base", "red", "held", FAILED_PLAN)
+NEVER_PAGED = ("held",)
 
 EXIT_OK, EXIT_STALLED, EXIT_UNKNOWN = 0, 1, 2
 
@@ -249,6 +276,29 @@ def commit_state(forge, repo, sha):
     return "unknown", True
 
 
+def commit_contexts(forge, repo, sha):
+    """(combined, deps, others, ok). `deps` is the `eunomia/deps` entry of the
+    combined endpoint's de-duplicated `statuses` (a status string, or None);
+    `others` is {context: status} for every other context. Never raw
+    `list_statuses` output: a lane that failed and was re-run green is green."""
+    if not sha:
+        return "unknown", None, {}, False
+    status, body = forge.get_commit_status(repo, sha)
+    if status != 200 or not isinstance(body, dict):
+        return "unknown", None, {}, False
+    combined = (body.get("state") or "").lower()
+    deps, others = None, {}
+    for s in body.get("statuses") or []:
+        if not isinstance(s, dict):
+            continue
+        val = (s.get("status") or s.get("state") or "").lower()
+        if s.get("context") == deps_mod.CONTEXT:
+            deps = val
+        else:
+            others[s.get("context")] = val
+    return combined, deps, others, True
+
+
 # --- stewardship: a branch an active lease already covers -------------------
 
 
@@ -272,6 +322,141 @@ def stewarded_branches():
     return out
 
 
+# --- failed-plan: a plan, not a pull request (plan 0194) --------------------
+
+
+def _dispatch_db_path():
+    raw = (os.environ.get("FLEET_DB") or "").strip()
+    return Path(os.path.expanduser(raw)) if raw else lib.fleet_dir() / "fleet.db"
+
+
+def _open_dispatch_db():
+    """A read-only connection to fleet.db's `dispatch` view (eunomia plan
+    0036), or None when either the file or the view is missing.
+
+    A host whose pin has not advanced to that plan yet is a NORMAL state, not
+    a scan trouble — the same "absent, not zero" read operator/lynceus's own
+    `api/lynceus/dispatches.py` gives this identical view — so a host with no
+    fleet.db simply finds zero `failed-plan` candidates rather than paging
+    forever about a source nobody installed."""
+    path = _dispatch_db_path()
+    if not path.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(dispatch)")}
+    except sqlite3.Error:
+        return None
+    if not cols:
+        con.close()
+        return None
+    return con
+
+
+def newest_dispatch(con, repo, plan_id):
+    """The newest `dispatch` row for (repo, plan_id), by `current_phase_ts` —
+    one row per LEASE, so a plan retried after a stranded run has several;
+    "newest" is the one whose phase history is freshest. A dict of its
+    columns, "unreadable" on a query failure, or None when the plan has never
+    been dispatched at all."""
+    try:
+        row = con.execute(
+            """SELECT lease, outcome, terminal, failure_reason, log_path,
+                      current_phase, current_phase_ts
+                 FROM dispatch WHERE repo = ? AND plan_id = ?
+             ORDER BY current_phase_ts DESC LIMIT 1""",
+            (repo, plan_id)).fetchone()
+    except sqlite3.Error:
+        return "unreadable"
+    if row is None:
+        return None
+    keys = ("lease", "outcome", "terminal", "failure_reason", "log_path",
+           "current_phase", "current_phase_ts")
+    return dict(zip(keys, row))
+
+
+def _days_ago(ts_str):
+    dt = lib.parse_ts(ts_str)
+    return max((lib.now_utc() - dt).days, 0) if dt else None
+
+
+def action_for_failed_plan(finding):
+    repo, plan_id, pr = finding["repo"], finding["plan"], finding["pr"]
+    if pr is None:
+        return f"fleet-requeue {repo} {plan_id}"
+    if finding["pr_state"] == "open":
+        return f"comment `respawn` on {repo}#{pr}"
+    return (f"{repo}#{pr} is closed — decide the plan's status in a reviewed "
+           "PR (abandoned, or a re-file); fleet-requeue refuses this case")
+
+
+def failed_plans_for_repo(repo, token, con, stewarded, troubles):
+    """[finding, ...] of state `failed-plan` (D1, plan 0194): every
+    `status: ready` plan on `repo`'s main whose newest dispatch is terminal
+    with a non-`merged` outcome, has no live dispatch lease, and has no open
+    pull request a live steward still owns.
+
+    `plan_files` returns None for a repo with no `plans/` tree at all just as
+    readily as for a genuine forge failure — Forgejo's 404 looks the same
+    either way, and most of `config/repos.conf` is not plan-driven. Not a
+    scan trouble: `bin/fleet-watch`'s own `cycle()` reads this exact result
+    the same way (a `warn()` and a skip, never a page); paging on it here
+    would mean a daily page for every non-fleet repo, forever."""
+    plans = fwatch.plan_files(repo, token)
+    if plans is None:
+        return []
+    leases = fwatch.dispatch_leases()
+    findings = []
+    for _path, fm in plans:
+        if fm.get("status") != "ready":
+            continue
+        plan_id = fm.get("id")
+        if not (isinstance(plan_id, str) and plan_id):
+            continue
+        row = newest_dispatch(con, repo, plan_id)
+        if row == "unreadable":
+            troubles.append(("dispatch-db", f"{repo}: dispatch view unreadable "
+                             f"for {plan_id}"))
+            continue
+        if row is None or not row["terminal"] or row["outcome"] == "merged":
+            continue
+        rec = leases.get((repo, plan_id))
+        # Liveness is fleetlib's own TTL/heartbeat verdict (lib.is_orphaned),
+        # never the lease's `state` field — the 2026-11-03 plan-0179 deadlock
+        # was exactly a dead run's `active` lease read as running for 14
+        # hours. operator/lynceus's own reads of this dispatch view
+        # (api/lynceus/sources.py `leases()`, api/lynceus/dispatches.py, as of
+        # commit 0bc5384) do not apply this verdict either: `leases()` reports
+        # "overdue" from a fixed age on `created`, and `dispatches.py` never
+        # reads lease state at all — so this cannot be read off either of
+        # those without re-introducing the same bug one layer down.
+        if rec is not None and not lib.is_orphaned(rec):
+            continue
+        pr = fwatch.marked_pr(repo, plan_id, token)
+        if pr == "unreadable":
+            troubles.append(("marked-pr", f"{repo}: marked PR for {plan_id} "
+                             "unreadable"))
+            continue
+        pr_num, pr_state = None, None
+        if isinstance(pr, dict):
+            pr_num = pr.get("number")
+            pr_state = (pr.get("state") or "").lower()
+            if pr_state == "open":
+                branch = (pr.get("head") or {}).get("ref") or ""
+                if (repo, branch) in stewarded:
+                    continue              # a live steward owns this PR
+        age_days = _days_ago(row["current_phase_ts"])
+        age_text = f"{age_days}d ago" if age_days is not None else "age unknown"
+        findings.append({
+            "repo": repo, "state": FAILED_PLAN, "plan": plan_id,
+            "lease": row["lease"], "pr": pr_num, "pr_state": pr_state,
+            "detail": (f"{plan_id} failed {age_text} in "
+                      f"{row['current_phase'] or 'unknown phase'}: "
+                      f"{row['failure_reason'] or 'unknown reason'}"),
+        })
+    return findings
+
+
 # --- classifying one pull request -------------------------------------------
 
 
@@ -286,11 +471,31 @@ def classify_pr(forge, repo, pr, troubles):
     base_sha = base.get("sha")
     merge_base = pr.get("merge_base")
 
-    ci_head, ok = commit_state(forge, repo, head_sha)
+    combined, deps, others, ok = commit_contexts(forge, repo, head_sha)
     if not ok:
         troubles.append(("status", f"{repo}#{num}: commit status for "
                          f"{str(head_sha)[:8]} unreadable"))
         return None, ""
+    ci_head = {"success": "green", "failure": "red", "error": "red"}.get(combined, "unknown")
+    if deps is not None:
+        # 1. a real failure in any other context outranks a hold.
+        if any(v in ("failure", "error") for v in others.values()):
+            ci_head = "red"
+        elif deps in ("failure", "error"):
+            # 2. only eunomia/deps fails: held if it is an unmet dependency,
+            # else a fault the owner must fix, which stays red.
+            hold = deps_mod.pr_hold(forge, repo, head_sha)
+            if hold is None:
+                ci_head = "red"
+            elif hold[0] == "held":
+                return "held", hold[1]
+            else:
+                troubles.append(("status", f"{repo}#{num}: {hold[1]}"))
+                return None, ""
+        else:
+            # 3. eunomia/deps is success or pending: read the rest alone.
+            ci_head = ("green" if all(v == "success" for v in others.values())
+                       else "unknown")
 
     if ci_head == "green":
         revs, detail = _drain(fleetforge.paged(forge.list_reviews, repo, num))
@@ -359,6 +564,8 @@ def process_repo(forge, repo, stewarded, troubles):
 
 
 def action_for(state, repo, num, branch):
+    if state == "held":
+        return "no action — held on an unmet plan dependency"
     if state in ("unreviewed", "stale-review"):
         return " ".join(orch.review_command() + [repo, str(num), "--post", "--no-followups"])
     if state == "stale-base":
@@ -366,11 +573,19 @@ def action_for(state, repo, num, branch):
     return "investigate — CI is failing against a current base"
 
 
+def action_for_finding(finding):
+    if finding["state"] == FAILED_PLAN:
+        return action_for_failed_plan(finding)
+    return action_for(finding["state"], finding["repo"], finding["pr"], finding["branch"])
+
+
 def compose_page(finding):
-    action = action_for(finding["state"], finding["repo"], finding["pr"], finding["branch"])
+    action = action_for_finding(finding)
     suffix = f"\n{action}"
     budget = PAGE_MAX_CHARS - len(suffix)
-    head = f"{finding['repo']}#{finding['pr']} {finding['state']}: {finding['detail']}"
+    pr = finding.get("pr")
+    loc = f"{finding['repo']}#{pr}" if pr is not None else finding["repo"]
+    head = f"{loc} {finding['state']}: {finding['detail']}"
     if len(head) > budget:
         head = head[:max(budget - 1, 0)].rstrip() + "…"
     return head + suffix
@@ -411,16 +626,47 @@ def _save_state(state):
         os.replace(tmp, p)
 
 
-def _page_finding(state, finding):
-    if any(p.get("repo") == finding["repo"] and p.get("pr") == finding["pr"]
-          and p.get("head_sha") == finding["head_sha"] for p in state["pages"]):
+def _match_page(entry, finding, today):
+    """Whether a stored page entry already covers this finding.
+
+    A `failed-plan` finding is keyed on (repo, plan, lease, UTC day) — D3's
+    daily cadence — so yesterday's entry never matches today's finding and a
+    fresh page goes out; every other state keeps the original per-head key,
+    unbounded in time (a cycle over an unchanged head stays silent forever)."""
+    if finding["state"] == FAILED_PLAN:
+        return (entry.get("state") == FAILED_PLAN
+               and entry.get("repo") == finding["repo"]
+               and entry.get("plan") == finding["plan"]
+               and entry.get("lease") == finding["lease"]
+               and entry.get("day") == today)
+    return (entry.get("repo") == finding["repo"] and entry.get("pr") == finding["pr"]
+           and entry.get("head_sha") == finding["head_sha"])
+
+
+def _page_finding(state, finding, today):
+    """D4: a stored entry only satisfies dedupe when it was actually
+    DELIVERED. An entry that matches but carries `delivered: false` is
+    retried here — same entry, fresh notify() — rather than skipped forever;
+    this is what makes an angelia outage (eunomia#1253) self-heal on the next
+    run instead of silently eating every page behind it."""
+    if finding["state"] in NEVER_PAGED:
+        return
+    existing = next((p for p in state["pages"] if _match_page(p, finding, today)), None)
+    if existing is not None and existing.get("delivered"):
         return
     title = f"fleet-stalled: {finding['state']}"
     delivered = orch.notify(title, compose_page(finding))
-    state["pages"].append({"repo": finding["repo"], "pr": finding["pr"],
-                           "head_sha": finding["head_sha"], "state": finding["state"],
-                           "delivered": bool(delivered),
-                           "first_seen": lib.ts(lib.now_utc())})
+    if existing is not None:
+        existing["delivered"] = bool(delivered)
+        existing["last_attempt"] = lib.ts(lib.now_utc())
+        return
+    entry = {"repo": finding["repo"], "state": finding["state"],
+            "delivered": bool(delivered), "first_seen": lib.ts(lib.now_utc())}
+    if finding["state"] == FAILED_PLAN:
+        entry.update({"plan": finding["plan"], "lease": finding["lease"], "day": today})
+    else:
+        entry.update({"pr": finding["pr"], "head_sha": finding["head_sha"]})
+    state["pages"].append(entry)
 
 
 def _page_trouble(state, reason, detail, today):
@@ -460,28 +706,46 @@ def run(args):
     all_findings = []
     if token is not None:
         forge = _forge(token)
-        for repo in names:
-            mode = mode_for(repo, conf_values)
-            if mode == "off":
-                continue
-            if mode not in BUILT_MODES:
-                sys.stderr.write(
-                    f"fleet-stalled: {repo} set to mode {mode!r} — not built "
-                    "yet, refusing rather than treating it as 'report' "
-                    "(config/stalled.conf)\n")
-                troubles.append(("mode", f"{repo}: mode {mode!r} is not built yet"))
-                continue
-            all_findings += process_repo(forge, repo, stewarded, troubles)
+        con = _open_dispatch_db()
+        # fleet-watch's own per-cycle read memos (plan 0093): without them,
+        # `marked_pr` re-scans a repo's ENTIRE pull-request listing from
+        # scratch for every `status: ready` plan in it, rather than once —
+        # a repo with several ready plans would cost several full scans of
+        # the same listing in the same run.
+        fwatch._pulls_memo, fwatch._plans_memo = {}, {}
+        try:
+            for repo in names:
+                mode = mode_for(repo, conf_values)
+                if mode == "off":
+                    continue
+                if mode not in BUILT_MODES:
+                    sys.stderr.write(
+                        f"fleet-stalled: {repo} set to mode {mode!r} — not built "
+                        "yet, refusing rather than treating it as 'report' "
+                        "(config/stalled.conf)\n")
+                    troubles.append(("mode", f"{repo}: mode {mode!r} is not built yet"))
+                    continue
+                all_findings += process_repo(forge, repo, stewarded, troubles)
+                if con is not None:
+                    all_findings += failed_plans_for_repo(repo, token, con, stewarded,
+                                                          troubles)
+        finally:
+            fwatch._pulls_memo = fwatch._plans_memo = None
+            if con is not None:
+                con.close()
 
     for f in all_findings:
-        print(f"{f['repo']}#{f['pr']} {f['state']} {f['head_sha']} branch={f['branch']}")
+        if f["state"] == FAILED_PLAN:
+            print(f"{f['repo']} {f['state']} {f['plan']} lease={f['lease']}")
+        else:
+            print(f"{f['repo']}#{f['pr']} {f['state']} {f['head_sha']} branch={f['branch']}")
 
+    today = lib.now_utc().strftime("%Y-%m-%d")
     state = _load_state()
     if not args.dry_run:
         for f in all_findings:
-            _page_finding(state, f)
+            _page_finding(state, f, today)
 
-    today = lib.now_utc().strftime("%Y-%m-%d")
     for reason, detail in troubles:
         print(f"fleet-stalled: EXIT2 {reason}: {detail}", file=sys.stderr)
         if not args.dry_run:
@@ -492,7 +756,7 @@ def run(args):
 
     if troubles:
         return EXIT_UNKNOWN
-    if all_findings:
+    if any(f["state"] not in NEVER_PAGED for f in all_findings):
         return EXIT_STALLED
     return EXIT_OK
 

@@ -1,0 +1,850 @@
+#!/usr/bin/env python3
+"""fleet-style — which pull requests take the style review, and is the evidence valid
+(ADR-0025, plan 0150).
+
+One function decides, so lint, the orchestrator and talos's dispatcher cannot
+disagree. A CLI and a module (loaded by path, the way bin/fleet-models loads its
+siblings); stdlib only.
+
+  fleet-style declared <repo> --json
+  fleet-style route <repo> --pr N --plan-file F|none --changes F --git-dir D
+                    --base SHA --head SHA --override full|none --json
+  fleet-style verify <repo> --pr N --plan-id ID|none --git-dir D
+                    --base SHA --head SHA --json
+
+Exit 0 means the answer was decided. `declared` exits 2 on a malformed
+`config/style-review.json`. Any other failure to decide is non-zero, and a
+caller treats that as `code_reviewer`: the full review is the answer to every
+doubt (ADR-0025 §3). Nothing in `route` can loosen a review. `--override` only
+ever asks for the full one.
+
+WHY MATCHING IS NOT `fnmatch` (plan 0150). `fnmatch`'s `*` crosses `/`, so
+`ios/Theme/*` would match `ios/Theme/Sub/Session.swift` and a pattern written for
+one directory would cover its whole subtree. Here a pattern is split on `/`; `**`
+is zero or more whole segments; `*` and `?` work inside one segment; there are
+no character classes; matching is case-sensitive. A path that is absolute or has
+an empty, `.` or `..` segment matches nothing.
+
+WHAT A DECLARATION IS REFUSED FOR (checked at every read; a refused value makes
+the file malformed, not undeclared). A later widening of this list is a
+decision, not a slip:
+  * a pattern that is empty, absolute, holds `..` or `.` or an empty segment,
+    starts with `**`, is `*` alone, or uses `**` inside a segment;
+  * a pattern that matches a probe: a `tests`, `Tests` or `*Tests` directory,
+    `*.strings`, `*.stringsdict`, `*.xcstrings`, a plan or a doc, a workflow,
+    `.gitignore`, `project.yml`, `*.pbxproj`, the screenshot command itself, or
+    anything under `evidence_dir`. A pattern whose own segments name a tests
+    directory, or whose last segment names one of those files, is refused too,
+    so `ios/App/FooTests/*.swift` cannot slip past the root-level probes;
+  * a `paths` pattern for a binary type (`.png .jpg .pdf .ttf .otf .car`, or
+    anything under `*.xcassets/` other than `Contents.json`): a binary can only
+    be declared under `binary_paths`;
+  * an `evidence_dir` that is absolute, holds `..`, or lies under a pattern;
+  * a `default` entry: a fleet-wide style path would declare files in
+    repositories nobody looked at.
+"""
+import argparse
+import datetime
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import struct
+import subprocess
+import sys
+import zlib
+from functools import lru_cache
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+CONFIG = BIN.parent / "config" / "style-review.json"
+
+NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+REPO_NAME = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+HEX_REV = re.compile(r"[0-9a-fA-F]{7,64}")
+DEFAULT_EVIDENCE_DIR = "docs/screenshots"
+DEFAULT_MAX_IMAGE_KB = 300
+BINARY_SUFFIXES = (".png", ".jpg", ".pdf", ".ttf", ".otf", ".car")
+STRINGS_SUFFIXES = (".strings", ".stringsdict", ".xcstrings")
+PNG_CHUNKS = {b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"sRGB", b"gAMA", b"cHRM"}
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+PLATFORMS = ("ios-simulator",)
+ENTRY_KEYS = {"paths", "binary_paths", "evidence_dir", "screenshot"}
+SHOT_KEYS = {"platform", "command", "runtime", "device", "scale", "themes",
+             "appearances", "max_image_kb", "timeout_minutes"}
+
+
+class Malformed(ValueError):
+    """The declaration file breaks a rule. `str()` names the line and the rule."""
+
+
+class Undecided(RuntimeError):
+    """A decision could not be made (git failed, an input was unreadable)."""
+
+
+# ------------------------------------------------------------------ matching
+
+
+def _segments(path):
+    """The segments of a normalised relative path, or None for a path that must
+    not match anything."""
+    if not isinstance(path, str) or not path or "\x00" in path or path.startswith("/"):
+        return None
+    segs = path.split("/")
+    if any(s in ("", ".", "..") for s in segs):
+        return None
+    return segs
+
+
+@lru_cache(maxsize=None)
+def _seg_re(seg):
+    out = []
+    for ch in seg:
+        out.append("[^/]*" if ch == "*" else "[^/]" if ch == "?" else re.escape(ch))
+    return re.compile("".join(out) + r"\Z", re.S)
+
+
+def match(pattern, path):
+    """Does `pattern` match `path`? See the module docstring for the rules."""
+    segs = _segments(path)
+    pat = pattern.split("/") if isinstance(pattern, str) and pattern else None
+    if segs is None or pat is None:
+        return False
+
+    @lru_cache(maxsize=None)
+    def go(i, j):
+        if i == len(pat):
+            return j == len(segs)
+        if pat[i] == "**":
+            return any(go(i + 1, k) for k in range(j, len(segs) + 1))
+        return j < len(segs) and bool(_seg_re(pat[i]).match(segs[j])) and go(i + 1, j + 1)
+
+    return go(0, 0)
+
+
+def matches_any(patterns, path):
+    return any(match(p, path) for p in patterns)
+
+
+# --------------------------------------------------------------- declaration
+
+
+def _probes(evidence_dir, command):
+    return ["tests/x", "Tests/x", "FooTests/x",
+            "x.strings", "x.stringsdict", "x.xcstrings",
+            "plans/x.md", "docs/x.md", ".forgejo/workflows/x.yml",
+            ".gitignore", "project.yml", "x.pbxproj",
+            command,
+            f"{evidence_dir}/x",
+            f"{evidence_dir}/2026-01-01-x/README.md",
+            f"{evidence_dir}/2026-01-01-x/a-b/c-before.png"]
+
+
+def _pattern_problem(pat, evidence_dir, command, binary):
+    """The rule `pat` breaks, or None."""
+    if not isinstance(pat, str) or not pat:
+        return "a pattern must be a non-empty string"
+    if pat.startswith("/"):
+        return f"pattern {pat!r} is absolute"
+    segs = pat.split("/")
+    if any(s == ".." for s in segs):
+        return f"pattern {pat!r} holds `..`"
+    if any(s in ("", ".") for s in segs):
+        return f"pattern {pat!r} has an empty or `.` segment"
+    if segs[0] == "**":
+        return f"pattern {pat!r} starts with `**`"
+    if pat == "*":
+        return "pattern `*` alone matches the whole top level"
+    if any("**" in s and s != "**" for s in segs):
+        return f"pattern {pat!r} uses `**` inside a segment"
+    if any(s in ("tests", "Tests") or s.endswith("Tests") for s in segs):
+        return f"pattern {pat!r} names a tests directory"
+    last = segs[-1]
+    if last.endswith(STRINGS_SUFFIXES):
+        return f"pattern {pat!r} names a strings file (copy is not style)"
+    if last in (".gitignore", "project.yml") or last.endswith(".pbxproj"):
+        return f"pattern {pat!r} names a project or ignore file"
+    if not binary:
+        if last.endswith(BINARY_SUFFIXES):
+            return (f"pattern {pat!r} names a binary type; declare it under "
+                    f"binary_paths, never paths")
+        for i, s in enumerate(segs[:-1]):
+            if s.endswith(".xcassets") and last != "Contents.json":
+                return (f"pattern {pat!r} reaches into an asset catalog; only "
+                        f"Contents.json is text")
+    for probe in _probes(evidence_dir, command):
+        if match(pat, probe):
+            return f"pattern {pat!r} matches {probe!r}, which may never be style"
+    return None
+
+
+def _plain_path(value):
+    """True for a repo-relative path with no empty, `.` or `..` segment."""
+    return _segments(value) is not None
+
+
+def _name_list(value, field):
+    if (not isinstance(value, list) or not value
+            or not all(isinstance(v, str) and NAME.fullmatch(v) for v in value)):
+        return f"{field} must be a non-empty list of names matching [a-z0-9][a-z0-9-]*"
+    return None
+
+
+def _int_in(value, lo, hi):
+    return isinstance(value, int) and not isinstance(value, bool) and lo <= value <= hi
+
+
+def _entry(repo, raw):
+    """A validated, defaulted entry, or `Malformed` (without a line)."""
+    if not isinstance(raw, dict):
+        raise Malformed(f"{repo}: an entry must be an object")
+    extra = sorted(set(raw) - ENTRY_KEYS)
+    if extra:
+        raise Malformed(f"{repo}: unknown key(s) {extra}")
+    evidence_dir = raw.get("evidence_dir", DEFAULT_EVIDENCE_DIR)
+    if (not isinstance(evidence_dir, str) or evidence_dir.startswith("/")
+            or ".." in evidence_dir.split("/") or not _plain_path(evidence_dir)):
+        raise Malformed(f"{repo}: evidence_dir must be a repo-relative path with no "
+                        f"`..`, `.` or empty segment")
+    shot = raw.get("screenshot")
+    if not isinstance(shot, dict):
+        raise Malformed(f"{repo}: screenshot must be an object")
+    extra = sorted(set(shot) - SHOT_KEYS)
+    if extra:
+        raise Malformed(f"{repo}: screenshot has unknown key(s) {extra}")
+    if shot.get("platform") not in PLATFORMS:
+        raise Malformed(f"{repo}: screenshot.platform must be one of {list(PLATFORMS)}")
+    command = shot.get("command")
+    if not isinstance(command, str) or not _plain_path(command):
+        raise Malformed(f"{repo}: screenshot.command must be a repo-relative path")
+    for field, pat in (("runtime", r"[A-Za-z0-9._-]+"), ("device", r"[A-Za-z0-9 ._()-]+")):
+        v = shot.get(field)
+        if not isinstance(v, str) or not re.fullmatch(pat, v):
+            raise Malformed(f"{repo}: screenshot.{field} must be a literal identifier")
+    if not _int_in(shot.get("scale"), 1, 3):
+        raise Malformed(f"{repo}: screenshot.scale must be an integer from 1 to 3")
+    for field in ("themes", "appearances"):
+        bad = _name_list(shot.get(field), f"screenshot.{field}")
+        if bad:
+            raise Malformed(f"{repo}: {bad}")
+    kb = shot.get("max_image_kb", DEFAULT_MAX_IMAGE_KB)
+    if not _int_in(kb, 50, 1000):
+        raise Malformed(f"{repo}: screenshot.max_image_kb must be an integer from 50 to 1000")
+    if not _int_in(shot.get("timeout_minutes"), 1, 60):
+        raise Malformed(f"{repo}: screenshot.timeout_minutes must be an integer from 1 to 60")
+    out_shot = dict(shot, max_image_kb=kb)
+
+    paths = raw.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise Malformed(f"{repo}: paths must be a non-empty list")
+    binary = raw.get("binary_paths", [])
+    if not isinstance(binary, list):
+        raise Malformed(f"{repo}: binary_paths must be a list")
+    for pats, is_binary, field in ((paths, False, "paths"), (binary, True, "binary_paths")):
+        for pat in pats:
+            why = _pattern_problem(pat, evidence_dir, command, is_binary)
+            if why:
+                raise Malformed(f"{repo}: {field}: {why}")
+    for pat in paths + binary:
+        if match(pat, f"{evidence_dir}/x"):
+            raise Malformed(f"{repo}: evidence_dir {evidence_dir!r} lies under pattern {pat!r}")
+    return {"paths": list(paths), "binary_paths": list(binary),
+            "evidence_dir": evidence_dir, "screenshot": out_shot}
+
+
+def _line_of(text, needle):
+    idx = text.find(json.dumps(needle))
+    return text.count("\n", 0, idx) + 1 if idx >= 0 else 1
+
+
+def load_config(path=None):
+    """{repo: entry} from the declaration file. `Malformed` names line and rule."""
+    path = Path(path or CONFIG)
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise Malformed(f"{path}:1: cannot read the declaration ({e.strerror or e})") from None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise Malformed(f"{path}:{e.lineno}: not valid JSON ({e.msg})") from None
+    if (not isinstance(data, dict) or set(data) != {"v", "repos"} or data["v"] != 1
+            or not isinstance(data["repos"], dict)):
+        raise Malformed(f'{path}:1: the file must be {{"v": 1, "repos": {{...}}}}')
+    repos = {}
+    for repo, raw in data["repos"].items():
+        line = _line_of(text, repo)
+        if repo == "default":
+            raise Malformed(f"{path}:{line}: there is no `default` entry; a fleet-wide "
+                            f"style path would declare files in repositories nobody looked at")
+        if not REPO_NAME.fullmatch(repo):
+            raise Malformed(f"{path}:{line}: key {repo!r} is not owner/repo")
+        try:
+            repos[repo] = _entry(repo, raw)
+        except Malformed as e:
+            raise Malformed(f"{path}:{line}: {e}") from None
+    return repos
+
+
+def declared(repo, config=None):
+    """The validated entry for `repo`, or None when it has none. A malformed file
+    raises `Malformed` even for an undeclared repo: the file is one decision."""
+    return load_config(config).get(repo)
+
+
+def declared_view(repo, entry):
+    if entry is None:
+        return {"repo": repo, "declared": False, "paths": None,
+                "evidence_dir": None, "screenshot": None}
+    return {"repo": repo, "declared": True, "paths": entry["paths"],
+            "evidence_dir": entry["evidence_dir"], "screenshot": entry["screenshot"]}
+
+
+# ----------------------------------------------------------------------- git
+
+
+class Git:
+    def __init__(self, git_dir):
+        self.git_dir = str(git_dir)
+
+    def run(self, *args):
+        try:
+            r = subprocess.run(["git", f"--git-dir={self.git_dir}", *args],
+                               capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise Undecided(f"git {args[0]}: {e}") from None
+        if r.returncode != 0:
+            raise Undecided(f"git {' '.join(args[:3])}: {r.stderr.decode(errors='replace').strip()[:200]}")
+        return r.stdout
+
+    def resolve(self, rev):
+        if not HEX_REV.fullmatch(rev or ""):
+            raise Undecided(f"{rev!r} is not a commit hash")
+        out = self.run("rev-parse", "--verify", f"{rev}^{{commit}}").decode().strip()
+        return out
+
+    def parent(self, rev):
+        try:
+            return self.run("rev-parse", "--verify", f"{rev}^1^{{commit}}").decode().strip()
+        except Undecided:
+            return None
+
+    def show(self, rev, path):
+        """Bytes of `path` at `rev`, or None when it is not there."""
+        try:
+            return self.run("show", f"{rev}:{path}")
+        except Undecided:
+            return None
+
+    def names(self, rev, prefix, recursive):
+        args = ["ls-tree", "-z", "--name-only"] + (["-r"] if recursive else []) + [rev, "--", prefix]
+        return [n for n in self.run(*args).decode().split("\0") if n]
+
+    def numstat_binary(self, base, head):
+        """Paths git reports as binary (`-`) between base and head."""
+        out = self.run("diff", "--numstat", "--no-renames", "-z", base, head).decode(errors="replace")
+        binary = set()
+        for rec in out.split("\0"):
+            m = re.match(r"(-|\d+)\t(-|\d+)\t(.*)\Z", rec, re.S)
+            if m and m.group(1) == "-" and m.group(2) == "-":
+                binary.add(m.group(3))
+        return binary
+
+
+# --------------------------------------------------------------------- route
+
+
+def _front_matter(text):
+    if not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    fm = {}
+    for line in parts[1].strip().splitlines():
+        if ":" in line and not line.startswith((" ", "\t", "#", "-")):
+            k, v = line.split(":", 1)
+            fm.setdefault(k.strip(), v.strip())
+    return fm
+
+
+def _is_date(s):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return False
+    try:
+        datetime.date(int(s[:4]), int(s[5:7]), int(s[8:]))
+    except ValueError:
+        return False
+    return True
+
+
+def _folder_problem(name, ident):
+    if len(name) < 12 or not _is_date(name[:10]) or name[10] != "-":
+        return f"evidence folder {name!r} does not start with a real YYYY-MM-DD- date"
+    if name[11:] != ident:
+        return f"evidence folder {name!r} is not named for {ident!r}"
+    return None
+
+
+def _image_rel(rel, shot):
+    """True for `<theme>-<appearance>/<screen>-before|after.png` in declared names."""
+    parts = rel.split("/")
+    if len(parts) != 2:
+        return False
+    combos = {f"{t}-{a}" for t in shot["themes"] for a in shot["appearances"]}
+    return parts[0] in combos and bool(re.fullmatch(r"[a-z0-9][a-z0-9-]*-(before|after)\.png", parts[1]))
+
+
+def _count_ordinals(repo, position):
+    fm = BIN / "fleet-models"
+    r = subprocess.run([str(fm), "reviewers", repo, position, "--json"],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise Undecided(f"{position} ordinals unresolved (exit {r.returncode})")
+    return len(json.loads(r.stdout))
+
+
+def route(repo, pr, plan_text, changes, git, base, head, override, config=None,
+          ordinals=_count_ordinals):
+    """The routing decision as a dict. `plan_text` is None when the pull request
+    has no plan. `changes` is the forge's list. `ordinals(repo, position)` is
+    injectable for tests; production shells out to bin/fleet-models."""
+    reasons = []
+    try:
+        entry = declared(repo, config)
+        malformed = None
+    except Malformed as e:
+        entry, malformed = None, str(e)
+
+    ident = f"pr{pr}"
+    if plan_text is not None:
+        fm = _front_matter(plan_text)
+        if fm.get("review") != "style":
+            reasons.append("the plan does not say `review: style`")
+        if fm.get("repo") != repo:
+            reasons.append(f"the plan's repo is {fm.get('repo')!r}, not {repo!r}")
+        if NAME.fullmatch(fm.get("id", "")):
+            ident = fm["id"]
+        else:
+            reasons.append("the plan has no usable id")
+    if malformed:
+        reasons.append(f"the style declaration is malformed: {malformed}")
+    elif entry is None:
+        reasons.append(f"{repo} declares no style paths")
+    if override == "full":
+        reasons.append("the owner asked for the full review (Review: full)")
+
+    folder = None
+    if entry is not None:
+        folder = _check_changes(entry, ident, plan_text is not None, changes, git,
+                                base, head, reasons)
+        try:
+            n_style, n_code = ordinals(repo, "style_reviewer"), ordinals(repo, "code_reviewer")
+            if n_style != n_code:
+                reasons.append(f"style_reviewer resolves {n_style} ordinal(s) for {repo}, "
+                               f"code_reviewer {n_code}")
+        except (Undecided, ValueError, OSError, subprocess.SubprocessError) as e:
+            reasons.append(f"style_reviewer ordinals could not be resolved: {e}")
+
+    style = not reasons
+    return {"position": "style_reviewer" if style else "code_reviewer",
+            "review": "style" if style else "full",
+            "reasons": reasons,
+            "evidence_id": ident,
+            "evidence_folder": folder if style else None,
+            "screenshot": entry["screenshot"] if style else None}
+
+
+def _check_changes(entry, ident, has_plan, changes, git, base, head, reasons):
+    """Append a reason per failed diff condition; return the evidence folder path."""
+    ed, shot = entry["evidence_dir"], entry["screenshot"]
+    plan_file = f"plans/{ident}.md"
+    binary = git.numstat_binary(base, head)
+    ed_segs = ed.split("/")
+    n = len(ed_segs)
+    folders, evidence, rest = set(), [], []
+    for ch in changes:
+        name, status, prev = ch["filename"], ch["status"], ch.get("previous_filename")
+        if has_plan and name == plan_file and prev in (None, "", name):
+            continue
+        # a rename contributes both its paths; the old one is a removal
+        for p, st in ((name, status), (prev, "renamed")):
+            if not p or (p == prev and p == name):
+                continue
+            segs = _segments(p) or []
+            (evidence if segs[:n] == ed_segs and len(segs) > n else rest).append((p, st))
+    seen = set()
+    for p, status in rest:
+        if p in seen:
+            continue
+        seen.add(p)
+        if p in binary:
+            if not matches_any(entry["binary_paths"], p):
+                reasons.append(f"{p} is a binary file outside binary_paths")
+        elif not matches_any(entry["paths"], p):
+            reasons.append(f"{p} is outside the declared style paths")
+    if not rest and not evidence:
+        reasons.append("no change remains after the plan's own file is dropped")
+    for p, status in evidence:
+        if status != "added":
+            reasons.append(f"{p} has status {status!r}; only additions are allowed "
+                           f"under {ed}")
+    added = [p for p, s in evidence if s == "added"]
+    for p in added:
+        folders.add(p.split("/")[n])
+    if len(folders) > 1:
+        reasons.append(f"more than one evidence folder: {', '.join(sorted(folders))}")
+    folder = None
+    if len(folders) == 1:
+        (name,) = folders
+        folder = f"{ed}/{name}"
+        why = _folder_problem(name, ident)
+        if why:
+            reasons.append(why)
+        for p in added:
+            parts = p.split("/")
+            if parts[n] != name:
+                continue
+            rel = "/".join(parts[n + 1:])
+            if rel != "README.md" and not _image_rel(rel, shot):
+                reasons.append(f"{p} is not README.md or a declared before/after .png")
+        existing = {Path(x).name for x in git.names(base, ed + "/", False)}
+        if name in existing:
+            reasons.append(f"evidence folder {name!r} already exists at the base")
+    return folder
+
+
+# -------------------------------------------------------------------- verify
+
+
+def png_problems(data, max_bytes):
+    """Why `data` is not an acceptable evidence PNG: an empty list means it is."""
+    if len(data) > max_bytes:
+        return [f"{len(data)} bytes exceeds the cap of {max_bytes}"]
+    if data[:8] != PNG_SIG:
+        return ["not a PNG (bad signature)"]
+    pos, chunks, idat, ihdr, ended = 8, [], [], None, False
+    while pos < len(data):
+        if ended:
+            return ["data after IEND"]
+        if pos + 12 > len(data):
+            return ["truncated chunk"]
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        ctype = data[pos + 4:pos + 8]
+        end = pos + 8 + length
+        if end + 4 > len(data):
+            return ["truncated chunk"]
+        body = data[pos + 8:end]
+        (crc,) = struct.unpack(">I", data[end:end + 4])
+        if zlib.crc32(ctype + body) & 0xFFFFFFFF != crc:
+            return [f"bad CRC in {ctype!r} chunk"]
+        if ctype not in PNG_CHUNKS:
+            return [f"carries a {ctype.decode('latin-1')} chunk (metadata must be stripped)"]
+        if not chunks and ctype != b"IHDR":
+            return ["IHDR is not the first chunk"]
+        if ctype == b"IHDR":
+            if chunks or length != 13:
+                return ["bad IHDR"]
+            ihdr = struct.unpack(">IIBBBBB", body)
+        elif ctype == b"IDAT":
+            if chunks and chunks[-1] not in (b"IDAT",) and idat:
+                return ["IDAT chunks are not contiguous"]
+            idat.append(body)
+        elif ctype == b"IEND":
+            ended = True
+        chunks.append(ctype)
+        pos = end + 4
+    if not ended:
+        return ["no IEND chunk"]
+    width, height, depth, ctype_, comp, filt, interlace = ihdr
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(ctype_)
+    ok_depth = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+    if (channels is None or depth not in ok_depth[ctype_] or comp or filt or interlace not in (0, 1)
+            or not (0 < width <= 16384 and 0 < height <= 16384)):
+        return ["unsupported or invalid IHDR"]
+    if ctype_ == 3 and b"PLTE" not in chunks:
+        return ["palette image without PLTE"]
+    bits = channels * depth
+    if interlace:
+        passes = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+                  (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+        expected = 0
+        for xs, ys, dx, dy in passes:
+            w = (width - xs + dx - 1) // dx if width > xs else 0
+            h = (height - ys + dy - 1) // dy if height > ys else 0
+            if w and h:
+                expected += h * (1 + (w * bits + 7) // 8)
+    else:
+        expected = height * (1 + (width * bits + 7) // 8)
+    if expected > 64 * 1024 * 1024:
+        return ["decoded size is implausibly large"]
+    d = zlib.decompressobj()
+    try:
+        out = d.decompress(b"".join(idat), expected + 1)
+        out += d.flush() if d.eof else b""
+    except zlib.error as e:
+        return [f"IDAT does not inflate ({e})"]
+    if not d.eof or d.unused_data or len(out) != expected:
+        return [f"IDAT inflates to {len(out)} bytes, IHDR implies {expected}"]
+    return []
+
+
+def _evidence_block(readme):
+    blocks = re.findall(r"^```json[ \t]*\n(.*?)\n```[ \t]*$", readme, re.S | re.M)
+    if len(blocks) != 1:
+        raise ValueError(f"README.md must hold exactly one json evidence block, found {len(blocks)}")
+    data = json.loads(blocks[0])
+    if not isinstance(data, dict):
+        raise ValueError("the evidence block is not an object")
+    return data
+
+
+def _triples(images):
+    if not isinstance(images, list):
+        raise ValueError("`images` is not a list")
+    return sorted((i["path"], i["bytes"], i["sha256"]) for i in images)
+
+
+def record_path(repo, pr, head):
+    spec = importlib.util.spec_from_loader(
+        "fleetlib", importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py")))
+    lib = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lib)
+    owner, name = repo.split("/")
+    return Path(lib.fleet_dir()) / "style-evidence" / owner / name / str(pr) / f"{head}.json"
+
+
+def verify(repo, pr, plan_id, git, base, head, config=None, record=None):
+    """Is the committed evidence at `head` valid (ADR-0025 §6-§7)? A dict."""
+    problems, images = [], []
+    result = {"ok": False, "folder": None, "code_head": None, "problems": problems,
+              "images": images, "total_bytes": 0}
+    try:
+        entry = declared(repo, config)
+    except Malformed as e:
+        problems.append(f"the style declaration is malformed: {e}")
+        return result
+    if entry is None:
+        problems.append(f"{repo} declares no style paths")
+        return result
+    ed, shot = entry["evidence_dir"], entry["screenshot"]
+    ident = plan_id if plan_id not in (None, "none") else f"pr{pr}"
+    base, head = git.resolve(base), git.resolve(head)
+    code_head = git.parent(head)
+    if code_head is None:
+        problems.append("the head commit has no parent")
+        return result
+    result["code_head"] = code_head
+
+    out = git.run("diff", "--name-status", "--no-renames", "-z", code_head, head).decode()
+    toks = out.split("\0")
+    changed = [(toks[i], toks[i + 1]) for i in range(0, len(toks) - 1, 2)]
+    nd = len(ed.split("/"))
+    folders = set()
+    for status, p in changed:
+        segs = _segments(p) or []
+        if segs[:nd] != ed.split("/") or len(segs) <= nd + 1:
+            problems.append(f"the head commit changes {p}, outside the evidence folder")
+        else:
+            folders.add(segs[nd])
+        if status != "A":
+            problems.append(f"the head commit does not add {p} (status {status})")
+    if not changed:
+        problems.append("the head commit changes nothing")
+    if len(folders) != 1:
+        problems.append("the head commit must add files in exactly one evidence folder"
+                        if folders else "the evidence folder is missing")
+        return result
+    (name,) = folders
+    folder = f"{ed}/{name}"
+    result["folder"] = folder
+    why = _folder_problem(name, ident)
+    if why:
+        problems.append(why)
+    if git.names(code_head, folder + "/", True):
+        problems.append(f"files in {folder} already exist at the head's parent")
+
+    # the committed files
+    files = git.names(head, folder + "/", True)
+    wanted_combos = [f"{t}-{a}" for t in shot["themes"] for a in shot["appearances"]]
+    screens = {}
+    for p in files:
+        rel = p[len(folder) + 1:]
+        if rel == "README.md":
+            continue
+        if not _image_rel(rel, shot):
+            problems.append(f"{p} is not README.md or a declared before/after .png")
+            continue
+        combo, fname = rel.split("/")
+        m = re.fullmatch(r"(.+)-(before|after)\.png", fname)
+        screens.setdefault((combo, m.group(2)), set()).add(m.group(1))
+    reference = screens.get((wanted_combos[0], "before"), set())
+    if not reference:
+        problems.append("no before images")
+    for combo in wanted_combos:
+        for kind in ("before", "after"):
+            got = screens.get((combo, kind), set())
+            if got != reference:
+                missing = sorted(reference - got)
+                extra = sorted(got - reference)
+                problems.append(f"{combo} {kind}: screens differ from {wanted_combos[0]} before"
+                                + (f" (missing {missing})" if missing else "")
+                                + (f" (extra {extra})" if extra else ""))
+
+    # decode and hash every image
+    cap = shot["max_image_kb"] * 1024
+    for p in sorted(files):
+        if not p.endswith(".png") or not _image_rel(p[len(folder) + 1:], shot):
+            continue
+        data = git.show(head, p)
+        if data is None:
+            problems.append(f"{p} cannot be read at the head")
+            continue
+        for w in png_problems(data, cap):
+            problems.append(f"{p}: {w}")
+        images.append({"path": p, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    result["total_bytes"] = sum(i["bytes"] for i in images)
+    actual = sorted((i["path"], i["bytes"], i["sha256"]) for i in images)
+
+    # the README evidence block
+    readme = git.show(head, f"{folder}/README.md")
+    if readme is None:
+        problems.append(f"{folder}/README.md is missing")
+    else:
+        try:
+            block = _evidence_block(readme.decode("utf-8", errors="replace"))
+            _check_block(block, shot, repo, pr, ident, code_head, base, name, git, actual, problems)
+        except (ValueError, KeyError, TypeError) as e:
+            problems.append(f"README evidence block unusable: {e}")
+
+    # the producer's record, outside every repository
+    rec = Path(record) if record else record_path(repo, pr, head)
+    try:
+        data = json.loads(rec.read_text())
+        if (data.get("repo") != repo or data.get("pr") != pr
+                or data.get("evidence_commit") != head):
+            problems.append("the producer's record names another repo, pull request or commit")
+        if _triples(data.get("images")) != actual:
+            problems.append("the producer's record and the committed images differ")
+    except OSError:
+        problems.append("the producer's record is missing")
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        problems.append(f"the producer's record is unusable: {e}")
+
+    result["ok"] = not problems
+    return result
+
+
+def _check_block(block, shot, repo, pr, ident, code_head, base, folder_name, git, actual, problems):
+    def need(key, want, label=None):
+        if block.get(key) != want:
+            problems.append(f"README names {key} {block.get(key)!r}, expected "
+                            f"{(label or want)!r}")
+    need("v", 1)
+    need("id", ident)
+    need("pr", pr)
+    need("code_head", code_head, "the head commit's parent")
+    need("base", base, "the pull request's base")
+    need("platform", shot["platform"])
+    need("runtime", shot["runtime"])
+    need("device", shot["device"])
+    need("command", shot["command"])
+    blob = git.show(base, shot["command"])
+    if blob is not None:
+        sha = git.run("rev-parse", f"{base}:{shot['command']}").decode().strip()
+        need("command_blob", sha, "the command's blob at the base")
+    else:
+        problems.append(f"the screenshot command {shot['command']} does not exist at the base")
+    taken = block.get("taken")
+    if not isinstance(taken, str) or taken[:10] != folder_name[:10]:
+        problems.append(f"README `taken` {taken!r} is not on the folder's date {folder_name[:10]}")
+    if _triples(block.get("images")) != actual:
+        problems.append("the README evidence block and the committed images differ")
+
+
+# ----------------------------------------------------------------------- CLI
+
+
+def _emit(obj):
+    print(json.dumps(obj, indent=2))
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        raise Undecided(f"{path}: {e}") from None
+
+
+def cmd_declared(args):
+    try:
+        entry = declared(args.repo)
+    except Malformed as e:
+        print(f"fleet-style: {e}", file=sys.stderr)
+        return 2
+    _emit(declared_view(args.repo, entry))
+    return 0
+
+
+def cmd_route(args):
+    plan_text = None
+    if args.plan_file != "none":
+        try:
+            plan_text = Path(args.plan_file).read_text()
+        except OSError as e:
+            raise Undecided(f"{args.plan_file}: {e}") from None
+    changes = _read_json(args.changes)
+    if not isinstance(changes, list) or not all(
+            isinstance(c, dict) and isinstance(c.get("filename"), str)
+            and isinstance(c.get("status"), str) for c in changes):
+        raise Undecided("--changes must be a list of {filename, status[, previous_filename]}")
+    git = Git(args.git_dir)
+    base, head = git.resolve(args.base), git.resolve(args.head)
+    _emit(route(args.repo, args.pr, plan_text, changes, git, base, head, args.override))
+    return 0
+
+
+def cmd_verify(args):
+    _emit(verify(args.repo, args.pr, args.plan_id, Git(args.git_dir), args.base, args.head))
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="fleet-style")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("declared")
+    p.add_argument("repo")
+    p.add_argument("--json", action="store_true", required=True)
+    p.set_defaults(func=cmd_declared)
+    for name, func in (("route", cmd_route), ("verify", cmd_verify)):
+        p = sub.add_parser(name)
+        p.add_argument("repo")
+        p.add_argument("--pr", type=int, required=True)
+        if name == "route":
+            p.add_argument("--plan-file", required=True)
+            p.add_argument("--changes", required=True)
+        else:
+            p.add_argument("--plan-id", required=True)
+        p.add_argument("--git-dir", required=True)
+        p.add_argument("--base", required=True)
+        p.add_argument("--head", required=True)
+        if name == "route":
+            p.add_argument("--override", required=True, choices=("full", "none"))
+        p.add_argument("--json", action="store_true", required=True)
+        p.set_defaults(func=func)
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except Undecided as e:
+        print(f"fleet-style: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

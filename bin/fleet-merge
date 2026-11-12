@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""fleet-merge — mergebot merges what ADR-0019 §4 allows, and nothing else (plan 0108).
+
+  fleet-merge once
+
+One pass over the repositories the watcher scans (`conf_repos()`'s dispatch
+list). On an AUTONOMOUS repository, for every open PR:
+
+  a `src` PR (carries `Plan: <id>`) is merged only if all ten checks hold;
+  a `tests` PR (carries `Tests-for: <id>`) only if the shorter list in
+  `_decide_tests` holds.
+
+The first check that fails is the one reported. See docs/fleet-merge.md.
+
+This is a program, not a model (ADR-0019 §4): every check reads forge or file
+state, so a merge is explained by re-running the checks. Nothing here calls a
+model or imports something that does, schedules an auto-merge, rebases, or
+pushes. A critical repository is not touched at all, not even to comment.
+
+The token comes from FLEET_MERGE_TOKEN_CMD (default
+~/bin/fetch-forgejo-mergebot-token.sh), with no fallback. `GET /user` must return
+the `agent_merger` login before anything else is read; any other login refuses
+the run and pages. The merge is `fleetforge.merge_pull` with the checked head
+SHA as `head_commit_id`, so a push between the check and the merge makes the
+forge refuse it. A failed merge is not retried in the same pass.
+
+Logging (stdout, the unit's own log): every merge and every refusal past
+check 1, one line naming the PR, the head SHA and the deciding check. A PR that
+stays blocked on the same check at the same head is logged once. An
+undecidable read or an identity failure pages (`fleet-watch notify`); so does
+a `src` PR refused only at check 4 (protected paths) with every later check
+holding — the owner's merge under ADR-0019 §4, once per PR head (plan 0214).
+
+Config (env):
+  FLEET_FORGEJO_URL     default http://forge.example:3000
+  FLEET_MERGE_TOKEN_CMD command printing mergebot's token
+  FLEET_NTFY_URL        page channel (as fleet-watch notify)
+"""
+import base64
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+ROOT = BIN.parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+# Read-only: `MARKER`, `front_matter`, `conf_repos`, `forge_timeout`, `notify`.
+watch = _load("fleet_watch_for_merge", BIN / "fleet-watch")
+
+UNIT = "org.eunomia.fleet-merge"
+DEPS_CONTEXT = "eunomia/deps"
+FORGEJO_URL = os.environ.get("FLEET_FORGEJO_URL", "http://forge.example:3000")
+# Host tool, not part of this repo (see bin/fleet-deps for its provenance and
+# contract): exit 0 and print the token as the LAST non-empty stdout line.
+TOKEN_CMD = os.environ.get("FLEET_MERGE_TOKEN_CMD",
+                           str(Path.home() / "bin" / "fetch-forgejo-mergebot-token.sh"))
+SCHEMA_PATH = ROOT / "config" / "meeting-findings.schema.json"
+PAGE_SIZE = 50
+PAGE_CAP = 20
+
+# The files that enforce ADR-0019 (§4: "the merger keeps that list"). A PR that
+# touches one is the owner's merge, never mergebot's.
+ENFORCING = frozenset({
+    "bin/fleet-merge",
+    "bin/fleet-deps",
+    "bin/fleet-watch",
+    "bin/fleet-depsd",
+    "bin/fleetlib.py",
+    "bin/fleetforge.py",
+    "bin/fleet-config",
+    "bin/fleet-install-hooks",
+    "bin/fleet-secret-guard",
+    "config/secret-patterns.conf",
+    "launchd/org.eunomia.fleet-merge.plist",
+    "launchd/org.eunomia.fleet-deps.plist",
+    "launchd/org.eunomia.fleet-depsd.plist",
+})
+ADR_PREFIX = "docs/adr/"
+LANE_PREFIX = "tests/lane/"
+PLANS_PREFIX = "plans/"
+
+_LINE = lambda marker: re.compile(rf"^{re.escape(marker)}(.*?)\s*$", re.M)   # noqa: E731
+_PLAN_LINE = _LINE(watch.MARKER)
+_TESTS_LINE = _LINE("Tests-for: ")
+_ID_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_SHA_OK = re.compile(r"^[0-9a-f]{40}\Z")
+_STATUS_RE = re.compile(r"""^status:[ \t]*["']?(\w+)["']?[ \t]*$""")
+
+
+class Refuse(Exception):
+    """A decided no: `check` names the deciding check, `why` says what."""
+
+    def __init__(self, check, why):
+        super().__init__(f"{check}: {why}")
+        self.check, self.why = check, why
+
+
+class OwnerMerge(Refuse):
+    """A `Refuse` that is the owner's merge, not a defect: every check but
+    this one holds (ADR-0019 §4). `plan_id` rides along so `_handle` can
+    page without re-reading the PR body."""
+
+    def __init__(self, check, why, plan_id):
+        super().__init__(check, why)
+        self.plan_id = plan_id
+
+
+class Undecidable(Exception):
+    """A read failed, so the program cannot decide. Pages; never guesses."""
+
+
+def _log(msg):
+    print(f"fleet-merge: {msg}", flush=True)
+
+
+# ------------------------------------------------------------------ paging
+def _markers_dir():
+    return lib.fleet_dir() / "merge-notified"
+
+
+def _marker(key):
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", key).strip("-")[:120] or "merge"
+    return _markers_dir() / f"{safe}.pending"
+
+
+def _page_once(key, title, body):
+    """One page per episode: an O_EXCL marker, removed again if delivery fails."""
+    marker = _marker(key)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.close(fd)
+    except FileExistsError:
+        return False
+    except OSError:
+        pass
+    if watch.notify(title, body, label=UNIT) is False:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _clear(key):
+    try:
+        _marker(key).unlink()
+    except OSError:
+        pass
+
+
+def _clear_stale(slug, keep):
+    try:
+        for m in _markers_dir().glob(f"{slug}--*.pending"):
+            if m.name not in keep:
+                m.unlink()
+    except OSError:
+        pass
+
+
+# --------------------------------------------- "blocked on the same check"
+def _seen_dir():
+    return lib.fleet_dir() / "merge-seen"
+
+
+def _seen_path(slug, num):
+    return _seen_dir() / f"{slug}--{num}"
+
+
+def _first_report(slug, num, head, check):
+    """True the first time a PR is blocked on `check` at `head` (and records it)."""
+    p = _seen_path(slug, num)
+    stamp = f"{head} {check}"
+    try:
+        if p.read_text(encoding="utf-8") == stamp:
+            return False
+    except OSError:
+        pass
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(stamp, encoding="utf-8")
+    except OSError:
+        pass
+    return True
+
+
+def _forget_closed(slug, open_nums):
+    try:
+        for p in _seen_dir().glob(f"{slug}--*"):
+            if p.name[len(slug) + 2:] not in open_nums:
+                p.unlink()
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ token
+def _token():
+    # Execs the hosttools host tool ~/bin/fetch-forgejo-mergebot-token.sh
+    # (hosttools bin/fetch-forgejo-mergebot-token.sh, PR #35 / f625a94), through
+    # sh -c so a command with arguments works (#1045), like fleet-deps.
+    try:
+        r = subprocess.run(["sh", "-c", TOKEN_CMD], capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"token helper failed ({e.__class__.__name__})"
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not lines:
+        return None, "token helper produced no token"
+    return lines[-1].strip(), ""
+
+
+def _forge(token):
+    return fleetforge.Forge(FORGEJO_URL, token, timeout=watch.forge_timeout())
+
+
+# ------------------------------------------------------------------- reads
+def autonomy(repo):
+    """'autonomous' | 'critical'; raises Undecidable when the answer is not clean."""
+    try:
+        r = subprocess.run([str(BIN / "fleet-config"), "get", "autonomy",
+                            "--repo", repo, "--json"],
+                           capture_output=True, text=True, timeout=60)
+        val = json.loads(r.stdout).get("value")
+    except (ValueError, AttributeError, OSError, subprocess.SubprocessError):
+        raise Undecidable("cannot read autonomy")
+    if r.returncode != 0 or val not in ("autonomous", "critical"):
+        raise Undecidable("cannot read autonomy")
+    return val
+
+
+def _pages(verb, what, *args, **kw):
+    """Every item of a paged list verb, to a confirmed empty page."""
+    out = []
+    for page in range(1, PAGE_CAP + 1):
+        st, body = verb(*args, page=page, limit=PAGE_SIZE, **kw)
+        if st != 200 or not isinstance(body, list):
+            raise Undecidable(f"cannot read {what}")
+        if not body:
+            return out
+        out.extend(body)
+    raise Undecidable(f"cannot read {what} (too many pages)")
+
+
+def _file_text(forge, repo, path, ref):
+    """(text, None) | (None, 'absent'); raises Undecidable on any other failure."""
+    st, f = forge.get_contents(repo, path, ref=ref)
+    if st == 404:
+        return None, "absent"
+    if st != 200 or not isinstance(f, dict):
+        raise Undecidable(f"cannot read {path}")
+    try:
+        return base64.b64decode(f.get("content") or "").decode("utf-8"), None
+    except Exception:                                    # noqa: BLE001
+        raise Undecidable(f"cannot decode {path}")
+
+
+def _plan_status_on_main(forge, repo, plan_id):
+    text, why = _file_text(forge, repo, f"plans/{plan_id}.md", "main")
+    if why:
+        return None
+    return watch.front_matter(text).get("status")
+
+
+def _one_marker(rx, body, name):
+    ids = rx.findall(body or "")
+    if len(ids) != 1:
+        return None, ("no `%s` line" % name if not ids
+                      else f"{len(ids)} `{name}` lines")
+    pid = ids[0].strip()
+    if not _ID_OK.match(pid):
+        return None, f"{pid[:60]!r} is not a plan id"
+    return pid, None
+
+
+# ------------------------------------------------------------- the checks
+def _changed_files(forge, repo, num):
+    st, files = forge.list_pull_files(repo, num)
+    if st != 200 or not isinstance(files, list):
+        raise Undecidable("cannot read the PR's file list")
+    return files
+
+
+def _names(f):
+    return [n for n in (f.get("filename"), f.get("previous_filename")) if n]
+
+
+def _frontmatter_flip_only(base, head):
+    """True when the two texts differ in exactly the front-matter `status:`
+    line, `ready` in the base and `done` in the head."""
+    b, h = base.splitlines(keepends=True), head.splitlines(keepends=True)
+    if len(b) != len(h) or not b or b[0].strip() != "---":
+        return False
+    close = next((i for i, l in enumerate(b[1:], 1) if l.strip() == "---"), None)
+    if close is None:
+        return False
+    diff = [i for i in range(len(b)) if b[i] != h[i]]
+    if len(diff) != 1 or not (0 < diff[0] < close):
+        return False
+    mb, mh = _STATUS_RE.match(b[diff[0]].strip()), _STATUS_RE.match(h[diff[0]].strip())
+    return bool(mb and mh and mb.group(1) == "ready" and mh.group(1) == "done")
+
+
+def _plan_diff_ok(forge, repo, pr, plan_id, files):
+    own = f"{PLANS_PREFIX}{plan_id}.md"
+    touched = [f for f in files if any(n.startswith(PLANS_PREFIX) for n in _names(f))]
+    for f in touched:
+        if f.get("previous_filename"):
+            raise Refuse("3 plan diff", "a plan file is renamed")
+        if f.get("filename") != own:
+            raise Refuse("3 plan diff", f"changes {f.get('filename')}, not only its own plan")
+    if not touched:
+        return
+    base_sha = (pr.get("base") or {}).get("sha")
+    head_sha = (pr.get("head") or {}).get("sha")
+    if not base_sha or not head_sha:
+        raise Undecidable("PR carries no base or head sha")
+    base, why = _file_text(forge, repo, own, base_sha)
+    head, why2 = _file_text(forge, repo, own, head_sha)
+    if why or why2 or not _frontmatter_flip_only(base, head):
+        raise Refuse("3 plan diff", "its own plan changes more than status ready -> done")
+
+
+def _approved_by(reviews, account, head):
+    """None when `account`'s latest submitted review on `head` approves, else why not."""
+    mine = [r for r in reviews
+            if ((r.get("user") or {}).get("login") or "").lower() == account.lower()
+            and r.get("commit_id") == head and not r.get("dismissed")
+            and r.get("state") not in ("PENDING", "REQUEST_REVIEW")]
+    if not mine:
+        return f"{account} has no review at the head"
+    mine.sort(key=lambda r: (r.get("id") if isinstance(r.get("id"), int) else -1))
+    last = mine[-1]
+    if last.get("state") != "APPROVED":
+        return f"{account}'s latest review at the head is {last.get('state')}"
+    if last.get("stale"):
+        return f"{account}'s approval is stale"
+    return None
+
+
+def _check_reviews(forge, repo, num, head, roles):
+    first, second = roles["reviewer"].account, roles["second_reviewer"].account
+    if first.lower() == second.lower():
+        raise Refuse("6 reviews", "reviewer and second_reviewer are one account")
+    reviews = _pages(forge.list_reviews, "reviews", repo, num)
+    for acct in (first, second):
+        why = _approved_by(reviews, acct, head)
+        if why:
+            raise Refuse("6 reviews", why)
+
+
+def _statuses(forge, repo, sha):
+    return _pages(forge.list_statuses, "statuses", repo, sha)
+
+
+def _latest(statuses, context):
+    best = None
+    for s in statuses:
+        if s.get("context") != context:
+            continue
+        key = (s.get("id") if isinstance(s.get("id"), int) else -1, s.get("created_at") or "")
+        if best is None or key > best[0]:
+            best = (key, s)
+    return best[1] if best else None
+
+
+def _state(s):
+    return (s or {}).get("status") or (s or {}).get("state")
+
+
+def _check_deps_status(statuses, roles):
+    s = _latest(statuses, DEPS_CONTEXT)
+    if s is None:
+        raise Refuse("7 deps status", f"no {DEPS_CONTEXT} status on the head")
+    if _state(s) != "success":
+        raise Refuse("7 deps status", f"{DEPS_CONTEXT} is {_state(s)}")
+    who = ((s.get("creator") or {}).get("login") or "")
+    if who.lower() != roles["agent_merger"].account.lower():
+        raise Refuse("7 deps status", f"{DEPS_CONTEXT} was created by {who or 'unknown'}")
+
+
+def _check_ci(forge, repo, statuses):
+    st, br = forge.get_branch(repo, "main")
+    if st != 200 or not isinstance(br, dict):
+        raise Undecidable("cannot read main's required contexts")
+    required = [c for c in (br.get("status_check_contexts") or [])
+                if isinstance(c, str) and c != DEPS_CONTEXT] \
+        if br.get("enable_status_check") else []
+    if not required:
+        raise Refuse("8 ci", "main requires no CI context besides " + DEPS_CONTEXT)
+    for ctx in required:
+        got = _state(_latest(statuses, ctx))
+        if got != "success":
+            raise Refuse("8 ci", f"{ctx} is {got or 'missing'}")
+
+
+def _validate(doc, schema, path="$"):
+    """The subset of JSON Schema draft-07 the findings schema uses: `type`,
+    `enum`, `pattern`, `required`, `properties`, `items`, and boolean
+    `additionalProperties`. Kept here rather than loaded from fleet-lane,
+    which runs models; the schema file stays the one definition of the shape."""
+    types = {"object": dict, "array": list, "string": str, "boolean": bool,
+             "null": type(None), "number": (int, float), "integer": int}
+    t = schema.get("type")
+    if t is not None:
+        ok = False
+        for name in (t if isinstance(t, list) else [t]):
+            py = types[name]
+            if isinstance(doc, py) and not (isinstance(doc, bool) and name in ("integer", "number")):
+                ok = True
+        if not ok:
+            return [f"{path}: wrong type"]
+    errs = []
+    if "enum" in schema and not any(doc == e and type(doc) is type(e) for e in schema["enum"]):
+        errs.append(f"{path}: not in enum")
+    if "pattern" in schema and isinstance(doc, str) and not re.search(schema["pattern"], doc):
+        errs.append(f"{path}: pattern")
+    if isinstance(doc, dict):
+        errs += [f"{path}: missing {k}" for k in schema.get("required", []) if k not in doc]
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties") is False and set(doc) - set(props):
+            errs.append(f"{path}: unexpected key")
+        for k, sub in props.items():
+            if k in doc:
+                errs += _validate(doc[k], sub, f"{path}.{k}")
+    elif isinstance(doc, list) and isinstance(schema.get("items"), dict):
+        for i, item in enumerate(doc):
+            errs += _validate(item, schema["items"], f"{path}[{i}]")
+    return errs
+
+
+def findings_path(plan_id, head):
+    # fleet-meet's findings_path (plan 0102): <work root>/meetings/<plan>/<sha12>/findings.json
+    return lib.work_root() / "meetings" / plan_id / head[:12] / "findings.json"
+
+
+def _check_integration_tests(repo, num, plan_id, head):
+    p = findings_path(plan_id, head)
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise Refuse("9 integration tests", "no findings document for this plan and head")
+    except (OSError, ValueError):
+        raise Refuse("9 integration tests", "findings document unreadable")
+    if _validate(doc, schema):
+        raise Refuse("9 integration tests", "findings document fails its schema")
+    impl = doc["impl"]
+    if (doc["plan"] != plan_id or doc["repo"] != repo
+            or impl["head_sha"] != head or impl["pr"] != num):
+        raise Refuse("9 integration tests", "findings document is for another plan or head")
+    tests = [t for lane in doc["lanes"] for t in lane["tests"]]
+    if not tests:
+        raise Refuse("9 integration tests", "findings record no test")
+    bad = [t["outcome"] for t in tests if t["outcome"] != "pass"]
+    if bad or doc["all_passed"] is not True:
+        raise Refuse("9 integration tests",
+                     f"{len(bad)} of {len(tests)} tests are not pass" if bad
+                     else "findings say not all passed")
+
+
+def _check_mergeable(pr):
+    if pr.get("mergeable") is not True:
+        raise Refuse("10 mergeable", "Forgejo does not report the PR mergeable")
+
+
+def _check_author(pr, roles):
+    who = ((pr.get("user") or {}).get("login") or "").lower()
+    barred = set()
+    for r in ("agent_merger", "reviewer", "second_reviewer"):
+        barred |= roles[r].logins
+    if not who or who in barred:
+        raise Refuse("5 author", f"author {who or 'unknown'} is a merger or reviewer account")
+
+
+def decide_src(forge, repo, pr, head, roles):
+    """Raises Refuse / Undecidable, or returns when all ten checks hold.
+    Check 1 (autonomy) has been made by the caller.
+
+    Check 4 (protected paths) no longer stops evaluation on its own: a hit is
+    recorded and every later check still runs. If one of those fails, that is
+    the refusal raised, exactly as if check 4 had not fired. If every later
+    check holds, the refusal raised is an `OwnerMerge` naming check 4 — the
+    owner's merge under ADR-0019 §4, not a defect (plan 0214). A later
+    protected-path group (plan 0201's "4b critical paths") joins the same
+    `owner_refusal` slot the same way, should it land here."""
+    num = pr["number"]
+    if (pr.get("base") or {}).get("ref") != "main":
+        raise Refuse("2 plan marker", "base is not main")
+    plan_id, why = _one_marker(_PLAN_LINE, pr.get("body"), "Plan:")
+    if why:
+        raise Refuse("2 plan marker", why)
+    if _plan_status_on_main(forge, repo, plan_id) != "ready":
+        raise Refuse("2 plan marker", f"plan {plan_id} is not at ready on main")
+    files = _changed_files(forge, repo, num)
+    _plan_diff_ok(forge, repo, pr, plan_id, files)
+    owner_refusal = None
+    for f in files:
+        for n in _names(f):
+            if n.startswith(ADR_PREFIX) or n.startswith(LANE_PREFIX) or n in ENFORCING:
+                owner_refusal = ("4 protected paths", f"touches {n}")
+                break
+        if owner_refusal:
+            break
+    _check_author(pr, roles)
+    _check_reviews(forge, repo, num, head, roles)
+    statuses = _statuses(forge, repo, head)
+    _check_deps_status(statuses, roles)
+    _check_ci(forge, repo, statuses)
+    _check_integration_tests(repo, num, plan_id, head)
+    _check_mergeable(pr)
+    if owner_refusal is not None:
+        raise OwnerMerge(*owner_refusal, plan_id)
+    return plan_id
+
+
+def decide_tests(forge, repo, pr, head, roles):
+    """The `tests` PR's list (plan 0108 D1b)."""
+    num = pr["number"]
+    if (pr.get("base") or {}).get("ref") != "main":
+        raise Refuse("t1 base", "base is not main")
+    plan_id, why = _one_marker(_TESTS_LINE, pr.get("body"), "Tests-for:")
+    if why:
+        raise Refuse("t2 marker", why)
+    if _PLAN_LINE.search(pr.get("body") or ""):
+        raise Refuse("t2 marker", "carries both Tests-for and Plan")
+    if _plan_status_on_main(forge, repo, plan_id) not in ("ready", "done"):
+        raise Refuse("t2 marker", f"plan {plan_id} is not ready or done on main")
+    files = _changed_files(forge, repo, num)
+    if not files:
+        raise Refuse("t3 files", "no changed files")
+    for f in files:
+        if f.get("previous_filename") or not (f.get("filename") or "").startswith(LANE_PREFIX):
+            raise Refuse("t3 files", f"{f.get('filename')} is not a plain change under {LANE_PREFIX}")
+    who = ((pr.get("user") or {}).get("login") or "").lower()
+    if who not in roles["author"].logins or who in (
+            roles["reviewer"].logins | roles["second_reviewer"].logins
+            | roles["agent_merger"].logins):
+        raise Refuse("t4 author", f"author {who or 'unknown'} is not the lane wrapper's account")
+    _check_reviews(forge, repo, num, head, roles)
+    _check_ci(forge, repo, _statuses(forge, repo, head))
+    _check_mergeable(pr)
+    return plan_id
+
+
+# -------------------------------------------------------------------- pass
+def _open_prs(forge, repo):
+    return _pages(forge.list_pulls, "open PRs", repo, state="open")
+
+
+def _ready_key(slug, num, head):
+    return f"{slug}--{num}-ready-{head[:12]}"
+
+
+def _page_owner_ready(repo, slug, num, head, r, keep):
+    """Pages once per (PR, head) that check 4 refused with every later check
+    holding. The marker is added to `keep` so `_clear_stale` (called once per
+    repo, after every PR in this pass) does not wipe it out from under a page
+    that was just sent — or just confirmed already sent."""
+    key = _ready_key(slug, num, head)
+    keep.add(_marker(key).name)
+    url = f"{FORGEJO_URL}/{repo}/pulls/{num}"
+    body = (f"{repo}#{num} (plan {r.plan_id}) at {head[:12]}: {r.why}. "
+            f"Every other check holds.\n{url}")
+    _page_once(key, "Ready for your merge", body)
+
+
+def _handle(forge, repo, slug, listed, roles, keep):
+    num = listed.get("number")
+    st, pr = forge.get_pull(repo, num)
+    if st != 200 or not isinstance(pr, dict):
+        raise Undecidable("cannot read the PR")
+    head = (pr.get("head") or {}).get("sha") or ""
+    if not _SHA_OK.match(head):
+        raise Undecidable("PR carries no head sha")
+    pr.setdefault("number", num)
+    kind = decide_tests if _TESTS_LINE.search(pr.get("body") or "") else decide_src
+    try:
+        kind(forge, repo, pr, head, roles)
+    except OwnerMerge as r:
+        if _first_report(slug, num, head, r.check):
+            _log(f"{repo}#{num} {head[:12]} not merged at check {r.check}: {r.why}")
+        _page_owner_ready(repo, slug, num, head, r, keep)
+        return
+    except Refuse as r:
+        if _first_report(slug, num, head, r.check):
+            _log(f"{repo}#{num} {head[:12]} not merged at check {r.check}: {r.why}")
+        return
+    st, _ = forge.merge_pull(repo, num, head)
+    if st in (200, 201, 204):
+        _log(f"{repo}#{num} {head[:12]} merged (all checks hold)")
+        _clear(f"{slug}--{num}")
+    else:
+        # Not retried in this pass; the next pass decides afresh.
+        _log(f"{repo}#{num} {head[:12]} merge refused by the forge (HTTP {st})")
+
+
+def once():
+    token, err = _token()
+    if token is None:
+        _page_once("identity", "fleet-merge refused", f"no mergebot token: {err}")
+        _log(f"refused: {err}")
+        return 2
+    forge = _forge(token)
+    roles = lib.agent_roles()
+    want = roles["agent_merger"].account
+    st, me = forge.get_user()
+    login = me.get("login") if st == 200 and isinstance(me, dict) else None
+    if login != want:
+        who = "unreadable" if login is None else "not the agent merger"
+        _page_once("identity", "fleet-merge refused",
+                   f"GET /user is {who} (expected {want}); nothing merged")
+        _log(f"refused: GET /user is {who}")
+        return 2
+    _clear("identity")
+
+    got = watch.conf_repos()
+    if got is None:
+        _page_once("conf", "fleet-merge cannot read repos.conf", "no repository was checked")
+        return 0
+    _clear("conf")
+    for repo in got[0]:
+        slug = repo.replace("/", "-")
+        keep = set()
+        try:
+            if autonomy(repo) != "autonomous":
+                continue                                 # critical: not touched at all
+            _clear(f"{slug}--autonomy")
+        except Undecidable as e:
+            keep.add(_marker(f"{slug}--autonomy").name)
+            _page_once(f"{slug}--autonomy", "fleet-merge cannot decide", f"{repo}: {e}")
+            _clear_stale(slug, keep)
+            continue
+        try:
+            prs = _open_prs(forge, repo)
+        except Undecidable as e:
+            keep.add(_marker(f"{slug}--list").name)
+            _page_once(f"{slug}--list", "fleet-merge cannot decide", f"{repo}: {e}")
+            _clear_stale(slug, keep)
+            continue
+        _clear(f"{slug}--list")
+        for listed in prs:
+            num = listed.get("number")
+            if num is None:
+                continue
+            key = f"{slug}--{num}"
+            try:
+                _handle(forge, repo, slug, listed, roles, keep)
+                _clear(key)
+            except Undecidable as e:
+                keep.add(_marker(key).name)
+                _page_once(key, "fleet-merge cannot decide", f"{repo}#{num}: {e}")
+        _clear_stale(slug, keep)
+        _forget_closed(slug, {str(p.get("number")) for p in prs})
+    return 0
+
+
+def main(argv):
+    if argv != ["once"]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return once()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

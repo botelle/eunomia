@@ -42,6 +42,18 @@ a hand-built join, not by any tool.
 | `class` | `claimed`, `stalled`, or `-` |
 | `reason` | for a failure, the run's own `failure_reason` |
 
+## `repaired_by` (plan 0089)
+
+Not a table column — printed as a count and its classes beneath a plan's row,
+the way the cost block is — but present on every row in `--format json`:
+`repaired_by: [{"id", "class"}]`, one entry per OTHER plan in this same repo
+whose own `repairs` front matter names this plan, empty when none does. It is
+derived purely from reading every plan's front matter; nothing here writes it
+back to the repaired plan's file. `counts.repaired` is the number of rows
+with a non-empty `repaired_by`. See `docs/feature-plans.md` for the field
+itself and its closed class set, and `docs/plan-graph.md` for the same data
+drawn as a graph.
+
 `not-terminal` is deliberate wording: a lease with no terminal record may be
 running, or may have died without writing one (`docs/fleet-db.md`, the terminal
 phase rule). The ledger does not call it running.
@@ -177,14 +189,106 @@ Opt-in, because it costs forge reads. It does two things:
    limits `docs/plan-triage.md` lists — six of six paths present for both `0025`
    and `0021`, one fully done and one not started.
 
+## The stage timeline (plan 0196)
+
+Every row of `--format json` also carries `submitted_by` and `stages`, a
+timeline of who filed the plan and how each of its six stages went — the
+columns above answer "what is the newest state", this answers "what happened
+at each stage, and when". The table format is unchanged; this is JSON-only.
+
+`stages` is an object keyed `submitted`, `approved`, `implementation`,
+`review`, `test`, `merged` (always this order and this set), each
+`{name, started_at, completed_at, failed_at, state, reason, attempts,
+attempt_started_at, budget_seconds, over_budget, seconds, tokens}`.
+
+- **`state`** is `empty` (never attempted), `running`, `completed`, `failed`,
+  or `unknown` (the stage's source could not be read — `reason` says which;
+  never shown as `empty`, which would say nothing happened rather than "could
+  not tell").
+- **A stage with more than one attempt** (a retried dispatch, several review
+  rounds, a rerun test lane) reads by one rule: state and reason come from the
+  **newest** attempt — an earlier failure followed by a later success is
+  `completed`; the reverse is `failed`. `started_at` is the first attempt's
+  start; `completed_at`/`failed_at` is the newest attempt's own end. `seconds`
+  and `tokens` **sum the finished attempts only** — a still-running attempt
+  contributes nothing, so a first attempt still in flight has `seconds: null`
+  and `tokens` all `null`, never `0`. `attempts` is the count collected
+  (`0` for an empty stage), so a first-try success reads differently from a
+  retried one.
+- **`budget_seconds`** is the bound ONE attempt gets (never a stage total, so
+  a retried stage does not read as over budget for time already spent and
+  done): the repo's `config/impl-bounds.conf` minutes for `implementation`,
+  the per-round review dispatch timeout for `review`, `bin/fleet-meet`'s
+  `MEET_TIMEOUT_SECONDS` (900) per lane run for `test`, and `null` for
+  `submitted`/`approved`/`merged`, which have none. `over_budget` is `true`
+  only while `state` is `running` and `now - attempt_started_at` exceeds it,
+  `false` while running within it, `null` otherwise — so a reader never has
+  to pick a basis itself.
+- **`approved`** and **`merged`** are point stages (no duration): `approved`
+  is when the plan file reached `main` (`seconds: null`, not `0`); `merged`
+  is the marked pull request's own merge time.
+- **A dead dispatch is not `running`.** A lease with no terminal record is
+  called `running` only when its own heartbeat liveness verdict says so
+  (`fleetlib.is_orphaned`), never from the dispatch's own `state` field — the
+  gap that let a lease read as running for 14 hours after its orchestrator
+  died (plan 0179, 2026-11-03).
+- **`review`** merges three sources in time order, newest wins: the `review`
+  table's own round verdicts, talos's `review_attempt` stops (a usage limit, a
+  no-verdict round, a budget stop), and the orchestrator's own
+  `review-stopped` phase (its fix-round bound exhausted). It is `completed`
+  once the newest of these approved the head; `failed` when the newest is a
+  stop with no later approval.
+- **`test`** combines every `lane_run` row of the plan, grouped by `runner`
+  (one group per lane) and combined per lane first, then across lanes: any
+  lane whose newest run failed makes the stage `failed`, naming that lane;
+  else any lane still running makes it `running`; else every lane's newest
+  run having passed (`pr-opened`) makes it `completed`.
+- **`tokens`** is always `{input, output, cache_read, source}`.
+  `source` is `"session"` (Claude sessions, linked the way `dispatch_session`
+  links a lease and `review.session_uuid` links a round),
+  `"lane"` (a test lane's own Claude `usage` object inside
+  `lane_run.usage_json` — a non-Claude lane's shape is not parsed, so its
+  tokens are `null`, `source: "not recorded"`), `"partial"` (some finished
+  attempts carried usage and others did not — the fields sum what was
+  recorded), or `"not recorded"` (none did; the three numeric fields are
+  `null`, never `0`).
+
+**`submitted_by`** is `"intakeapp"` when the plan's filing pull request body
+starts with intakebot's marker (`Filed by intakebot from an accepted business plan`),
+`"cli"` otherwise, and `null` when no filing pull request could be found.
+
+**Bounded, optional, and off by default.** Finding a plan's filing pull
+request needs a forge read with no cheap index to search by changed file, so
+it runs only under `--verdict` or `--with-filings`; without either, `stages`
+still answers fully from git and `fleet.db` alone, except `submitted`, which
+reads `state: "unknown", reason: "forge not read"` and `submitted_by: null`.
+Every other stage never needs the forge.
+
+## `--with-filings`
+
+Also reads the forge for the filing pull request of each plan already listed
+(filling `submitted_by` and the `submitted` stage, same as `--verdict`), and
+appends one row per plan file added by an **open** pull request that is not
+yet on `main` at all — a plan still being filed, with no entry otherwise.
+Such a row has `status: "in-review"`, every column `--verdict` would otherwise
+set left `null`, `stages.submitted` `running`, and every other stage `empty`.
+The default output (no flag) is unchanged, so an existing reader sees no new
+rows appear under it.
+
+When the forge cannot be read for this (no token, or the listing fails),
+no `in-review` row is added — the same as when none exist — but
+`forge.filings_error` names what happened, in both formats, so a reader can
+tell "none" apart from "could not tell."
+
 ## `--format json`
 
 The shape a service serves: `scope`, `db` (state, path, detail), `rows` (one
 object per table row, keys equal to the column names, plus `probe` under
-`--verdict`), `counts`, `unmatched`, `unattributed`, `out_of_scope`, `errors`
-and `notes`. `plan-graph` (0047) already publishes the node set; this adds the
-outcome per node rather than a second graph. `tests/test_plan_ledger.py`
-parses both formats and asserts every row and value agrees.
+`--verdict`, plus `stages`/`submitted_by`, see above), `counts`, `unmatched`,
+`unattributed`, `out_of_scope`, `errors` and `notes`. `plan-graph` (0047)
+already publishes the node set; this adds the outcome per node rather than a
+second graph. `tests/test_plan_ledger.py` parses both formats and asserts
+every row and value agrees.
 
 ## What this cannot do
 

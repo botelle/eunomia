@@ -432,3 +432,176 @@ def test_a_backfill_fills_a_null_session_and_never_replaces_a_value(tmp_path):
     _backfill_bodies(mod, con, {1: f"Review-provenance: model=m; session={OTHER_SESSION}"})
     assert _row(con, 1)[2] == SESSION
     assert con.execute("SELECT COUNT(*) FROM review").fetchone()[0] == 1
+
+
+# ------------------------------------------------------- plan 0197 D2: usage
+def _usage_row(con, rid):
+    return con.execute(
+        "SELECT usage_in, usage_cached, usage_cache_write, usage_out, usage_seconds "
+        "FROM review WHERE forgejo_id=?", (rid,)).fetchone()
+
+
+def test_a_usage_line_stores_it_and_a_body_without_one_stores_nulls(tmp_path):
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    _backfill_bodies(mod, con, {
+        1: "Review-provenance: model=m\n"
+           "Review-provenance-usage: in=100; cached=20; cache-write=5; out=40; seconds=12",
+        2: "Review-provenance: model=m\nno usage line here",
+    })
+    assert _usage_row(con, 1) == (100, 20, 5, 40, 12)
+    assert _usage_row(con, 2) == (None, None, None, None, None)
+
+
+def test_unknown_usage_keys_stay_null_not_zero(tmp_path):
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    _backfill_bodies(mod, con, {
+        1: "Review-provenance-usage: in=unknown; cached=10; cache-write=0; out=5; seconds=unknown",
+    })
+    assert _usage_row(con, 1) == (None, 10, 0, 5, None)
+
+
+def test_the_last_usage_line_wins_over_an_earlier_planted_one(tmp_path):
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    _backfill_bodies(mod, con, {
+        1: "Review-provenance-usage: in=1; cached=1; cache-write=1; out=1; seconds=1\n\n"
+           "...\n\nReview-provenance-usage: in=999; cached=0; cache-write=0; out=0; seconds=30",
+    })
+    assert _usage_row(con, 1) == (999, 0, 0, 0, 30)
+
+
+# ---------------------------------------------------- plan 0197 D3: findings
+def _findings_row(con, rid):
+    return con.execute(
+        "SELECT findings_high, findings_medium, findings_low FROM review "
+        "WHERE forgejo_id=?", (rid,)).fetchone()
+
+
+_FINDINGS_BLOCK_BODY = (
+    "Verdict: COMMENT\n\n"
+    "```findings\n"
+    "HIGH: none\n"
+    "MEDIUM: the cache key omits the tenant id\n"
+    "MEDIUM: the retry loop has no backoff\n"
+    "LOW: a stray print statement\n"
+    "```\n"
+)
+_HEADING_BODY = (
+    "## Findings\n\n"
+    "### MEDIUM\n"
+    "- the cache key omits the tenant id\n"
+    "- the retry loop has no backoff\n\n"
+    "### LOW\n"
+    "- a stray print statement\n\n"
+    "### HIGH\n\n"
+    "None.\n"
+)
+_NO_FINDINGS_BODY = (
+    "## Findings\n\n"
+    "### HIGH\n\nNone.\n\n"
+    "### MEDIUM\n\nNone.\n\n"
+    "### LOW\n\nNone.\n"
+)
+_UNREADABLE_BODY = (
+    "```findings\n"
+    "HIGH: none\n"
+    "this line is not SEVERITY: headline shaped at all\n"
+    "```\n"
+)
+# No ```findings block and no severity heading/bold-section anywhere: never
+# engages the findings format at all, so there is no "states no findings" to
+# read here, unlike _NO_FINDINGS_BODY above which opens all three sections
+# and declares each empty. Must read as unreadable (null), not zero -- a
+# zero here silently understated every total it joined (review of #1432,
+# round 2, where this body used to read as 0/0/0).
+_UNSTRUCTURED_BODY = "LGTM. Approved.\n"
+
+
+def test_findings_counts_from_a_findings_block_body(tmp_path):
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    _backfill_bodies(mod, con, {1: _FINDINGS_BLOCK_BODY})
+    assert _findings_row(con, 1) == (0, 2, 1)
+
+
+def test_findings_counts_from_a_heading_style_body(tmp_path):
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    _backfill_bodies(mod, con, {1: _HEADING_BODY})
+    assert _findings_row(con, 1) == (0, 2, 1)
+
+
+def test_findings_counts_from_a_no_findings_body_are_zero(tmp_path):
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    _backfill_bodies(mod, con, {1: _NO_FINDINGS_BODY})
+    assert _findings_row(con, 1) == (0, 0, 0)
+
+
+def test_findings_counts_from_an_unreadable_body_are_null(tmp_path):
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    _backfill_bodies(mod, con, {1: _UNREADABLE_BODY})
+    assert _findings_row(con, 1) == (None, None, None)
+
+
+def test_findings_counts_from_an_unstructured_body_are_null(tmp_path):
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    _backfill_bodies(mod, con, {1: _UNSTRUCTURED_BODY})
+    assert _findings_row(con, 1) == (None, None, None)
+
+
+def test_a_later_backfill_corrects_a_previously_stored_wrong_zero(tmp_path):
+    """findings_* must NOT fill-once like session_uuid/usage: it is read by
+    count_findings(), our own parser, not a fixed-format provenance line, so
+    a bug in it can write a wrong value for an unreadable body (review of
+    #1432, round 2). A plain COALESCE would make that value permanent, since
+    0 is not NULL -- no later backfill, however correct its parser, could
+    ever reach a row already written. Simulates the stale 0/0/0 a pre-fix
+    parser would have written for `_UNSTRUCTURED_BODY`, and checks a
+    re-backfill (same immutable body) corrects it to NULL."""
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    _backfill_bodies(mod, con, {1: _UNSTRUCTURED_BODY})
+    assert _findings_row(con, 1) == (None, None, None)
+    con.execute(
+        "UPDATE review SET findings_high=0, findings_medium=0, findings_low=0 "
+        "WHERE forgejo_id=1")
+    con.commit()
+    assert _findings_row(con, 1) == (0, 0, 0)
+    _backfill_bodies(mod, con, {1: _UNSTRUCTURED_BODY})
+    assert _findings_row(con, 1) == (None, None, None)
+
+
+# ------------------------------------------------- plan 0197 D4: report cost
+# Price-file shape and date-selection coverage lives in tests/test_model_prices.py;
+# this is the one integration point `report()` itself needs covered here.
+def test_report_shows_em_dash_for_a_model_with_no_price_and_counts_the_exclusion(
+        tmp_path, capsys):
+    db = tmp_path / "f.db"
+    mod = _load(db)
+    con = _con(mod, db)
+    con.execute(
+        "INSERT INTO review (forgejo_id, repo, pr, round, reviewer, model, verdict, "
+        "submitted_at, usage_in, usage_cached, usage_cache_write, usage_out, usage_seconds) "
+        "VALUES (1,'operator/demo',7,1,'revbot','muse-wonder-1.0','APPROVED',"
+        "'2026-11-05T10:00:00Z',100,0,0,50,20)")
+    con.commit()
+    mod.report(con)
+    out = capsys.readouterr().out
+    assert "muse-wonder-1.0" in out
+    model_line = [l for l in out.splitlines() if l.startswith("muse-wonder-1.0")][0]
+    assert model_line.strip().endswith("—")
+    assert "no API-equivalent cost" in out

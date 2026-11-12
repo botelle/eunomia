@@ -199,7 +199,8 @@ def _secret_rules():
     for line in (ROOT / "config" / "secret-patterns.conf").read_text().splitlines():
         if not line.strip() or line.startswith("#"):
             continue
-        kind, name, pattern = line.split("\t", 2)
+        # content rows carry a fourth tier column (plan 0071); it is not part of the regex
+        kind, name, pattern = line.split("\t")[:3]
         rules[kind].append((name, re.compile(pattern, re.I)))
     return rules
 

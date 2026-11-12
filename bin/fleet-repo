@@ -7,7 +7,7 @@
   fleet-repo check   <owner/repo>
 
 Enrolment used to be two unrelated gestures with no shared record:
-`fleet-install-hooks <repo>` for enforcement, and `FLEET_WATCH_REPOS=a,b` for
+`fleet-install-hooks <repo>` for enforcement, and a hand-filled env var for
 dispatch — an env var with no default, no command and no persistence, which as
 of 2026-09-06 was set nowhere on this fleet while zero repos carried the
 pre-push hook. This is the record (plan 0013).
@@ -64,16 +64,16 @@ RETIRED = ("extlane", "no-extlane")
 # main-via-contents-API read is plan 0013's unbuilt second half — and `list`
 # and `check` are the other two places an operator asks what the fleet is
 # doing. Kept as constants so a future edit cannot fix one and leave two.
-NOTE_NO_READER = (
-    "NOTE: fleet-watch does not read this file yet — it still reads "
-    "FLEET_WATCH_REPOS (bin/fleet-watch:134). Enrolment here is a record, not "
-    "yet a dispatch.")
+NOTE_TAKES_EFFECT = (
+    "This takes effect when its pull request merges and the eunomia pin "
+    "reaches that commit. A new repository's pin still has to be created once, "
+    "by the owner: fleet-pin-advance --create-missing.")
 
 
 def _notes():
-    """The caveat, on stderr — it is commentary on the state of the system,
-    not part of the record `list` prints to stdout."""
-    print(NOTE_NO_READER, file=sys.stderr)
+    """What happens next, on stderr — commentary, not part of the record
+    `list` prints to stdout."""
+    print(NOTE_TAKES_EFFECT, file=sys.stderr)
 
 
 def flag_tokens(entry):
@@ -255,7 +255,6 @@ def cmd_list(args):
         print(e, file=sys.stderr)
     if not repos:
         print("no repos enrolled (config/repos.conf is absent or empty)")
-        _notes()
         return EXIT_OK
     w = _watch() if args.check else None
     for name in sorted(repos):
@@ -268,7 +267,6 @@ def cmd_list(args):
                   f"{name:<28} {flags:<28} {state}")
         else:
             print(f"{name:<28} {flags}")
-    _notes()
     return EXIT_OK if not errs else EXIT_REFUSED
 
 
@@ -321,10 +319,8 @@ def cmd_enable(args):
         repos.pop(repo, None)
     write_conf(repos, args.conf, kept)
     print(f"\n{repo}: " + (" ".join(flag_tokens(entry)) or "no flags"))
-    # Say only what is true at this head. `fleet-watch` still reads
-    # FLEET_WATCH_REPOS and nothing else; the main-via-API read is 0013's second
-    # half and is not built. Telling an operator the record "takes effect when
-    # merged" would have them merge and wait for a dispatch that cannot come.
+    # Plan 0134: the units read this file from the eunomia pin, so a merge
+    # followed by the pin reaching it is the whole of enrolment.
     print("recorded in config/repos.conf.")
     _notes()
     return rc
@@ -361,8 +357,6 @@ def cmd_check(args):
     label = {EXIT_OK: "eligible", EXIT_REFUSED: "refused",
              EXIT_UNKNOWN: "not determinable"}[code]
     print(f"{repo}: {label}" + ("" if code == EXIT_OK else f" — {why}"))
-    # "eligible" is read as "it will dispatch", and today nothing will.
-    _notes()
     return code
 
 

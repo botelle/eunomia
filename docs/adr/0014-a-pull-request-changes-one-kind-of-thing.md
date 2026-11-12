@@ -3,6 +3,14 @@
 - **Status:** Accepted
 - **Date:** 2026-09-25
 - **Deciders:** the operator (owner/merger)
+- **Amended by:** [ADR-0019](0019-on-an-autonomous-repo-the-plan-is-the-human-approval.md),
+  2026-09-29 — §6: on an autonomous repository a `tests` PR is reviewed by
+  both reviewer accounts without shell or write tools.
+- **Amended by:** [ADR-0024](0024-no-review-requires-a-named-model.md), 2026-10-21 — the
+  new reviewer positions' `'default'` row is configuration, not Fable.
+- **Amended by:** [ADR-0025](0025-a-style-only-change-may-take-a-style-review-inside-declared-paths-with-screenshots.md), 2026-10-22 — §6: a `src` pull request may route to
+  `style_reviewer` when ADR-0025 §3 holds; §1: on that route the classifier also
+  drops the plan's screenshot folder.
 - **Amends:** [ADR-0003](0003-adr-track.md) §2 (the ADR pull request no longer
   carries the flow-spec change; the ordering survives);
   [ADR-0009](0009-a-lane-may-have-a-supervisor.md) §1 (three agentic review
@@ -17,6 +25,7 @@
   kind). It is updated by a following `docs` pull request, as §3 requires.
   `docs/per-repo-models.md` and `docs/test-lane.md` are operational docs, and
   they change with the `src` pull requests that change their subjects.
+- **Amended by:** [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22 — the new reviewer positions are not `us-hosted` only.
 
 ## Context
 
@@ -44,6 +53,11 @@ An implementation pull request that carries `Plan: <id>` may also change
 `plans/<id>.md`, the plan it implements. The classifier drops that one path
 before deciding the kind. That keys on the marker and the path, not on
 reading the change.
+
+*(Amended by [ADR-0025](0025-a-style-only-change-may-take-a-style-review-inside-declared-paths-with-screenshots.md),
+2026-10-22. On a style route (ADR-0025 §3), the classifier also drops the plan's
+new evidence folder of committed screenshots, under the repository's declared
+`evidence_dir`. What survives: every other path decides the kind.)*
 
 **2. Kind is decided by path, never by reading content or by branch name.** A
 fleet-wide default map assigns paths to kinds, and a repository may override
@@ -87,6 +101,14 @@ pull requests.
 - `deploy` → `deploy_reviewer`
 - `src` → `code_reviewer`
 
+*(Amended by [ADR-0025](0025-a-style-only-change-may-take-a-style-review-inside-declared-paths-with-screenshots.md), 2026-10-22. It read only "`src` → `code_reviewer`".
+A `src` pull request goes to `style_reviewer` instead when ADR-0025 §3 holds:
+the pull request opted in, every changed path is a declared style path or the
+pull request's new screenshot folder, the owner has not asked for the full
+review, and `style_reviewer` resolves as many ordinals as `code_reviewer`. What
+survives: every other `src` pull request goes to `code_reviewer`, and an unmapped
+path still gets the strictest automatic review.)*
+
 `tests` gets **no automatic review**. The code reviewer holds `Bash` and runs
 probes at the pull request's head, so dispatching one would execute
 vendor-authored files on a fleet host before a person has read them. The
@@ -94,13 +116,21 @@ reader is a human (ADR-0006 §5), and the pull request still needs the usual
 approvals, so placing files under `tests/lane/` skips the model but not the
 merge gate.
 
+*(Amended by [ADR-0019](0019-on-an-autonomous-repo-the-plan-is-the-human-approval.md),
+2026-09-29, for autonomous repositories only. A `tests` PR is reviewed by both
+reviewer accounts, each dispatched without shell or write tools, and `mergebot`
+merges it on both approvals and green CI. What survives: no reviewer holding `Bash`
+ever reviews a `tests` PR, and on critical repositories the reader is still a
+human.)*
+
 `deploy_reviewer` and `docs_reviewer` are dispatched **without shell or
 write tools**. They read the diff and the files; they execute nothing. This is
 a property of the dispatch, not an instruction in the rubric.
 
 `adr_reviewer`, `docs_reviewer` and `deploy_reviewer` are reviewer positions
 under ADR-0013 §3–§5. They take one or more runners, ordinal 1 gives the
-verdict, the `'default'` row is Fable, and the review names its model.
+verdict, the `'default'` row is configuration, and the review names its model.
+*(Amended by ADR-0024, 2026-10-21; this read "the `'default'` row is Fable".)*
 
 ## Amendments
 
@@ -120,6 +150,7 @@ gain ADR reviewer(s), docs reviewer(s) and deploy reviewer(s).
 
 **ADR-0011 §2.** `adr_reviewer`, `docs_reviewer` and `deploy_reviewer` are
 held by `us-hosted` runners only, like `plan_reviewer` and `code_reviewer`.
+*(Withdrawn by [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22. Any runner may hold any of these positions.)*
 
 ## Consequences
 

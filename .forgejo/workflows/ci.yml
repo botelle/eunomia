@@ -19,6 +19,10 @@ name: CI
 # instead of four minutes. A mixed push — any file outside plans/ — still runs the
 # whole suite, because `paths-ignore` skips only when EVERY changed path matches.
 #
+# `docs/adr/**` is ignored too, with plans.yml running the suite tests that read
+# it (tests/test_adr_status.py and the ADR-0006 sentences in
+# test_orchestrator_session.py). Only that subtree: see the next paragraph.
+#
 # `docs/**` IS NOT IGNORED, and the reason is the rule for anything added here:
 # an ignored path must be one the SUITE does not read. It reads two docs and
 # EXECUTES them — tests/test_fleet_cr.py runs every fenced block in
@@ -97,6 +101,7 @@ on:
   push:
     paths-ignore:
       - 'plans/**'
+      - 'docs/adr/**'
     # A test lane's result lands under this namespace, opened as a draft PR
     # by bin/fleet-lane (plan 0070) — untested vendor-authored files, and
     # ci.yml's `tests` job runs pytest on every push it does not ignore. A
@@ -117,14 +122,23 @@ on:
 # identical code. The push run was then read as a red build and correctly
 # refused a review round, so a scheduling artifact blocked real work.
 #
-# A QUEUE, not a canceller, and scoped to the whole workflow.
+# A QUEUE, not a canceller, scoped to one ref.
 #
 # Two corrections are baked into that line, both learned the expensive way.
 #
 # 1. An earlier version keyed on `github.ref` and grouped NOTHING: the two
-#    triggers do not share a ref for one commit (on 755a5b9 the push run
-#    reports head_branch `feat/fleet-reviews`, the pull_request run `#24`).
-#    `github.head_ref || github.ref`, the widely copied form, fails identically.
+#    triggers did not share a ref for one commit (on 755a5b9 the push run
+#    reported head_branch `feat/fleet-reviews`, the pull_request run `#24`).
+#    `github.head_ref || github.ref`, the widely copied form, failed
+#    identically. That failure needed TWO EVENT TYPES disagreeing on the ref
+#    for the SAME commit, and `pull_request` is gone now — push only
+#    (`test_only_one_trigger_fires_per_commit`). A push event always carries
+#    exactly one ref, so keying on `github.ref` groups correctly within one
+#    push. This is NOT "one commit maps to one ref": ADR-0002 §1 is explicit
+#    that pushing an already-built commit to a SECOND ref fires a second push
+#    run with ITS OWN ref — and that is D4's intended per-ref split working as
+#    designed, not a repeat of the 755a5b9 failure, which was two DIFFERENT
+#    refs reported for ONE push and stops happening once `pull_request` is gone.
 #
 # 2. Keying on the commit then grouped them correctly — and made things WORSE,
 #    because `cancel-in-progress: true` killed one of the pair, and a cancelled
@@ -133,40 +147,69 @@ on:
 #    real work again, by a new route. Never cancel a run whose status something
 #    else consumes as a verdict.
 #
-# Workflow-scoped because the remaining collision is between DIFFERENT commits:
-# this runner's workspace is per-repository, so two eunomia jobs at once share a
-# checkout and a .venv. Run 21 is the proof — it failed on a tree
-# BYTE-IDENTICAL to one that had already passed twice (4347177 and ea57062 both
-# have tree 19c4bb0b), so nothing in its code can explain it. The fleet's own
-# precedent is an explicit flock for exactly this ("one at a time on cihost,
-# fleet-wide", infra/cihost/testflight-build.sh:27); this is that flock,
-# expressed where the jobs are scheduled.
-# A LITERAL key, not `${{ github.workflow }}`, so that `Plans` shares this lane.
-# The hazard the group exists for is the runner's per-repository workspace, which
-# does not care which workflow is checking out into it — two workflows for this
-# repo at once collide exactly as two runs of one workflow do. Keying on the
-# workflow name would have made `Plans` a second, parallel lane and reintroduced
-# run 21 by a new route. Same value in both files, deliberately.
+# PER-REF (plan 0113), not the one literal lane every branch queued behind
+# until this changed. The literal lane existed because this runner's workspace
+# is per-repository, so two eunomia jobs at once shared a checkout and a
+# .venv — run 21 is the proof, a failure on a tree BYTE-IDENTICAL to one that
+# had already passed twice (4347177 and ea57062 both have tree 19c4bb0b), so
+# nothing in its code could explain it. Loosening that lane was not assumed
+# safe: docs/fleet-history.md, "What two eunomia runs share (plan 0113)",
+# inventories every piece of host state two concurrent runs could touch, and
+# D2 there pointed the pip cache and pytest's base temp at a per-run
+# directory, in every job that installs or tests. What is left shared — the
+# one Colima VM, act's own action cache under `~/.cache/act/`, the pinned
+# pyright build's npm cache (redirecting it would cost every run a fresh
+# registry fetch, for a collision D1 never observed), and anything a test
+# writes outside `tmp_path` that no env var redirects — is recorded there as
+# *shared, not redirectable*, for the revert trigger below to watch. 3
+# isolated and 3 control rounds of 3
+# overlapping runs each (108 jobs, all green, every round with a measured
+# cross-branch `tests (cihost)` overlap) are recorded under
+# docs/ci-evidence/0113/ and summarized in that section; `fleet-ci-stress
+# gate` passes on them. Run 21 was NOT reproduced in those 18 overlapping
+# runs — that section states what the control rounds do and do not prove, and
+# it is not "the mechanism was found".
+#
+# SAME PREFIX in all three files, not `${{ github.workflow }}`: two workflows
+# pushing to one ref still share the per-repository workspace above, so `CI`
+# and `Plans` (or `deploy-docsite`) running at once on one branch is the same
+# collision as two runs of one workflow, and a workflow-keyed group would
+# reintroduce it by a new route. This is the narrow step taken — different
+# BRANCHES running in parallel — and nothing wider: a sha, `head_ref` or
+# `run_id` would let two pushes to ONE branch overlap, which D3 did not
+# measure.
+#
+# REVERT TRIGGER (plan 0113 D5): go back to `group: eunomia-cihost-workspace`
+# in all three files — one PR against main reverting this commit and its test
+# change — when any eunomia CI job goes red on a tree that already has a green
+# run elsewhere (compare `git rev-parse <sha>^{tree}`, the run-21 signature)
+# AND the failure does not reproduce locally under the same pytest-randomly
+# seed (`-p randomly --randomly-seed=<seed from the log>`; `-p` takes a plugin
+# module name, so the seed is never passed through it — a failure that
+# reproduces under its seed is an order-dependent test, not concurrency). Also
+# revert if a red log names one of the *shared, not redirectable* paths above.
+# This trigger does not expire: the signature means the same thing whenever it
+# appears.
 concurrency:
-  group: eunomia-cihost-workspace
+  group: eunomia-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # Both labels run `tests` — not just `cihost-linux` once it exists — because
-  # the point of plan 0024 Track A is a *comparison*: docs/fleet-history.md
-  # needs both columns (checkout, install, test, total) for the same commit,
-  # and a table with one column filled in proves nothing. `fail-fast: false`
-  # because the two labels are being measured, not raced against each other —
-  # a flaky or slow run on one must not cancel the other's data.
+  # `tests` runs on `cihost`, the macOS host, only. It used to run on
+  # `cihost-linux` as well, for plan 0024 Track A's host-vs-container
+  # comparison. That comparison is recorded in docs/fleet-history.md, and
+  # ADR-0007 was amended on 2026-11-08 to drop the second full-suite run:
+  # the fleet runs on macOS only, and every push paid about 11 minutes of
+  # cihost CPU for a column nobody reads. `probe-reach` below still runs on
+  # both labels, because it checks what the container itself can reach.
   #
-  # The job is named with the label so the two resulting commit statuses are
-  # distinct (`CI / tests (cihost)` and `CI / tests (cihost-linux)`) rather
-  # than two runs of one ambiguous status.
+  # The matrix stays, with one label, so the status keeps its name
+  # (`CI / tests (cihost)`) and CI_LABEL keeps working for plans.yml.
   tests:
     strategy:
       fail-fast: false
       matrix:
-        label: [cihost, cihost-linux]
+        label: [cihost]
     name: tests (${{ matrix.label }})
     runs-on: ${{ matrix.label }}
     timeout-minutes: 10
@@ -216,6 +259,66 @@ jobs:
           date +%s > "$stamp_file"
 
       - uses: actions/checkout@v4
+
+      # Plan 0113 D1: the facts docs/fleet-history.md's "What two eunomia runs
+      # share" table cites, printed before the D2 step below changes any of
+      # them — so this is the host's default, the thing a second run at the
+      # same moment would also get. Paths and counts only, never file content,
+      # the same rule probe-reach follows. TIMING at the end because the plan
+      # (D1) conditions keeping this step on its own cost staying under a
+      # second; dropping that line (as an earlier revision on this branch did)
+      # leaves nobody able to check that condition from the job log.
+      - name: per-run state before redirect (plan 0113)
+        shell: bash
+        run: |
+          start=$(date +%s)
+          echo "STATE workspace=$(pwd -P) GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          echo "STATE RUNNER_TEMP=${RUNNER_TEMP:-unset} TMPDIR=${TMPDIR:-unset} HOME=$HOME"
+          echo "STATE pip_cache_dir=$(python3 -m pip cache dir 2>/dev/null || echo unknown)"
+          echo "STATE pytest_base=$(ls -d "${TMPDIR:-/tmp}"/pytest-of-* 2>/dev/null | tr '\n' ' ')"
+          echo "STATE act_cache_entries=$(ls ~/.cache/act 2>/dev/null | wc -l | tr -d ' ')"
+          echo "STATE pyright_cache=$(ls -d ~/.cache/pyright-python 2>/dev/null | tr '\n' ' ')"
+          for p in ~/dev/.fleet ~/.local/share/pins ~/dev/.orchestrator-transcripts; do
+            [ -e "$p" ] && echo "STATE home_path=$p exists" || echo "STATE home_path=$p absent"
+          done
+          echo "STATE FLEET_DB=${FLEET_DB:-unset}"
+          if command -v colima >/dev/null 2>&1; then
+            echo "STATE colima=$(colima list 2>&1 | tail -1 | tr -s ' ')"
+          else
+            echo "STATE colima=not-visible-from-this-executor"
+          fi
+          end=$(date +%s)
+          echo "TIMING label=${CI_LABEL:-tests} step=state seconds=$((end - start))"
+
+      # Plan 0113 D2: the pip cache and pytest's base temp (which follows
+      # TMPDIR) — both printed as host defaults by the row above — are
+      # pointed at a directory only this run+job owns, under $RUNNER_TEMP,
+      # and keyed by $GITHUB_RUN_ID and $CI_LABEL besides in case a runner
+      # ever shares $RUNNER_TEMP between jobs. No PYTEST_ADDOPTS:
+      # tests/test_env_isolation.py runs a nested pytest that inherits it,
+      # and two sessions sharing one --basetemp there would wipe each
+      # other's. The pinned pyright build (the `typecheck` step's own cache,
+      # read via PYRIGHT_PYTHON_CACHE_DIR) is NOT redirected here: D3's
+      # isolated rounds (docs/ci-evidence/0113/, scratch tree `0e03c4f5f5`)
+      # ran without this redirect, so pointing it at a directory this
+      # cleanup step then deletes would mean every run re-fetches pyright's
+      # npm package from the registry — a new, real failure mode (a registry
+      # hiccup reds a run on a tree that passed elsewhere, the same surface
+      # shape as run 21) traded for a collision that was never observed and
+      # is now left recorded as shared, not redirectable, in
+      # docs/fleet-history.md.
+      - name: per-run scratch (plan 0113)
+        shell: bash
+        run: |
+          scratch="${RUNNER_TEMP:-/tmp}/0113-r${GITHUB_RUN_ID:-0}-${CI_LABEL:-tests}"
+          rm -rf "$scratch"
+          mkdir -p "$scratch/tmp" "$scratch/pip"
+          {
+            echo "TMPDIR=$scratch/tmp"
+            echo "PIP_CACHE_DIR=$scratch/pip"
+            echo "EUNOMIA_0113_SCRATCH=$scratch"
+          } >> "$GITHUB_ENV"
+          echo "scratch: $scratch"
 
       - name: checkout
         shell: bash
@@ -274,6 +377,24 @@ jobs:
           echo "TIMING label=$CI_LABEL step=bin-parse seconds=$((end - start))"
           exit $fail
 
+      # The file list lives in pyrightconfig.json and nowhere else: this step
+      # passes no file arguments, so adding a tool to the ratchet is a one-line
+      # change to the config. The version is pinned because pyright's rules
+      # shift between releases and an unpinned CI goes red on a day nobody
+      # changed the code. Its own step, not part of `install`, because
+      # plans.yml carries a verbatim copy of `install` and `tests`. The pip
+      # wrapper finds or fetches its own Node; no path to node is hardcoded.
+      - name: typecheck
+        shell: bash
+        run: |
+          start=$(date +%s)
+          .venv/bin/python -m pip install -q pyright==1.1.414
+          rc=0
+          .venv/bin/pyright || rc=$?
+          end=$(date +%s)
+          echo "TIMING label=$CI_LABEL step=typecheck seconds=$((end - start))"
+          exit $rc
+
       # A final step, not a trap in the ones above, so the total prints even
       # when a step above it fails (`if: always()`) — the timing number is
       # exactly as useful for a red run as a green one. Reads the start
@@ -296,6 +417,14 @@ jobs:
           else
             echo "TIMING label=$CI_LABEL step=total seconds=unknown"
           fi
+
+      # Plan 0113 D2: the scratch dir is this job's own, so nothing else on
+      # the runner can be left holding it; always, so a failed step above
+      # still frees it.
+      - name: per-run scratch cleanup (plan 0113)
+        if: always()
+        shell: bash
+        run: rm -rf "${EUNOMIA_0113_SCRATCH:-/nonexistent}"
 
   # The reach probe is the evidentiary basis for the ADR this plan files
   # (0024 §2, §4 Definition of done): the ADR's table cites this job's own
@@ -482,3 +611,130 @@ jobs:
             exit $fail
           fi
           exit 0
+
+  # Plan 0097: run the calls talos makes into eunomia, as programs, against
+  # THIS checkout's bin/. `cihost` only: the bare repositories exist only
+  # there. `needs: tests` so it never overlaps `tests (cihost)` in this run's
+  # own checkout — plan 0113's measurements (docs/fleet-history.md, "What two
+  # eunomia runs share") are about separate RUNS not colliding, not about
+  # whether two JOBS of the SAME run share a checkout directory on this
+  # self-hosted runner; the concurrency group above serialises RUNS, not jobs
+  # within a run, so `needs:` is what keeps these two jobs off each other
+  # regardless of how that unmeasured intra-run question would resolve. No
+  # secrets: the runner and Forgejo both run as `operator`, so talos is read by
+  # a plain `file://` clone. The clone is the job's only git operation against
+  # that root; it never writes there.
+  talos-contract:
+    name: talos-contract
+    needs: tests
+    runs-on: cihost
+    timeout-minutes: 5
+    env:
+      # cihost's Forgejo app.ini `ROOT`.
+      FORGEJO_REPOS_ROOT: /opt/homebrew/var/forgejo/data/forgejo-repositories
+      # The runner id seeded as the owner default for both reviewer positions.
+      # Taken from bin/fleet-models's catalog (bin/orchestrator RUNNERS): a
+      # hosted, pinned runner, which the reviewer positions require.
+      SEED_RUNNER: sub-fable
+    steps:
+      - name: stamp
+        shell: bash
+        run: date +%s > "$RUNNER_TEMP/ci-timing-start-talos-contract"
+
+      - uses: actions/checkout@v4
+
+      # Plan 0113 D2: the venv, the talos clone and FLEET_DB below are already
+      # under $RUNNER_TEMP, but the `install` step's pip install still used
+      # the host's default pip cache, and pytest's base temp still followed
+      # the host's default TMPDIR — both shared with `tests` and `lint`. Same
+      # per-run+per-job key as the `tests` job's own scratch step.
+      - name: per-run scratch (plan 0113)
+        shell: bash
+        run: |
+          scratch="${RUNNER_TEMP:-/tmp}/0113-r${GITHUB_RUN_ID:-0}-talos-contract"
+          rm -rf "$scratch"
+          mkdir -p "$scratch/tmp" "$scratch/pip"
+          {
+            echo "TMPDIR=$scratch/tmp"
+            echo "PIP_CACHE_DIR=$scratch/pip"
+            echo "EUNOMIA_0113_SCRATCH=$scratch"
+          } >> "$GITHUB_ENV"
+
+      - name: read talos
+        shell: bash
+        run: |
+          start=$(date +%s)
+          if [ ! -d "$FORGEJO_REPOS_ROOT" ]; then
+            echo "::error::$FORGEJO_REPOS_ROOT is missing"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/talos"
+          git clone --depth 1 --branch main \
+            "file://$FORGEJO_REPOS_ROOT/operator/talos.git" "$RUNNER_TEMP/talos"
+          # hygiene, so nothing later can push through it
+          git -C "$RUNNER_TEMP/talos" remote remove origin
+          echo "talos commit: $(git -C "$RUNNER_TEMP/talos" rev-parse HEAD)"
+          contract="$RUNNER_TEMP/talos/contracts/eunomia-calls.json"
+          if [ ! -s "$contract" ]; then
+            echo "::error::talos contract missing: $contract"
+            exit 1
+          fi
+          echo "EUNOMIA_TALOS_CONTRACT=$contract" >> "$GITHUB_ENV"
+          end=$(date +%s)
+          echo "TIMING label=talos-contract step=read-talos seconds=$((end - start))"
+
+      - name: install
+        shell: bash
+        run: |
+          start=$(date +%s)
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -q --upgrade pip
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -q pytest
+          end=$(date +%s)
+          echo "TIMING label=talos-contract step=install seconds=$((end - start))"
+
+      - name: seed a fresh fleet.db
+        shell: bash
+        run: |
+          set -e
+          export FLEET_DB="$RUNNER_TEMP/talos-contract-fleet.db"
+          rm -f "$FLEET_DB"
+          echo "FLEET_DB=$FLEET_DB" >> "$GITHUB_ENV"
+          bin/fleet-db-migrate
+          bin/fleet-models set default code_reviewer "$SEED_RUNNER"
+          bin/fleet-models set default plan_reviewer "$SEED_RUNNER"
+
+      - name: talos calls
+        shell: bash
+        run: |
+          start=$(date +%s)
+          out="$RUNNER_TEMP/talos-contract.out"
+          set +e
+          "$RUNNER_TEMP/venv/bin/python" -m pytest -q -rs -p no:randomly \
+            tests/test_talos_contract_live.py | tee "$out"
+          rc=${PIPESTATUS[0]}
+          set -e
+          end=$(date +%s)
+          echo "TIMING label=talos-contract step=calls seconds=$((end - start))"
+          [ "$rc" -eq 0 ] || exit "$rc"
+          # anything but passes (a skip, or nothing collected) is a false green
+          if grep -Eq 'skipped|no tests ran' "$out" || ! grep -Eq '[0-9]+ passed' "$out"; then
+            echo "::error::the contract test did not pass every entry and position"
+            exit 1
+          fi
+
+      - name: total
+        if: always()
+        shell: bash
+        run: |
+          job_start=$(cat "$RUNNER_TEMP/ci-timing-start-talos-contract" 2>/dev/null || echo "")
+          if [ -n "$job_start" ]; then
+            echo "TIMING label=talos-contract step=total seconds=$(( $(date +%s) - job_start ))"
+          else
+            echo "TIMING label=talos-contract step=total seconds=unknown"
+          fi
+
+      - name: per-run scratch cleanup (plan 0113)
+        if: always()
+        shell: bash
+        run: rm -rf "${EUNOMIA_0113_SCRATCH:-/nonexistent}"

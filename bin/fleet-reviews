@@ -28,6 +28,7 @@ anyone who wants currency later; nothing here reads it.
 import argparse
 import importlib.machinery
 import importlib.util
+import json
 import os
 import re
 import sqlite3
@@ -51,6 +52,17 @@ REPOS = os.environ.get("FLEET_REVIEW_REPOS",
                        "agent-bus,agent-guardrails,ares,bakeoff-ongoing,"
                        "operator-net,keyvault,eunomia,infra,speakhush").split(",")
 REVIEWER = os.environ.get("FLEET_REVIEWER", "revbot")
+# Plan 0197 D4: the owner-maintained price sheet, read fresh on every
+# `--report` (never cached at import time: a price correction must take
+# effect on the next run, not the next process restart).
+PRICES_PATH = Path(__file__).resolve().parent.parent / "config" / "model-prices.json"
+_PRICE_FIELDS = ("input", "cached_input", "cache_write_short", "cache_write_long", "output")
+# The page prices the MODEL, not the effort level (plan 0197 D4's own note):
+# a row keyed "gemini-4-argon-medium" would just be a second copy of these two
+# rows, kept in step by hand. The alias lives here, in the one function that
+# looks a model up, so config/model-prices.json stays exactly the owner's
+# table -- no entry a human did not approve.
+_PRICE_MODEL_ALIAS = {"gemini-4-argon-medium": "gemini-4-argon-high"}
 
 
 def _qualify(repo):
@@ -110,7 +122,20 @@ CREATE TABLE IF NOT EXISTS review (
                                       -- provenance line; NULL where the line has none (never
                                       -- guessed from a time window -- plan 0076)
   dismissed    INTEGER DEFAULT 0,     -- Forgejo keeps state=APPROVED and sets this
-  stale        INTEGER DEFAULT 0
+  stale        INTEGER DEFAULT 0,
+  -- Plan 0197 D2: from the body's `Review-provenance-usage:` line (talos plan
+  -- 0042, not yet shipped there as of 2026-11-08). NULL in every column, never
+  -- 0, until that line exists on a review, or for a key it wrote `unknown`.
+  usage_in          INTEGER,
+  usage_cached      INTEGER,
+  usage_cache_write INTEGER,
+  usage_out         INTEGER,
+  usage_seconds     INTEGER,
+  -- Plan 0197 D3: HIGH/MEDIUM/LOW finding counts, by talos file-followups.py's
+  -- own rules. NULL means the body could not be read that way, never 0.
+  findings_high     INTEGER,
+  findings_medium   INTEGER,
+  findings_low      INTEGER
 );
 CREATE INDEX IF NOT EXISTS review_pr ON review(repo, pr);
 
@@ -138,6 +163,292 @@ _PROV = re.compile(r"Review-provenance:\s*model=([^;\s]+)\s*;?\s*(.*)")
 # its remainder can swallow the next line of the review's prose.
 _PROV_LINE = re.compile(r"Review-provenance:[^\n]*")
 _PROV_SESSION = re.compile(r"[;:\s]\s*session=([0-9A-Fa-f-]{8,})\s*(?=;|$)")
+
+# Plan 0197 D2: talos plan 0042's `Review-provenance-usage:` line (not yet
+# shipped there as of 2026-11-08; a backfill against a body with no such line
+# simply finds none and stores every usage column NULL). Readers take the
+# LAST occurrence of the line in a body (0042 D2's own rule: a re-cast keeps an
+# approval's trailer verbatim minus this line, but prose earlier in the body
+# could still quote one, and the dispatcher's own line is always appended
+# last). `(?m)` + `[^\n]*` rather than `.*` across the whole body, for the same
+# reason `_PROV_LINE` is: a greedy match must not swallow the next line.
+_USAGE_LINE = re.compile(r"(?m)^Review-provenance-usage:[^\n]*$")
+_USAGE_KV = re.compile(r"\b(in|cached|cache-write|out|seconds)\s*=\s*([^;\s]+)")
+
+
+def _parse_review_usage(body):
+    """{"in","cached","cache_write","out","seconds"} -> int or None, from the
+    LAST `Review-provenance-usage:` line in `body`, or every value None when
+    there is no such line at all. `unknown` (talos 0042 D1: a harness whose
+    report does not say which convention it uses) reads as None, same as an
+    absent key -- never a guessed 0, which plan 0197's own boundary forbids."""
+    lines = _USAGE_LINE.findall(body or "")
+    out = {"in": None, "cached": None, "cache_write": None, "out": None, "seconds": None}
+    if not lines:
+        return out
+    for key, raw in _USAGE_KV.findall(lines[-1]):
+        field = "cache_write" if key == "cache-write" else key
+        if raw == "unknown":
+            continue
+        try:
+            out[field] = int(raw)
+        except ValueError:
+            continue
+    return out
+
+
+# Plan 0197 D3: HIGH/MEDIUM/LOW finding counts, by the same two rules talos
+# file-followups.py uses (read at operator/talos origin/main 7d50a26, 2026-11-08
+# -- a cross-repo read, not a dependency: nothing here imports that file). This
+# covers its ```findings fenced-block contract (authoritative, exact) and its
+# `_HEADING`/`_BOLD_SECTION` prose tiers (a severity opened by a heading or a
+# closed-bold run). Its OTHER prose tiers -- numbered/labelled items, and a
+# bare long bold-led paragraph with no severity marker of its own -- are not
+# reimplemented: a review that uses only those falls through to NULL here,
+# never a wrong count, the same direction talos's own fail-loud discipline
+# fails in.
+_SEV = "(HIGH|MEDIUM|LOW)"
+_FINDINGS_BLOCK_LINE = re.compile(rf"^{_SEV}\s*:\s*(.+?)\s*$", re.I)
+_NONE_STATEMENT = re.compile(r"^(?:none|nothing)\b[.!]?\s*$", re.I)
+_SECTION_OPEN = re.compile(rf"^(?:#{{2,4}}\s+{_SEV}\b.*|\*\*{_SEV}\*\*.*)$", re.I)
+_SECTION_SEV = re.compile(_SEV, re.I)
+_ITEM_LINE = re.compile(r"^(?:[-*+]\s+|\d+[.)]\s+|\*\*(?!\s))")
+
+
+def _findings_fenced_spans(text):
+    """(start, end, unclosed) for every ```findings-tagged block, by line
+    index -- the same direct-scan `_findings_spans` talos file-followups.py
+    uses rather than pairing every fence in the document: an unrelated
+    unclosed or malformed fence earlier in the body must not hide this one."""
+    spans, lines = [], text.splitlines()
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        run = len(s) - len(s.lstrip("`"))
+        if run >= 3 and s[run:].strip().lower() == "findings":
+            j = i + 1
+            while j < len(lines):
+                c = lines[j].strip()
+                crun = len(c) - len(c.lstrip("`"))
+                if crun >= run and not c[crun:].strip():
+                    break
+                j += 1
+            spans.append((i, min(j, len(lines)), j >= len(lines)))
+            i = j + 1
+            continue
+        i += 1
+    return spans
+
+
+def _findings_block(text):
+    """(found, counts): found=False means no ```findings block exists at all
+    (the caller falls back to prose); found=True with counts=None means one
+    exists but is untrustworthy -- an unclosed fence, or a line inside it that
+    is neither `SEVERITY: headline` nor `NONE` -- so every severity is NULL,
+    never a partial guess; found=True with counts filled is the structured,
+    authoritative read (every severity it does not mention truly had none,
+    because the block is a complete contract, not a partial note)."""
+    lines = text.splitlines()
+    spans = _findings_fenced_spans(text)
+    if not spans:
+        return False, None
+    start, end, unclosed = spans[-1]
+    if unclosed:
+        return True, None
+    counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for line in lines[start + 1:end]:
+        s = line.strip()
+        if not s or s.upper() == "NONE":
+            continue
+        m = _FINDINGS_BLOCK_LINE.match(s)
+        if not m:
+            return True, None
+        sev, headline = m.group(1).upper(), m.group(2).strip(" *")
+        if _NONE_STATEMENT.match(headline):
+            continue
+        counts[sev] += 1
+    return True, counts
+
+
+def _blank_fenced(text):
+    """`text` with every CLOSED fenced block blanked (any fence, not only a
+    `findings`-tagged one), so a quoted example elsewhere in the body is not
+    read as a real section. An unclosed fence is left alone: talos's own
+    `_without_fenced` makes the same choice, because blanking the rest of the
+    document past a stray unclosed opener is a silent drop, and a false read
+    of a quoted example costs less than that."""
+    lines = text.splitlines()
+    open_at = opener_len = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        run = len(s) - len(s.lstrip("`"))
+        if run < 3:
+            continue
+        rest = s[run:].strip()
+        if open_at is None:
+            if "`" in rest:
+                continue
+            open_at, opener_len = i, run
+        elif run >= opener_len and not rest:
+            for k in range(open_at, i + 1):
+                lines[k] = ""
+            open_at = None
+    return "\n".join(lines)
+
+
+def _prose_sections(text):
+    """{severity: [body lines]} for every heading- or closed-bold-opened
+    section in `text`. The LAST section of a severity wins (same rule as
+    `_findings_block`'s last-block-wins, for the same reason: an earlier
+    quoted example must not outrank the reviewer's real section)."""
+    sections = {}
+    cur_sev, cur_lines = None, []
+    for line in text.splitlines():
+        if _SECTION_OPEN.match(line.strip()):
+            if cur_sev is not None:
+                sections[cur_sev] = cur_lines
+            cur_sev = _SECTION_SEV.search(line).group(0).upper()
+            cur_lines = []
+            continue
+        if cur_sev is not None:
+            cur_lines.append(line)
+    if cur_sev is not None:
+        sections[cur_sev] = cur_lines
+    return sections
+
+
+def _prose_count(lines):
+    """None (unreadable) or an int, from one severity's section body: a
+    declaration of no findings is 0; a list/numbered/bold-led item line is
+    counted; prose with no such shape and no declaration is None, never a
+    guessed 0 for a section that said something this cannot parse."""
+    body = [l for l in lines if l.strip()]
+    if not body:
+        return 0
+    if _NONE_STATEMENT.match(body[0].strip()):
+        return 0
+    items = sum(1 for l in body if _ITEM_LINE.match(l.strip()))
+    return items if items else None
+
+
+def count_findings(body):
+    """{"HIGH","MEDIUM","LOW"} -> int or None, from one review body (plan 0197
+    D3). The ```findings fenced block first, exact; a heading/bold-section
+    prose read otherwise; a severity named nowhere in a body that otherwise
+    parses (i.e. that opens at least one severity section) is 0 (a review
+    that states no findings), matching the plan's own "absent is null, never
+    zero" EXCEPT where the absence is itself the answer. A body that opens
+    NO severity section at all -- never engages the findings format, so there
+    is no "states no findings" to read -- is unreadable: every severity is
+    None, not the 0/0/0 that would silently understate every total it joins
+    (review of #1432, round 2)."""
+    found, counts = _findings_block(body or "")
+    if found:
+        return ({"HIGH": None, "MEDIUM": None, "LOW": None} if counts is None
+               else counts)
+    sections = _prose_sections(_blank_fenced(body or ""))
+    if not sections:
+        return {"HIGH": None, "MEDIUM": None, "LOW": None}
+    return {sev: (_prose_count(sections[sev]) if sev in sections else 0)
+            for sev in ("HIGH", "MEDIUM", "LOW")}
+
+
+class PriceFileError(ValueError):
+    """`config/model-prices.json` does not have the shape plan 0197 D4
+    states. Raised rather than silently skipping the bad row: a price file is
+    a reviewed, owner-approved document, and a row that fails validation is a
+    defect in IT, not a model to price as `—`."""
+
+
+def load_prices(path=None):
+    """The list of price rows in `config/model-prices.json`, validated (plan
+    0197 D4): every row has `model`, `checked_on` and `source`; no two rows
+    for the same `model` share an `effective_from`; every price, top-level or
+    inside `long_context`, is absent or a non-negative number. Read fresh on
+    every call -- this file is owner-maintained and a correction must not
+    need a process restart to take effect (D4's own "compute dollars on
+    read" boundary)."""
+    data = json.loads(Path(path or PRICES_PATH).read_text())
+    if not isinstance(data, list):
+        raise PriceFileError(f"{path or PRICES_PATH}: must be a JSON array")
+    seen = set()
+    for i, row in enumerate(data):
+        who = f"entry {i} ({row.get('model')!r})" if isinstance(row, dict) else f"entry {i}"
+        if not isinstance(row, dict):
+            raise PriceFileError(f"{who}: not an object")
+        for key in ("model", "checked_on", "source"):
+            if not row.get(key):
+                raise PriceFileError(f"{who}: missing {key!r}")
+        dup_key = (row["model"], row.get("effective_from"))
+        if dup_key in seen:
+            raise PriceFileError(
+                f"{who}: duplicate row for effective_from={row.get('effective_from')!r}")
+        seen.add(dup_key)
+        for field in _PRICE_FIELDS:
+            v = row.get(field)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+                raise PriceFileError(f"{who}: {field}={v!r} is not a non-negative number or null")
+        lc = row.get("long_context")
+        if lc is not None:
+            if not isinstance(lc, dict) or not isinstance(lc.get("threshold_input_tokens"), int):
+                raise PriceFileError(f"{who}: long_context needs an int threshold_input_tokens")
+            for field in _PRICE_FIELDS:
+                v = lc.get(field)
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+                    raise PriceFileError(
+                        f"{who}: long_context.{field}={v!r} is not a non-negative number or null")
+    return data
+
+
+def _price_row_for(prices, model, date):
+    """The row for `model` whose `effective_from` is the latest on or before
+    `date` (an ISO date/timestamp string; lexicographic comparison is correct
+    for ISO 8601), where a null `effective_from` covers every earlier date.
+    None when `model` has no row at all."""
+    model = _PRICE_MODEL_ALIAS.get(model, model)
+    best = None
+    for row in prices:
+        if row["model"] != model:
+            continue
+        ef = row.get("effective_from")
+        if ef is not None and ef > (date or "")[:10]:
+            continue
+        if best is None or (ef or "") > (best.get("effective_from") or ""):
+            best = row
+    return best
+
+
+def cost_for(prices, model, date, in_tok, cached_tok, cache_write_tok, out_tok):
+    """The API-equivalent cost in dollars, or None when `model` has no price
+    row, or when every one of the four token counts is None (nothing to
+    price). A count that IS known prices at 0 tokens of the others that
+    aren't, same as every other total in this module treating "unknown" and
+    "zero" as different facts only where the difference is knowable.
+
+    `cache_write_tok` prices at the SHORT-TTL rate: every usage source this
+    plan reads (talos plan 0042's wire line, and the writer transcripts
+    bin/fleet-collect parses) reports one undifferentiated cache-write count,
+    never split by TTL, and 5-minute ephemeral caching is every harness's
+    default -- an explicit long-TTL cache write needs a `cache_control` the
+    harnesses here do not send. Revisit if that changes.
+
+    `in_tok + cached_tok` decides the GPT long-context tier (plan 0197 D4's
+    table): that is the model's own prompt size, which is what a vendor's own
+    context-length pricing tier keys on, not the "new, non-cached" bucket this
+    module otherwise treats as `in`."""
+    row = _price_row_for(prices, model, date)
+    if row is None:
+        return None
+    if all(v is None for v in (in_tok, cached_tok, cache_write_tok, out_tok)):
+        return None
+    total_in = (in_tok or 0) + (cached_tok or 0)
+    lc = row.get("long_context")
+    if lc is not None and total_in > lc["threshold_input_tokens"]:
+        row = lc
+    price = lambda field: row.get(field) or 0
+    return ((in_tok or 0) * price("input") + (cached_tok or 0) * price("cached_input")
+            + (cache_write_tok or 0) * price("cache_write_short")
+            + (out_tok or 0) * price("output")) / 1_000_000
 
 
 class TokenError(RuntimeError):
@@ -241,6 +552,8 @@ def backfill(con, forge):
                 m = _PROV.search(body)
                 line = _PROV_LINE.search(body) if m else None
                 ms = _PROV_SESSION.search(line.group(0)) if line else None
+                usage = _parse_review_usage(body)
+                findings = count_findings(body)
                 # ON CONFLICT DO UPDATE, not INSERT OR IGNORE: a review's
                 # `dismissed` flag changes AFTER it is written (any push to the
                 # branch dismisses standing approvals), and Forgejo does not
@@ -250,7 +563,10 @@ def backfill(con, forge):
                 cur = con.execute(
                     "INSERT INTO review (forgejo_id, repo, pr, round, reviewer, "
                     "model, provenance, verdict, head_sha, submitted_at, "
-                    "dismissed, stale, session_uuid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "dismissed, stale, session_uuid, usage_in, usage_cached, "
+                    "usage_cache_write, usage_out, usage_seconds, findings_high, "
+                    "findings_medium, findings_low) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(forgejo_id) DO UPDATE SET "
                     "  round=excluded.round, verdict=excluded.verdict, "
                     "  dismissed=excluded.dismissed, stale=excluded.stale, "
@@ -258,13 +574,36 @@ def backfill(con, forge):
                     "  provenance=COALESCE(excluded.provenance, review.provenance), "
                     # A backfill fills a NULL and never replaces a value: the
                     # column is the reviewer's own session id, and a later read
-                    # of the same review must not move it.
-                    "  session_uuid=COALESCE(review.session_uuid, excluded.session_uuid)",
+                    # of the same review must not move it. The usage columns
+                    # are read from the SAME posted, immutable body, so they
+                    # fill once the same way.
+                    "  session_uuid=COALESCE(review.session_uuid, excluded.session_uuid), "
+                    "  usage_in=COALESCE(review.usage_in, excluded.usage_in), "
+                    "  usage_cached=COALESCE(review.usage_cached, excluded.usage_cached), "
+                    "  usage_cache_write=COALESCE(review.usage_cache_write, excluded.usage_cache_write), "
+                    "  usage_out=COALESCE(review.usage_out, excluded.usage_out), "
+                    "  usage_seconds=COALESCE(review.usage_seconds, excluded.usage_seconds), "
+                    # NOT fill-once, unlike the columns above: findings come
+                    # from count_findings(), our own severity parser, not a
+                    # fixed-format provenance line, so a bug in it (review of
+                    # #1432, round 2: an unreadable body read as 0/0/0 instead
+                    # of NULL) can write a wrong value. COALESCE would make
+                    # that wrong value permanent -- no later backfill, however
+                    # correct its parser, could ever overwrite a non-NULL
+                    # column. Always recomputing from the same immutable body
+                    # is exactly as idempotent when the parser is right, and
+                    # is the only way a parser fix ever reaches rows already
+                    # written.
+                    "  findings_high=excluded.findings_high, "
+                    "  findings_medium=excluded.findings_medium, "
+                    "  findings_low=excluded.findings_low",
                     (rv.get("id"), full, pr["number"], n, REVIEWER,
                      m.group(1) if m else None, m.group(2).strip() if m else None,
                      rv.get("state"), rv.get("commit_id"), rv.get("submitted_at"),
                      1 if rv.get("dismissed") else 0, 1 if rv.get("stale") else 0,
-                     ms.group(1) if ms else None))
+                     ms.group(1) if ms else None, usage["in"], usage["cached"],
+                     usage["cache_write"], usage["out"], usage["seconds"],
+                     findings["HIGH"], findings["MEDIUM"], findings["LOW"]))
                 added += cur.rowcount
     con.commit()
     print(f"backfill: {seen} reviews seen, {added} rows written")
@@ -277,6 +616,14 @@ def backfill(con, forge):
     return 0
 
 
+def _fmt_n(v):
+    return "—" if v is None else str(v)
+
+
+def _fmt_cost(v):
+    return "—" if v is None else f"${v:,.2f}"
+
+
 def report(con, repo_filter=None):
     # rows are stored fully qualified, so a bare `--repo eunomia` matched
     # nothing and printed "0 pull requests" — a wrong answer that looks like a
@@ -284,7 +631,7 @@ def report(con, repo_filter=None):
     # nothing rather than reporting an empty census.
     if repo_filter:
         repo_filter = _qualify(repo_filter)
-    q = """
+    pr_q = """
       SELECT r.repo, r.pr, COUNT(*) AS rounds,
              SUM(CASE WHEN r.verdict='APPROVED' AND NOT r.dismissed
                       THEN 1 ELSE 0 END) AS approvals,
@@ -294,18 +641,90 @@ def report(con, repo_filter=None):
        GROUP BY r.repo, r.pr
        ORDER BY rounds DESC, r.repo, r.pr
     """.format(where="WHERE r.repo = ?" if repo_filter else "")
-    rows = con.execute(q, (repo_filter,) if repo_filter else ()).fetchall()
-    if repo_filter and not rows:
+    pr_rows = con.execute(pr_q, (repo_filter,) if repo_filter else ()).fetchall()
+    if repo_filter and not pr_rows:
         known = [r[0] for r in con.execute("SELECT DISTINCT repo FROM review ORDER BY 1")]
         print(f"no reviews recorded for {repo_filter!r}. known repos: "
               f"{', '.join(known) or '(none)'}", file=sys.stderr)
         return
     _model_coverage_warning(con)
-    print(f"{'repo':24} {'pr':>5} {'rounds':>7} {'appr':>5}  span")
-    for repo, pr, rounds, appr, a, b, models in rows:
+
+    # Plan 0197 D5: cost is computed PER ROUND (each round can carry its own
+    # model and date) and rolled up from there, both by PR and by model --
+    # never in SQL, because the price lookup (`cost_for`) is a owner-file read,
+    # not an expression sqlite can evaluate.
+    try:
+        prices = load_prices()
+    except (OSError, ValueError) as e:
+        prices = []
+        print(f"WARN: {PRICES_PATH} unusable ({e}) — every cost below is "
+              f"'—'", file=sys.stderr)
+
+    round_q = """
+      SELECT r.repo, r.pr, r.model, r.verdict, r.dismissed, r.submitted_at,
+             r.usage_in, r.usage_cached, r.usage_cache_write, r.usage_out,
+             r.usage_seconds, r.findings_high, r.findings_medium, r.findings_low
+        FROM review r {where}
+    """.format(where="WHERE r.repo = ?" if repo_filter else "")
+    rounds = con.execute(round_q, (repo_filter,) if repo_filter else ()).fetchall()
+
+    def _sum(acc, key, val):
+        if val is not None:
+            acc[key] = (acc[key] or 0) + val
+
+    by_pr, by_model, priced = {}, {}, 0
+    for (repo, pr, model, verdict, dismissed, submitted_at, uin, ucached, ucw,
+         uout, usec, fhigh, fmed, flow) in rounds:
+        cost = cost_for(prices, model, submitted_at, uin, ucached, ucw, uout) if model else None
+        if cost is not None:
+            priced += 1
+        pr_acc = by_pr.setdefault((repo, pr), {"high": None, "medium": None,
+                                               "low": None, "cost": None})
+        _sum(pr_acc, "high", fhigh)
+        _sum(pr_acc, "medium", fmed)
+        _sum(pr_acc, "low", flow)
+        _sum(pr_acc, "cost", cost)
+
+        m_acc = by_model.setdefault(model or "(none)", {
+            "reviews": 0, "approvals": 0, "high": None, "medium": None,
+            "low": None, "tokens": None, "seconds": None, "cost": None,
+        })
+        m_acc["reviews"] += 1
+        if verdict == "APPROVED" and not dismissed:
+            m_acc["approvals"] += 1
+        _sum(m_acc, "high", fhigh)
+        _sum(m_acc, "medium", fmed)
+        _sum(m_acc, "low", flow)
+        for tok in (uin, ucached, ucw, uout):
+            _sum(m_acc, "tokens", tok)
+        _sum(m_acc, "seconds", usec)
+        _sum(m_acc, "cost", cost)
+
+    print(f"{'repo':24} {'pr':>5} {'rounds':>7} {'appr':>5} "
+          f"{'H':>3} {'M':>3} {'L':>3} {'cost':>10}  span")
+    for repo, pr, rounds_n, appr, a, b, models in pr_rows:
         span = f"{(a or '')[:16]} → {(b or '')[:16]}"
-        print(f"{repo:24} {pr:>5} {rounds:>7} {appr:>5}  {span}")
-    print(f"\n{len(rows)} pull requests, {sum(r[2] for r in rows)} reviews")
+        p = by_pr.get((repo, pr), {})
+        print(f"{repo:24} {pr:>5} {rounds_n:>7} {appr:>5} "
+              f"{_fmt_n(p.get('high')):>3} {_fmt_n(p.get('medium')):>3} "
+              f"{_fmt_n(p.get('low')):>3} {_fmt_cost(p.get('cost')):>10}  {span}")
+    total_cost = sum(p["cost"] for p in by_pr.values() if p["cost"] is not None)
+    print(f"\n{len(pr_rows)} pull requests, {sum(r[2] for r in pr_rows)} reviews, "
+          f"{_fmt_cost(total_cost if priced else None)} API-equivalent "
+          f"({priced} of {len(rounds)} review(s) priced)")
+
+    print(f"\n{'model':28} {'reviews':>7} {'appr':>5} {'H':>3} {'M':>3} "
+          f"{'L':>3} {'tokens':>10} {'seconds':>8} {'API-equivalent':>15}")
+    for model in sorted(by_model):
+        m = by_model[model]
+        print(f"{model:28} {m['reviews']:>7} {m['approvals']:>5} "
+              f"{_fmt_n(m['high']):>3} {_fmt_n(m['medium']):>3} {_fmt_n(m['low']):>3} "
+              f"{_fmt_n(m['tokens']):>10} {_fmt_n(m['seconds']):>8} "
+              f"{_fmt_cost(m['cost']):>15}")
+    no_price = sum(1 for m in by_model.values() if m["cost"] is None)
+    if no_price:
+        print(f"\n{no_price} model(s) above show no API-equivalent cost "
+              f"(no price row, or no usage recorded for any of their reviews)")
 
 
 def _model_coverage_warning(con):
@@ -342,11 +761,20 @@ def _migrate(con):
     """CREATE TABLE IF NOT EXISTS adds no columns to a table that already
     exists, so a DB written before `dismissed` landed would read NULL there and
     `NOT r.dismissed` would drop every one of its rows from the approval count.
-    Add what is missing, defaulted to 0."""
+    Add what is missing, defaulted to 0.
+
+    The plan 0197 columns default to NULL, not 0: `dismissed`/`stale` are flags
+    where "unset" and "false" are the same fact, but a token count or a
+    finding count where "unset" and "zero" are different facts (the boundary
+    this plan states explicitly) must not default to the wrong one."""
     have = {r[1] for r in con.execute("PRAGMA table_info(review)")}
     for col in ("dismissed", "stale"):
         if col not in have:
             con.execute(f"ALTER TABLE review ADD COLUMN {col} INTEGER DEFAULT 0")
+    for col in ("usage_in", "usage_cached", "usage_cache_write", "usage_out",
+                "usage_seconds", "findings_high", "findings_medium", "findings_low"):
+        if col not in have:
+            con.execute(f"ALTER TABLE review ADD COLUMN {col} INTEGER")
     con.commit()
 
 

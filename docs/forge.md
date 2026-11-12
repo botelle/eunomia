@@ -29,13 +29,17 @@ must pass or how a caller must read what comes back:
 | Verb | Forgejo | GitHub |
 | --- | --- | --- |
 | `get_pull(repo, n)` | `GET /repos/{owner}/{repo}/pulls/{n}` | `GET /repos/{owner}/{repo}/pulls/{n}` |
+| `get_pull_by_branch(repo, base, head)` | `GET /repos/{owner}/{repo}/pulls/{base}/{head}` | **unsupported** — always `(0, None)`, no request made. GitHub's nearest equivalent (`GET /pulls?head=&base=`) answers with a LIST, the shape plan 0215 exists to stop reading on the per-branch path; no caller runs this backend today, so there is no live case to decide the list-vs-single-object question against. |
 | `list_pulls(repo, state="all", page=1, limit=50, sort=None)` | `GET /repos/{owner}/{repo}/pulls?state=&page=&limit=[&sort=]` | `GET /repos/{owner}/{repo}/pulls?state=&page=&per_page=[&sort=&direction=]` |
 | `list_reviews(repo, n, page=1, limit=50)` | `GET /repos/{owner}/{repo}/pulls/{n}/reviews?page=&limit=` | `GET /repos/{owner}/{repo}/pulls/{n}/reviews?page=&per_page=` |
 | `list_issue_comments(repo, n, since=None, page=1, limit=50)` | `GET /repos/{owner}/{repo}/issues/{n}/comments?page=&limit=[&since=]` | `GET /repos/{owner}/{repo}/issues/{n}/comments?page=&per_page=[&since=]` |
 | `get_branch(repo, name)` | `GET /repos/{owner}/{repo}/branches/{name}` | `GET /repos/{owner}/{repo}/branches/{name}` |
+| `list_action_runs(repo, page=1, limit=50)` | `GET /repos/{owner}/{repo}/actions/runs` | **unsupported** — always `(0, None)`, no request made. GitHub's run object has no `stopped` field and its `updated_at` is not a completion time, so translating it would invent a value. Forgejo's body is returned unchanged (`{total_count, workflow_runs}`); the caller pages by hand. |
 | `get_branch_protections(repo)` | `GET /repos/{owner}/{repo}/branch_protections` | **unsupported** — always `(0, None)`, no request made |
 | `get_contents(repo, path, ref=None)` | `GET /repos/{owner}/{repo}/contents/{path}[?ref=]` | `GET /repos/{owner}/{repo}/contents/{path}[?ref=]` |
 | `list_contents(repo, dir, ref=None)` | `GET /repos/{owner}/{repo}/contents/{dir}[?ref=]` | `GET /repos/{owner}/{repo}/contents/{dir}[?ref=]` |
+| `get_git_tree(repo, sha)` | `GET /repos/{owner}/{repo}/git/trees/{sha}?per_page=1000` | `GET /repos/{owner}/{repo}/git/trees/{sha}` |
+| `get_git_blob(repo, sha)` | `GET /repos/{owner}/{repo}/git/blobs/{sha}` | `GET /repos/{owner}/{repo}/git/blobs/{sha}` |
 | `post_status(repo, sha, state, description, context)` | `POST /repos/{owner}/{repo}/statuses/{sha}` | `POST /repos/{owner}/{repo}/statuses/{sha}` (Statuses API, not Check Runs) |
 | `create_issue_comment(repo, n, body)` | `POST /repos/{owner}/{repo}/issues/{n}/comments` | `POST /repos/{owner}/{repo}/issues/{n}/comments` |
 | `edit_pull_body(repo, n, body)` | `PATCH /repos/{owner}/{repo}/pulls/{n}` | `PATCH /repos/{owner}/{repo}/pulls/{n}` |
@@ -118,6 +122,19 @@ already carry. The divergences that do exist:
   this fleet's self-hosted instance. Neither backend's `get_contents`
   attempts to paper over this: the module hands back whatever the forge
   said, same as it always has for a non-JSON or unexpected body.
+- **`get_git_tree`/`get_git_blob` (plan 0216) read the git trees and blobs
+  API instead of the contents API, because the contents API computes each
+  entry's last commit and is too slow for a large directory** — `GET
+  /contents/plans?ref=<sha>` took 110 s against eunomia's 194-entry `plans/`
+  (263 KB), past the client's timeout, where `GET /git/trees/<sha>` for the
+  same directory answered in 0.27 s. `get_git_tree` reads one tree level —
+  `sha` may be a tree sha or a commit sha, since both platforms resolve a
+  commit sha to its own tree the same way `list_tree` already relies on for
+  a branch's root commit — and `get_git_blob` reads one file's content by
+  the blob sha a tree entry names, not by path or ref. A blob sha names its
+  content, so a cache keyed by it (`bin/fleet-deps`'s `plan-lint-blobs/`) is
+  never stale the way a cache keyed by path could be across two different
+  heads. Both verbs are read-only and shaped identically on both backends.
 - **`search_repos` wraps its rows under a different key on each backend, and
   is not normalised (plan 0057).** Forgejo's `/repos/search` with no query
   lists every repository the token can see, under `data`. GitHub has no
@@ -325,6 +342,7 @@ wrong; the test, not this table, is authoritative.
 | `bin/fleet-leak-watch:127` | `urlopen()` — an **ntfy** notification POST, not a forge call | non-forge; stays open-coded |
 | `bin/orchestrator:169` | `urlopen()` — an **ntfy** notification POST, not a forge call | non-forge; stays open-coded |
 | `bin/fleet-orphans:586` | `urlopen()` — an **ntfy** notification POST, not a forge call | non-forge; stays open-coded |
+| `bin/fleet-drift:159` | `urlopen()` — a service's own **health URL** poll, not a forge call | non-forge; stays open-coded |
 
 `bin/fleet-watch` is migrated: plan 0051 replaced its own `_api()` and the six
 call sites through it (`get_branch_protections`, `list_contents`,

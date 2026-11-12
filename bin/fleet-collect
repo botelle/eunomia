@@ -45,6 +45,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECTS = Path.home() / ".claude" / "projects"
+# Transcripts the reviewer uid publishes (talos plan 0014), flat `<session_id>.jsonl`.
+# Read at call time so FLEET_REVIEWER_TRANSCRIPTS can move it. The reviewer's own
+# home is never read.
+DEFAULT_REVIEWER_TRANSCRIPTS = "/Users/Shared/dispatch-review/transcripts"
+REVIEWER_PROJECT = "revbot-reviews"
+REVIEWER_KEY_PREFIX = "reviewer/"
+# Plan 0197 D1: the orchestrator's own writer output (bin/orchestrator's
+# `transcript_dir()`), read-only here and under a DIFFERENT env var than that
+# function's own `EUNOMIA_TRANSCRIPT_DIR` -- FLEET_* names every one of this
+# tool's own reading-side overrides (FLEET_REVIEWER_TRANSCRIPTS, FLEET_WORK_ROOT),
+# and an operator who relocates the writing side sets this one too.
+DEFAULT_WRITER_TRANSCRIPTS = Path.home() / "dev" / ".orchestrator-transcripts"
+WRITER_KEY_PREFIX = "writer/"
 # SPEC.md puts the runtime tree at ~/dev/.fleet/
 DB = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "dev" / ".fleet" / "fleet.db"
 
@@ -84,6 +97,9 @@ DERIVED_TABLES = frozenset({
 DURABLE_TABLES = frozenset({
     "review", "model_price", "repo_model", "repo_model_change",
     "fleet_setting", "fleet_setting_change",
+    "repo_setting", "repo_setting_change",
+    "lane_run",
+    "seat_access", "seat_access_change",
 })
 
 
@@ -697,7 +713,7 @@ def scan_file(path: Path, sid: str, project: str, parent: "str|None", kind: str)
     if not turns and not tools:
         return None, [], []
     session = (
-        sid, session_uuid or path.stem, project, parent, kind, first_ts, last_ts,
+        sid, path.stem if project == REVIEWER_PROJECT else (session_uuid or path.stem), project, parent, kind, first_ts, last_ts,
         len(turns), len(tools), tot[0], tot[1], tot[2], tot[3],
         json.dumps(models), title, first_prompt,
     )
@@ -878,6 +894,239 @@ def _sync_source(con, seen, key, path, scan_fn, delete_sql, insert_sql, counts):
         print(f"WARN: {key}: ingest failed (recorded, continuing)", file=sys.stderr)
 
 
+def _writer_transcripts_root():
+    """Plan 0197 D1: the root to glob for writer transcripts, or None when this
+    sweep must not read one.
+
+    Same shape as `_ci_enabled`, and for the same reason: `transcript_dir()`
+    (bin/orchestrator) is deliberately OUTSIDE the fleet tree (SPEC Principle
+    6), so moving FLEET_DIR -- every test's own tmp tree, via `EUNOMIA_FLEET_DIR`
+    or a direct `FLEET_DIR` monkeypatch -- does not also redirect it, and a
+    relocated tree would otherwise glob the real ~/dev/.orchestrator-transcripts
+    of the host running it (806 real files, measured on opshost 2026-11-08) into
+    a throwaway test database. `FLEET_WRITER_TRANSCRIPTS` always wins -- that is
+    what a test sets to exercise this sweep against a fixture tree; otherwise
+    the default path is used only when FLEET_DIR is still untouched."""
+    env = os.environ.get("FLEET_WRITER_TRANSCRIPTS", "").strip()
+    if env:
+        return Path(env)
+    if FLEET_DIR == DEFAULT_FLEET_DIR:
+        return DEFAULT_WRITER_TRANSCRIPTS
+    return None
+
+
+def _load_orchestrator():
+    """bin/orchestrator, by path -- same loader idiom as `_load_models` above.
+    Needed only for its `RUNNERS` registry, to map a writer's runner name (from
+    the run log's own `writer-start`/`routed` lines) to the vendor family
+    (`openai` | `google` | `muse`) that decides which parser reads its
+    transcript. Plan 0202 keeps adding runner names to that one table (three
+    more Codex ids, one more antigravity one); reading it rather than
+    restating the mapping here is what keeps this from drifting out of step."""
+    path = Path(__file__).resolve().parent / "orchestrator"
+    loader = importlib.machinery.SourceFileLoader("orchestrator", str(path))
+    spec = importlib.util.spec_from_loader("orchestrator", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _writer_usage_codex(text):
+    """The last `turn.completed` event's `usage`, the same record
+    `bin/fleet-lane`'s `_codex_usage` reads for a TEST lane (measured
+    2026-10-13, codex-cli 0.153.4): `input_tokens`, `cached_input_tokens`,
+    `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`.
+
+    `cached_input_tokens` is a SUBSET of `input_tokens`, not an addition to it
+    (docs/measurements/adr-0006-blackbox-test-lanes.md: 25168 total against
+    23424 cached) -- so the fresh bucket returned here is the remainder, never
+    the raw field, or summing it with the cache-read bucket would double-count.
+    `reasoning_output_tokens` is folded into the output bucket, the same
+    convention the plan's own price table states for Gemini's thinking tokens.
+    None when no such event carries a usable usage object, never zero (plan
+    0197 boundary: absent is null)."""
+    found = None
+    for line in (text or "").splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("type") == "turn.completed":
+            usage = rec.get("usage")
+            if isinstance(usage, dict) and any(
+                    isinstance(v, int) and not isinstance(v, bool)
+                    for v in usage.values()):
+                found = usage
+    if found is None:
+        return None
+    cached = found.get("cached_input_tokens")
+    cached_i = int(cached) if isinstance(cached, int) else 0
+    in_tok = max(0, int(found.get("input_tokens") or 0) - cached_i)
+    out_tok = int(found.get("output_tokens") or 0) + int(found.get("reasoning_output_tokens") or 0)
+    cache_write = found.get("cache_write_input_tokens")
+    return (in_tok, out_tok, (cached if isinstance(cached, int) else None),
+            (cache_write if isinstance(cache_write, int) else None))
+
+
+def _writer_usage_antigravity(text):
+    """The last `result` event's `usage` object.
+
+    NOT YET MEASURED against a real antigravity stream in this repo (the only
+    pinned shape in docs/measurements/adr-0006-blackbox-test-lanes.md is
+    codex's). These are Gemini's own published `usageMetadata` field names
+    (`promptTokenCount`, `cachedContentTokenCount`, `candidatesTokenCount`,
+    `thoughtsTokenCount`) -- the best available account until a real stream is
+    captured and this is corrected. Any shape this does not recognise yields
+    None for every bucket, never a guessed zero."""
+    found = None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not (isinstance(rec, dict) and rec.get("event") == "result"):
+            continue
+        inner = rec.get("result")
+        inner = inner if isinstance(inner, dict) else rec
+        usage = inner.get("usage")
+        if isinstance(usage, dict) and usage:
+            found = usage
+    if found is None:
+        return None
+    prompt, cached = found.get("promptTokenCount"), found.get("cachedContentTokenCount")
+    candidates, thoughts = found.get("candidatesTokenCount"), found.get("thoughtsTokenCount")
+    if prompt is None and candidates is None:
+        return None
+    cached_i = int(cached) if isinstance(cached, int) else 0
+    in_tok = max(0, int(prompt or 0) - cached_i)
+    out_tok = int(candidates or 0) + int(thoughts or 0)
+    return (in_tok, out_tok, (cached if isinstance(cached, int) else None), None)
+
+
+def _writer_usage_muse(text):
+    """The last `run.usage` event's final model entry, the same record
+    `bin/fleet-lane`'s `_muse_usage` reads for a TEST lane (measured
+    2026-11-07, `--provider echo`): a `models` list, each entry
+    `{"model","input_tokens","cached_tokens","output_tokens","reasoning_tokens","calls"}`.
+    `cached_tokens` reads as its own bucket there, not a subset of
+    `input_tokens` the way codex's `cached_input_tokens` is -- so, unlike
+    `_writer_usage_codex`, nothing here is subtracted."""
+    last = None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("payload_type") == "run.usage":
+            payload = rec.get("payload")
+            if isinstance(payload, dict):
+                last = payload
+    if last is None:
+        return None
+    models = last.get("models")
+    if not isinstance(models, list) or not models or not isinstance(models[-1], dict):
+        return None
+    m = models[-1]
+    cached = m.get("cached_tokens")
+    out_tok = int(m.get("output_tokens") or 0) + int(m.get("reasoning_tokens") or 0)
+    return (int(m.get("input_tokens") or 0), out_tok,
+            (cached if isinstance(cached, int) else None), None)
+
+
+# Writer family -> (the label for `session.kind`, its usage parser). Claude and
+# Fable are deliberately absent: that writer is already counted from
+# ~/.claude/projects, and every other family (the hosted/epeius runners) is out
+# of this plan's scope -- `scan_writer_transcript` reads this membership to
+# decide "nothing to add here" from "cannot read this yet".
+_WRITER_FAMILIES = {
+    "openai": ("codex", _writer_usage_codex),
+    "google": ("antigravity", _writer_usage_antigravity),
+    "muse": ("muse", _writer_usage_muse),
+}
+
+
+def _writer_route(con, transcript_path):
+    """(lease, runner, model) for the writer session that produced
+    `transcript_path`, or None when `dispatch_phase` carries no
+    `implementer-exit` row naming it yet.
+
+    Reads `dispatch_phase` rather than the filename: a lease id is not safely
+    separable from an appended fix-round tag by splitting on `-` (both can
+    contain one), while `implementer-exit`'s own `transcript` fact is the exact
+    path `write_transcript` (bin/orchestrator) returned when it wrote this
+    file, and a string match against it is unambiguous. The run-log sweep that
+    fills `dispatch_phase` runs earlier in this same `main()` (D2, plan 0045),
+    so this sees the current sweep's own rows, not last sweep's."""
+    exit_row = con.execute(
+        "SELECT lease, seq FROM dispatch_phase WHERE phase='implementer-exit' "
+        "AND json_extract(detail_json,'$.transcript')=? ORDER BY seq DESC LIMIT 1",
+        (transcript_path,),
+    ).fetchone()
+    if exit_row is None:
+        return None
+    lease, exit_seq = exit_row
+    runner = model = None
+    start_row = con.execute(
+        "SELECT detail_json FROM dispatch_phase WHERE lease=? AND phase='writer-start' "
+        "AND seq<? ORDER BY seq DESC LIMIT 1", (lease, exit_seq),
+    ).fetchone()
+    if start_row is not None:
+        facts = json.loads(start_row[0])
+        runner, model = facts.get("runner"), facts.get("model")
+    if runner is None:
+        # Older run, or a family that logs no `writer-start` (every epeius and
+        # hosted runner: `_run_epeius`/`_run_epeius_hosted` log `epeius-start`
+        # instead) -- `routed` carries the runner for every family, just never
+        # the model.
+        routed_row = con.execute(
+            "SELECT detail_json FROM dispatch_phase WHERE lease=? AND phase='routed' "
+            "AND seq<? ORDER BY seq DESC LIMIT 1", (lease, exit_seq),
+        ).fetchone()
+        if routed_row is not None:
+            runner = json.loads(routed_row[0]).get("runner")
+    if runner is None:
+        return None
+    return lease, runner, model
+
+
+def scan_writer_transcript(path, con, runner_family):
+    """One `~/dev/.orchestrator-transcripts/<lease>[-tag].log` -> a `session`
+    row for a non-Claude writer family (plan 0197 D1), keyed by the lease it
+    ran under.
+
+    Returns (row, None) to insert; (None, None) when this transcript is a
+    Claude writer (already counted from `~/.claude/projects`, never doubled)
+    or a family this plan does not cover; or (None, reason) when the
+    `dispatch_phase` correlation this needs has not landed yet -- the caller
+    must NOT record that as seen, so it is retried once it has, rather than
+    silently dropped forever."""
+    route = _writer_route(con, str(path.resolve()))
+    if route is None:
+        return None, ("no dispatch_phase correlation (writer-start/routed vs "
+                       "implementer-exit) for this transcript yet")
+    lease, runner, model = route
+    spec = _WRITER_FAMILIES.get(runner_family.get(runner))
+    if spec is None:
+        return None, None
+    label, parse_fn = spec
+    usage = parse_fn(path.read_text(errors="replace"))
+    in_tok, out_tok, cache_read, cache_write = usage if usage else (None, None, None, None)
+    session = (
+        f"{WRITER_KEY_PREFIX}{path.name}", lease, None, None, f"writer-{label}",
+        None, None, None, None, in_tok, out_tok, cache_read, cache_write,
+        json.dumps([model] if model else []), None, None,
+    )
+    return session, None
+
+
 def _ci_enabled() -> bool:
     """Whether this sweep runs the CI source (plan 0045).
 
@@ -968,6 +1217,26 @@ def _reconstruct_fleet_setting(con, ledger_complete) -> int:
     return 0
 
 
+def _reconstruct_repo_setting(con, ledger_complete) -> int:
+    """Plan 0085 D2b: replay repo-scoped `fleet-setting-changed` events into an
+    absent or empty `repo_setting`. Never raises; same shape as
+    `_reconstruct_fleet_setting`."""
+    try:
+        cfg = _load_config()
+        report = cfg.reconstruct_repo_setting(con, ledger_complete=ledger_complete)
+        for line in cfg.describe_repo_reconstruction(report):
+            print(line)
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        print("WARN: repo_setting reconstruction failed (recorded, continuing):\n" +
+              traceback.format_exc()[-500:], file=sys.stderr)
+        return 1
+    return 0
+
+
 def _load_models():
     """bin/fleet-models, by path -- same loader idiom as _load_config above."""
     path = Path(__file__).resolve().parent / "fleet-models"
@@ -993,6 +1262,25 @@ def _reconstruct_repo_model(con, ledger_complete) -> int:
         except Exception:
             pass
         print("WARN: repo_model reconstruction failed (recorded, continuing):\n" +
+              traceback.format_exc()[-500:], file=sys.stderr)
+        return 1
+    return 0
+
+
+def _reconstruct_seat_access(con, ledger_complete) -> int:
+    """Plan 0178 D1b: replay `seat-access-changed` events into an absent or empty
+    `seat_access`. Never raises; same shape as `_reconstruct_repo_model`."""
+    try:
+        models = _load_models()
+        report = models.reconstruct_seat_access(con, ledger_complete=ledger_complete)
+        for line in models.describe_access_reconstruction(report):
+            print(line)
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        print("WARN: seat_access reconstruction failed (recorded, continuing):\n" +
               traceback.format_exc()[-500:], file=sys.stderr)
         return 1
     return 0
@@ -1051,6 +1339,13 @@ def main() -> int:
         for r in con.execute("SELECT path,size,mtime FROM ingest WHERE error IS NULL")
     }
     files = []
+    reviewer_root = Path(os.environ.get("FLEET_REVIEWER_TRANSCRIPTS") or DEFAULT_REVIEWER_TRANSCRIPTS)
+    if reviewer_root.is_dir():
+        for f in sorted(reviewer_root.glob("*.jsonl")):
+            if f.name not in SKIP_NAMES:
+                files.append((f, REVIEWER_PROJECT, None, "session"))
+    else:
+        print(f"fleet-collect: transcript root {reviewer_root} absent, skipped")
     if PROJECTS.is_dir():
         for proj_dir in sorted(PROJECTS.iterdir()):
             if not proj_dir.is_dir():
@@ -1070,10 +1365,13 @@ def main() -> int:
             continue
         # Key on the path relative to PROJECTS: filename stems are NOT unique across
         # projects, and a collision would delete another transcript's rows.
-        try:
-            sid = str(path.relative_to(PROJECTS))
-        except ValueError:
-            sid = str(path)
+        if project == REVIEWER_PROJECT:
+            sid = REVIEWER_KEY_PREFIX + path.name
+        else:
+            try:
+                sid = str(path.relative_to(PROJECTS))
+            except ValueError:
+                sid = str(path)
         if seen.get(sid) == (st.st_size, st.st_mtime):
             continue
 
@@ -1144,6 +1442,74 @@ def main() -> int:
 
     failed += ev_counts["failed"] + lg_counts["failed"]
 
+    # Plan 0197 D1: writer tokens for every non-Claude family. Placed AFTER the
+    # run-log sweep above, not before: correlating a transcript to the runner
+    # and model that produced it reads `dispatch_phase`, and must see THIS
+    # sweep's own `writer-start`/`implementer-exit` rows, not last sweep's --
+    # otherwise a transcript ingested before its own run log would never
+    # correlate on its first sweep, and (wrongly marked seen) never would.
+    wt_counts = {"ok": 0, "skipped": 0, "failed": 0}
+    writer_root = _writer_transcripts_root()
+    if writer_root is not None and writer_root.is_dir():
+        try:
+            runner_family = {name: r.family for name, r in _load_orchestrator().RUNNERS.items()}
+        except Exception:
+            runner_family = None
+            print("WARN: writer transcripts: could not load bin/orchestrator's "
+                  "RUNNERS (recorded, continuing)", file=sys.stderr)
+        # runner_family is None, not {}, on a failed load above: an empty
+        # dict here would make _WRITER_FAMILIES.get(runner_family.get(runner))
+        # miss for every transcript the same way an out-of-scope family does,
+        # and the loop below writes those misses to `ingest` with NO error --
+        # "seen, nothing to do". That row is permanent: `seen` then matches on
+        # every later sweep and the transcript is never looked at again, even
+        # once RUNNERS loads cleanly (review of #1432, round 2). So the whole
+        # sweep below is skipped this run instead -- no session or ingest rows
+        # written, nothing marked seen -- and it retries in full next sweep.
+        for path in sorted(writer_root.glob("*.log")) if runner_family is not None else []:
+            key = f"{WRITER_KEY_PREFIX}{path.name}"
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if seen.get(key) == (st.st_size, st.st_mtime):
+                continue
+            try:
+                row, err = scan_writer_transcript(path, con, runner_family)
+            except Exception:
+                con.rollback()
+                err = traceback.format_exc()[-500:]
+                row = None
+            if row is not None:
+                con.execute(
+                    "INSERT OR REPLACE INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    row,
+                )
+            if err:
+                wt_counts["failed"] += 1
+                con.execute(
+                    "INSERT OR REPLACE INTO ingest VALUES (?,?,?,?,?)",
+                    (key, st.st_size, st.st_mtime,
+                     datetime.now(timezone.utc).isoformat(), err),
+                )
+                con.commit()
+                print(f"WARN: {key}: ingest failed (recorded, continuing)", file=sys.stderr)
+                continue
+            wt_counts["ok" if row is not None else "skipped"] += 1
+            con.execute(
+                "INSERT OR REPLACE INTO ingest VALUES (?,?,?,?,NULL)",
+                (key, st.st_size, st.st_mtime, datetime.now(timezone.utc).isoformat()),
+            )
+            con.commit()
+        if runner_family is None:
+            wt_counts["failed"] += len(list(writer_root.glob("*.log")))
+    print(f"writer transcripts: {wt_counts['ok']} ingested, {wt_counts['skipped']} skipped "
+          f"(Claude or out of scope), {wt_counts['failed']} not yet correlated"
+          + (" (RUNNERS load failed -- entire sweep deferred to next run)"
+             if writer_root is not None and writer_root.is_dir() and runner_family is None
+             else ""))
+    failed += wt_counts["failed"]
+
     # plan 0068 D4: reconstruct fleet_setting from the events just ingested
     # above. ledger_complete is False the moment ANY events file failed to
     # ingest -- a plausible-looking table built from a partial ledger is
@@ -1151,9 +1517,15 @@ def main() -> int:
     # on an absent table).
     failed += _reconstruct_fleet_setting(con, ledger_complete=ev_counts["failed"] == 0)
 
+    # plan 0085 D2b: the repo-scoped half of the same events, into repo_setting.
+    failed += _reconstruct_repo_setting(con, ledger_complete=ev_counts["failed"] == 0)
+
     # plan 0063 D2: the same for repo_model, into an ABSENT (or empty) table only;
     # a surviving table is compared and reported, never changed.
     failed += _reconstruct_repo_model(con, ledger_complete=ev_counts["failed"] == 0)
+
+    # plan 0178 D1b: seat_access, likewise.
+    failed += _reconstruct_seat_access(con, ledger_complete=ev_counts["failed"] == 0)
 
     # D-CI: the fourth source, last -- it is the only one that waits on a network,
     # so the three that cannot are already committed if it hangs or dies.

@@ -60,10 +60,29 @@ the edge is satisfied — the same vocabulary `docs/plan-dependencies.md`
 already uses for a blocked dispatch, so a blocked-dispatch event and this
 graph never disagree about what a blocker is called.
 
-Top-level: `nodes`, `edges`, `cycles` (a list of cycles, each a list of ids —
-empty when the plan set is acyclic), and `errors` (a plan that failed to parse,
-reported rather than dropped, matching `fleet-plan audit`'s own rule that
-absent must not read as zero).
+Top-level: `nodes`, `edges`, `repairs` (below), `cycles` (a list of cycles,
+each a list of ids — empty when the plan set is acyclic), and `errors` (a plan
+that failed to parse, reported rather than dropped, matching `fleet-plan
+audit`'s own rule that absent must not read as zero).
+
+## `repairs` (plan 0089)
+
+A separate top-level list, one entry per valid `repairs` front-matter entry,
+in declared order:
+
+```json
+{"from": "0100-a-repair-names-what-it-repairs", "to": "0057-ci-logs-ingested-and-served",
+ "class": "sequencing"}
+```
+
+It is never folded into `edges`. `repairs` records history — which plan fixed,
+reversed or completed which, and what kind of defect — and it never gates
+dispatch, so it must not change any answer `edges` already gives: layering,
+cycle detection and unreachability (D5, below) all walk `edges` alone, exactly
+as they did before this field existed. `--format mermaid` draws it as a
+dotted, labelled arrow directly between the two plan nodes (`repairs: <class>`);
+`--format svg` draws it as a separate dashed stroke (`class="repair-edge"`),
+distinct from the plan/path/external edge styles above.
 
 ## Unreachability is computed, not implied
 

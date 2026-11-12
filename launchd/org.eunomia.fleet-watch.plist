@@ -23,7 +23,7 @@
   PermissionError and skip with a warning).
     mkdir -p ~/dev/.fleet
     cp launchd/org.eunomia.fleet-watch.plist ~/Library/LaunchAgents/
-    # fill FLEET_WATCH_REPOS, FLEET_NTFY_URL, FLEET_OPERATOR_UID and
+    # fill FLEET_NTFY_URL, FLEET_OPERATOR_UID and
     # FLEET_IMPLEMENTER_UIDS first — see below
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-watch.plist
   Reload after editing (a frozen job needs bootout+bootstrap, not kickstart):
@@ -40,10 +40,11 @@
 
   ENVIRONMENT, and the two mistakes worth naming.
 
-  FLEET_WATCH_REPOS is the allowlist and there is no default: an unconfigured
-  watcher reads nothing at all. `config/repos.conf` is NOT consulted — plan 0013's
-  main-via-contents-API read is unbuilt, and `fleet-repo` says so to the operator's
-  face. Enrolment there is a record, not a dispatch.
+  The allowlist is the `dispatch` lines of config/repos.conf in the pinned
+  eunomia worktree this unit runs from (plan 0134), not an environment variable:
+  enrolling a repository is a reviewed PR plus the pin reaching it. A missing or
+  unparseable file scans nothing and pages once. FLEET_WATCH_REPOS is no longer
+  read; if it is still set and differs, the watcher warns each cycle.
 
   Do NOT set FLEET_ADMIN_TOKEN_CMD. It is retired. The branch-protection verdict
   now comes from keyvault's forgejo-broker (infra ADR-0003 §2) — the watcher asks a
@@ -87,12 +88,18 @@
 
   <key>EnvironmentVariables</key>
   <dict>
-    <!-- no default: an unconfigured watcher scans nothing. comma-separated owner/repo -->
-    <key>FLEET_WATCH_REPOS</key><string></string>
-
     <!-- replace with the real Fleet-ops push URL at install; empty = print-only,
          and the runbook treats pushes as THE failure channel -->
     <key>FLEET_NTFY_URL</key><string></string>
+
+    <!-- angelia, tried FIRST by every page (plan 0144 D2); FLEET_NTFY_URL above
+         is the fallback until angelia is shown to deliver. Fill URL and APP at
+         install. The token is NEVER here: the helper named by TOKEN_CMD prints
+         it per page, and a launchd plist is readable on the host and committed. -->
+    <key>FLEET_ANGELIA_URL</key><string></string>
+    <key>FLEET_ANGELIA_APP</key><string></string>
+    <key>FLEET_ANGELIA_USER</key><string></string>
+    <key>FLEET_ANGELIA_TOKEN_CMD</key><string></string>
 
     <!-- numeric Forgejo user id; empty disables the respawn comment path -->
     <key>FLEET_OPERATOR_UID</key><string></string>
@@ -146,6 +153,18 @@
        never the expensive thing here. The expensive thing is the child, and the
        child must not be throttled. -->
 
+  <!-- launchd opens this path ONCE, at exec, and hands the resulting fd to
+       this long-lived process — exactly the startup-diagnostics channel a
+       crash before fleet-watch's own logging can run still needs, so these
+       two keys are UNCHANGED by plan 0187's rotation. What changed is on the
+       process side: once a week fleet-watch renames this path out (to a
+       dated archive under logs/archive/, see docs/plan-dispatch.md) and
+       reopens fd 1 and fd 2 itself onto a fresh file at this same path —
+       otherwise the inherited fd would keep writing into the now-archived
+       inode forever, since a rename does not change what an already-open fd
+       points to. `tail -f` does not survive that rename (it follows the
+       descriptor); `tail -F` does (it follows the path). No plist key makes
+       either true — it's HOW the two tools themselves read a renamed file. -->
   <key>StandardOutPath</key>
   <string>/Users/operator/dev/.fleet/watch.log</string>
   <key>StandardErrorPath</key>

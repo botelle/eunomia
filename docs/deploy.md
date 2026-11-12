@@ -65,7 +65,12 @@ by name even if it is in `FLEET_PINS` (one mover per pin), while
 
 1. `git fetch` the pin, read `origin/main` as the target. The fetch rides an
    ssh ControlMaster that is already up (`ssh -O check`) and never dials a new
-   one; with none up the binding is skipped this cycle.
+   one; with none up the binding is skipped this cycle. On opshost the master is
+   kept up by `launchd/org.eunomia.fleet-git-master.plist`, which needs a
+   `Host forge.example` block in `~/.ssh/config` with `Port 3022` and
+   `ControlMaster auto` / `ControlPersist yes` (the plist's header has the
+   block). Until 2026-09-30 nothing kept a master up, so every cycle on opshost
+   ended `unfetchable` and fleet-deploy had never deployed.
 2. **Skip an attempted target.** A `deploy-started` for this binding at the
    target with no `deploy-verified` means it was tried and failed. Nothing
    happens until `main` moves to a different SHA.
@@ -115,3 +120,66 @@ fleet-events --type deploy-verified --json --since 30d \
 A commit that failed is a `deploy-started` with no `deploy-verified` at that
 SHA. A rollback is a `deploy-started` (`kind: rollback`) for the older SHA,
 followed by its own `deploy-verified`.
+
+## Enrolling a repository is one reviewed line (plans 0122, 0134)
+
+`config/repos.conf` is the only list. The units that run from the eunomia pin
+read it from that checkout, never from `~/dev/eunomia` and never over the API:
+
+| Unit | Reads from `repos.conf` |
+|---|---|
+| `org.eunomia.fleet-watch` | the `dispatch` repositories it scans |
+| `org.eunomia.fleet-rebase` | the `dispatch` repositories the sweep covers |
+| `fleet-record` | the `dispatch` repositories whose merges it records |
+| `org.eunomia.fleet-pin-advance`, `org.eunomia.fleet-pin-watch` | a pin, `~/.local/share/pins/<name>`, for every listed repository |
+
+So merging a PR that adds a `repo:` line, and the eunomia pin reaching that
+commit, is the whole of enrolment: no installed plist is edited.
+A `repos.conf` that is missing, unreadable or lists no repository scans nothing
+and pages once; it never falls back to `FLEET_WATCH_REPOS`, which is no longer
+read (a leftover value that differs is warned about each cycle). The file is
+intent; the broker's per-cycle protection verdict stays the authority.
+
+A line the parser cannot read (an unknown flag such as `dispach`, a line that is
+not a `repo:` line, a `repo:` with no name) does not stop the fleet: every line
+that parses is still scanned, but the repository on the bad line is **not**
+scanned, and the watcher logs one `WARN` per cycle and pages once per distinct set
+of errors, titled "repos.conf has a line the watcher cannot read" and listing each
+`repos.conf:<line>: <message>` (plan 0136). The page clears when the file parses
+cleanly. `fleet-record` reads the same list from the pin, not from its checkout.
+
+Environment variables still read by these units: `FLEET_PINS` (pins that are
+**not** a listed repository, `~/agent` only, `path=ref` syntax kept),
+`FLEET_OPERATOR_UID`, `FLEET_IMPLEMENTER_UIDS`, `FLEET_NTFY_URL`,
+`FLEET_FORGEJO_URL`, `FLEET_BROKER_SOCKET`, `FLEET_RECORD_*`.
+`tests/test_pin_set_covers_the_fleet.py` fails if a plist names a per-repo pin
+or a watch list. `org.eunomia.fleet-pin-watch` runs the watcher with the
+pins-only flag, which returns before any cycle: now that every unit can read the
+list, that early return is its only guard against dispatching.
+
+**The one owner step.** A new repository's pin is created once, by hand, below.
+After a change to the plists, reinstall the four units from the pin (bootout,
+wait for exit, enable, bootstrap, as above) to drop the hand-filled lists.
+
+**Creating a missing pin.** The scheduled mover still refuses `missing`. After
+a deploy, and whenever `repos.conf` grows, the owner runs once by hand:
+
+    fleet-pin-advance --dry-run --create-missing    # `would create` / refusals
+    fleet-pin-advance --create-missing
+
+It clones, over `ssh://git@forge.example:2222/operator/<repo>.git` with no
+checkout, then detaches at `origin/main`, only for a repository that is in
+`repos.conf` and that the broker vouches for. `dirty`, `attached`, `not-a-repo`,
+`unfetchable`, a broker that cannot vouch, and a repo with no `main` rule are
+still refused. The flag is never set in a plist.
+
+**Fetch load (to be filled in by the owner after the first full-set run).**
+Each run fetches every pin over one ssh key; `unfetchable` refusals have
+clustered at the front of the list (78 of 854 runs before this change).
+
+| | wall-clock of one run | `unfetchable` over a day |
+|---|---|---|
+| 3 pins (before) | _not measured in this PR_ | 78 of 854 runs |
+| full set (after) | _record after deploy_ | _record after deploy_ |
+
+If the rate rises above 78/854, say so; parallelism is deliberately not added.

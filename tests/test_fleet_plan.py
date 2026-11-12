@@ -268,3 +268,228 @@ def test_a_non_numeric_head_is_still_not_an_id(tmp_path):
     splits to "notes", which is not four digits, so it claims no id."""
     p = _named(tmp_path, "notes-on-0025.md")
     assert not any("also claimed by" in e for e in _load().lint(p))
+
+
+# --------------------------------------------------- review: (plan 0150, ADR-0025 §1)
+
+import json
+
+import pytest
+
+STYLE_REPO = "acme/widgets"
+STYLE_CONFIG = {"v": 1, "repos": {STYLE_REPO: {
+    "paths": ["app/Theme/*.swift", "app/Colors/**/*.json"],
+    "binary_paths": ["app/Art/*.png"],
+    "screenshot": {"platform": "ios-simulator", "command": "tools/shoot.sh",
+                   "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+                   "device": "iPhone 17", "scale": 3, "themes": ["classic"],
+                   "appearances": ["light"], "timeout_minutes": 10}}}}
+LEASE = "docs/screenshots/*-0009-x/**"
+
+
+def _style_plan(tmp_path, monkeypatch, review="style", repo=STYLE_REPO, tier=1,
+                paths=("app/Theme/*.swift", LEASE, "plans/0009-x.md")):
+    cfg = tmp_path / "style-review.json"
+    cfg.write_text(json.dumps(STYLE_CONFIG))
+    mod = _load()
+    monkeypatch.setattr(mod._style(), "CONFIG", cfg)
+    p = tmp_path / "0009-x.md"
+    text = PLAN.format(status="ready", boundaries="- x because y").replace(
+        "repo: operator/eunomia", f"repo: {repo}\nreview: {review}").replace(
+        "tier: 1", f"tier: {tier}").replace('paths: ["a"]', "paths: " + json.dumps(list(paths)))
+    p.write_text(text)
+    return mod, p
+
+
+def test_a_declared_style_plan_with_its_lease_inside_lints_at_any_tier(tmp_path, monkeypatch):
+    for tier in (0, 1, 3):
+        mod, p = _style_plan(tmp_path, monkeypatch, tier=tier)
+        assert mod.lint(p) == []
+
+
+def test_the_full_review_and_an_absent_field_are_always_fine(tmp_path, monkeypatch):
+    mod, p = _style_plan(tmp_path, monkeypatch, review="full", repo="acme/other")
+    assert mod.lint(p) == []
+    assert mod.lint(_write(tmp_path)) == []
+
+
+def test_a_review_outside_the_closed_set_is_refused(tmp_path, monkeypatch):
+    mod, p = _style_plan(tmp_path, monkeypatch, review="styel")
+    assert any("review 'styel'" in e for e in mod.lint(p))
+
+
+def test_a_style_plan_in_an_undeclared_repo_is_refused(tmp_path, monkeypatch):
+    mod, p = _style_plan(tmp_path, monkeypatch, repo="acme/other")
+    assert any("declares no style paths" in e for e in mod.lint(p))
+
+
+def test_a_lease_entry_outside_the_patterns_is_refused(tmp_path, monkeypatch):
+    mod, p = _style_plan(tmp_path, monkeypatch, paths=(
+        "app/Theme/*.swift", "app/Other/o.swift", "app/Theme/**", LEASE))
+    errs = mod.lint(p)
+    assert any("'app/Other/o.swift'" in e for e in errs)
+    assert any("'app/Theme/**'" in e for e in errs)   # a glob that is not a declared pattern
+
+
+def test_a_literal_path_that_a_pattern_matches_is_allowed(tmp_path, monkeypatch):
+    mod, p = _style_plan(tmp_path, monkeypatch, paths=(
+        "app/Theme/Colors.swift", "app/Art/logo.png", LEASE))
+    assert mod.lint(p) == []
+
+
+def test_a_style_plan_without_its_evidence_lease_is_refused(tmp_path, monkeypatch):
+    mod, p = _style_plan(tmp_path, monkeypatch, paths=("app/Theme/*.swift",))
+    assert any("evidence lease 'docs/screenshots/*-0009-x/**'" in e for e in mod.lint(p))
+
+
+def test_a_malformed_declaration_refuses_a_style_plan(tmp_path, monkeypatch):
+    mod, p = _style_plan(tmp_path, monkeypatch)
+    mod._style().CONFIG.write_text("{")
+    assert any("malformed" in e for e in mod.lint(p))
+
+
+# --------------------------------------------------------- spec_watch (plan 0177)
+
+GOVERNANCE = """spec_watch:
+  - name: api-routes
+    kind: api
+    code:
+      - "api/speakhush/**"
+    specs:
+      - "docs/declared-behaviour.md"
+  - name: screens
+    kind: screen
+    code:
+      - "ios/SpeakHush/Leads/**"
+    specs:
+      - "ios/SpeakHushFlows/Leads/**"
+"""
+
+SPEC_PLAN = """---
+id: 0009-x
+status: ready
+repo: acme/widgets
+zone: public
+tier: 1
+paths: {paths}
+---
+
+## 1. Goal
+g
+
+## 2. Deliverables
+- d
+
+## 3. Boundaries
+- don't reuse the collector regex, because it guards free text
+
+## 4. Definition of done
+{dod}
+
+## 5. Handoff
+h
+
+## 6. Resources
+- lease: b
+"""
+
+
+def _spec_repo(tmp_path, governance=GOVERNANCE):
+    """A `plans/` directory beside a `governance.yaml`, mirroring a real
+    repo's layout — `_governance_path` reads the plan's grandparent."""
+    (tmp_path / "plans").mkdir()
+    if governance is not None:
+        (tmp_path / "governance.yaml").write_text(governance)
+    return tmp_path / "plans"
+
+
+def _spec_plan(plans_dir, paths, dod="- dod", extra=""):
+    p = plans_dir / "0009-x.md"
+    text = SPEC_PLAN.format(paths=json.dumps(list(paths)), dod=dod)
+    if extra:
+        text = text.replace("---\n\n## 1. Goal", f"{extra.rstrip()}\n---\n\n## 1. Goal")
+    p.write_text(text)
+    return p
+
+
+def test_a_reached_rule_with_no_spec_at_all_is_refused(tmp_path):
+    plans = _spec_repo(tmp_path)
+    p = _spec_plan(plans, ["api/speakhush/leads.py"])
+    errs = _load().lint(p)
+    assert any("api-routes" in e for e in errs), errs
+
+
+def test_a_reached_rule_with_the_spec_leased_but_not_mentioned_is_still_refused(tmp_path):
+    plans = _spec_repo(tmp_path)
+    p = _spec_plan(plans, ["api/speakhush/leads.py", "docs/declared-behaviour.md"])
+    errs = _load().lint(p)
+    assert any("api-routes" in e for e in errs), errs
+
+
+def test_a_reached_rule_with_the_spec_leased_and_mentioned_is_clean(tmp_path):
+    plans = _spec_repo(tmp_path)
+    p = _spec_plan(plans, ["api/speakhush/leads.py", "docs/declared-behaviour.md"],
+                   dod="- update `docs/declared-behaviour.md` with the new route")
+    errs = _load().lint(p)
+    assert not any("api-routes" in e for e in errs), errs
+
+
+def test_a_new_file_lease_reaches_its_rule_through_the_fixed_prefix(tmp_path):
+    """No file under `ios/SpeakHush/Leads/` exists yet — the `code` glob
+    can only be reached by comparing fixed prefixes, never by matching an
+    existing file."""
+    plans = _spec_repo(tmp_path)
+    p = _spec_plan(plans, ["ios/SpeakHush/Leads/**"])
+    errs = _load().lint(p)
+    assert any("screens" in e for e in errs), errs
+
+
+def test_spec_exempt_with_a_reason_silences_a_reached_rule(tmp_path):
+    plans = _spec_repo(tmp_path)
+    p = _spec_plan(plans, ["api/speakhush/leads.py"])
+    p.write_text(p.read_text().replace(
+        "tier: 1", 'tier: 1\nspec_exempt: "refactor, no route or screen change"'))
+    errs = _load().lint(p)
+    assert not any("api-routes" in e for e in errs), errs
+
+
+def test_an_empty_spec_exempt_is_refused(tmp_path):
+    plans = _spec_repo(tmp_path)
+    p = _spec_plan(plans, ["api/speakhush/leads.py"])
+    p.write_text(p.read_text().replace("tier: 1", 'tier: 1\nspec_exempt: ""'))
+    errs = _load().lint(p)
+    assert any("spec_exempt" in e for e in errs), errs
+
+
+def test_no_governance_yaml_adds_no_problems(tmp_path):
+    plans = _spec_repo(tmp_path, governance=None)
+    p = _spec_plan(plans, ["api/speakhush/leads.py"])
+    errs = _load().lint(p)
+    assert not any("spec_watch" in e or "api-routes" in e for e in errs), errs
+
+
+def test_governance_yaml_with_no_spec_watch_key_adds_no_problems(tmp_path):
+    plans = _spec_repo(tmp_path, governance="other_key: 1\n")
+    p = _spec_plan(plans, ["api/speakhush/leads.py"])
+    errs = _load().lint(p)
+    assert not any("spec_watch" in e or "api-routes" in e for e in errs), errs
+
+
+def test_the_replay_speakhush_0066_through_0068_each_fail(tmp_path):
+    """speakhush plans 0066-0068 (eunomia has no access to clone that repo
+    from this sandbox, so these are synthetic reconstructions of the shape
+    the plan's own 'Why this exists' describes: a lease reaching
+    `api/speakhush/**` or a Leads screen, with neither spec leased nor
+    mentioned) — each must fail the rule its own code reaches."""
+    plans = _spec_repo(tmp_path)
+    for name, paths in (
+        ("0066-investigate-a-lead", ["api/speakhush/leads/investigate.py"]),
+        ("0067-draft-a-lead-reply", ["ios/SpeakHush/Leads/DraftReply.swift"]),
+        ("0068-save-or-decline-a-lead", ["api/speakhush/leads/decide.py",
+                                        "ios/SpeakHush/Leads/Decide.swift"]),
+    ):
+        p = plans / f"{name}.md"
+        p.write_text(SPEC_PLAN.format(paths=json.dumps(paths), dod="- dod")
+                     .replace("id: 0009-x", f"id: {name}"))
+        errs = _load().lint(p)
+        assert any("spec_watch rule" in e for e in errs), (name, errs)

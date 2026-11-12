@@ -33,9 +33,9 @@
 </defs>
 <rect class="bg" x="0" y="0" width="1900" height="2150" fill="#ffffff"/>
 <text class="t" x="950" y="52" text-anchor="middle">Plan dispatch — the gate, the lane, and black-box tests</text>
-<text class="sub" x="950" y="76" text-anchor="middle">Version 1.10 — 2026-09-13 by Fleet Operator</text>
+<text class="sub" x="950" y="76" text-anchor="middle">Version 1.11 — 2026-09-27 by Fleet Operator</text>
 <text class="n" x="60" y="46" text-anchor="start">Tracing: one feature plan, from draft to merge.</text>
-<text class="n" x="60" y="62" text-anchor="start">Test lanes are opt-in per repo, default off. Setting the flag is a configuration change.</text>
+<text class="n" x="60" y="62" text-anchor="start">Every repository has a test lane. Who tests and who reviews is per-repo configuration (ADR-0013).</text>
 <text class="n" x="60" y="78" text-anchor="start">The implementation lane is built; the test lanes are not.</text>
 <rect class="panel" x="1560" y="96" width="300" height="322" rx="8"/>
 <text class="h" x="1578" y="124" text-anchor="start">Legend</text>
@@ -68,7 +68,7 @@
 <text class="b" x="156" y="217">A prompt from any stakeholder. Opus turns</text>
 <text class="b" x="156" y="234">it into one plan file per feature, opened</text>
 <text class="b" x="156" y="251">as a plan PR.</text>
-<text class="n" x="156" y="271">Via intakebot it also routes the architecture,</text>
+<text class="n" x="156" y="271">Via the gateway it also routes architecture,</text>
 <text class="n" x="156" y="286">security and privacy questions to a human</text>
 <text class="n" x="156" y="301">BEFORE there is a plan to review.</text>
 <rect class="ship" x="140" y="360" width="360" height="150" rx="8"/>
@@ -83,7 +83,7 @@
 <path class="fail" d="M140,1470 L80,1470 L80,435 L136,435"/>
 <text class="n" x="88" y="1430" text-anchor="start">failures</text>
 <path class="ret" d="M320,360 L320,314"/>
-<text class="n" x="330" y="336" text-anchor="start">a handle, via intakebot or a page</text>
+<text class="n" x="330" y="336" text-anchor="start">a handle, via the gateway or a page</text>
 <rect class="zone" x="580" y="150" width="420" height="180" rx="8"/>
 <text class="h" x="596" y="174" text-anchor="start">plans/ on a branch</text>
 <rect class="plain" x="596" y="186" width="388" height="30" rx="4"/>
@@ -157,22 +157,20 @@
 <text class="h" x="156" y="1444">Minos: you merge the code PR</text>
 <text class="b" x="156" y="1465">Records which test lanes ran — a PR that</text>
 <text class="b" x="156" y="1482">silently lost them is a false green.</text>
-<rect class="todo" x="1020" y="946" width="420" height="136" rx="8"/>
+<rect class="ship" x="1020" y="946" width="420" height="296" rx="8"/>
 <text class="actM" x="1424" y="970" text-anchor="end">MECHANICAL</text>
-<text class="badge todob" x="1036" y="970">TO BUILD</text>
-<text class="h" x="1036" y="992">Repo opted in?</text>
-<text class="b" x="1036" y="1013">config/repos.conf, default off — an untouched</text>
-<text class="b" x="1036" y="1030">repo discloses nothing.</text>
-<text class="b" x="1036" y="1047">Setting it either way is a configuration</text>
-<text class="b" x="1036" y="1064">change, not a reviewed merge.</text>
-<path class="fl" d="M1230,1082 L1230,1108"/>
-<rect class="ship" x="1020" y="1112" width="420" height="130" rx="8"/>
-<text class="actM" x="1424" y="1136" text-anchor="end">MECHANICAL</text>
-<text class="badge shipb" x="1036" y="1136">SHIPPED</text>
-<text class="h" x="1036" y="1158">Bundle builder — first party</text>
-<text class="b" x="1036" y="1179">Generated contract only: OpenAPI or --help,</text>
-<text class="b" x="1036" y="1196">event names, config keys, harness entry.</text>
-<text class="n" x="1036" y="1216">No source. Nothing is present unless code put it there.</text>
+<text class="badge shipb" x="1036" y="970">SHIPPED</text>
+<text class="h" x="1036" y="992">Every repo's test lane — no consent flag</text>
+<text class="b" x="1036" y="1013">No flag in config/repos.conf gates this: every repo</text>
+<text class="b" x="1036" y="1030">has a test lane. Which runner holds `tester` is the</text>
+<text class="b" x="1036" y="1047">disclosure decision, made per repo in fleet-models.</text>
+<text class="b" x="1036" y="1064">Ordinal 1 resolves from the repo's own row, else the</text>
+<text class="b" x="1036" y="1081">'default' row (`sub-opus` — Anthropic, which already</text>
+<text class="b" x="1036" y="1098">holds the code, so the default discloses nothing new).</text>
+<text class="n" x="1036" y="1118">Bundle builder — first party. Generated contract only:</text>
+<text class="n" x="1036" y="1133">OpenAPI or --help, event names, config keys, harness</text>
+<text class="n" x="1036" y="1148">entry. No source. Nothing is present unless code put</text>
+<text class="n" x="1036" y="1163">it there.</text>
 <path class="bus" d="M1230,1242 L1230,1276"/>
 <path class="bus" d="M1120,1276 L1340,1276"/>
 <path class="fl" d="M1120,1276 L1120,1312"/>
@@ -249,24 +247,24 @@
 <text class="b" x="1578" y="730" text-anchor="start">disagree, the spec was ambiguous.</text>
 <rect class="panel" x="1560" y="798" width="300" height="250" rx="8"/>
 <text class="h" x="1578" y="826" text-anchor="start">Where the decision lives</text>
-<text class="b" x="1578" y="852" text-anchor="start">Mechanism and default-off: an ADR</text>
-<text class="b" x="1578" y="870" text-anchor="start">in eunomia.</text>
+<text class="b" x="1578" y="852" text-anchor="start">Every repo is tested: ADR-0013, not a</text>
+<text class="b" x="1578" y="870" text-anchor="start">flag in config/repos.conf.</text>
 <text class="b" x="1578" y="888" text-anchor="start"></text>
-<text class="b" x="1578" y="906" text-anchor="start">Per-repo answer: config/repos.conf,</text>
-<text class="b" x="1578" y="924" text-anchor="start">read from main. Setting it is a</text>
+<text class="b" x="1578" y="906" text-anchor="start">Who tests, who reviews: fleet-models,</text>
+<text class="b" x="1578" y="924" text-anchor="start">read from main. Setting either is a</text>
 <text class="b" x="1578" y="942" text-anchor="start">configuration change, not a merge.</text>
 <text class="b" x="1578" y="960" text-anchor="start"></text>
-<text class="b" x="1578" y="978" text-anchor="start">A refusal: an ADR in the repo</text>
-<text class="b" x="1578" y="996" text-anchor="start">that refused, so the absence reads</text>
-<text class="b" x="1578" y="1014" text-anchor="start">as decided, not overlooked.</text>
+<text class="b" x="1578" y="978" text-anchor="start">A same-family check: recorded, not</text>
+<text class="b" x="1578" y="996" text-anchor="start">refused — the review or test names</text>
+<text class="b" x="1578" y="1014" text-anchor="start">its model (ADR-0013 §5-6).</text>
 <rect class="panel" x="1560" y="1082" width="300" height="214" rx="8"/>
 <text class="h" x="1578" y="1110" text-anchor="start">What is actually built</text>
 <text class="b" x="1578" y="1136" text-anchor="start">fleet-watch, the plan format,</text>
 <text class="b" x="1578" y="1154" text-anchor="start">repo enrollment, plan review,</text>
-<text class="b" x="1578" y="1172" text-anchor="start">bin/fleet-bundle and mopsus:</text>
-<text class="b" x="1578" y="1190" text-anchor="start">shipped. Orchestrator: the whole</text>
-<text class="b" x="1578" y="1208" text-anchor="start">wrapper — lease, session, review</text>
-<text class="b" x="1578" y="1226" text-anchor="start">loop, steward, freeze.</text>
+<text class="b" x="1578" y="1172" text-anchor="start">bin/fleet-bundle, the tester gate</text>
+<text class="b" x="1578" y="1190" text-anchor="start">in fleet-lane, and mopsus: shipped.</text>
+<text class="b" x="1578" y="1208" text-anchor="start">Orchestrator: the whole wrapper —</text>
+<text class="b" x="1578" y="1226" text-anchor="start">lease, session, review loop, steward.</text>
 <text class="b" x="1578" y="1244" text-anchor="start"></text>
 <text class="b" x="1578" y="1262" text-anchor="start">The IGNITION GATE and the test</text>
 <text class="b" x="1578" y="1280" text-anchor="start">lane are specified and not built.</text>

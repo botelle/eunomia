@@ -95,6 +95,16 @@ def _orchestrator_module():
     return mod
 
 
+def _config_module():
+    """`bin/fleet-config`, loaded on demand for `resolve_setting` and the cap
+    parser — the one reader of `fleet_setting`. A fresh load per call so its
+    `DB` sees `FLEET_DB` and `EUNOMIA_FLEET_DIR` as they are now."""
+    loader = importlib.machinery.SourceFileLoader("fleet_config", str(BIN / "fleet-config"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleet_config", loader))
+    loader.exec_module(mod)
+    return mod
+
+
 def _models_module():
     """`bin/fleet-models`, loaded on demand, for `resolve_repo` and
     `active_ordinals` — the one reader of `repo_model`, reused rather than
@@ -110,7 +120,14 @@ class Stop(Exception):
     """A refusal, with the reason as its message. Every gate raises this;
     `main` is the one place that catches it, logs it, pages it and exits
     non-zero. Never a bare `sys.exit` mid-function — a refusal must always
-    reach the run log and the page."""
+    reach the run log and the page.
+
+    `outcome` (plan 0100 D4) is the `lane_run` outcome the run ends with; the
+    default is decided by how far the run got when it was raised."""
+
+    def __init__(self, message="", outcome=None):
+        super().__init__(message)
+        self.outcome = outcome
 
 
 # ------------------------------------------------------------------ constants
@@ -123,16 +140,100 @@ DECLARED_BEHAVIOUR_PATH = "docs/declared-behaviour.md"
 # does not spend the operator's whole session.
 SPAWN_TIMEOUT_SECONDS = 1800
 
+# antigravity's per-turn tool metadata, which it can attach to the answer
+# document itself (see `_antigravity_document`).
+ANTIGRAVITY_TOOL_KEYS = frozenset({"toolAction", "toolSummary"})
+
+# The antigravity adapter's second stdin line. Measured on antigravity 1.3.3,
+# 2026-10-12, five runs: given the lane prompt alone the model's first act is
+# a tool call (`run_command ls -la`), headless mode denies it, and the turn
+# ends with an empty response — whatever the prompt says about tools, and with
+# `--model` pinned. The CLI runs one turn per stdin line in one conversation,
+# and the turn after the denial is the one that answers. The line is written
+# only after a first turn that was denied a tool and held no document
+# (`_antigravity_second_turn`); a first turn that answered gets no second one.
+# It is outside `prompt.txt`, so it is outside the prompt hash: `stdin.bin`
+# and the `second-turn` log line are the record that it was sent.
+ANTIGRAVITY_SECOND_TURN = (
+    "No tool is available in this session, and a tool call ends the turn with "
+    "no output. If you have not already replied with the one JSON document, "
+    "reply with it now and nothing else."
+)
+
+# How a run ends (plan 0100 D4): a closed set, held once.
+OUTCOMES = ("running", "pr-opened", "quota", "vendor-error", "timeout",
+            "bad-result", "landing-failed", "refused", "capped", "no-tests")
+# "later, unchanged, this may pass" — a vendor quota and a runner cap both.
+EXIT_LATER = 75
+CAP_WINDOW = "-1 day"          # rolling 24 hours, never a calendar day
+USAGE_JSON_MAX = 8 * 1024
+DETAIL_MAX = 300
+
+# `model_source` (plan 0190): a closed set naming where `model` came from.
+# `launch-config` is this program's own registry pin (`Runner.model`), known
+# before anything is spawned; `cli-report` is a vendor's own trusted result
+# metadata (`modelUsage`, `run.usage`'s `models`) — never free-form stdout
+# text, which plan 0190's Boundaries call untrusted. NULL is a row from
+# before this column existed: unknown attribution, never backfilled (see
+# `_migrate` below).
+MODEL_SOURCES = ("launch-config", "cli-report")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS lane_run (
+  run_id         TEXT PRIMARY KEY,       -- ULID
+  repo           TEXT NOT NULL,
+  plan           TEXT NOT NULL,
+  runner         TEXT NOT NULL,
+  family         TEXT,
+  model          TEXT,
+  requested_model TEXT,                  -- plan 0190: the launch-pinned identity, never overwritten
+  model_source   TEXT,                   -- plan 0190: 'launch-config' or 'cli-report', see MODEL_SOURCES
+  sha            TEXT,                   -- reader worktree HEAD, 40 hex
+  prompt_sha256  TEXT,
+  prompt_bytes   INTEGER,
+  started_at     TEXT NOT NULL,
+  ended_at       TEXT,
+  spawned        INTEGER NOT NULL,
+  outcome        TEXT NOT NULL,
+  rc             INTEGER,
+  usage_json     TEXT,
+  detail         TEXT,
+  pr             INTEGER
+);
+CREATE INDEX IF NOT EXISTS lane_run_runner_started ON lane_run(runner, started_at);
+"""
+
+
+def _migrate(con):
+    """`CREATE TABLE IF NOT EXISTS` adds no columns to a `lane_run` written
+    before plan 0190: without this, a pre-existing table would silently keep
+    recording NULL for `requested_model`/`model_source` on every run, forever
+    (the same gap `fleet-reviews`'s own `_migrate` closed for `review`'s
+    `dismissed`/`stale`). Add what is missing, both NULL — a legacy row's
+    `model`, if any, is left exactly as it was written; nothing here infers a
+    `requested_model` for it from this host's CURRENT registry pin, which may
+    have moved since that row was written (Boundaries: no inference from the
+    current seat)."""
+    have = {r[1] for r in con.execute("PRAGMA table_info(lane_run)")}
+    for col in ("requested_model", "model_source"):
+        if col not in have:
+            con.execute(f"ALTER TABLE lane_run ADD COLUMN {col} TEXT")
+    con.commit()
+
+
 # The one directory a lane result may write under (Boundaries: "a repo with
 # another test layout is a later amendment, not a field nobody has defined").
-CONFINE_ROOT = "tests"
+# ADR-0014 §1-§2: the lane writes only here, so its output is told apart from
+# unit tests by path (plan 0102).
+CONFINE_ROOT = "tests/lane"
+_CONFINE_PARTS = tuple(CONFINE_ROOT.split("/"))
+# What pytest's default `prepend` import mode refuses to see twice.
+_TEST_MODULE_RE = re.compile(r"^(?:test_.*\.py|conftest\.py)$")
 
 # Directories a forge or a hook executes from — refused even though every
 # one of them also fails the CONFINE_ROOT check above; stated explicitly
 # rather than relying only on that check to close the door.
 _EXECUTABLE_ROOTS = (".forgejo", ".github", ".claude", ".git", ".githooks")
-
-_ADR_PATH_RE = re.compile(r"docs/adr/\d{4}-[A-Za-z0-9-]+\.md")
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -146,8 +247,8 @@ LANE_PREAMBLE = """\
 You are a blackbox integration tester, not an implementer (ADR-0006).
 
 You have been handed, in this order: this repository's feature plan, the
-text of every architecture decision record the plan cites in its Resources
-section, and a GENERATED CONTRACT — the externally observable surface of
+text of every architecture decision record the plan cites, by path or by
+name, and a GENERATED CONTRACT — the externally observable surface of
 this repository (routes, CLI arguments, declared event names, configuration
 keys, harness entry points) plus a hand-written declared-behaviour document
 describing exit codes and output shapes. You have NOT been handed this
@@ -164,41 +265,247 @@ rather than guessing.
 Reply with exactly one JSON document matching this shape, and no other top
 level keys:
 
-  {"files": [{"path": "tests/...", "content": "..."}, ...],
+  {"files": [{"path": "tests/lane/...", "content": "..."}, ...],
    "gaps": ["...", ...],
    "notes": "..."}
 
-Every "path" must be a relative path under tests/. Nothing outside this one
-JSON document is read; anything you say outside it is discarded.
+Every "path" must be a relative path under tests/lane/. A test file finds the
+repository root with `Path(__file__).resolve().parents[2]`. Nothing outside
+this one JSON document is read; anything you say outside it is discarded.
 """
 
 
-def _find_adr_paths(plan_text):
-    """Every unique `docs/adr/NNNN-*.md` path the plan text names, in the
-    order first seen. A bare mention of "ADR-0006" is not a path and is not
-    matched — Resources' own words, "a name without a path is not an ADR
-    reference"."""
+# Plan 0141 D1: the budget is the smallest prompt size the registered testers
+# are measured to read whole, less a quarter (docs/test-lane.md, "Prompt
+# budget"). PROVISIONAL: the by-hand measurement against each CLI is NOT yet
+# done, so this is not a measured value. Its only evidence is eunomia#922: a
+# 214-218 KB prompt reached antigravity 1.3.3 with 31,011 bytes cut, so it read
+# whole at most ~187 KB; 187,000 less a quarter is 140,000. Replace it with the
+# measured figure once D1 is recorded.
+PROMPT_BUDGET = 140_000
+
+_ADR_CITE_RE = re.compile(r"docs/adr/\d{4}-[A-Za-z0-9-]+\.md|ADR-(\d{4})")
+_HEADING_RE = re.compile(r"^#{1,6}[ \t]+(.*)$", re.M)
+
+
+def _find_adr_cites(plan_text):
+    """Every ADR the plan text cites, by `docs/adr/NNNN-*.md` path or by bare
+    `ADR-NNNN` name, in the order first seen. A path is returned as itself, a
+    name as the number; resolution is `_resolve_adrs`'s."""
     seen = []
-    for m in _ADR_PATH_RE.finditer(plan_text or ""):
-        if m.group(0) not in seen:
-            seen.append(m.group(0))
+    for m in _ADR_CITE_RE.finditer(plan_text or ""):
+        cite = m.group(0) if m.group(1) is None else m.group(1)
+        if cite not in seen:
+            seen.append(cite)
     return seen
 
 
-def build_prompt(plan_text, worktree, bundle_text):
-    """Preamble, then the plan verbatim, then every referenced ADR's text,
-    then the bundle JSON — the fixed order D1.3 names. A missing referenced
-    ADR is skipped, not a refusal: the plan text is copied verbatim and this
-    program does not validate the plan's own claims about its Resources."""
-    parts = [LANE_PREAMBLE, "\n--- PLAN ---\n", plan_text]
-    for rel in _find_adr_paths(plan_text):
-        p = worktree / rel
-        if p.is_file():
-            parts.append(f"\n--- {rel} ---\n")
-            parts.append(p.read_text(encoding="utf-8", errors="replace"))
-    parts.append("\n--- GENERATED CONTRACT (bundle) ---\n")
-    parts.append(bundle_text)
-    return "".join(parts)
+def _resolve_adrs(plan_text, worktree):
+    """(paths, notes). `ADR-NNNN` resolves to the one `docs/adr/NNNN-*.md`; no
+    file, or more than one, is named in notes and skipped, never guessed. A
+    name and a path for the same file yield it once."""
+    paths, notes = [], []
+    for cite in _find_adr_cites(plan_text):
+        if cite.startswith("docs/"):
+            hits = [cite] if (worktree / cite).is_file() else []
+            label = cite
+        else:
+            hits = sorted(str(p.relative_to(worktree)) for p in
+                          (worktree / "docs" / "adr").glob(f"{cite}-*.md") if p.is_file())
+            label = f"ADR-{cite}"
+        if len(hits) == 1:
+            if hits[0] not in paths:
+                paths.append(hits[0])
+        elif hits:
+            notes.append(f"{label}: matches more than one file ({', '.join(hits)}); skipped")
+        else:
+            notes.append(f"{label}: no such file in the worktree; skipped")
+    return paths, notes
+
+
+def _leased_paths(plan_text):
+    """The plan front matter's `paths:` list."""
+    m = re.match(r"---\n(.*?)\n---", plan_text or "", re.S)
+    out, in_paths = [], False
+    for line in (m.group(1).splitlines() if m else []):
+        if re.match(r"paths:\s*$", line):
+            in_paths = True
+        elif in_paths:
+            item = re.match(r"\s+-\s+[\"']?([^\"'#]+?)[\"']?\s*$", line)
+            if not item:
+                break
+            out.append(item.group(1))
+    return out
+
+
+_DELIV_HEAD_RE = re.compile(r"^#{3,6}[ \t]+D(\d+)\.[ \t]*(.*)$")
+_DELIV_LEAD_RE = re.compile(r"^(?:[-*][ \t]+)?\*\*D(\d+):\*\*[ \t]*(.*)$")
+_DOD_ITEM_RE = re.compile(r"^(\d+)\.[ \t]+(.*)$")
+
+
+def _plan_section(plan_text, number):
+    """The lines under the plan's `## <number>.` heading, up to the next `## N.`
+    heading, or []."""
+    out, inside = [], False
+    for line in (plan_text or "").splitlines():
+        if re.match(r"##[ \t]+\d+\.", line):
+            inside = bool(re.match(rf"##[ \t]+{number}\.", line))
+        elif inside:
+            out.append(line)
+    return out
+
+
+def plan_items(plan_text):
+    """[(id, first line)] the plan numbers itself (plan 0142 D1): `D<n>` for each
+    `### D<n>.` heading or `**D<n>:**` lead in section 2, `DoD<n>` for each
+    numbered item in section 4, in order, deduplicated. The number is the one
+    the plan wrote; an item it did not number gets no id."""
+    out, seen = [], set()
+
+    def add(item_id, text):
+        if item_id not in seen:
+            seen.add(item_id)
+            out.append((item_id, text.strip()))
+
+    body = _plan_section(plan_text, 2)
+    for i, line in enumerate(body):
+        m = _DELIV_HEAD_RE.match(line) or _DELIV_LEAD_RE.match(line)
+        if not m:
+            continue
+        text = m.group(2)
+        if not text.strip():
+            text = next((l for l in body[i + 1:] if l.strip()), "")
+        add(f"D{m.group(1)}", text)
+    for line in _plan_section(plan_text, 4):
+        m = _DOD_ITEM_RE.match(line)
+        if m:
+            add(f"DoD{m.group(1)}", m.group(2))
+    return out
+
+
+def plan_item_ids(plan_text):
+    return [i for i, _ in plan_items(plan_text)]
+
+
+def _covers_block(plan_text):
+    """The preamble's addendum naming the plan's item ids (plan 0142 D2), or ""
+    for a plan with none."""
+    items = plan_items(plan_text)
+    if not items:
+        return ""
+    return ("\n--- PLAN ITEMS ---\n"
+            "Mark every test with `@pytest.mark.covers(\"D2\", \"DoD4\")` naming the\n"
+            "ids of the plan items that test checks, and only those. A test may name\n"
+            "none. The ids are:\n"
+            + "".join(f"  {i}: {t}\n" for i, t in items))
+
+
+def _split_sections(document):
+    """A markdown string as [(heading or None, text)], each text running from
+    its heading line to the next heading, so the pieces join back to the
+    document."""
+    starts = [m.start() for m in _HEADING_RE.finditer(document)]
+    if not starts or starts[0] != 0:
+        starts.insert(0, 0)
+    out = []
+    for a, b in zip(starts, starts[1:] + [len(document)]):
+        text = document[a:b]
+        m = _HEADING_RE.match(text)
+        out.append((m.group(1).strip() if m else None, text))
+    return out
+
+
+def _synopsis(cli):
+    prog = cli.get("prog") or Path(cli.get("path", "")).name
+    desc = " ".join((cli.get("description") or "").split())
+    usage = " ".join((cli.get("usage") or "").split())
+    return f"{prog} — {(desc or usage)[:120]}".rstrip(" —")
+
+
+def _size(text):
+    return len(text.encode("utf-8"))
+
+
+def build_prompt(plan_text, worktree, bundle_text, budget=None):
+    """The prompt, in the order plan 0141 D2 names, within `budget` bytes
+    (PROMPT_BUDGET by default): preamble and plan verbatim; every ADR the plan
+    cites by path or by name; the part of the bundle the plan's leased `paths`
+    touch, in full; an index of the other programs; then the rest of the bundle
+    in whole units for as long as the budget allows, and a line naming what was
+    left out. The prompt is a pure function of its arguments, so two lanes
+    given one plan at one sha get the same bytes."""
+    budget = PROMPT_BUDGET if budget is None else budget
+    adr_paths, notes = _resolve_adrs(plan_text, worktree)
+    head = [LANE_PREAMBLE, _covers_block(plan_text), "\n--- PLAN ---\n", plan_text]
+    for rel in adr_paths:
+        head.append(f"\n--- {rel} ---\n")
+        head.append((worktree / rel).read_text(encoding="utf-8", errors="replace"))
+    if notes:
+        head.append("\n--- notes ---\n" + "".join(f"{n}\n" for n in notes))
+
+    bundle = json.loads(bundle_text)
+    leased = set(_leased_paths(plan_text))
+    clis = bundle.get("clis") or []
+    prog_names = {Path(c.get("path", "")).name for c in clis if c.get("path") in leased}
+    touched_clis = [c for c in clis if c.get("path") in leased]
+    other_clis = [c for c in clis if c.get("path") not in leased]
+    keys = bundle.get("config_keys") or []
+    touched_keys = [k for k in keys if any(
+        Path(r).name in prog_names or r in leased for r in k.get("read_by") or [])]
+    other_keys = [k for k in keys if k not in touched_keys]
+    db = bundle.get("declared_behaviour")
+    sections = _split_sections(db) if isinstance(db, str) else []
+    touched_secs = [s for s in sections if s[0] and any(p in s[0] for p in leased)]
+    other_secs = [s for s in sections if s not in touched_secs]
+
+    def dump(v):
+        return json.dumps(v, indent=2)
+
+    touched = ["\n--- GENERATED CONTRACT: what this plan touches ---\n"]
+    if touched_clis:
+        touched.append("clis:\n" + dump(touched_clis) + "\n")
+    if touched_keys:
+        touched.append("config_keys:\n" + dump(touched_keys) + "\n")
+    for _, text in touched_secs:
+        touched.append("\n--- declared_behaviour section ---\n" + text)
+    must = "".join(head) + "".join(touched)
+    if _size(must) > budget:
+        raise Stop(f"refused: the plan's own contract is {_size(must)} bytes, "
+                   f"over the {budget}-byte prompt budget")
+
+    index = ("\n--- index: the other programs ---\n"
+             + "".join(f"{_synopsis(c)}\n" for c in other_clis))
+    skipped_top = ("clis", "config_keys", "declared_behaviour")
+    units = [(f"bundle key {k}", f"\n--- bundle: {k} ---\n{dump({k: v})}\n")
+             for k, v in bundle.items() if k not in skipped_top]
+    if other_clis:
+        units.append(("clis (other programs)",
+                      "\n--- bundle: clis (other programs) ---\n" + dump(other_clis) + "\n"))
+    if other_keys:
+        units.append(("config_keys (others)",
+                      "\n--- bundle: config_keys (others) ---\n" + dump(other_keys) + "\n"))
+    for heading, text in other_secs:
+        units.append((f"declared_behaviour section {heading or '(preamble)'}",
+                      "\n--- declared_behaviour section ---\n" + text))
+    units.insert(0, ("index", index))
+
+    # room for the omitted line at its longest: every unit named
+    everything = sum(_size(t) for _, t in units)
+    reserve = _size("\n--- omitted: " + ", ".join(n for n, _ in units)
+                    + f" ({everything} bytes) ---\n")
+    left = budget - _size(must) - reserve
+    kept, omitted, omitted_bytes = [], [], 0
+    for name, text in units:
+        if _size(text) <= left:
+            kept.append(text)
+            left -= _size(text)
+        else:
+            omitted.append(name)
+            omitted_bytes += _size(text)
+    tail = ""
+    if omitted:
+        tail = f"\n--- omitted: {', '.join(omitted)} ({omitted_bytes} bytes) ---\n"
+    return must + "".join(kept) + tail
 
 
 # --------------------------------------------------------------- the adapters
@@ -224,6 +531,109 @@ CLAUDE_TESTER_ARGV = ("claude", "-p", "--output-format", "json", "--model", "opu
 # measured — with only PATH and HOME it answers "Not logged in".
 CLAUDE_TESTER_ENV = ("USER", "LOGNAME", "TMPDIR")
 
+# Plan 0101: the codex tester's confinement profile (`sandbox-exec -f`), which
+# the registry argv names as `<profile>`. The profile, not any codex flag, is
+# what denies the reads (docs/test-lane.md).
+CODEX_TESTER_PROFILE = ROOT / "config" / "codex-tester.sb"
+
+# On a subscription lane a key in the child's environment would silently move
+# billing to the API. The environment is already an allowlist (PATH, HOME and
+# the names an adapter lists); this is the second lock, applied after it.
+CODEX_NEVER_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY")
+
+# Plan 0183: the muse tester's confinement profile, built the same way as
+# CODEX_TESTER_PROFILE (plan 0101) and filled through the SAME argv-token
+# mechanism (`<lane>`, `<muse-home>`, `<muse-bin-dir>`, `<prompt-file>`), but
+# carried in the adapter's own pinned `argv` (MUSE_TESTER_ARGV below) rather
+# than in the registry: `RUNNERS["sub-muse"]` keeps the empty `argv` plan
+# 0173 gave it (eunomia still never spawns that registry entry's own argv),
+# the same way `CLAUDE_TESTER_ARGV` is this program's own literal and never
+# `RUNNERS["sub-opus"].argv`.
+MUSE_TESTER_PROFILE = ROOT / "config" / "muse-tester.sb"
+
+# Fixed, never inherited from the parent environment (config/muse-tester.sb's
+# own comment explains why): keeps the self-updating launcher quiet on every
+# spawn, rather than letting it attempt a version check and download against
+# this run's confined network and filesystem on every lane. `MUSE_AUTH_PATH`
+# (the other fixed variable this runner's adapter needs) is built from
+# `muse_login_file()` below, not here, since it names a real path.
+MUSE_TESTER_FIXED_ENV = {"MUSE_NO_AUTO_UPDATE": "1"}
+
+# Plan 0100. Not talos's `_QUOTA_RE` nor mopsus's rule: neither matches the text
+# the Claude CLI printed at the 2026-09-28 limit ("You've hit your session
+# limit"). These are the FALLBACK; the Claude check is structural first.
+_CLAUDE_QUOTA_RE = re.compile(
+    r"You[\'\u2019]ve hit your \S+ limit|You[\'\u2019]ve reached your \S+ limit|(?:spend|usage) limit")
+
+# issue #662 (PR #657 review, M1): these used to be matched as a
+# substring anywhere in the whole stdout stream, which is both CLI events and
+# model-authored text interleaved. A crashed or retried run whose stream
+# merely quoted one of these strings \u2014 in a transient warning, or in the
+# model's own reply \u2014 was misclassified as `quota`. They are now matched only
+# by `_terminal_quota_text`, i.e. only against the stream's own last non-empty
+# line, and only when that line is not itself JSON (so never inside a parsed
+# event's assistant/message/result content).
+#
+# `RESOURCE_EXHAUSTED` is deliberately EXCLUDED from the antigravity set.
+# `strings` on /opt/homebrew/bin/antigravity (measured 2026-09-29, antigravity
+# CLI as installed on opshost) shows `RESOURCE_EXHAUSTED` used repeatedly as a
+# bare gRPC/connect-rpc status code \u2014 the shape a transient, in-process-retried
+# 429 would log on each attempt \u2014 while "You have exhausted your quota on this
+# model." appears exactly once, as its own dedicated user-facing string. Only
+# the latter is treated as the CLI's terminal word on a quota refusal; the bare
+# code is not, because the plan's own measurement is that antigravity retries
+# per-minute 429s in-process, so a bare `RESOURCE_EXHAUSTED` line can be logged
+# on a retry that then succeeds, or on one that is still in flight when the
+# process crashes or times out.
+_CODEX_QUOTA_TEXTS = (
+    "You've hit your usage limit", "usage_limit_reached",
+    "workspace_owner_usage_limit_reached", "workspace_member_usage_limit_reached",
+    "workspace_owner_credits_depleted", "workspace_member_credits_depleted")
+_ANTIGRAVITY_QUOTA_TEXTS = ("You have exhausted your quota on this model",)
+
+# Plan 0183. UNMEASURED against a real stream: no run in building this plan
+# ever reached the owner's usage cap on muse-wonder-1.0, so this is not a
+# `_terminal_quota_text` structural match seen in the wild, only the two
+# user-facing strings `strings` found on the installed binary (muse-cli
+# 1.4.14 / 1.4.14-R7309.1): "This turn stopped because your usage limit was
+# reached." and the shorter "usage limit reached". Replace with the measured
+# phrase the first time a real lane run hits the cap.
+_MUSE_QUOTA_TEXTS = ("usage limit was reached", "usage limit reached")
+
+
+def _line_around(text, pos):
+    start = text.rfind("\n", 0, pos) + 1
+    end = text.find("\n", pos)
+    return text[start:end if end != -1 else len(text)].strip()
+
+
+def _terminal_quota_text(text, needles):
+    """The stream's own terminal signal, never a substring anywhere in it
+    (issue #662). Only the LAST non-empty line is eligible: an earlier line
+    that got superseded by further output (a retried warning, more progress)
+    is not the run's outcome \u2014 only the terminal failure counts. And that
+    line is eligible only when it does NOT parse as JSON: a JSON line is
+    either a structured CLI event (whose assistant/message/result content
+    fields must never be searched \u2014 that is model-authored text, not a CLI
+    failure) or, if we do not recognise its shape, still vendor/event data we
+    must not guess the meaning of. Neither codex's nor antigravity's binaries
+    show a *measured* JSON error-event shape carrying these texts (see the
+    comment above `_ANTIGRAVITY_QUOTA_TEXTS`/`_CODEX_QUOTA_TEXTS`), so a JSON
+    terminal line never matches here \u2014 an unmeasured JSON error event fails
+    safe to `vendor-error`, not `quota`, via the caller's fallback."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    last = lines[-1]
+    try:
+        json.loads(last)
+    except ValueError:
+        pass
+    else:
+        return None
+    return last if any(n in last for n in needles) else None
+
+
 def build_adapters(orch_mod):
     """One entry per vendor runner, naming the functions plan 0066 pinned in
     the orchestrator module — never re-declared here (D2). A runner absent
@@ -233,21 +643,97 @@ def build_adapters(orch_mod):
     checked by `harness_argv`/`check_settings_precondition` at spawn time).
 
     Each entry is `{"stdin_bytes": fn(prompt) -> bytes,
-                     "parse": fn(stdout_text, out_path) -> (doc_or_None, usage)}`,
+                     "parse": fn(stdout_text, out_path) -> (doc_or_None, usage),
+                     "quota": fn(rc, stdout_text, out_path) -> message_or_None,
+                     "usage": fn(stdout_text) -> (usage_dict_or_None, model_or_None)}`
+    (plan 0100: `quota` recognises a vendor's usage-limit refusal and runs only
+    when the run produced no document), and may add `"is_error"`
+    (`fn(stdout_text) -> bool`, a vendor-reported failure at exit 0),
     and may add `"argv"` (a pinned literal tuple this program owns, used
     instead of the registry's), `"env"` (the extra environment names the
     child may see) and `"scratch_cwd"` (run from an empty system temporary
-    directory rather than under the work root).
+    directory rather than under the work root), `"schema_in_cwd"` (copy the
+    result schema into that directory, for a CLI that reads it from disk),
+    `"schema_text"` (`fn(text) -> text`, the form of the schema that copy takes),
+    `"never_env"` (names removed from the child's environment even if listed),
+    `"login_file"` (`fn() -> Path`, a login the run may rewrite; logged if it did),
+    `"second_turn"` (`fn(stdout_so_far) -> None | bytes`, see `spawn_lane`),
+    `"prompt_in_cwd"` (write the prompt into that directory as `prompt.txt`,
+    for a CLI with no stdin-prompt mode, filled into its argv as
+    `<prompt-file>`), `"home_is_cwd"` (spawn with `HOME` overridden to that
+    same directory, never the operator's real one) and `"fixed_env"` (a dict
+    merged into the child's environment unconditionally, for a variable that
+    must be set but is not necessarily present in this process's own
+    environment to copy down).
     `out_path` is unused by the antigravity adapter (its result rides
     stdout); `stdout_text` is unused by the codex adapter (its result rides
     the `-o` file) — both parameters are always passed so callers do not
     need to know which shape a given runner uses."""
 
+    def _antigravity_document(resp):
+        if isinstance(resp, dict):
+            doc = resp
+        elif isinstance(resp, str):
+            try:
+                doc, _ = json.JSONDecoder().raw_decode(resp.lstrip())
+            except ValueError:
+                return None
+        else:
+            return None
+        if not isinstance(doc, dict):
+            return None
+        # The CLI's own tool metadata, not the model's answer. Measured on
+        # antigravity 1.3.3: in 2026-10-12's runs it rode a second copy of the
+        # document, which was skipped; on 2026-10-16 the model answered on its
+        # first turn and the ONLY copy carried it, so schema validation refused
+        # an otherwise valid result. Exactly these two names are dropped, and
+        # only at the top level: any other key still fails validation, because
+        # a field the schema does not name is never forwarded (plan 0070 D1.5).
+        return {k: v for k, v in doc.items() if k not in ANTIGRAVITY_TOOL_KEYS}
+
     def _antigravity_parse(stdout_text, out_path):
-        rec = orch_mod.read_antigravity_result(stdout_text)
-        if not isinstance(rec, dict):
-            return None, None
-        return rec.get("response"), rec.get("usage")
+        """`response` is JSON text, not an object, and under `--json-schema`
+        it can still hold more than one document back to back (measured on
+        1.3.3: a second copy carrying `toolAction`/`toolSummary`). The lane
+        document is the object a turn's response starts with, from the first
+        turn that has one; a turn whose response is empty or starts with
+        anything else is passed over. Schema validation decides whether the
+        document is a good one. The usage is the last turn's: the CLI counts
+        cumulatively, so that is what the whole run spent."""
+        results = orch_mod.read_antigravity_results(stdout_text)
+        usage = results[-1].get("usage") if results else None
+        for rec in results:
+            doc = _antigravity_document(rec.get("response"))
+            if doc is not None:
+                return doc, usage
+        return None, usage
+
+    def _antigravity_second_turn(stdout_so_far):
+        """Asked while the vendor runs. None: no turn has ended yet. `b""`:
+        the first turn ended and nothing more is to be sent. Otherwise the
+        bytes of the one further line, sent once."""
+        results = orch_mod.read_antigravity_results(stdout_so_far)
+        if not results:
+            return None
+        first = results[0]
+        if _antigravity_document(first.get("response")) is not None \
+                or not first.get("denied_actions"):
+            return b""
+        return (orch_mod.antigravity_stdin_line(ANTIGRAVITY_SECOND_TURN) + "\n").encode("utf-8")
+
+    def _antigravity_no_document(stdout_text):
+        """Why a clean exit carried no document, when the stream says: the
+        model called a tool, headless mode denied it, and the turn ended with
+        an empty response. Read from every turn, not only the last."""
+        names = sorted({
+            str(d.get("action"))
+            for rec in orch_mod.read_antigravity_results(stdout_text)
+            for d in (rec.get("denied_actions") if isinstance(rec.get("denied_actions"), list) else [])
+            if isinstance(d, dict)})
+        if not names:
+            return None
+        return ("the vendor called a tool it does not hold "
+                f"({', '.join(names)}), was denied, and returned no document")
 
     def _codex_parse(stdout_text, out_path):
         try:
@@ -283,21 +769,261 @@ def build_adapters(orch_mod):
         except ValueError:
             return None, None
 
+    def _claude_result_record(stdout_text):
+        """The last JSON object in stdout whose `type` is `result`."""
+        found = None
+        for cand in [stdout_text] + [l for l in stdout_text.splitlines()
+                                     if l.startswith("{")]:
+            try:
+                rec = json.loads(cand)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("type") == "result":
+                found = rec
+        return found
+
+    def _claude_quota(rc, stdout_text, out_path):
+        """Structural first: an `is_error` result with HTTP 429. The text
+        patterns are only a fallback, and neither neighbour's regex is reused
+        (plan 0100 boundary)."""
+        rec = _claude_result_record(stdout_text)
+        if rec is not None:
+            if not rec.get("is_error"):
+                return None
+            text = rec.get("result") if isinstance(rec.get("result"), str) else ""
+            if rec.get("api_error_status") == 429:
+                return text or "HTTP 429"
+            return text if _CLAUDE_QUOTA_RE.search(text) else None
+        if rc:
+            m = _CLAUDE_QUOTA_RE.search(stdout_text)
+            if m:
+                return _line_around(stdout_text, m.start())
+        return None
+
+    def _claude_is_error(stdout_text):
+        rec = _claude_result_record(stdout_text)
+        return bool(rec and rec.get("is_error"))
+
+    def _claude_usage(stdout_text):
+        rec = _claude_result_record(stdout_text)
+        if rec is None:
+            return None, None
+        out = {k: rec[k] for k in ("usage", "modelUsage", "total_cost_usd",
+                                   "duration_ms", "num_turns") if k in rec}
+        model = None
+        mu = rec.get("modelUsage")
+        if isinstance(mu, dict) and mu:
+            def _out_tokens(k):
+                v = mu[k]
+                return v.get("outputTokens", 0) if isinstance(v, dict) else 0
+            model = max(mu, key=_out_tokens)
+        return (out or None), model
+
+    def _antigravity_quota(rc, stdout_text, out_path):
+        """Structural first: a `result` event carrying a `response` is never a
+        quota (that IS the document, whatever it says). The text fallback is
+        `_terminal_quota_text` (issue #662) — the stream's own last non-empty,
+        non-JSON line — never a substring anywhere in the stream, and never
+        inside a `result`/`assistant`/`user` event's content."""
+        rec = orch_mod.read_antigravity_result(stdout_text)
+        if isinstance(rec, dict) and rec.get("response"):
+            return None
+        return _terminal_quota_text(stdout_text, _ANTIGRAVITY_QUOTA_TEXTS)
+
+    def _antigravity_usage(stdout_text):
+        results = orch_mod.read_antigravity_results(stdout_text)
+        usage = results[-1].get("usage") if results else None
+        return (usage if isinstance(usage, dict) else None), None
+
+    def _codex_quota(rc, stdout_text, out_path):
+        """`-o` file present on exit 0 is a success, never a quota. Otherwise
+        the same terminal-line rule as antigravity (issue #662): only the
+        stream's own last non-empty, non-JSON line, never agent message text
+        anywhere earlier in it."""
+        if rc == 0 and Path(out_path).is_file():
+            return None
+        return _terminal_quota_text(stdout_text, _CODEX_QUOTA_TEXTS)
+
+    def _codex_usage(stdout_text):
+        """Usage from the `--json` event stream: the last `turn.completed`
+        event's `usage` object. Measured 2026-10-13, codex-cli 0.153.4:
+        `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`,
+        `output_tokens`, `reasoning_output_tokens`. Anything
+        else — no such event, no `usage`, a `usage` with no token count — is
+        `None`, never `0` or `{}`, because plan 0100's record reads an empty
+        value as "free"."""
+        found = None
+        for line in stdout_text.splitlines():
+            if not line.startswith("{"):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("type") == "turn.completed":
+                usage = rec.get("usage")
+                if isinstance(usage, dict) and any(
+                        isinstance(v, int) and not isinstance(v, bool)
+                        for v in usage.values()):
+                    found = usage
+        return found, None
+
+    def _muse_terminal_text(stdout_text):
+        """The last `run.terminal.completed` event's `payload.text`, or None
+        when no such event appears at all. Deliberately NOT
+        `orch_mod.read_muse_result` (the writer path's own reader): that
+        function falls back to the RAW stream when no terminal event is
+        found, which is right for plan-question detection on prose but wrong
+        here — a crash before any terminal event must read as "no document",
+        never as a document built from whatever diagnostic lines happened to
+        be on stdout."""
+        last = None
+        for line in (stdout_text or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("payload_type") == "run.terminal.completed":
+                payload = rec.get("payload")
+                if isinstance(payload, dict) and isinstance(payload.get("text"), str):
+                    last = payload["text"]
+        return last
+
+    def _muse_parse(stdout_text, out_path):
+        text = _muse_terminal_text(stdout_text)
+        if text is None:
+            return None, None
+        text = text.strip()
+        m = re.match(r"^```(?:json)?\s*\n(.*)\n```$", text, re.S)
+        if m:
+            text = m.group(1)
+        try:
+            return json.loads(text), None
+        except ValueError:
+            return None, None
+
+    def _muse_quota(rc, stdout_text, out_path):
+        """Structural first: a terminal-completed event is never a quota,
+        whatever its text says — `_muse_parse` already decided whether that
+        text was a usable document. The fallback is the same
+        `_terminal_quota_text` issue-#662 rule codex and antigravity use:
+        only the stream's own last non-empty, non-JSON line."""
+        if _muse_terminal_text(stdout_text) is not None:
+            return None
+        return _terminal_quota_text(stdout_text, _MUSE_QUOTA_TEXTS)
+
+    def _muse_usage(stdout_text):
+        """The last `run.usage` event's `payload` (stream `exec.usage`): a
+        `models` list, each `{"model", "input_tokens", "cached_tokens",
+        "output_tokens", "reasoning_tokens", "calls"}`, plus the run's own
+        aggregate `calls`/`completed_calls`/`allowance`. Measured 2026-11-07
+        against `--provider echo` (deterministic, no model call), so `model`
+        rode as `null` in every measurement run; against the real `meta`
+        provider it is expected to carry `muse-wonder-1.0`, read from the
+        LAST model entry the same way `_claude_usage` reads `modelUsage`."""
+        last = None
+        for line in (stdout_text or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("payload_type") == "run.usage":
+                payload = rec.get("payload")
+                if isinstance(payload, dict):
+                    last = payload
+        if last is None:
+            return None, None
+        models = last.get("models")
+        model = None
+        if isinstance(models, list) and models:
+            m = models[-1].get("model") if isinstance(models[-1], dict) else None
+            model = m if isinstance(m, str) else None
+        return last, model
+
     return {
         "sub-opus": {
             "stdin_bytes": lambda prompt: prompt.encode("utf-8"),
             "parse": _claude_parse,
+            "quota": _claude_quota,
+            "is_error": _claude_is_error,
+            "usage": _claude_usage,
             "argv": CLAUDE_TESTER_ARGV,
             "env": CLAUDE_TESTER_ENV,
             "scratch_cwd": True,
         },
         "sub-antigravity": {
             "stdin_bytes": lambda prompt: (orch_mod.antigravity_stdin_line(prompt) + "\n").encode("utf-8"),
+            "second_turn": _antigravity_second_turn,
+            "no_document": _antigravity_no_document,
             "parse": _antigravity_parse,
+            "quota": _antigravity_quota,
+            "usage": _antigravity_usage,
         },
         "sub-codex": {
             "stdin_bytes": lambda prompt: prompt.encode("utf-8"),
             "parse": _codex_parse,
+            "quota": _codex_quota,
+            "usage": _codex_usage,
+            # The lane's own empty directory (codex walks every ancestor of its
+            # cwd for AGENTS.md, and one under ~/dev would put ~/dev on that
+            # walk). It is also the profile's `LANE`: the only place the
+            # sandboxed process may write, so the schema goes in it too.
+            "scratch_cwd": True,
+            "schema_in_cwd": True,
+            "schema_text": lambda text: json.dumps(strict_schema(json.loads(text)), indent=1),
+            "never_env": CODEX_NEVER_ENV,
+            "login_file": codex_login_file,
+        },
+        # Plan 0183. `argv` is this program's OWN pinned literal — never
+        # `RUNNERS["sub-muse"].argv`, which plan 0173 keeps empty on purpose
+        # (the same relationship `CLAUDE_TESTER_ARGV` has to `sub-opus`'s
+        # registry argv, not the relationship `sub-codex`'s confined argv has
+        # to ITS registry entry). The confinement is the
+        # `/usr/bin/sandbox-exec -f <profile>` prefix, exactly as plan 0101's
+        # for codex; `--preset empty` (no tool, no skill, no `--workspace`)
+        # and the `--disable-*` flags after it are surface reduction, pinned
+        # and named, and are NOT the control (config/muse-tester.sb's own
+        # comment says why, and why `--disable-approval` is the one load-
+        # bearing flag among them: without it muse's in-process approval
+        # reviewer tries to start a second, nested seatbelt sandbox that
+        # cannot start inside this outer one).
+        "sub-muse": {
+            "argv": ("/usr/bin/sandbox-exec", "-f", str(MUSE_TESTER_PROFILE),
+                     "-D", "LANE=<lane>", "-D", "MUSE_HOME=<muse-home>",
+                     "-D", "MUSE_BIN_DIR=<muse-bin-dir>",
+                     orch_mod.MUSE_BIN, "exec", "--json",
+                     "--provider", "meta", "--model", "muse-wonder-1.0",
+                     "--prompt-file", "<prompt-file>",
+                     "--no-session-log", "--preset", "empty",
+                     "--no-foreign-personal-context", "--disable-approval",
+                     "--disable-shell", "--disable-write", "--disable-web-tools",
+                     "--disable-request-user-input", "--approval-mode", "never"),
+            "stdin_bytes": lambda prompt: b"",   # muse reads --prompt-file, never stdin (measured: "missing prompt")
+            "parse": _muse_parse,
+            "quota": _muse_quota,
+            "usage": _muse_usage,
+            # The lane's own empty directory, same reasoning as sub-codex's
+            # (muse treats its cwd as an implicit workspace root even with no
+            # --workspace flag) — it is also the profile's `LANE`.
+            "scratch_cwd": True,
+            "prompt_in_cwd": True,
+            # HOME overridden to the SAME empty scratch directory (config/
+            # muse-tester.sb's own comment is the why): muse resolves
+            # `~/.claude/CLAUDE.md` and `~/.agents/skills` from `$HOME`
+            # itself, and a HOME with neither keeps it from ever asking.
+            "home_is_cwd": True,
+            # MUSE_AUTH_PATH points the real login back in once HOME is
+            # faked above — without it the launcher's own credential lookup
+            # (`$HOME/.config/muse/auth.json`) would follow HOME too and find
+            # no login at all.
+            "fixed_env": dict(MUSE_TESTER_FIXED_ENV, MUSE_AUTH_PATH=str(muse_login_file())),
+            "login_file": muse_login_file,
         },
     }
 
@@ -310,15 +1036,58 @@ def _validate_type(value, type_spec):
         "array": lambda v: isinstance(v, list),
         "string": lambda v: isinstance(v, str),
         "boolean": lambda v: isinstance(v, bool),
+        "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
         "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
         "null": lambda v: v is None,
     }
     return any(checks.get(t, lambda v: False)(value) for t in types)
 
 
+def codex_login_file():
+    """The owner's codex login. A lane run may rewrite it: codex trades its
+    refresh token for a new pair and must save the pair, and the profile
+    allows that one write (plan 0101 §3). Whether a run changed it is logged."""
+    return Path(os.path.realpath(os.path.expanduser("~"))) / ".codex" / "auth.json"
+
+
+def muse_login_file():
+    """The owner's muse login. The same hazard plan 0101 §3 names for codex,
+    confirmed here while measuring config/muse-tester.sb: this file's mtime
+    moved during a confined `--provider echo` run that never made a real
+    model call, so a lane run may rewrite it, and the profile allows that one
+    write. Whether a run changed it is logged, same as codex's."""
+    return Path(os.path.realpath(os.path.expanduser("~"))) / ".config" / "muse" / "auth.json"
+
+
+def _mtime(path):
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def strict_schema(schema):
+    """The result schema as OpenAI's structured output accepts it: every
+    object lists all of its properties in `required`. Measured 2026-10-13,
+    codex-cli 0.153.4: `--output-schema` with the schema as written is
+    refused before the model runs (400 `invalid_json_schema`, "'required' is
+    required … to be an array including every key in properties. Missing
+    'executable'"). Every document this form admits, the schema as written
+    admits too, and that one is what the result is validated against."""
+    if isinstance(schema, list):
+        return [strict_schema(v) for v in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {k: strict_schema(v) for k, v in schema.items()}
+    if isinstance(out.get("properties"), dict):
+        out["required"] = list(out["properties"])
+    return out
+
+
 def validate_schema(doc, schema, path="$"):
     """A minimal, recursive subset of JSON Schema draft-07: `type`,
-    `required`, `properties`, `items`, `additionalProperties` (boolean only).
+    `required`, `properties`, `items`, `additionalProperties` (boolean only),
+    `enum` and `pattern` (strings only; `re.search`, so anchor it).
     Not a general engine — this program has exactly one schema to check a
     vendor's result against, and a hand-rolled validator sized to that shape
     is less surface than a dependency this repository does not otherwise
@@ -329,6 +1098,11 @@ def validate_schema(doc, schema, path="$"):
     if "type" in schema and not _validate_type(doc, schema["type"]):
         errors.append(f"{path}: expected type {schema['type']!r}, got {type(doc).__name__}")
         return errors
+    if "enum" in schema and not any(doc == e and type(doc) is type(e)
+                                    for e in schema["enum"]):
+        errors.append(f"{path}: {doc!r} is not one of {schema['enum']!r}")
+    if "pattern" in schema and isinstance(doc, str) and not re.search(schema["pattern"], doc):
+        errors.append(f"{path}: {doc!r} does not match {schema['pattern']!r}")
     if isinstance(doc, dict):
         for key in schema.get("required", []):
             if key not in doc:
@@ -351,7 +1125,7 @@ def validate_schema(doc, schema, path="$"):
 
 # -------------------------------------------------------------- confinement
 def confine_path(rel_path, worktree):
-    """`rel_path` normalised to a location under `tests/` inside `worktree`,
+    """`rel_path` normalised to a location under `tests/lane/` inside `worktree`,
     or a `Stop` naming why not. Every check here refuses the WHOLE result —
     callers must not write any file before every path in a result has passed
     this function (Definition of done: "one offending path refuses the whole
@@ -364,7 +1138,7 @@ def confine_path(rel_path, worktree):
     normalised = posixpath.normpath(rel_path)
     if normalised != rel_path:
         raise Stop(f"result path {rel_path!r} is not already normalised ({normalised!r})")
-    if parts[0] != CONFINE_ROOT:
+    if parts[:len(_CONFINE_PARTS)] != list(_CONFINE_PARTS) or len(parts) == len(_CONFINE_PARTS):
         raise Stop(f"result path {rel_path!r} does not resolve under {CONFINE_ROOT}/")
     if parts[0] in _EXECUTABLE_ROOTS:
         raise Stop(f"result path {rel_path!r} resolves under {parts[0]}/ — refused")
@@ -388,13 +1162,21 @@ def confine_path(rel_path, worktree):
     return normalised
 
 
-def check_result_files(files, worktree, landing_base_paths):
+def check_result_files(files, worktree, landing_base_paths, landing_base_names=()):
     """Every file entry, checked BEFORE any is written (see `confine_path`).
     `landing_base_paths` is the set of paths that already exist at the
     landing base's tip — a returned path in that set refuses the whole
     result, because a vendor may add tests and may not rewrite the ones that
-    gate the repo."""
+    gate the repo.
+
+    `landing_base_names` is every `test_*.py` / `conftest.py` basename already
+    under `tests/` at that tip. pytest's `prepend` import mode refuses two test
+    modules with one basename in different directories and would fail CI's
+    whole collection, so a returned file that repeats one (or repeats another
+    returned file's) is refused. `tests/lane/conftest.py`, when new, is the one
+    exception: the lane's own fixtures are a layer of their own."""
     normalised = []
+    seen_names = {}
     for entry in files:
         if not isinstance(entry, dict):
             raise Stop(f"result file entry {entry!r} is not an object")
@@ -403,6 +1185,18 @@ def check_result_files(files, worktree, landing_base_paths):
         rel = confine_path(entry.get("path"), worktree)
         if rel in landing_base_paths:
             raise Stop(f"result path {rel!r} already exists at the landing base — refused")
+        if any(rel == r for r, _ in normalised):
+            raise Stop(f"result path {rel!r} appears twice — refused")
+        base = posixpath.basename(rel)
+        if _TEST_MODULE_RE.match(base) and rel != f"{CONFINE_ROOT}/conftest.py":
+            if base in landing_base_names:
+                raise Stop(f"result path {rel!r} repeats the basename {base!r} of a "
+                           "test module already under tests/ — pytest's prepend "
+                           "import mode would refuse the whole collection")
+            if base in seen_names:
+                raise Stop(f"result paths {seen_names[base]!r} and {rel!r} share the "
+                           f"basename {base!r} — refused for the same reason")
+            seen_names[base] = rel
         if not isinstance(entry.get("content"), str):
             raise Stop(f"result path {rel!r} carries non-string content")
         normalised.append((rel, entry["content"]))
@@ -410,10 +1204,24 @@ def check_result_files(files, worktree, landing_base_paths):
 
 
 # ------------------------------------------------------------------- run log
+# Keys whose values this program defines: written verbatim (plan 0102 D6). The
+# shape of the two hashes is checked, not scrubbed — a value that fails its shape
+# is written as `invalid` and never reaches the log.
+STRUCTURED_KEYS = frozenset({"repo", "plan", "runner", "sha", "sha256", "bytes",
+                             "number", "branch", "rc", "timed_out", "files",
+                             "gaps", "zone"})
+_SHAPES = {"sha": re.compile(r"[0-9a-f]{40}\Z"), "sha256": re.compile(r"[0-9a-f]{64}\Z")}
+
+
 class RunLog:
     """`~/dev/.fleet/work/logs/lane--<plan>--<runner>.log`, the orchestrator's
-    own `key=value` phase style. Every line passes through
-    `redact_transcript` before it is written (plan 0058's shared control)."""
+    own `key=value` phase style.
+
+    Free text is redacted (plan 0058's shared control); fields this program
+    defines are not. Redacting the joined line scrubbed the run's own `sha` and
+    `prompt sha256` as `[redacted:long-hex]` — the failure `docs/feature-plans.md`
+    opens with — so `note` redacts one VALUE at a time and only those whose key
+    is not in `STRUCTURED_KEYS`."""
 
     def __init__(self, plan_id, runner_name, orch_mod):
         self.path = lib.work_root() / "logs" / f"lane--{plan_id}--{runner_name}.log"
@@ -425,15 +1233,24 @@ class RunLog:
         except OSError:
             pass
 
+    def _value(self, key, value):
+        if key in STRUCTURED_KEYS:
+            text = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+            shape = _SHAPES.get(key)
+            if shape is not None and not shape.match(text):
+                return "invalid"
+            return text.replace("\n", " ")
+        clean, _ = self._orch.redact_transcript(str(value))
+        return clean.replace("\n", " ")
+
     def note(self, phase, **facts):
         parts = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), phase]
-        parts += [f"{k}={v}" for k, v in facts.items()]
-        line = " ".join(str(x) for x in parts)
-        clean, _ = self._orch.redact_transcript(line)
+        parts += [f"{k}={self._value(k, v)}" for k, v in facts.items()]
+        line = " ".join(parts)
         if self._fh is None:
             return
         try:
-            self._fh.write(clean + "\n")
+            self._fh.write(line + "\n")
             self._fh.flush()
         except OSError:
             pass
@@ -444,6 +1261,219 @@ class RunLog:
                 self._fh.close()
         except OSError:
             pass
+
+
+# ----------------------------------------------------------------- the record
+def _utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _ulid():
+    """Made the way `fleet-config`'s `_ulid()` makes one."""
+    crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    data = int(time.time() * 1000).to_bytes(6, "big") + os.urandom(10)
+    bits = int.from_bytes(data, "big") << 2
+    return "".join(crockford[(bits >> (130 - 5 * (i + 1))) & 0x1F] for i in range(26))
+
+
+def usage_json(usage):
+    """`usage` serialised with sorted keys, capped at 8 KiB. A larger value is
+    stored as a truncation marker, never cut mid-string (plan 0100 D5)."""
+    if usage is None:
+        return None
+    text = json.dumps(usage, sort_keys=True)
+    n = len(text.encode("utf-8"))
+    if n > USAGE_JSON_MAX:
+        return json.dumps({"truncated": True, "bytes": n}, sort_keys=True)
+    return text
+
+
+class LaneRecord:
+    """The one `lane_run` row of this run (plan 0100 D2). Structured fields
+    are written as VALUES, never through redaction; only `detail`, free text
+    from a refusal or a vendor, passes through `redact_transcript`.
+
+    A database that cannot be written never stops the run from being refused
+    or paged: every write here records the failure in `write_error` and
+    returns, and the caller's page says the record could not be written."""
+
+    def __init__(self, repo, plan_id, runner_name, family, orch_mod, db_path, model=None):
+        """`model` is the pinned launch-config identity (`Runner.model`), known
+        before anything is spawned — the same way `family` already is. It
+        seeds both `model` and `requested_model` with `model_source` set to
+        `launch-config`; a later trusted CLI report (`set(model=..., ...)`)
+        overwrites `model` and its source, never `requested_model` (plan
+        0190: the two identities must survive a mismatch).
+
+        Kept last and keyword-defaulted, not inserted ahead of `orch_mod`/
+        `db_path`: a caller outside this plan's lane
+        (`tests/test_orchestrator_lane_status.py`) still constructs this
+        positionally without `model`, and plan 0190 does not own that file."""
+        self.run_id = _ulid()
+        self.fields = {"repo": repo, "plan": plan_id, "runner": runner_name,
+                       "family": family, "model": model, "requested_model": model,
+                       "model_source": "launch-config" if model is not None else None}
+        self._orch = orch_mod
+        self.db_path = db_path
+        self.has_row = False
+        self.final = False
+        self.write_error = None
+        self.cap_note = None
+        self.outcome = None          # the outcome the row ended with (plan 0104 D5)
+
+    def set(self, **fields):
+        self.fields.update(fields)
+
+    def report_model(self, model):
+        """A vendor's own trusted result metadata reported `model` served the
+        run (plan 0190) — never free-form stdout text. A no-op for `None`:
+        the CLI not reporting a model must not erase the launch-config
+        identity `__init__` already seeded (Boundaries: never claim the
+        configured model was served when the CLI does not say so).
+        `requested_model` is untouched either way, so the two identities
+        survive a mismatch."""
+        if model:
+            self.fields["model"] = model
+            self.fields["model_source"] = "cli-report"
+
+    def _detail(self, text):
+        if not text:
+            return None
+        clean, _ = self._orch.redact_transcript(str(text))
+        return clean[:DETAIL_MAX]
+
+    def _connect(self):
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        try:
+            con.execute("PRAGMA journal_mode=WAL").fetchone()
+        except sqlite3.OperationalError:
+            pass
+        con.executescript(SCHEMA)
+        _migrate(con)
+        return con
+
+    def _insert(self, con, outcome, spawned, detail=None, ended=False):
+        f = self.fields
+        con.execute(
+            "INSERT INTO lane_run (run_id, repo, plan, runner, family, model, "
+            "requested_model, model_source, sha, "
+            "prompt_sha256, prompt_bytes, started_at, ended_at, spawned, outcome, "
+            "rc, usage_json, detail, pr) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.run_id, f["repo"], f["plan"], f["runner"], f.get("family"),
+             f.get("model"), f.get("requested_model"), f.get("model_source"),
+             f.get("sha"), f.get("prompt_sha256"),
+             f.get("prompt_bytes"), _utc_now(), _utc_now() if ended else None,
+             spawned, outcome, f.get("rc"), f.get("usage_json"),
+             self._detail(detail), f.get("pr")))
+        self.has_row = True
+        self.final = ended
+        if ended and self.outcome is None:
+            # A row born ended (`capped`, or an unspawned refusal) is the run's
+            # outcome too. Without this, finish() returned early on `final`
+            # and lane-ended reported a capped run as `refused` (the 0138
+            # sub-codex lane, 2026-10-16; review of #902, MEDIUM).
+            self.outcome = outcome
+
+    def reserve(self, cap_string, cap_parser):
+        """Check the cap and insert the row in ONE `BEGIN IMMEDIATE`
+        transaction (D3): two lanes started together cannot both take the last
+        slot. Raises `Stop` (outcome `capped`) after recording a `capped` row.
+        A write failure here is a refusal too — spending is never admitted
+        without a record."""
+        caps = cap_parser(cap_string)
+        limit = caps[self.fields["runner"]]
+        try:
+            con = self._connect()
+        except (sqlite3.Error, OSError) as e:
+            self.write_error = f"{e.__class__.__name__}: {e}"
+            raise Stop(f"the lane_run record cannot be opened ({self.write_error}) — "
+                       "refusing to spend without a record") from None
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                count = con.execute(
+                    "SELECT COUNT(*) FROM lane_run WHERE runner=? AND spawned=1 "
+                    "AND started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)",
+                    (self.fields["runner"], CAP_WINDOW)).fetchone()[0]
+                if count >= limit:
+                    detail = f"{count}/{limit} runs in the last 24h"
+                    self._insert(con, "capped", 0, detail, ended=True)
+                    con.execute("COMMIT")
+                    raise Stop(f"runner {self.fields['runner']!r} is at its cap: "
+                               f"{detail}", outcome="capped")
+                self._insert(con, "running", 1)
+                con.execute("COMMIT")
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                    self.has_row = False
+                raise
+            self.cap_note = f"{count + 1}/{limit} runs in the last 24h"
+        except sqlite3.Error as e:
+            self.write_error = f"{e.__class__.__name__}: {e}"
+            raise Stop(f"the lane_run record cannot be written ({self.write_error}) — "
+                       "refusing to spend without a record") from None
+        finally:
+            con.close()
+
+    def finish(self, outcome, detail=None, **fields):
+        """The row's last write: an UPDATE of the reserved row, or an INSERT of
+        an unspawned one. Never raises — a failing database must not mask the
+        error the run is ending on."""
+        self.fields.update(fields)
+        if self.final:
+            return
+        if self.outcome is None:
+            self.outcome = outcome
+        try:
+            con = self._connect()
+            try:
+                if self.has_row:
+                    f = self.fields
+                    con.execute(
+                        "UPDATE lane_run SET outcome=?, ended_at=?, rc=?, model=?, "
+                        "requested_model=?, model_source=?, "
+                        "usage_json=?, detail=?, pr=?, sha=?, prompt_sha256=?, "
+                        "prompt_bytes=? WHERE run_id=?",
+                        (outcome, _utc_now(), f.get("rc"), f.get("model"),
+                         f.get("requested_model"), f.get("model_source"),
+                         f.get("usage_json"), self._detail(detail), f.get("pr"),
+                         f.get("sha"), f.get("prompt_sha256"), f.get("prompt_bytes"),
+                         self.run_id))
+                    self.final = True
+                else:
+                    self._insert(con, outcome, 0, detail, ended=True)
+            finally:
+                con.close()
+        except (sqlite3.Error, OSError) as e:
+            self.write_error = f"{e.__class__.__name__}: {e}"
+
+    def cap_count(self, runner_name):
+        """This runner's spawned runs in the window, read-only, for
+        `--dry-run`; 0 if the table is not there yet."""
+        try:
+            con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=1)
+            try:
+                return con.execute(
+                    "SELECT COUNT(*) FROM lane_run WHERE runner=? AND spawned=1 "
+                    "AND started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)",
+                    (runner_name, CAP_WINDOW)).fetchone()[0]
+            finally:
+                con.close()
+        except (sqlite3.Error, OSError):
+            return 0
+
+
+def _read_cap(cfg):
+    """The `lane_run_cap` value, or None. Fails CLOSED (plan 0100): unlike the
+    other `fleet-config` readers, whose failure mode is the old value, any
+    failure to read the row — an absent or corrupt database, a row that fails
+    validation — is None, and None refuses."""
+    try:
+        return cfg.resolve_setting("lane_run_cap", None, "unset")[0]
+    except Exception:
+        return None
 
 
 # -------------------------------------------------------------------- gates
@@ -539,6 +1569,342 @@ def check_bundle_gaps(bundle):
                        "the contract (plan 0019); refusing to send it")
 
 
+# ------------------------------------------------- gate 7: the target's CI
+# Plan 0137 (issue #618). The lane pushes a branch and opens a pull request in
+# the TARGET repository; if that repository's CI would run either, the
+# vendor's files execute before a person has read them. The reader below is a
+# narrow subset of YAML — the shapes a trigger block takes — and refuses what
+# it does not understand, because `bin/` takes no YAML package and a gate that
+# silently did not run is worse than one that refuses.
+class _Unsupported(Exception):
+    pass
+
+
+def _strip_comment(line):
+    quote = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i]
+    return line
+
+
+def _scalar(text):
+    t = text.strip()
+    if not t:
+        return None
+    if t[0] in "\"'":
+        if len(t) < 2 or t[-1] != t[0]:
+            raise _Unsupported(f"unterminated quoted scalar {t[:30]!r}")
+        inner = t[1:-1]
+        if t[0] == "'":
+            return inner.replace("''", "'")
+        if "\\" in inner or '"' in inner:
+            raise _Unsupported("escape in a double-quoted scalar")
+        return inner
+    if t[0] in "&*!|>%@`" or t.startswith("<<"):
+        raise _Unsupported(f"anchor, alias, tag or block scalar at {t[:30]!r}")
+    if ": " in t or t.endswith(":"):
+        raise _Unsupported(f"mapping inside a plain scalar {t[:30]!r}")
+    return t
+
+
+def _split_flow(body):
+    """Top-level comma split of the inside of a flow collection."""
+    parts, depth, quote, cur = [], 0, None, ""
+    for ch in body:
+        if quote:
+            cur += ch
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            cur += ch
+        elif ch in "[{":
+            depth += 1
+            cur += ch
+        elif ch in "]}":
+            depth -= 1
+            cur += ch
+        elif ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if quote or depth != 0:
+        raise _Unsupported("unbalanced flow collection")
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
+
+def _flow_key(text):
+    quote = None
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ":" and (i + 1 == len(text) or text[i + 1] in " \t"):
+            return text[:i], text[i + 1:]
+    return text, None
+
+
+def _flow(text):
+    t = text.strip()
+    if t.startswith("["):
+        if not t.endswith("]"):
+            raise _Unsupported("flow sequence not closed")
+        return [_flow(p) for p in _split_flow(t[1:-1])]
+    if t.startswith("{"):
+        if not t.endswith("}"):
+            raise _Unsupported("flow mapping not closed")
+        out = {}
+        for p in _split_flow(t[1:-1]):
+            k, v = _flow_key(p)
+            out[_scalar(k)] = _flow(v) if v is not None else None
+        return out
+    return _scalar(t)
+
+
+def _balanced(text):
+    depth, quote = 0, None
+    for ch in text:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+    return depth <= 0 and quote is None
+
+
+def _block_lines(text):
+    """(indent, content) per non-blank line, comments gone, a flow collection
+    that runs over several lines joined onto one."""
+    raw = []
+    for line in text.split("\n"):
+        if "\t" in line[:len(line) - len(line.lstrip())]:
+            raise _Unsupported("tab indentation")
+        body = _strip_comment(line).rstrip()
+        if body.strip():
+            raw.append((len(body) - len(body.lstrip(" ")), body.strip()))
+    out, i = [], 0
+    while i < len(raw):
+        ind, content = raw[i]
+        i += 1
+        while not _balanced(content) and i < len(raw):
+            content += " " + raw[i][1]
+            i += 1
+        out.append((ind, content))
+    return out
+
+
+def _parse_block(lines, i, indent):
+    ind, content = lines[i]
+    if content == "-" or content.startswith("- "):
+        seq = []
+        while i < len(lines) and lines[i][0] == indent and (
+                lines[i][1] == "-" or lines[i][1].startswith("- ")):
+            rest = lines[i][1][1:].strip()
+            i += 1
+            if rest:
+                if rest[0] in "[{":
+                    seq.append(_flow(rest))
+                else:
+                    if _flow_key(rest)[1] is not None:
+                        raise _Unsupported("mapping inside a sequence item")
+                    seq.append(_scalar(rest))
+            elif i < len(lines) and lines[i][0] > indent:
+                val, i = _parse_block(lines, i, lines[i][0])
+                seq.append(val)
+            else:
+                seq.append(None)
+        return seq, i
+    out = {}
+    while i < len(lines) and lines[i][0] == indent:
+        content = lines[i][1]
+        key, rest = _flow_key(content)
+        if rest is None:
+            raise _Unsupported(f"a line that is not a key: {content[:30]!r}")
+        key = _scalar(key)
+        i += 1
+        if rest.strip():
+            out[key] = _flow(rest) if rest.strip()[0] in "[{" else _scalar(rest)
+        elif i < len(lines) and (lines[i][0] > indent or (
+                lines[i][0] == indent and lines[i][1].startswith("-"))):
+            out[key], i = _parse_block(lines, i, lines[i][0])
+        else:
+            out[key] = None
+    if i < len(lines) and lines[i][0] > indent:
+        raise _Unsupported("indentation this reader does not follow")
+    return out, i
+
+
+_ON_KEY_RE = re.compile(r"""^(?:on|"on"|'on')\s*:(.*)$""")
+
+
+def workflow_triggers(text):
+    """The `on` block of a workflow as {trigger: config-or-None}."""
+    rows = text.split("\n")
+    seen_content = False
+    for row in rows:
+        s = row.rstrip()
+        if s == "..." or (s == "---" and seen_content):
+            raise _Unsupported("a multi-document file")
+        if s.strip() and not s.lstrip().startswith("#") and s != "---":
+            seen_content = True
+    block = None
+    for n, row in enumerate(rows):
+        m = _ON_KEY_RE.match(row)
+        if not m:
+            continue
+        block = [m.group(1)]
+        for nxt in rows[n + 1:]:
+            if nxt.strip() and not nxt.lstrip().startswith("#") and (
+                    nxt[0] not in " \t-"):
+                break
+            block.append(nxt)
+        break
+    if block is None:
+        raise _Unsupported("no top-level `on:` key")
+    head = _strip_comment(block[0]).strip()
+    rest = [b for b in block[1:] if _strip_comment(b).strip()]
+    if head and not head.startswith(("[", "{")):
+        if rest:
+            raise _Unsupported("`on:` has a value and a body")
+        value = _scalar(head)
+    else:
+        lines = _block_lines("\n".join(([head] if head else []) + block[1:]))
+        if not lines:
+            raise _Unsupported("`on:` is empty")
+        if head:
+            if len(lines) != 1:
+                raise _Unsupported("`on:` has a value and a body")
+            value = _flow(lines[0][1])
+        else:
+            value, end = _parse_block(lines, 0, lines[0][0])
+            if end != len(lines):
+                raise _Unsupported("`on:` has content this reader did not consume")
+    if isinstance(value, str):
+        return {value: None}
+    if isinstance(value, list):
+        if not all(isinstance(v, str) for v in value):
+            raise _Unsupported("a non-scalar in the `on:` list")
+        return {v: None for v in value}
+    if isinstance(value, dict):
+        return value
+    raise _Unsupported("`on:` is empty")
+
+
+def _glob_regex(pattern):
+    if any(c in pattern for c in "[?\\+(){}|^$"):
+        raise _Unsupported(f"glob {pattern!r} uses syntax this evaluator does not handle")
+    out = ""
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out += ".*"
+            i += 2
+        elif pattern[i] == "*":
+            out += "[^/]*"
+            i += 1
+        else:
+            out += re.escape(pattern[i])
+            i += 1
+    return re.compile(out + r"\Z")
+
+
+def _patterns(value):
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return value
+    raise _Unsupported("a branch filter that is not a list of strings")
+
+
+def _admits(config, branch):
+    """Does a trigger's branch filter admit `branch`? `paths` never excludes."""
+    if config is None:
+        return True
+    if not isinstance(config, dict):
+        raise _Unsupported("a trigger whose configuration is not a mapping")
+    has_b, has_i = "branches" in config, "branches-ignore" in config
+    if has_b and has_i:
+        raise _Unsupported("both branches and branches-ignore")
+    if has_i:
+        pats = _patterns(config["branches-ignore"])
+        if any(p.startswith("!") for p in pats):
+            raise _Unsupported("a negated pattern under branches-ignore")
+        return not any(_glob_regex(p).match(branch) for p in pats)
+    if has_b:
+        admitted = False
+        for p in _patterns(config["branches"]):
+            if p.startswith("!"):
+                if _glob_regex(p[1:]).match(branch):
+                    admitted = False
+            elif _glob_regex(p).match(branch):
+                admitted = True
+        return admitted
+    return True
+
+
+def workflow_runs_lane(text, branch):
+    """The trigger that would run the lane, or None. Raises _Unsupported."""
+    triggers = workflow_triggers(text)
+    if "push" in triggers and _admits(triggers["push"], branch):
+        return f"push to {branch}"
+    for name in ("pull_request", "pull_request_target"):
+        if name in triggers and _admits(triggers[name], "main"):
+            return f"{name} to main"
+    return None
+
+
+WORKFLOW_DIRS = (".forgejo/workflows", ".github/workflows")
+
+
+def check_target_ci(repo, plan_id, runner_name):
+    """Gate 7: no workflow the target has on `main` would run the lane."""
+    store = lane_store_path(repo)
+    ref = "refs/remotes/origin/main"
+    branch = f"agent/tests/{plan_id}/{runner_name}"
+    files = []
+    for d in WORKFLOW_DIRS:
+        r = _git(["ls-tree", "-r", "--name-only", ref, "--", d + "/"], store)
+        if r.returncode != 0:
+            raise Stop(f"could not list {d} on main to check the target's CI: "
+                       f"{r.stderr.strip()[:200]}")
+        names = [n for n in r.stdout.split("\n") if n]
+        if names:
+            files = [n for n in names if n.endswith((".yml", ".yaml"))]
+            break
+    for path in sorted(files):
+        r = subprocess.run(["git", "show", f"{ref}:{path}"], cwd=str(store),
+                           capture_output=True, timeout=120)
+        if r.returncode != 0:
+            raise Stop(f"{path} could not be read to check the target's CI "
+                       f"({r.stderr.decode('utf-8', 'replace').strip()[:100]}) — refusing")
+        try:
+            hit = workflow_runs_lane(r.stdout.decode("utf-8"), branch)
+        except UnicodeDecodeError:
+            raise Stop(f"{path} is not UTF-8 text — refusing, because a workflow "
+                       "this gate cannot read might run the lane")
+        except _Unsupported as e:
+            raise Stop(f"{path} could not be evaluated ({e}) — refusing, "
+                       "because a workflow this gate cannot read might run the lane")
+        if hit:
+            raise Stop(f"{path} runs on {hit}")
+    return files
+
+
 # ------------------------------------------------------------------- bundle
 def build_bundle(worktree, out_path):
     r = subprocess.run([sys.executable, str(BIN / "fleet-bundle"), str(worktree),
@@ -585,8 +1951,18 @@ def _kill_group(proc):
         pass
 
 
-def spawn_lane(argv, cwd, env, stdin_bytes, timeout=SPAWN_TIMEOUT_SECONDS):
+SECOND_TURN_POLL_SECONDS = 0.5
+
+
+def spawn_lane(argv, cwd, env, stdin_bytes, timeout=SPAWN_TIMEOUT_SECONDS,
+               second_turn=None, sent=None):
     """Spawn the vendor CLI. Returns (rc, timed_out, stdout_text).
+
+    `second_turn`, when an adapter has one, is asked with the stdout so far
+    until it answers something other than None, the vendor exits, or the
+    timeout passes; stdin stays open until then. Bytes it returns are written
+    once, appended to the list `sent`, and stdin is closed. It is never asked
+    again, so a run is at most two turns.
 
     `cwd` is a fresh empty directory outside every repository; `env` is
     built explicitly by the caller — never `os.environ`. `start_new_session`
@@ -614,14 +1990,33 @@ def spawn_lane(argv, cwd, env, stdin_bytes, timeout=SPAWN_TIMEOUT_SECONDS):
 
     reader = threading.Thread(target=_drain, daemon=True)
     reader.start()
+    deadline = time.monotonic() + timeout
     try:
         proc.stdin.write(stdin_bytes)
-        proc.stdin.close()
+        proc.stdin.flush()
+        if second_turn is not None:
+            seen, more = -1, None
+            while proc.poll() is None and time.monotonic() < deadline:
+                if len(chunks) != seen:
+                    seen = len(chunks)
+                    more = second_turn(b"".join(chunks[:seen]).decode("utf-8", "replace"))
+                    if more is not None:
+                        break
+                time.sleep(SECOND_TURN_POLL_SECONDS)
+            if more:
+                proc.stdin.write(more)
+                if sent is not None:
+                    sent.append(more)
     except (OSError, ValueError):
         pass
+    finally:
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
     timed_out = False
     try:
-        rc = proc.wait(timeout=timeout)
+        rc = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         timed_out = True
         _kill_group(proc)
@@ -633,17 +2028,44 @@ def spawn_lane(argv, cwd, env, stdin_bytes, timeout=SPAWN_TIMEOUT_SECONDS):
 
 
 # --------------------------------------------------------------- the PR body
-def build_pr_body(plan_id, runner_name, sha, prompt_sha256, usage, gaps, notes):
-    fenced_gaps = "\n".join(f"> {line}" for line in (gaps or [])) or "> (none)"
+HEADER_FIELDS = ("Tests-for", "runner", "sha", "prompt sha256", "usage")
+
+
+def _quoted(lines):
+    """Every vendor-authored line, prefixed `> `. A vendor line can then never
+    start a line of the header block (`fleet-meet` reads only that block) nor
+    close the fence, because none of its lines begins at column 0."""
+    out = []
+    for text in lines:
+        out.extend(f"> {l}" for l in str(text).splitlines() or [""])
+    return out
+
+
+def build_pr_body(plan_id, runner_name, sha, prompt_sha256, usage_text, gaps, notes):
+    """The header block comes first, ends at the first blank line, and is all
+    this program wrote (plan 0102 D4): `usage_text` is the same string
+    `lane_run.usage_json` stores, or None for `-`. Everything after it that a
+    vendor authored is quoted."""
+    fenced_gaps = "\n".join(_quoted(gaps or [])) or "> (none)"
+    fenced_notes = "\n".join(_quoted([notes] if notes else [])) or "> (none)"
     return (
-        f"Tests-for: {plan_id}\n\n"
+        f"Tests-for: {plan_id}\n"
         f"runner: {runner_name}\n"
         f"sha: {sha}\n"
         f"prompt sha256: {prompt_sha256}\n"
-        f"usage: {usage if usage is not None else '-'}\n\n"
+        f"usage: {usage_text if usage_text is not None else '-'}\n\n"
         f"gaps:\n```\n{fenced_gaps}\n```\n\n"
-        f"notes:\n{notes or '(none)'}\n"
+        f"notes:\n```\n{fenced_notes}\n```\n"
     )
+
+
+def check_body_header(body):
+    """No line outside the header block starts with a header field name."""
+    lines = body.split("\n")
+    rest = lines[lines.index("") + 1:] if "" in lines else []
+    for l in rest:
+        for f in HEADER_FIELDS:
+            assert not l.startswith(f + ":"), f"vendor text forged a {f!r} header line"
 
 
 # ------------------------------------------------------------------- main
@@ -660,8 +2082,79 @@ def _git(args, cwd, timeout=120):
                           text=True, timeout=timeout)
 
 
+LANE_STORE_NAME = ".lane-store"
+LANE_STORE_REFSPEC = "+refs/heads/main:refs/remotes/origin/main"
+
+
+def lane_store_path(repo):
+    """`<work root>/<repo slug>/.lane-store` — the reader's OWN object store
+    (plan 0104 D5). Never `fleetlib.store_path`: that store is the one the
+    implementation lane pushes through, and its `fetch --prune origin` holds
+    every head of the repo, `refs/remotes/origin/feat/<slug>` included."""
+    return lib.work_root() / lib.repo_slug(repo) / LANE_STORE_NAME
+
+
+def ensure_lane_store(repo, sha):
+    """Create or refresh the lane-private store and prove `sha` is on `main`.
+
+    The store is fetched with ONE refspec, `+refs/heads/main:refs/remotes/origin/main`,
+    and no tags, so no implementation branch and no other head can be an object
+    in it. A construction, not a request: a prompt line asking the tester not
+    to look is not."""
+    store = lane_store_path(repo)
+    url = f"{lib.git_ssh_base().rstrip('/')}/{repo}.git"
+    with lib.store_lock(repo):
+        if not (store / "HEAD").exists():
+            store.parent.mkdir(parents=True, exist_ok=True)
+            r = _git(["init", "--bare", "--quiet", str(store)], store.parent)
+            if r.returncode != 0:
+                raise Stop(f"could not create the lane store: {r.stderr.strip()[:200]}")
+            _git(["remote", "add", "origin", url], store)
+        _git(["remote", "set-url", "origin", url], store)
+        # Rewritten on every call: a store whose refspec was widened by hand
+        # must not stay widened.
+        _git(["config", "--replace-all", "remote.origin.fetch", LANE_STORE_REFSPEC], store)
+        _git(["config", "remote.origin.tagOpt", "--no-tags"], store)
+        r = _git(["fetch", "--quiet", "--prune", "--no-tags", "origin"], store, timeout=900)
+        if r.returncode != 0:
+            raise Stop(f"could not fetch main into the lane store: {r.stderr.strip()[:200]}")
+        # fetch may add the `origin/HEAD` symref; it names main and nothing
+        # else, but the store is meant to hold exactly one ref, so drop it
+        _git(["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"], store)
+        r = _git(["merge-base", "--is-ancestor", sha, "refs/remotes/origin/main"], store)
+        if r.returncode != 0:
+            raise Stop(f"--sha {sha[:12]} is not on main — a lane reads a commit "
+                       "of main and nothing else (plan 0104 D5)")
+    return store
+
+
+def add_lane_reader(repo, key, sha):
+    """The reader worktree, attached to the lane-private store at `sha`."""
+    store = ensure_lane_store(repo, sha)
+    wt = lib.worktree_path(repo, key)
+    if wt.exists():
+        remove_lane_reader(repo, key)
+    r = _git(["worktree", "add", "--quiet", "--detach", str(wt), sha], store)
+    if r.returncode != 0:
+        raise Stop(f"could not check out {sha[:12]} in the lane store: {r.stderr.strip()[:200]}")
+    return wt
+
+
+def remove_lane_reader(repo, key):
+    store = lane_store_path(repo)
+    wt = lib.worktree_path(repo, key)
+    if store.exists():
+        _git(["worktree", "remove", "--force", str(wt)], store)
+        _git(["worktree", "prune"], store)
+    shutil.rmtree(wt, ignore_errors=True)
+
+
 def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
-       orch_mod=None):
+       orch_mod=None, result=None):
+    """`result`, when given, is filled with what the run ended as — `outcome`,
+    `pr` and `sha` — for `run_leased` (plan 0104 D5)."""
+    result = result if result is not None else {}
+    result.update(outcome="refused", pr=None, sha=sha, runner=runner_name)
     orch_mod = orch_mod or _orchestrator_module()
     adapters = build_adapters(orch_mod)
     if runner_name is None:
@@ -670,6 +2163,7 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
         except Stop as e:
             print(f"fleet-lane: refused: {e}", file=sys.stderr)
             return 1
+    result["runner"] = runner_name
     # orch_mod.Stop is a DIFFERENT class object than this module's own Stop
     # (each SourceFileLoader load builds its own): check_settings_precondition,
     # harness_argv and _implbot_token all raise the orchestrator's own, so
@@ -681,6 +2175,13 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
     land_key = f"lane-land-{_slug(plan_id)}-{_slug(runner_name)}"
     read_wt = None
     land_wt = None
+    cfg = _config_module()
+    registry_entry = orch_mod.RUNNERS.get(runner_name)
+    rec = LaneRecord(repo, plan_id, runner_name,
+                     getattr(registry_entry, "family", None),
+                     orch_mod, cfg.DB,
+                     model=getattr(registry_entry, "model", None))
+    stage = "gate"          # gate -> reserved -> spawned -> landing
     try:
         log.note("gate-start", repo=repo, plan=plan_id, sha=sha, runner=runner_name)
 
@@ -690,7 +2191,10 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
             raise Stop(f"runner {runner_name!r} is declared but not wired: "
                        f"{runner.unwired}")
 
-        read_wt = lib.add_worktree(repo, read_key, sha, refspecs=[sha])
+        read_wt = add_lane_reader(repo, read_key, sha)
+        head = _git(["rev-parse", "HEAD"], read_wt).stdout.strip()
+        if re.fullmatch(r"[0-9a-f]{40}", head):
+            rec.set(sha=head)
         plan_path = f"plans/{plan_id}.md"
         fm, plan_text = check_zone(read_wt, plan_path, orch_mod)
         log.note("gate-zone", zone=fm.get("zone"))
@@ -708,18 +2212,29 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
         bundle = build_bundle(read_wt, bundle_path)
         check_bundle_gaps(bundle)
         log.note("bundle", gaps=len(bundle.get("gaps") or []))
+        workflows = check_target_ci(repo, plan_id, runner_name)
+        log.note("gate-target-ci", workflows=len(workflows))
 
         prompt = build_prompt(plan_text, read_wt, json.dumps(bundle, indent=2))
         prompt_path = lane_dir / "prompt.txt"
         prompt_path.write_text(prompt, encoding="utf-8")
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         log.note("prompt", bytes=len(prompt.encode("utf-8")), sha256=prompt_sha256)
+        rec.set(prompt_sha256=prompt_sha256, prompt_bytes=len(prompt.encode("utf-8")))
 
         if dry_run:
             log.note("dry-run", gaps=[g.get("target") for g in (bundle.get("gaps") or [])])
             print(f"prompt bytes: {len(prompt.encode('utf-8'))}")
             print(f"prompt sha256: {prompt_sha256}")
             print(f"bundle gaps: {[g.get('target') for g in (bundle.get('gaps') or [])]}")
+            cap_value = _read_cap(cfg)
+            cap_n = (cfg.parse_lane_run_cap(cap_value).get(runner_name)
+                     if cap_value is not None else None)
+            if cap_n is None:
+                print(f"cap: {runner_name} unset")
+            else:
+                print(f"cap: {runner_name} {rec.cap_count(runner_name)}/{cap_n} "
+                      "in the last 24h")
             return 0
 
         schema_file = Path(schema_path) if schema_path else DEFAULT_SCHEMA_PATH
@@ -742,11 +2257,20 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
         else:
             cwd.mkdir(parents=True)
         schema_dest = cwd / "schema.json"
-        if not adapter.get("scratch_cwd"):
+        if adapter.get("schema_in_cwd") or not adapter.get("scratch_cwd"):
             # The Claude adapter is handed nothing but its prompt: the schema
             # is validated here, on the way back, not shipped into its directory.
-            schema_dest.write_text(schema_file.read_text(encoding="utf-8"), encoding="utf-8")
+            schema_text = schema_file.read_text(encoding="utf-8")
+            schema_dest.write_text(adapter.get("schema_text", lambda t: t)(schema_text),
+                                   encoding="utf-8")
         out_dest = cwd / "result.json"
+        prompt_dest = cwd / "prompt.txt"
+        if adapter.get("prompt_in_cwd"):
+            # muse reads its prompt only from a file (`--prompt-file`), never
+            # from stdin (measured: "missing prompt" with no PROMPT/
+            # --prompt-file given) — unlike every other runner here, whose
+            # prompt rides the piped `stdin_bytes` below instead.
+            prompt_dest.write_text(prompt, encoding="utf-8")
 
         if adapter.get("argv"):
             exe = shutil.which(adapter["argv"][0], path=os.environ.get("PATH", os.defpath))
@@ -756,9 +2280,22 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
             argv = (exe,) + tuple(adapter["argv"][1:])
         else:
             argv = orch_mod.harness_argv(runner)
-        argv = tuple(str(schema_dest) if a == "<schema>"
-                    else str(out_dest) if a == "<out>"
-                    else a for a in argv)
+        real_home = os.path.realpath(os.path.expanduser("~"))
+        fills = {"<schema>": str(schema_dest), "<out>": str(out_dest),
+                 "<lane>": str(cwd), "<prompt-file>": str(prompt_dest),
+                 "<profile>": str(CODEX_TESTER_PROFILE),
+                 "<codex-home>": os.path.join(real_home, ".codex"),
+                 "<muse-home>": os.path.join(real_home, ".config", "muse"),
+                 "<muse-bin-dir>": os.path.dirname(orch_mod.MUSE_BIN)}
+        if any("<profile>" in a for a in argv) and not CODEX_TESTER_PROFILE.is_file():
+            raise Stop(f"{runner_name!r} is confined by {CODEX_TESTER_PROFILE}, "
+                       "which is missing — refusing to spawn")
+
+        def _fill(a):
+            for token, value in fills.items():
+                a = a.replace(token, value)
+            return a
+        argv = tuple(_fill(a) for a in argv)
 
         env = {}
         for k in ("PATH", "HOME"):
@@ -767,24 +2304,102 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
         for k in tuple(runner.extra_env) + tuple(adapter.get("env", ())):
             if k in os.environ:
                 env[k] = os.environ[k]
+        for k in adapter.get("never_env", ()):
+            env.pop(k, None)
+        env.update(adapter.get("fixed_env") or {})
+        if adapter.get("home_is_cwd"):
+            # muse resolves `~/.claude/CLAUDE.md` and `~/.agents/skills` from
+            # `$HOME` itself (config/muse-tester.sb's own comment is the
+            # measurement); a HOME that holds neither keeps it from ever
+            # asking, rather than relying on the sandbox to refuse it by name.
+            env["HOME"] = str(cwd)
 
         stdin_bytes = adapter["stdin_bytes"](prompt)
         (lane_dir / "stdin.bin").write_bytes(stdin_bytes)
 
+        # The cap fails closed (plan 0100 D3): no row, an unreadable database,
+        # an invalid row, a runner the value does not name, or `0` all refuse.
+        cap_value = _read_cap(cfg)
+        fix = "fleet-config set lane_run_cap '<runner>=<n>,…'"
+        if cap_value is None:
+            raise Stop(f"lane_run_cap is unset or unreadable — set it with: {fix}")
+        cap_n = cfg.parse_lane_run_cap(cap_value).get(runner_name)
+        if cap_n is None:
+            raise Stop(f"lane_run_cap does not name {runner_name!r} — add it with: {fix}")
+        if cap_n == 0:
+            raise Stop(f"lane_run_cap pauses {runner_name!r} (=0) — raise it with: {fix}")
+        rec.reserve(cap_value, cfg.parse_lane_run_cap)
+        stage = "reserved"
+        log.note("cap", runner=runner_name, admitted=rec.cap_note)
+
         log.note("spawn", argv=" ".join(argv), cwd=str(cwd))
-        rc, timed_out, stdout_text = spawn_lane(argv, cwd, env, stdin_bytes)
+        stage = "spawned"
+        sent = []
+        login = adapter["login_file"]() if adapter.get("login_file") else None
+        login_before = _mtime(login) if login else None
+        rc, timed_out, stdout_text = spawn_lane(
+            argv, cwd, env, stdin_bytes, second_turn=adapter.get("second_turn"), sent=sent)
+        if adapter.get("second_turn"):
+            (lane_dir / "stdin.bin").write_bytes(stdin_bytes + b"".join(sent))
+            log.note("second-turn", sent=bool(sent))
+        if login:
+            log.note("login-file", changed=_mtime(login) != login_before)
         clean_stdout, shapes = orch_mod.redact_transcript(stdout_text)
+        (lane_dir / "stdout.redacted.txt").write_text(clean_stdout)
         log.note("spawn-exit", rc=rc, timed_out=timed_out,
                  shapes=",".join(shapes) or "-")
+        rec.set(rc=rc)
+        try:
+            usage_obj, model = adapter["usage"](stdout_text)
+            rec.set(usage_json=usage_json(usage_obj))
+            # A served model the CLI itself reported (plan 0190) wins over
+            # the launch-config pin `__init__` already seeded; a `None`
+            # here — codex and antigravity never report one, measured —
+            # must not erase that pin, so `report_model` is a no-op for it.
+            rec.report_model(model)
+        except Exception:
+            pass
 
         doc, usage = adapter["parse"](stdout_text, str(out_dest))
         if doc is None:
-            raise Stop("the vendor's result did not parse into a document")
+            # timeout is decided BEFORE quota (issue #662, PR #657 review M1):
+            # a run this program killed on its own SPAWN_TIMEOUT_SECONDS
+            # is never `quota`, whatever text its stream carries. Antigravity
+            # retries per-minute 429s in-process, so a stream that survived a
+            # transient RESOURCE_EXHAUSTED warning and then hung until the
+            # timeout would otherwise be misread as a vendor quota refusal.
+            if timed_out:
+                raise Stop("the vendor timed out and was killed", outcome="timeout")
+            # Only a run that produced no document can be a quota: a reply that
+            # parses is never one, whatever its text says.
+            quota_fn = adapter.get("quota")
+            quota_msg = quota_fn(rc, stdout_text, str(out_dest)) if quota_fn else None
+            if quota_msg is not None:
+                raise Stop(quota_msg, outcome="quota")
+            if rc != 0 or adapter.get("is_error", lambda t: False)(stdout_text):
+                tail = clean_stdout.strip()[-200:]
+                raise Stop(f"the vendor stopped on an error (exit {rc}): {tail}",
+                           outcome="vendor-error")
+            why = adapter.get("no_document", lambda t: None)(stdout_text)
+            raise Stop(why or "the vendor's result did not parse into a document",
+                       outcome="bad-result")
         errors = validate_schema(doc, schema)
         if errors:
-            raise Stop(f"the vendor's result failed schema validation: {errors[:5]}")
+            raise Stop(f"the vendor's result failed schema validation: {errors[:5]}",
+                       outcome="bad-result")
         log.note("result", files=len(doc.get("files") or []),
                  gaps=len(doc.get("gaps") or []))
+        if not doc.get("files"):
+            # Nothing to commit: not a landing failure, and no pull request
+            # (plan 0137 D2). The gaps are the result; keep what fits.
+            gaps = doc.get("gaps") or []
+            rec.finish("no-tests", detail=f"{len(gaps)} gaps: " + "; ".join(gaps))
+            orch_mod.notify(f"test lane wrote no tests: {plan_id} ({runner_name}), "
+                            f"{len(gaps)} gaps", "no pull request was opened")
+            print(f"fleet-lane: no tests: {len(gaps)} gaps, no pull request",
+                  file=sys.stderr)
+            return 1
+        stage = "landing"
 
         branch = f"agent/tests/{plan_id}/{runner_name}"
         land_wt = lib.add_worktree(repo, land_key, "origin/main", refspecs=["main"])
@@ -792,8 +2407,16 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
             p.relative_to(land_wt).as_posix()
             for p in (land_wt / CONFINE_ROOT).rglob("*") if p.is_file()
         } if (land_wt / CONFINE_ROOT).is_dir() else set()
+        base_names = {
+            p.name for p in (land_wt / "tests").rglob("*")
+            if p.is_file() and _TEST_MODULE_RE.match(p.name)
+        } if (land_wt / "tests").is_dir() else set()
 
-        normalised = check_result_files(doc.get("files") or [], land_wt, existing_paths)
+        try:
+            normalised = check_result_files(doc.get("files") or [], land_wt, existing_paths,
+                                            base_names)
+        except Stop as e:
+            raise Stop(str(e), outcome="bad-result") from None
 
         r = _git(["checkout", "-B", branch], land_wt)
         if r.returncode != 0:
@@ -815,10 +2438,12 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
         if r.returncode != 0:
             raise Stop(f"git push failed: {r.stderr.strip()[:200]}")
 
-        body = build_pr_body(plan_id, runner_name, sha, prompt_sha256, usage,
+        body = build_pr_body(plan_id, runner_name, rec.fields.get("sha") or sha, prompt_sha256,
+                             rec.fields.get("usage_json"),
                              doc.get("gaps") or [], doc.get("notes"))
         assert not re.search(rf"^Plan: {re.escape(plan_id)}\s*$", body, re.M), \
             "PR body must never match marked_pr()'s regex"
+        check_body_header(body)
         title = f"WIP: tests: {plan_id} via {runner_name}"
         status, pr = fleetforge.Forge(orch_mod._forgejo_base_url(), token,
                                       timeout=orch_mod.forge_timeout()).create_pull(
@@ -828,21 +2453,92 @@ def run(repo, plan_id, sha, runner_name, schema_path=None, dry_run=False,
                        f"{branch} — the branch is on origin; a human must open "
                        "the pull request by hand")
         log.note("pr", number=pr.get("number"), branch=branch)
+        rec.finish("pr-opened", detail=f"pull request {repo}#{pr.get('number')} opened",
+                   pr=pr.get("number"))
+        # The page channel comes from the installed unit's environment; a hand
+        # run has none, and `notify` says so (`NOTIFY(undelivered)`) while
+        # `record_page` still keeps the trace (docs/test-lane.md). The outcome
+        # goes to stdout so a person at the terminal is not left to that.
         orch_mod.notify(f"test lane: {plan_id} ({runner_name})",
                         f"{repo}#{pr.get('number')} — a human read is next",
                         )
+        print(f"pr: {repo}#{pr.get('number')}")
         return 0
     except refusal_excs as e:
-        log.note("refused", reason=str(e))
-        orch_mod.notify(f"test lane refused: {plan_id} ({runner_name})", str(e))
+        outcome = getattr(e, "outcome", None) or {
+            "gate": "refused", "reserved": "vendor-error",
+            "spawned": "vendor-error", "landing": "landing-failed"}[stage]
+        rec.finish(outcome, detail=str(e))
+        no_record = (f"\n(the lane_run record could not be written: {rec.write_error})"
+                     if rec.write_error else "")
+        if outcome == "quota":
+            log.note("quota", reason=str(e))
+            orch_mod.notify(
+                f"test lane stopped by vendor quota: {plan_id} ({runner_name})",
+                f"{orch_mod.redact_transcript(str(e))[0][:DETAIL_MAX]}\n{rec.cap_note or 'runs in the last 24h: unknown'}\n"
+                "the owner's subscription is at its limit; nothing will retry"
+                + no_record)
+            print(f"fleet-lane: vendor quota: {e}", file=sys.stderr)
+            return EXIT_LATER
+        log.note("refused", reason=str(e), outcome=outcome)
+        orch_mod.notify(f"test lane refused: {plan_id} ({runner_name})",
+                        str(e) + no_record)
         print(f"fleet-lane: refused: {e}", file=sys.stderr)
-        return 1
+        return EXIT_LATER if outcome == "capped" else 1
     finally:
+        # An unexpected exception after the reservation still ends the row;
+        # `finish` never raises, so it cannot mask the original error.
+        if not dry_run and not rec.final:
+            exc = sys.exc_info()[1]
+            rec.finish("landing-failed" if stage == "landing" else
+                       "vendor-error" if stage in ("reserved", "spawned") else "refused",
+                       detail=f"unexpected {exc.__class__.__name__}: {exc}" if exc
+                       else "run ended without an outcome")
+        result.update(outcome=rec.outcome or result["outcome"],
+                      pr=rec.fields.get("pr"), sha=rec.fields.get("sha") or sha)
         if read_wt is not None:
-            lib.remove_worktree(repo, read_key)
+            remove_lane_reader(repo, read_key)
         if land_wt is not None:
             lib.remove_worktree(repo, land_key)
         log.close()
+
+
+def run_leased(repo, plan_id, sha, runner_name, lease_id, **kw):
+    """`run` under a lease the watcher assigned (plan 0104 D5).
+
+    Activates the lease before the first gate, heartbeats for the run, and
+    releases the lease on EVERY controlled exit — success, refusal, failure —
+    then emits `lane-ended`. Unlike the implementation lane, releasing re-arms
+    nothing: a lane is only ever dispatched with its implementation lane, so
+    holding the lease would only make every finished lane read `dead` a TTL
+    later. An uncontrolled death never reaches here and leaves the lease to
+    derive orphaned, which is the `dead` signal."""
+    orch_mod = kw.get("orch_mod") or _orchestrator_module()
+    kw["orch_mod"] = orch_mod
+    result = {"outcome": "refused", "pr": None, "sha": sha, "runner": runner_name}
+    kw["result"] = result
+    ok, why = orch_mod.activate(lease_id)
+    if not ok:
+        # Not ours to release: activation refuses when the lease is not this
+        # session's, and releasing someone else's lease is worse than leaking.
+        print(f"fleet-lane: lease {lease_id} would not activate: {why}", file=sys.stderr)
+        orch_mod.notify(f"test lane lease refused: {plan_id}", f"{lease_id}: {why}")
+        return 1
+    hb = orch_mod.Heartbeat(os.environ.get("EUNOMIA_SESSION", "")).start()
+    rc = 1
+    try:
+        rc = run(repo, plan_id, sha, runner_name, **kw)
+        return rc
+    finally:
+        hb.stop()
+        released, detail = orch_mod.release_lease(lease_id)
+        if not released:
+            orch_mod.notify(f"test lane finished but could not release its lease: {plan_id}",
+                            f"{repo} {plan_id} ({result.get('runner')}): {lease_id}: {detail}")
+        orch_mod.emit("lane-ended", repo, {
+            "plan": plan_id, "runner": result.get("runner"), "lease": lease_id,
+            "sha": result.get("sha"), "outcome": result.get("outcome"),
+            "pr": result.get("pr")}, lease=lease_id)
 
 
 def main(argv=None):
@@ -854,10 +2550,16 @@ def main(argv=None):
                     help="a tester row of the repo; default: ordinal 1")
     ap.add_argument("--schema", default=None)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--lease", default=None,
+                    help="the lane lease the watcher assigned (plan 0104); "
+                         "released on every controlled exit")
     args = ap.parse_args(argv)
     if "/" in args.plan_id or args.plan_id in (".", ".."):
         print(f"fleet-lane: {args.plan_id!r} is not a plan id", file=sys.stderr)
         return 2
+    if args.lease and not args.dry_run:
+        return run_leased(args.repo, args.plan_id, args.sha, args.runner, args.lease,
+                          schema_path=args.schema)
     return run(args.repo, args.plan_id, args.sha, args.runner,
               schema_path=args.schema, dry_run=args.dry_run)
 

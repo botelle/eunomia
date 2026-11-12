@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-depsd — a resident service (plan 0181) that re-checks every held plan
+  when a watched repository's main moves or the owner attests an
+  `external:<slug>`. It owns `dependency_hold` and `dependency_scan` in
+  fleet.db, serves a small LAN API (/api/v1/holds, /api/v1/attestations,
+  /healthz) and a Forgejo webhook (/webhook/forgejo), and writes a wake file
+  under ~/dev/.fleet/wake/ for `fleet-watch` when a plan's last hold clears.
+  See docs/depsd.md.
+
+  Plan 0189: the SAME webhook also answers a `pull_request` lifecycle
+  delivery, persisting a job in `bin/fleet-plan-review`'s existing queue, and
+  a second thread reconciles and drains that queue on its own schedule —
+  calling that file's own claim/dispatch entry points, so a dispatch (which
+  may call the forge and post a review under the fleet's existing reviewer
+  identity, same as a hand-run `fleet-plan-review worker`) can run for
+  several minutes without delaying this service's own recompute loop. No new
+  environment variable: it reuses FLEET_FORGEJO_URL/FLEET_BROKER_SOCKET
+  below, the same way `org.eunomia.fleet-watch`'s own dispatching does. See
+  docs/depsd.md's "Reconciling, and the bounded worker wake" and
+  docs/plan-review-dispatch.md's "Automatic triggers".
+
+  RESIDENT, the same SPEC.md Principle 2 exception `fleet-watch` runs under:
+  it holds a `service` lease on `<host>:fleet-depsd` (released on SIGTERM) and
+  keeps every fact in fleet.db, so a kill at any instant loses nothing — the
+  poll backstop (FLEET_DEPSD_POLL, default 600s) recomputes in full on the
+  very next tick.
+
+  Install (opshost only, after fleet-db-migrate has created dependency_hold and
+  dependency_scan):
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-depsd.plist ~/Library/LaunchAgents/
+    # fill FLEET_DEPSD_WEBHOOK_SECRET_CMD / FLEET_DEPSD_ATTEST_TOKEN_CMD
+    # below only if this deployment's helpers are not at their default paths
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-depsd.plist
+  Verify: curl http://192.0.2.5:8797/healthz and /api/v1/holds.
+
+  The webhook secret and the attest token are NEVER in this file — each is
+  read, per plan 0181 D2/D3, from the stdout of a helper named by
+  FLEET_DEPSD_WEBHOOK_SECRET_CMD / FLEET_DEPSD_ATTEST_TOKEN_CMD (default
+  ~/bin/fetch-fleet-depsd-webhook-secret.sh and
+  ~/bin/fetch-fleet-depsd-attest-token.sh, from operator/hosttools) and held
+  in memory only.
+
+  FLEET_DEPSD_BIND must not be a wildcard address (refused at start, exit 2)
+  — the service is for the LAN, where Forgejo on vaulthost and lynceus on opshost can
+  reach it, and nothing else.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the same reason
+  org.eunomia.fleet-watch.plist gives.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.eunomia.fleet-depsd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-depsd</string>
+    <string>serve</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FLEET_DEPSD_BIND</key><string>192.0.2.5:8797</string>
+    <key>FLEET_DEPSD_POLL</key><string>600</string>
+    <key>FLEET_FORGEJO_URL</key><string>http://forge.example:3000</string>
+    <!-- the ssh forward from org.eunomia.fleet-broker-tunnel lands here —
+         same default fleet-watch itself reads -->
+    <key>FLEET_BROKER_SOCKET</key><string>/Users/operator/run/forgejo-broker.sock</string>
+  </dict>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/operator/dev/.fleet/depsd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/operator/dev/.fleet/depsd.log</string>
+</dict>
+</plist>

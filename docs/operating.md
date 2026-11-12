@@ -50,6 +50,7 @@ the way it does.
 | `fleet-pin-watch` | yes | loaded, firing | loaded; drift pages, `fleet-pin-advance` heals eunomia's pin |
 | `fleet-pin-advance` | — | not present | loaded |
 | `fleet-orphans` | — | not present | loaded, daily; pages (exit 2 = orphans found) |
+| `fleet-drift` | yes (0098) | — | plist on `main`, **not loaded** until the host step below |
 | `fleet-snapshot` | yes | not present | loaded; exit 1 = "NOT BACKED UP" (see below) |
 | `fleet-db-snapshot` | yes (0063) | — | plist on `main`, **not loaded** |
 | `mopsus` | yes (0046, 0064) | not present | loaded; briefs with a shortlist and a Minos link |
@@ -185,3 +186,37 @@ running the current code, from a pin someone can see is current, with its failur
 arriving somewhere a person will read them. Three of the four gaps above are of
 that shape rather than "not written yet", and they were invisible until someone
 went and looked at the host.
+
+## fleet-drift — a deployed service that stays behind main (plan 0098)
+
+`org.eunomia.fleet-drift` runs the pinned `bin/fleet-drift` every 900 s. It reads
+`config/deployed.conf`, one line per service:
+
+    <services.conf name> <healthz URL> [allow=<hours>]
+
+The name must be a `service:` name in `config/services.conf`; `allow` defaults to
+24. A malformed line, unknown name or duplicate refuses the whole file (exit 2).
+
+It reads the service's own `up_to_date` and never computes a verdict itself:
+
+| state | meaning |
+|---|---|
+| `current` | `up_to_date` is `true` |
+| `behind` | `up_to_date` is `false` |
+| `unknown` | anything else: field missing, non-200, timeout, bad JSON |
+
+A spell is one unbroken run of non-current samples; behind and unknown may
+alternate inside it without restarting the clock. When a spell outlasts `allow`,
+one page is sent (`behind main for <h>h` or `cannot tell for <h>h — <reason>`);
+when a paged spell ends, one `current again` page. Reasons are a fixed
+vocabulary (`field-missing`, `http-<status>`, `timeout`, `unreachable`,
+`bad-json`), never a response body. State lives in `<fleet dir>/drift/<name>.json`.
+`fleet-drift --dry-run` prints each classification and changes nothing.
+
+It only reports: it never deploys, restarts or rolls back.
+
+Install (opshost, a host step after the merge):
+
+    cp launchd/org.eunomia.fleet-drift.plist ~/Library/LaunchAgents/
+    # set FLEET_NTFY_URL in the copy, then
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-drift.plist

@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""fleet-requeue — hand a failed dispatch back to the watcher (plan 0112).
+
+  fleet-requeue REPO PLAN_ID [--dry-run]
+
+Releases the plan's dispatch lease, through `fleet-release --force`, only when
+ALL of these hold: exactly one dispatch lease exists for (REPO, PLAN_ID); it is
+dead (`is_orphaned`); a `plan-failed` event names it and is newer than its
+`activated`; and no marked PR exists and the forge could be read. It never
+spawns — the watcher re-dispatches under the cap and the quota gate — and it
+has no --force: a live lease is never released here.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+fwatch = _load("fleet_watch", BIN / "fleet-watch")
+
+
+class Refusal(Exception):
+    pass
+
+
+def actor():
+    """EUNOMIA_SESSION when set, else `owner-<user>`. Never a service's id."""
+    sid = os.environ.get("EUNOMIA_SESSION", "").strip()
+    if sid:
+        return sid
+    sid = "owner-" + os.environ.get("USER", "").strip()
+    if not lib._SID_RE.match(sid) or sid == "owner-":
+        raise Refusal(f"no EUNOMIA_SESSION and $USER does not make a valid session id "
+                      f"({sid!r}) — set EUNOMIA_SESSION")
+    return sid
+
+
+def resolve_lease(repo, plan_id):
+    """The one live dispatch lease for (repo, plan_id). dispatch_leases() is a
+    dict keyed by (repo, plan_id), so a second lease would silently overwrite
+    the first; count them from the same records to refuse on that."""
+    if (repo, plan_id) not in fwatch.dispatch_leases():
+        raise Refusal(f"nothing to requeue: no active or assigned dispatch lease "
+                      f"for {repo} {plan_id}")
+    found = [r for r in lib.all_leases()
+             if (r.get("note") or "") == fwatch.NOTE_PREFIX + plan_id
+             and r.get("state") in ("assigned", "active")
+             and (lib.resource_of(r).get("repo") or "") == repo]
+    if len(found) != 1:
+        raise Refusal(f"{len(found)} dispatch leases for {repo} {plan_id}, need "
+                      f"exactly one: {', '.join(r.get('id', '?') for r in found)}")
+    return found[0]
+
+
+def failure_event(repo, plan_id, rec):
+    """The newest `plan-failed` naming this lease, at or after its activation."""
+    d = lib.fleet_dir()
+    activated = lib.parse_ts(rec.get("activated"))
+    best = None
+    for p in [d / "events.jsonl", *sorted(d.glob("events-*.jsonl"))]:
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if "plan-failed" not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            detail = ev.get("detail") if isinstance(ev, dict) else None
+            if not (isinstance(detail, dict) and ev.get("type") == "plan-failed"
+                    and detail.get("lease") == rec.get("id")):
+                continue
+            when = lib.parse_ts(ev.get("ts"))
+            if activated and (not when or when < activated):
+                continue
+            if best is None or (ev.get("ts") or "") >= (best.get("ts") or ""):
+                best = ev
+    return best
+
+
+def marked_pr_check(repo, plan_id):
+    """As mopsus's `_marked_pr_check`: a PR dict, "unreadable", or None."""
+    try:
+        token, _ = fwatch._token()
+        if not token:
+            return "unreadable"
+        return fwatch.marked_pr(repo, plan_id, token)
+    except Exception:
+        return "unreadable"
+
+
+def check(repo, plan_id):
+    """Run the four checks; return (lease record, failure reason) or raise."""
+    rec = resolve_lease(repo, plan_id)
+    lease = rec.get("id")
+    if not lib.is_orphaned(rec):
+        raise Refusal(f"{lease} is within its heartbeat TTL — a running "
+                      "orchestrator's, and releasing it would be a takeover")
+    ev = failure_event(repo, plan_id, rec)
+    if ev is None:
+        raise Refusal(f"{lease} is dead but no plan-failed event names it since it "
+                      "activated — a crash, whose cause is unknown; see fleet-orphans")
+    pr = marked_pr_check(repo, plan_id)
+    if pr == "unreadable":
+        raise Refusal("the forge could not be read, so a marked PR cannot be ruled out")
+    if pr:
+        num = pr.get("number", "?")
+        if (pr.get("state") or "").lower() == "open":
+            raise Refusal(f"PR #{num} is open and carries the marker — post `respawn` "
+                          "on it instead")
+        raise Refusal(f"PR #{num} is closed or merged and carries the marker — post "
+                      "`redispatch` on it instead")
+    reason = (ev.get("detail") or {}).get("reason") or "-"
+    return rec, reason
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="fleet-requeue", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("repo")
+    ap.add_argument("plan_id")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="run every check and print what would be released; write nothing")
+    args = ap.parse_args(argv)
+    try:
+        sid = actor()
+        rec, reason = check(args.repo, args.plan_id)
+    except Refusal as e:
+        print(f"fleet-requeue: refusing — {e}", file=sys.stderr)
+        return 1
+    lease = rec["id"]
+    if args.dry_run:
+        print(f"would release {lease}\nfailure: {reason}")
+        return 0
+    env = dict(os.environ, EUNOMIA_SESSION=sid)
+    r = subprocess.run([sys.executable, str(BIN / "fleet-release"), lease, "--force"],
+                       env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"fleet-requeue: fleet-release failed: {r.stderr.strip()}", file=sys.stderr)
+        return 1
+    print(f"{lease}\nfailure: {reason}\nthe watcher re-dispatches under the cap")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

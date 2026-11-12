@@ -257,6 +257,45 @@ def test_the_instruction_reaches_the_session_verbatim(tmp_path):
     assert "PLAN" in ran[0]
 
 
+MINOS_SIG = "\n\n_via minos (2d54cf11968f08fb.access)_"
+
+
+@pytest.mark.parametrize("body", ["respawn", "Respawn" + MINOS_SIG, "`respawn`"])
+def test_a_respawn_control_word_is_not_an_instruction(tmp_path, body):
+    mod = _load(tmp_path, EUNOMIA_STEWARD_POLL="5")
+    thread = [_instr(10, body)]
+    assert mod.pending_instructions(thread) == []
+    assert [c["id"] for c in mod.pending_control_comments(thread)] == [10]
+    forge = FakeForge(thread)
+    ran, released = [], []
+    _steward(mod, forge, ran, released)
+    assert ran == []
+    assert len(forge.posted) == 1
+    assert "Ack: #10" in forge.posted[0]
+    assert "control word" in forge.posted[0]
+    # once acked it is neither pending nor a control comment again
+    done = thread + [_ack(20, 10)]
+    assert mod.pending_instructions(done) == []
+    assert mod.pending_control_comments(done) == []
+
+
+def test_respawn_with_other_text_stays_an_instruction(tmp_path):
+    mod = _load(tmp_path)
+    for body in ("respawn\nand fix the flaky test",
+                 "respawn" + MINOS_SIG + "\nand fix the flaky test"):
+        pend = mod.pending_instructions([_instr(10, body)])
+        assert [c["body"] for c in pend] == [body]
+        assert mod.pending_control_comments([_instr(10, body)]) == []
+
+
+def test_a_foreign_respawn_is_unchanged(tmp_path):
+    mod = _load(tmp_path)
+    c = _c(10, STRANGER, "respawn")
+    assert mod.pending_instructions([c]) == []
+    assert mod.pending_control_comments([c]) == []
+    assert [x["id"] for x in mod.foreign_comments([c])] == [10]
+
+
 def test_an_acked_instruction_is_not_run_again_next_cycle(tmp_path):
     mod = _load(tmp_path, EUNOMIA_STEWARD_POLL="5")
     forge = FakeForge([_instr(10), _ack(20, 10)])
@@ -305,3 +344,39 @@ def test_there_is_still_no_local_ack_file(tmp_path):
     src = (BIN / "orchestrator").read_text()
     for smell in ("ack_state", "acks.json", "ack_ledger", "acked.txt"):
         assert smell not in src
+
+
+# ------------------------------------------------- the unfreeze acks (0124)
+def _frozen(mod, text):
+    return mod.frozen_note("approved by operator", "br", "fb", 7, text)
+
+
+def test_the_frozen_ack_shows_the_comment_to_post(tmp_path):
+    mod = _load(tmp_path)
+    note = _frozen(mod, "fix the docstring")
+    assert "```\nunfreeze\nfix the docstring\n```" in note
+    assert "instruction repeated" not in note
+    assert "only permits a push" in note
+
+
+def test_the_frozen_ack_truncates_a_long_instruction(tmp_path):
+    mod = _load(tmp_path)
+    note = _frozen(mod, "x" * 500)
+    assert "unfreeze\n" + "x" * 200 + "\u2026\n```" in note
+    assert "x" * 201 not in note
+
+
+def test_the_frozen_ack_fence_survives_backticks_in_the_text(tmp_path):
+    mod = _load(tmp_path)
+    note = _frozen(mod, "run ```make``` now")
+    assert "````\nunfreeze\nrun ```make``` now\n````" in note
+
+
+def test_a_bare_grant_ack_explains_itself(tmp_path):
+    mod = _load(tmp_path)
+    note = mod.bare_grant_note("br")
+    assert note.startswith("`unfreeze` accepted.")
+    assert ("This grants a push but names no change. To have me do something on "
+            "the approved branch, post `unfreeze` and the change together, for "
+            "example `unfreeze` then `rebase onto main and resolve the conflicts`."
+            ) in note

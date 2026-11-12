@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """fleet-release — release a lease you hold (SPEC.md §Lease record).
 
-  fleet-release LEASE_ID [--force]
+  fleet-release LEASE_ID [--force] [--expect-orphaned HOLDER] [--reason TOKEN]
 
 Releasing a lease held by another session refuses, because a release you didn't
 own is a takeover wearing politer clothes. --force is the human override; the
 identity mismatch is recorded in the event detail rather than papered over.
+
+--expect-orphaned HOLDER is ADR-0029 §3's check for a caller that is NOT the
+holder (fleet-watch's sweep, releasing a dead orchestrator's lease): under the
+lease's lock it re-reads the record and re-derives orphanhood, the same
+re-derivation `fleet-claim --takeover` makes, and refuses — writing nothing —
+unless the lease is still orphaned and its holder is still HOLDER. Without it,
+--force behaves exactly as before.
+
+--reason TOKEN must be exactly `plan-done` or `plan-abandoned` (ADR-0029 §3) —
+a closed allowlist, because `events.jsonl` is rendered by atlas and must never
+hold secret material (SPEC.md Principle 6); a pattern would admit a
+token-shaped secret where this allowlist cannot.
 """
 import argparse
 import importlib.machinery
@@ -19,6 +31,10 @@ _lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
 lib = importlib.util.module_from_spec(_lib_spec)
 _lib_loader.exec_module(lib)
 
+# A closed allowlist of release reasons (ADR-0029 §3) — a new reason is added
+# here deliberately, in a reviewed change, never accepted as free text.
+REASONS = ("plan-done", "plan-abandoned")
+
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="fleet-release", description=__doc__,
@@ -26,11 +42,15 @@ def main(argv=None) -> int:
     ap.add_argument("lease_id")
     ap.add_argument("--force", action="store_true",
                     help="release a lease held by another session (recorded in the event)")
+    ap.add_argument("--expect-orphaned", metavar="HOLDER", default=None,
+                    help="refuse unless the lease is still orphaned and still held by HOLDER")
+    ap.add_argument("--reason", choices=REASONS, default=None,
+                    help="recorded in the event detail")
     args = ap.parse_args(argv)
 
     sid = lib.session_id()
     lib.validate_lease_id(args.lease_id)
-    detail = None
+    detail = {}
     with lib.held_lock(lib.lock_path(args.lease_id)):
         rec = lib.read_lease_checked(args.lease_id)
         if rec is None:
@@ -39,18 +59,32 @@ def main(argv=None) -> int:
             print(args.lease_id)   # idempotent: releasing twice is not an error
             return 0
         holder = rec.get("holder")
+        if args.expect_orphaned is not None:
+            # Re-derived UNDER the lock, the same discipline takeover already
+            # follows: the watcher's read and this release are two separate
+            # moments, and a holder that recovered between them must not lose
+            # its lease to a release built on a stale read (ADR-0029 §3).
+            if holder != args.expect_orphaned:
+                sys.exit(f"fleet-release: {args.lease_id} is held by {holder!r}, "
+                         f"not {args.expect_orphaned!r} — refusing "
+                         "(--expect-orphaned mismatch)")
+            if not lib.is_orphaned(rec):
+                sys.exit(f"fleet-release: {args.lease_id} is not orphaned — "
+                         f"holder {holder!r} is live; refusing")
         if holder != sid:
             if not args.force:
                 sys.exit(f"fleet-release: {args.lease_id} is held by {holder!r}, "
                          f"not {sid!r} — refusing (use --force to override)")
-            detail = {"forced": True, "holder_was": holder}
+            detail.update({"forced": True, "holder_was": holder})
+        if args.reason is not None:
+            detail["reason"] = args.reason
         rec["state"] = "released"
         lib.write_lease(rec)
         try:
             lib.marker_path(args.lease_id).unlink()
         except FileNotFoundError:
             pass
-    lib.emit("lease-released", args.lease_id, sid, detail=detail)
+    lib.emit("lease-released", args.lease_id, sid, detail=detail or None)
     print(args.lease_id)
     return 0
 

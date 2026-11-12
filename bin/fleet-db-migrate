@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""fleet-db-migrate -- bring fleet.db's durable schema up to this checkout's code.
+
+Plan 0096. A strict reader (`fleet-config`'s `resolve_repo_setting`) refuses a
+store whose table is missing, and only a write path creates the table, so a host
+that had never written a repo setting refused every review once the reader
+shipped. This creates every table the schema owners define, before anything
+reads it.
+
+It never restates DDL. Each owner's own `SCHEMA` constant (and fleet-reviews's
+`_migrate`) is the source, loaded by path from the directory this file sits in,
+so a table added to an owner is migrated with no change here. Only additive DDL
+runs: CREATE ... IF NOT EXISTS and the owner's own `_migrate`. An owner's
+`_migrate` may rebuild a table to widen a CHECK (fleet-models does, for a new
+position), copying every row in one transaction and rolling back on a mismatch.
+Nothing else is dropped, altered away, or deleted.
+
+NOT covered, on purpose: fleet-collect's derived tables (it migrates itself
+under PRAGMA user_version -- this never touches that), talos's tables (talos
+owns them), and mopsus's inline `review_probe` / `resume_request`.
+
+    fleet-db-migrate [--dry-run]
+
+`FLEET_DB` overrides the path, as it does for the owners themselves. Exit 0
+only if every owner succeeded; a failed owner does not stop the others.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+# (name, file). Each must expose a `SCHEMA` string; fleet-reviews also `_migrate`.
+# NOTE: `docs/fleet-db.md`'s own prose enumeration of this list, and its
+# durable-tier table, both still predate `fleet-plan-review`'s addition here
+# (plan 0188) — that file is outside this plan's `paths:` lane, so the fix is
+# a follow-up, not something this plan can land.
+OWNERS = (("fleet-config", "fleet-config"),
+          ("fleet-models", "fleet-models"),
+          ("fleet-reviews", "fleet-reviews"),
+          ("fleet-lane", "fleet-lane"),
+          ("fleet-depsd", "fleet-depsd"),
+          ("fleet-plan-review", "fleet-plan-review"))
+
+
+def _load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _apply(mod, con):
+    con.executescript(mod.SCHEMA)
+    if hasattr(mod, "_migrate"):
+        mod._migrate(con)
+
+
+def _tables(con):
+    return {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'")}
+
+
+def _owner_tables(mod):
+    """The tables an owner's schema defines, found by applying it to a scratch
+    in-memory database -- so the list is read from the owner, never restated."""
+    scratch = sqlite3.connect(":memory:")
+    try:
+        _apply(mod, scratch)
+        return _tables(scratch)
+    finally:
+        scratch.close()
+
+
+def db_path():
+    lib = _load("fleetlib", BIN / "fleetlib.py")
+    return os.path.expanduser(
+        os.environ.get("FLEET_DB", str(lib.fleet_dir() / "fleet.db")))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-db-migrate", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--dry-run", action="store_true",
+                    help="list the tables that would be created; change nothing")
+    args = ap.parse_args(argv)
+
+    path = db_path()
+    existing = set()
+    if args.dry_run:
+        if os.path.exists(path):
+            ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                existing = _tables(ro)
+            finally:
+                ro.close()
+        con = None
+    else:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        con = sqlite3.connect(path)
+        try:
+            con.execute("PRAGMA journal_mode=WAL").fetchone()
+        except sqlite3.OperationalError as e:
+            print(f"fleet-db-migrate: could not switch to WAL ({e}) -- continuing",
+                  file=sys.stderr)
+
+    failed = False
+    for name, fname in OWNERS:
+        try:
+            mod = _load("_migrate_" + name.replace("-", "_"), BIN / fname)
+            tables = _owner_tables(mod)
+            if args.dry_run:
+                missing = sorted(tables - existing)
+                print(f"ok {name} (would create {len(missing)} of {len(tables)} tables"
+                      + (f": {', '.join(missing)}" if missing else "") + ")")
+                continue
+            _apply(mod, con)
+            print(f"ok {name} ({len(tables)} tables)")
+        except (Exception, SystemExit) as e:
+            failed = True
+            print(f"FAILED {name}: {e}")
+    if con is not None:
+        con.close()
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

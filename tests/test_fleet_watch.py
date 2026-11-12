@@ -30,7 +30,8 @@ BIN = Path(__file__).resolve().parent.parent / "bin"
 # the next _load and makes tests order-dependent (the r3 low this list exists
 # for; the r7 identity sets are read at import too).
 _WATCH_ENV = ("FLEET_WATCH_REPOS", "FLEET_WATCH_CAP", "FLEET_OPERATOR_UID",
-              "FLEET_PR_PAGE_CAP", "FLEET_ORCHESTRATOR", "FLEET_NTFY_URL",
+              "FLEET_PR_PAGE_CAP", "FLEET_PR_ISSUE_PAGE_CAP",
+              "FLEET_ORCHESTRATOR", "FLEET_NTFY_URL",
               "FLEET_IMPLEMENTER_UIDS", "FLEET_IMPLEMENTER_LOGINS",
               "FLEET_AGENT_ACCOUNTS", "FLEET_PINS",
               # read at import, and test_this_hosts_forgejo_url_still_drives...
@@ -215,6 +216,16 @@ def _instant(ts):
         return None
 
 
+def _issue_shape(pr):
+    """One `pulls=` fixture row reshaped the way the real issues-index item
+    carries it (plan 0218): `merged`/`merged_at` nested under `pull_request`,
+    `head` dropped (nothing in that shape has one). Every other field passes
+    through unchanged."""
+    rest = {k: v for k, v in pr.items() if k not in ("merged", "merged_at", "head")}
+    rest["pull_request"] = {"merged": pr.get("merged"), "merged_at": pr.get("merged_at")}
+    return rest
+
+
 def _api_factory(protected=True, plans=("0009-thing.md",), plan_text=PLAN,
                  pulls=None, comments=None, calls=None):
     """A Forgejo stub keyed on (method, path-fragment), wrapped as a
@@ -235,11 +246,24 @@ def _api_factory(protected=True, plans=("0009-thing.md",), plan_text=PLAN,
             return 200, _contents_list(plans)
         if "/contents/plans/" in path:
             return 200, _contents_file(plan_text)
+        # plan 0106 D6: the plan's last change on main, and the PR behind it,
+        # merged by the human unless a test says otherwise.
+        if "/commits?" in path:
+            return 200, [{"sha": "a" * 40}]
+        if path.endswith("/pull") and "/commits/" in path:
+            return 200, {"number": 1, "merged_by": {"login": "operator"}}
         if "/pulls?" in path:
             # page like real Forgejo: rows on page 1, then an EMPTY page.
             # (The watcher stops only on an empty page — a SHORT page cannot
             # prove the end when an instance caps MAX_RESPONSE_ITEMS.)
             return 200, ((pulls or []) if "page=1" in path else [])
+        if "/issues?" in path and "type=pulls" in path:
+            # The dedupe scan's own listing since plan 0218 — same rows as
+            # `/pulls?` above, reshaped into the issues index's own item
+            # shape (`merged`/`merged_at` nested under `pull_request`, no
+            # `head`), since `_pull_pages` reads THIS endpoint now.
+            rows = [_issue_shape(p) for p in (pulls or [])]
+            return 200, (rows if "page=1" in path else [])
         if "/issues/" in path and "/comments" in path:
             # Modelled on the REAL handler (r10 H1). Forgejo's per-issue
             # `ListIssueComments` declares no ListOptions: it IGNORES `page`
@@ -316,6 +340,17 @@ class _ForgeDouble:
         if sort:
             q += f"&sort={sort}"
         return self("GET", f"/repos/{repo}/pulls?{q}")
+
+    def list_pull_issues(self, repo, state="all", page=1, limit=50):
+        return self("GET", f"/repos/{repo}/issues?type=pulls&state={state}"
+                           f"&limit={limit}&page={page}")
+
+    def list_commits(self, repo, sha=None, path=None, page=1, limit=50):
+        q = f"sha={sha}&path={urllib.parse.quote(path or '', safe='/')}&limit={limit}"
+        return self("GET", f"/repos/{repo}/commits?{q}")
+
+    def get_commit_pull(self, repo, sha):
+        return self("GET", f"/repos/{repo}/commits/{sha}/pull")
 
     def list_issue_comments(self, repo, n, since=None, page=1, limit=50):
         # No page/limit in the reconstructed path: the real endpoint has no
@@ -732,7 +767,8 @@ def test_the_waiting_set_is_pinned_and_every_orchestrator_steward_line_is_classi
     mod = _load(tmp_path / "fleet")
     assert mod.STEWARD_WAITING_PHASES == {
         "steward-start", "steward-foreign", "steward-unfreeze",
-        "steward-followup", "steward-instruction", "steward-refused"}
+        "steward-followup", "steward-instruction", "steward-refused",
+        "ci-inherited"}                # plan 0144 D4: the review loop's wait
     SPENDING_OR_ENDED = {
         "steward-end",             # the exit line
         "steward-grant-spent",     # written after a fix session, before its re-review
@@ -741,9 +777,10 @@ def test_the_waiting_set_is_pinned_and_every_orchestrator_steward_line_is_classi
     src = (BIN / "orchestrator").read_text()
     emitted = set(re.findall(r'log\.note\(\s*"(steward-[a-z-]+)"', src))
     assert len(emitted) >= 8, f"the emitter grep found {emitted} — it has rotted"
-    assert emitted == mod.STEWARD_WAITING_PHASES | SPENDING_OR_ENDED, (
-        f"unclassified: {emitted - (mod.STEWARD_WAITING_PHASES | SPENDING_OR_ENDED)}; "
-        f"no longer emitted: {(mod.STEWARD_WAITING_PHASES | SPENDING_OR_ENDED) - emitted}")
+    waiting_steward = {p for p in mod.STEWARD_WAITING_PHASES if p.startswith("steward-")}
+    assert emitted == waiting_steward | SPENDING_OR_ENDED, (
+        f"unclassified: {emitted - (waiting_steward | SPENDING_OR_ENDED)}; "
+        f"no longer emitted: {(waiting_steward | SPENDING_OR_ENDED) - emitted}")
     assert not mod.STEWARD_WAITING_PHASES & SPENDING_OR_ENDED
 
 
@@ -816,7 +853,7 @@ def test_never_spawns_on_an_unreadable_dedupe_scan(tmp_path):
     mod = _load(tmp_path / "fleet", FLEET_WATCH_REPOS="operator/sniff")
 
     def api(method, path, body=None, token=None):
-        if "/pulls?" in path:
+        if "/issues?" in path and "type=pulls" in path:
             return 500, None            # cannot prove the plan is undispatched
         return _api_factory()(method, path, body, token)
     _wire(mod, api, orch)
@@ -1226,22 +1263,25 @@ def test_unparsable_lease_created_refuses_respawn(tmp_path):
     assert len(_spawns(log)) == before
 
 
-def test_dedupe_pages_over_a_stable_sort(tmp_path):
-    """r2 M2: recentupdate reorders under concurrent updates, so a marked PR
-    can slide into the already-scanned region and vanish — dispatching a
-    duplicate for done work."""
+def test_dedupe_pages_the_issues_index_not_pulls(tmp_path):
+    """Plan 0218: the dedupe scan reads the issues index (`type=pulls`), not
+    the slow `/pulls` listing — and that endpoint has no `sort=` parameter at
+    all (Forgejo cannot sort it oldest-first), so the scan must never ask for
+    one."""
     orch, log = _stub_orchestrator(tmp_path)
-    seen = []
+    seen, all_paths = [], []
     mod = _load(tmp_path / "fleet", FLEET_WATCH_REPOS="operator/sniff")
 
     def api(method, path, body=None, token=None):
-        if "/pulls?" in path:
+        all_paths.append(path)
+        if "/issues?" in path and "type=pulls" in path:
             seen.append(path)
         return _api_factory()(method, path, body, token)
     _wire(mod, api, orch)
     mod.cycle()
-    assert seen and all("sort=oldest" in p for p in seen), seen
-    assert not any("recentupdate" in p for p in seen)
+    assert seen and all("type=pulls" in p for p in seen), seen
+    assert not any("sort=" in p for p in seen)
+    assert not any("/pulls?" in p for p in all_paths), all_paths
 
 
 def test_every_matching_rule_must_pass(tmp_path):
@@ -1369,12 +1409,13 @@ def test_page_cap_exhaustion_pages_once(tmp_path):
     runbook's own diagnostic misdirects — it must reach the failure channel."""
     orch, log = _stub_orchestrator(tmp_path)
     mod = _load(tmp_path / "fleet", FLEET_WATCH_REPOS="operator/sniff",
-                FLEET_PR_PAGE_CAP="2")
+                FLEET_PR_ISSUE_PAGE_CAP="2")
 
     def api(method, path, body=None, token=None):
-        if "/pulls?" in path:                 # every page full, never empty
-            return 200, [{"user": {"login": "x"}, "state": "open",
-                          "number": 1, "body": ""}] * 50
+        if "/issues?" in path and "type=pulls" in path:
+            # every page full, never empty
+            return 200, [_issue_shape({"user": {"login": "x"}, "state": "open",
+                                      "number": 1, "body": ""})] * 50
         return _api_factory()(method, path, body, token)
     _wire(mod, api, orch)
     notes = []
@@ -2666,10 +2707,110 @@ def test_an_unreachable_remote_is_not_reported_as_current(tmp_path):
     """The fail-open this fleet keeps rediscovering: answering 'in sync' from a
     ref that could not be refreshed."""
     mod = _load(tmp_path / "fleet")
+    mod.PIN_FETCH_RETRY_SECS = 0     # both attempts fail regardless; don't wait
     _, pin = _pin_repo(tmp_path)
     subprocess.run(["git", "-C", str(pin), "remote", "set-url", "origin",
                     str(tmp_path / "gone.git")], check=True)
-    assert mod.pin_status(str(pin))[0] == "unfetchable"
+    state, detail, facts = mod.pin_status(str(pin))
+    assert state == "unfetchable"
+    assert facts["fetch_retried"] is True
+    assert facts["fetch_retry_ok"] is False
+
+
+# --- diagnosability: a failed fetch carries WHY, and retries once ----------
+# opshost 2026-09-29, ~/dev/.fleet/pin-advance.log: 78 of 854 fleet-pin-advance
+# runs refused at least one pin as `unfetchable`, and the stderr that would
+# say why was discarded. These tests exercise `_fetch_with_retry` directly
+# (a fake `_fetch_origin`, not a real broken remote) so a fetch that fails
+# once then succeeds, and one that fails twice, are each reproducible without
+# a real network condition.
+
+def test_a_fetch_that_fails_once_then_succeeds_recovers_with_the_retry_noted(tmp_path):
+    mod = _load(tmp_path / "fleet")
+    mod.PIN_FETCH_RETRY_SECS = 0
+    work, pin = _pin_repo(tmp_path)
+    (work / "f").write_text("two\n")
+    subprocess.run(["git", "-C", str(work), "commit", "-qam", "two"], check=True)
+    subprocess.run(["git", "-C", str(work), "push", "-q"], check=True)
+    real_fetch_origin = mod._fetch_origin   # the retry's "succeeds" branch must
+                                            # actually run git, or origin/main
+                                            # never advances in the pin's refs
+    calls = []
+
+    def fake_fetch_origin(path):
+        calls.append(path)
+        if len(calls) == 1:
+            return False, 128, "fatal: unable to access: Could not resolve host"
+        return real_fetch_origin(path)
+
+    mod._fetch_origin = fake_fetch_origin
+    state, detail, facts = mod.pin_status(str(pin))
+    assert len(calls) == 2, "one retry, not more"
+    assert state == "stale", detail          # origin moved; fetch itself recovered
+    assert facts["fetch_retried"] is True
+    assert facts["fetch_retry_ok"] is True
+    assert "retried once, succeeded" in detail
+
+
+def test_a_fetch_that_fails_twice_is_unfetchable_with_rc_and_stderr(tmp_path):
+    mod = _load(tmp_path / "fleet")
+    mod.PIN_FETCH_RETRY_SECS = 0
+    _, pin = _pin_repo(tmp_path)
+    calls = []
+
+    def fake_fetch_origin(path):
+        calls.append(path)
+        return False, 128, "fatal: could not read from remote repository."
+
+    mod._fetch_origin = fake_fetch_origin
+    state, detail, facts = mod.pin_status(str(pin))
+    assert len(calls) == 2, "exactly one retry, then give up"
+    assert state == "unfetchable"
+    assert facts["fetch_retried"] is True
+    assert facts["fetch_retry_ok"] is False
+    assert facts["fetch_rc"] == 128
+    assert "could not read from remote repository" in facts["fetch_stderr"]
+    assert "rc=128" in detail
+    assert "retried once, still failed" in detail
+
+
+def test_unfetchable_stderr_is_redacted_for_token_shaped_text(tmp_path):
+    """stderr can carry a remote URL with an embedded credential; the fleet's
+    one redaction path (bin/orchestrator.redact, reused from
+    fleet-leak-watch's FINDINGS) must run over it before it reaches a log or
+    a page."""
+    mod = _load(tmp_path / "fleet")
+    mod.PIN_FETCH_RETRY_SECS = 0
+    _, pin = _pin_repo(tmp_path)
+    token = "ghp_" + ("a" * 36)
+    secret_stderr = (
+        f"fatal: unable to access "
+        f"'https://operator:{token}@forge.example/operator/eunomia.git/': "
+        "The requested URL returned error: 403"
+    )
+
+    def fake_fetch_origin(path):
+        return False, 128, secret_stderr
+
+    mod._fetch_origin = fake_fetch_origin
+    state, detail, facts = mod.pin_status(str(pin))
+    assert state == "unfetchable"
+    assert token not in facts["fetch_stderr"]
+    assert token not in detail
+    assert "[redacted" in facts["fetch_stderr"]
+
+
+def test_a_successful_first_fetch_is_not_retried(tmp_path):
+    """The common case must not pay the retry delay or claim a retry that
+    never happened."""
+    mod = _load(tmp_path / "fleet")
+    mod.PIN_FETCH_RETRY_SECS = 999    # would hang the test if ever slept
+    _, pin = _pin_repo(tmp_path)
+    state, detail, facts = mod.pin_status(str(pin))
+    assert state == "current"
+    assert facts["fetch_retried"] is False
+    assert facts["fetch_retry_ok"] is None
+    assert "retried" not in detail
 
 
 def test_a_missing_or_non_repo_path_is_named_as_such(tmp_path):
@@ -3188,7 +3329,7 @@ def test_the_service_resource_is_keyed_on_the_unit_not_the_label(tmp_path):
     assert r["type"] == "service"
     assert r["service"].endswith(":fleet-watch")
     assert r["service"].startswith(r["host"] + ":")
-    assert "com.operator" not in str(r), "keyed on the launchd label"
+    assert "org.eunomia" not in str(r), "keyed on the launchd label"
 
 
 def test_a_foreign_active_holder_blocks_a_second_scheduler(tmp_path, monkeypatch):
@@ -3375,3 +3516,403 @@ def test_the_harness_cannot_reach_the_real_job_directory(tmp_path):
     mod = _load(tmp_path / "f", FLEET_WATCH_REPOS="operator/sniff")
     assert str(mod.fleetjob.JOB_DIR).startswith(str(tmp_path)), (
         f"the suite would reap production job definitions: {mod.fleetjob.JOB_DIR}")
+
+
+# ---- plan 0086: `redispatch` — a closed or merged marked PR can be sent back ----
+
+def _iso(delta_hours):
+    from datetime import timezone
+    return (datetime.now(timezone.utc) + timedelta(hours=delta_hours)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _merged_pr(number=7, **over):
+    pr = {"user": {"login": "implbot"}, "state": "closed", "merged": True,
+          "number": number, "body": "Plan: 0009-thing",
+          "merged_at": _iso(-3), "closed_at": _iso(-3)}
+    pr.update(over)
+    return pr
+
+
+def _redispatch(body="redispatch", uid=3, hours=-1, cid=1, **over):
+    c = {"id": cid, "user": {"id": uid}, "body": body, "created_at": _iso(hours)}
+    c.update(over)
+    return c
+
+
+def _rd_world(tmp_path, pulls=None, comments=None, plan_text=PLAN, branches=(),
+              per_pr=None, uid="3"):
+    """A watcher over one repo with a merged marked PR (unless `pulls` says
+    otherwise). `branches` are refs that exist on origin; `per_pr` maps a PR
+    number to ITS comments (the default hands every PR the same list)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    orch, log = _stub_orchestrator(tmp_path)
+    fd = tmp_path / "fleet"
+    mod = _load(fd, FLEET_WATCH_REPOS="operator/sniff", FLEET_OPERATOR_UID=uid)
+    base = _api_factory(pulls=pulls if pulls is not None else [_merged_pr()],
+                        comments=comments, plan_text=plan_text)
+    reads = []
+
+    def api(method, path, body=None, token=None):
+        m = re.search(r"/issues/(\d+)/comments", path)
+        if m:
+            reads.append(int(m.group(1)))
+            if per_pr is not None:
+                return 200, list(per_pr.get(int(m.group(1)), []))
+        m = re.search(r"/contents/plans/[^?]*\?ref=(feat/[^&]+)", path)
+        if m:
+            return (200, _contents_file(plan_text)) if m.group(1) in branches \
+                else (404, None)
+        return base(method, path, body, token)
+    _wire(mod, api, orch)
+    notes = []
+    mod.notify = lambda t, b: notes.append((t, b))
+    return mod, fd, log, notes, reads
+
+
+def _live(mod):
+    return [r for r in mod.lib.all_leases() if r.get("state") in ("assigned", "active")]
+
+
+def test_merged_pr_plus_fresh_redispatch_spawns_exactly_once(tmp_path):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[_redispatch()])
+    assert mod.cycle() == 1
+    assert len(_wait_spawns(log, 1)) == 1
+    (lease,) = _live(mod)
+    assert mod.lib.resource_of(lease)["branch"] == "feat/0009-thing-r2"
+    # the dispatch consumed the comment: even with the lease gone, no second spawn
+    mod._retire(lease["id"])
+    assert mod.cycle() == 0
+    assert len(_spawns(log)) == 1
+
+
+def test_redispatch_older_than_the_newest_lease_does_not_spawn(tmp_path):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[_redispatch(hours=-1)])
+    mod.spawn("operator/sniff", "plans/0009-thing.md", {"id": "0009-thing"})
+    mod._retire(_live(mod)[0]["id"])           # a released lease, created NOW
+    assert mod.cycle() == 0
+    assert len(_wait_spawns(log, 1)) == 1, "only the setup dispatch"
+
+
+@pytest.mark.parametrize("comment", [
+    _redispatch(uid=99),                              # another human
+    _redispatch(uid=5),                               # implbot
+    _redispatch(body="please redispatch"),            # not on its own line
+])
+def test_redispatch_from_the_wrong_author_or_phrasing_does_not_spawn(tmp_path, comment):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[comment])
+    assert mod.cycle() == 0
+    assert _spawns(log) == []
+
+
+def test_redispatch_without_a_pinned_uid_is_disabled(tmp_path):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[_redispatch()], uid="")
+    assert mod.cycle() == 0
+    assert _spawns(log) == []
+
+
+def test_redispatch_on_an_older_marked_pr_does_not_spawn(tmp_path):
+    pulls = [_merged_pr(5), _merged_pr(8)]
+    mod, fd, log, notes, reads = _rd_world(
+        tmp_path, pulls=pulls, per_pr={5: [_redispatch()], 8: []})
+    assert mod.cycle() == 0
+    assert _spawns(log) == []
+    assert reads == [8], "the check reads the NEWEST marked PR only"
+
+
+def test_redispatch_on_an_open_pr_is_respawns_case_not_ours(tmp_path):
+    pulls = [{"user": {"login": "implbot"}, "state": "open", "number": 7,
+              "body": "Plan: 0009-thing"}]
+    mod, fd, log, notes, _ = _rd_world(tmp_path, pulls=pulls,
+                                       comments=[_redispatch()])
+    assert mod.cycle() == 0
+    assert _spawns(log) == []
+    # an OLDER closed PR carrying the comment must not leak through while a
+    # newer one is open: that stale comment would fire the wrong gesture
+    older = [_merged_pr(5), dict(pulls[0], number=7)]
+    mod, fd, log, notes, _ = _rd_world(tmp_path / "older", pulls=older,
+                                       comments=[_redispatch()])
+    assert mod.cycle() == 0
+    assert _spawns(log) == []
+    mod, fd, log, notes, _ = _rd_world(tmp_path / "sweep", pulls=pulls,
+                                       comments=[_redispatch()])
+    # and the sweep: an orphaned lease + open PR + `redispatch` is not `respawn`
+    _orphaned_lease(mod, fd)
+    before = len(_wait_spawns(log, 1))
+    assert mod.cycle() == 0
+    assert len(_spawns(log)) == before
+
+
+@pytest.mark.parametrize("status", ["abandoned", "done", "draft"])
+def test_redispatch_never_overrides_the_plans_status(tmp_path, status):
+    text = PLAN.replace("status: ready", f"status: {status}")
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[_redispatch()],
+                                       plan_text=text)
+    assert mod.cycle() == 0                       # dispatch loop
+    _orphaned_lease(mod, fd)                      # and the sweep's gate
+    before = len(_wait_spawns(log, 1))
+    assert mod.cycle() == 0
+    assert len(_spawns(log)) == before
+
+
+def test_orphaned_lease_plus_merged_pr_assigns_the_successor_before_retiring(tmp_path):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[_redispatch()])
+    dead = _orphaned_lease(mod, fd)
+    order = []
+    real_retire = mod._retire
+
+    def retire(lid):
+        order.append(("retire", lid, len(_live(mod))))
+        return real_retire(lid)
+    mod._retire = retire
+    assert mod.cycle() == 1
+    assert order == [("retire", dead, 2)], \
+        "the successor must hold a lease BEFORE the dead one is released"
+    (lease,) = _live(mod)
+    assert lease["id"] != dead
+    assert mod.lib.resource_of(lease)["branch"] == "feat/0009-thing-r2"
+
+
+def _fail_orchestrator_start(mod, monkeypatch):
+    real = subprocess.Popen
+
+    def popen(argv, *a, **k):
+        if os.path.basename(str(argv[0])) == "orch-stub.sh" and "--ready" not in argv:
+            raise OSError("no such orchestrator")
+        return real(argv, *a, **k)
+    monkeypatch.setattr(mod.subprocess, "Popen", popen)
+    return lambda: monkeypatch.setattr(mod.subprocess, "Popen", real)
+
+
+def test_a_failed_start_pages_once_and_the_comment_is_used_up(tmp_path, monkeypatch):
+    comments = [_redispatch(hours=-1, cid=1)]
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=comments)
+    heal = _fail_orchestrator_start(mod, monkeypatch)
+    for _ in range(3):
+        assert mod.cycle() == 0
+    pages = [b for t, b in notes if "redispatch" in b.lower()]
+    assert len(pages) == 1, notes
+    assert "used" in pages[0], pages
+    assert _live(mod) == []
+    heal()
+    assert mod.cycle() == 0, "the released lease consumed the comment"
+    assert _spawns(log) == []
+    comments.append(_redispatch(hours=+1, cid=2))     # a NEWER comment
+    assert mod.cycle() == 1
+    assert len(_wait_spawns(log, 1)) == 1
+    assert mod.cycle() == 0
+
+
+def test_a_successor_that_never_activates_does_not_loop(tmp_path):
+    """The loop test: the successor's lease orphans on the activate timeout and
+    the SAME comment must not buy another dispatch."""
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[_redispatch()])
+    assert mod.cycle() == 1
+    _wait_spawns(log, 1)
+    mod.lib.ACTIVATE_TIMEOUT_MIN = -1              # every assigned lease is dead
+    for _ in range(3):
+        assert mod.cycle() == 0
+    assert len(_spawns(log)) == 1
+
+
+def test_a_merged_pr_with_no_closed_at_is_bounded_by_merged_at(tmp_path):
+    pulls = [_merged_pr(closed_at=None)]
+    mod, fd, log, notes, _ = _rd_world(tmp_path, pulls=pulls,
+                                       comments=[_redispatch()])
+    assert mod.cycle() == 1
+    # merged after the comment => the comment predates the bound: no spawn
+    pulls2 = [_merged_pr(closed_at=None, merged_at=_iso(0))]
+    mod2, fd2, log2, _, _ = _rd_world(tmp_path / "b", pulls=pulls2,
+                                      comments=[_redispatch(hours=-1)])
+    assert mod2.cycle() == 0
+
+
+def test_respawn_after_a_redispatch_resumes_the_successors_own_branch(tmp_path):
+    pulls = [{"user": {"login": "implbot"}, "state": "open", "number": 9,
+              "body": "Plan: 0009-thing"}]
+    mod, fd, log, notes, _ = _rd_world(
+        tmp_path, pulls=pulls, comments=[_redispatch(body="respawn")],
+        branches=("feat/0009-thing", "feat/0009-thing-r2"))
+    dead = _orphaned_lease(mod, fd)
+    p = fd / "leases" / f"{dead}.json"
+    rec = json.loads(p.read_text())
+    rec["resource"]["branch"] = "feat/0009-thing-r2"
+    p.write_text(json.dumps(rec))
+    seen = []
+    real_spawn = mod.spawn
+
+    def spawn(*a, **k):
+        seen.append(k)
+        return real_spawn(*a, **k)
+    mod.spawn = spawn
+    assert mod.cycle() == 1
+    assert seen[-1].get("branch") == "feat/0009-thing-r2"
+    assert seen[-1].get("resume") is True
+    (lease,) = _live(mod)
+    assert mod.lib.resource_of(lease)["branch"] == "feat/0009-thing-r2"
+
+
+def test_the_redispatch_branch_skips_names_already_on_origin(tmp_path):
+    mod, fd, log, notes, _ = _rd_world(
+        tmp_path, comments=[_redispatch()],
+        branches=("feat/0009-thing", "feat/0009-thing-r2"))
+    assert mod.cycle() == 1
+    (lease,) = _live(mod)
+    assert mod.lib.resource_of(lease)["branch"] == "feat/0009-thing-r3"
+
+
+def test_an_unreadable_origin_means_no_redispatch(tmp_path):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[_redispatch()])
+    inner = mod._forge
+
+    class Forge:
+        def __init__(self, f): self.f = f
+        def __getattr__(self, n): return getattr(self.f, n)
+        def get_contents(self, repo, path, ref=None):
+            if ref and ref.startswith("feat/"):
+                return 500, None
+            return self.f.get_contents(repo, path, ref=ref)
+    mod._forge = lambda token: Forge(inner(token))
+    assert mod.cycle() == 0
+    assert _spawns(log) == []
+
+
+def test_missing_timestamps_fail_closed_and_say_which(tmp_path, capsys):
+    mod, fd, log, notes, _ = _rd_world(
+        tmp_path, pulls=[_merged_pr(merged_at=None, closed_at=None, merged=False)],
+        comments=[_redispatch()])
+    assert mod.cycle() == 0
+    assert "merged_at/closed_at" in capsys.readouterr().err
+    mod2, fd2, log2, _, _ = _rd_world(
+        tmp_path / "b", comments=[_redispatch(created_at="garbage")])
+    assert mod2.cycle() == 0
+    assert _spawns(log2) == []
+    assert "created_at" in capsys.readouterr().err
+
+
+def test_the_page_and_the_check_name_the_same_newest_closed_pr(tmp_path):
+    pulls = [_merged_pr(5), _merged_pr(8, merged=False, merged_at=None)]
+    mod, fd, log, notes, reads = _rd_world(tmp_path, pulls=pulls, comments=[])
+    _orphaned_lease(mod, fd)
+    assert mod.cycle() == 0
+    hints = [b for t, b in notes if "redispatch" in b]
+    assert len(hints) == 1 and "PR #8 is closed" in hints[0], notes
+    assert set(reads) == {8}
+    assert mod.cycle() == 0                        # once per lease
+    assert len([b for t, b in notes if "redispatch" in b]) == 1
+    # the marker is per lease, under its own key, and is reaped with the lease
+    lid = _live(mod)[0]["id"]
+    assert (fd / "leases" / f"{mod._hint_key(lid)}.watch-notified").exists()
+    mod._retire(lid)
+    mod._sweep_markers()
+    assert not list((fd / "leases").glob("redispatch--*"))
+
+
+def test_a_lease_already_paged_the_old_way_still_gets_the_new_page(tmp_path):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[])
+    lid = _orphaned_lease(mod, fd)
+    mod._notify_once(lid, "Orchestrator dead", "old text")   # the consumed marker
+    notes.clear()
+    assert mod.cycle() == 0
+    assert any("post `redispatch`" in b for _, b in notes), notes
+
+
+def test_no_marked_pr_at_all_keeps_the_old_page(tmp_path):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, pulls=[], comments=[])
+    _orphaned_lease(mod, fd)
+    assert mod.cycle() == 0                       # spawns nothing: plan has a lease
+    assert any(b.endswith("no open marked PR") for _, b in notes), notes
+
+
+def test_unreadable_comments_or_dedupe_spend_nothing(tmp_path):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[_redispatch()])
+    inner = mod._forge
+
+    class NoComments:
+        def __init__(self, f): self.f = f
+        def __getattr__(self, n): return getattr(self.f, n)
+        def list_issue_comments(self, *a, **k): return 500, None
+    mod._forge = lambda token: NoComments(inner(token))
+    assert mod.cycle() == 0
+    class NoPulls(NoComments):
+        def list_pulls(self, *a, **k): return 500, None
+    mod._forge = lambda token: NoPulls(inner(token))
+    assert mod.cycle() == 0
+    assert _spawns(log) == [] and notes == []
+
+
+def test_a_closed_pr_without_the_gesture_is_untouched_in_dry_run(tmp_path, capsys):
+    mod, fd, log, notes, _ = _rd_world(tmp_path, comments=[])
+    assert mod.cycle(dry_run=True) == 0
+    assert "would dispatch" not in capsys.readouterr().out
+    assert _spawns(log) == [] and notes == []
+
+
+def test_a_ready_plan_merged_by_the_agent_merger_is_not_dispatched(tmp_path):
+    """Plan 0106 D6 / ADR-0019 §2: the same plan dispatches when operator merged
+    it, and does not (and pages) when mergebot did."""
+    orch, _ = _stub_orchestrator(tmp_path)
+    for who, want in (("mergebot", 0), ("operator", 1)):
+        mod = _load(tmp_path / f"fleet-h-{who}", FLEET_WATCH_REPOS="operator/sniff")
+        pages = []
+
+        def api(method, path, body=None, token=None, _w=who):
+            if path.endswith("/pull") and "/commits/" in path:
+                return 200, {"number": 4, "merged_by": {"login": _w}}
+            return _api_factory()(method, path, body, token)
+        _wire(mod, api, orch)
+        mod.notify = lambda t, b, _p=pages: _p.append(t) or True
+        assert mod.cycle() == want, who
+        assert ("Plan not human-merged" in pages) == (want == 0)
+
+
+def test_plan_files_lists_by_tree_and_caches_front_matter_by_blob_sha(tmp_path):
+    """2026-10-28: the contents listing of eunomia's plans/ took 33-80 s and
+    timed out. plan_files lists through list_tree, and an unchanged blob is
+    read once: the second call fetches only the file whose sha changed."""
+    mod = _load(tmp_path / "fleet", FLEET_WATCH_REPOS="operator/sniff")
+    reads = []
+
+    class F:
+        def __init__(self, shas):
+            self.shas = shas
+
+        def list_tree(self, repo, d, ref="main"):
+            return 200, [{"name": n, "sha": s, "type": "file"}
+                         for n, s in self.shas.items()]
+
+        def list_contents(self, repo, d, ref=None):
+            raise AssertionError("the slow listing must not be used")
+
+        def get_contents(self, repo, path, ref=None):
+            name = path.rsplit("/", 1)[-1]
+            reads.append(name)
+            body = _contents_file(PLAN.replace("0009-thing", name[:-3]))
+            body["sha"] = self.shas[name]
+            return 200, body
+
+    shas = {"0009-thing.md": "a1", "0010-other.md": "b1"}
+    mod._forge = lambda token: F(shas)
+    assert len(mod.plan_files("operator/sniff", "tok")) == 2
+    assert sorted(reads) == ["0009-thing.md", "0010-other.md"]
+    reads.clear()
+    shas["0010-other.md"] = "b2"
+    assert len(mod.plan_files("operator/sniff", "tok")) == 2
+    assert reads == ["0010-other.md"]
+
+
+def test_plan_files_falls_back_to_the_contents_listing(tmp_path):
+    mod = _load(tmp_path / "fleet", FLEET_WATCH_REPOS="operator/sniff")
+
+    class F:
+        def list_tree(self, repo, d, ref="main"):
+            return 0, None
+
+        def list_contents(self, repo, d, ref=None):
+            return 200, _contents_list(["0009-thing.md"])
+
+        def get_contents(self, repo, path, ref=None):
+            return 200, _contents_file(PLAN)
+
+    mod._forge = lambda token: F()
+    assert [p for p, _ in mod.plan_files("operator/sniff", "tok")] == ["plans/0009-thing.md"]

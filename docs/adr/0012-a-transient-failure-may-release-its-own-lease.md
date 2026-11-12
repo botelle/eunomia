@@ -5,6 +5,7 @@
 - **Deciders:** the operator (owner/merger)
 - **Amended 2026-09-25 by the owner**: §1's lease condition names the record,
   not orphanhood, and adds "no marked PR" (review of #558, eunomia#559)
+- **Amended by:** [ADR-0029](0029-a-finished-dispatch-releases-its-lease.md) — "What is still not permitted" no longer covers a lease that fleet-watch releases under ADR-0029 §1 (an orphaned dispatch lease of a plan that reads `done` or `abandoned`)
 - **Relates:** `SPEC.md` Principle 4 (this is its second named exception),
   `docs/plan-dispatch.md` §"Why a failing wrapper keeps its lease" (the loop this
   bounds), `plans/0046-mopsus-escalates-with-a-handle.md` (named `mechanical`
@@ -60,6 +61,15 @@ re-dispatches under the dispatch cap like any other plan.
 **What is still not permitted.** Takeover of a *live* lease; releasing any lease
 whose failure could have left work behind; any retry by the orchestrator itself;
 and anything mopsus's `triage` mode would decide. Each needs its own record.
+
+*(Amended 2026-11-02 by ADR-0029. "Releasing any lease whose failure could have
+left work behind" no longer covers a dispatch lease that ADR-0029 §1 permits
+`fleet-watch` to release: one whose plan reads `done` or `abandoned`, under
+the conditions §1 lists. §1 governs; this note does not restate it. The work
+such a lease could have left behind is already merged or given up with its
+plan, which is why the release is safe. Everything else in this paragraph
+stands, and so does the reason for it: mopsus still releases only a failure
+that did no work, and each new case needs its own record.)*
 
 ## Consequences
 

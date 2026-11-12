@@ -10,7 +10,7 @@ and `--ready` exits 0 (see "The orchestrator" below).*
 You write a feature plan, open it as a PR, and **merge it**. That merge is the
 ignition: nothing else arms, schedules, or approves the work. `fleet-watch`
 sees a `status: ready` plan reachable on `main` with no work PR against it, and
-starts exactly one orchestrator for it.
+starts exactly one orchestrator **and its test lanes** for it.
 
 Reachability on `main` **is** the authorisation. `fleet-plan lint` checks
 validity, not authority — only a human's reviewed merge produces reachability,
@@ -51,7 +51,7 @@ degradation:
 
 | Condition | Behaviour |
 |---|---|
-| repo not in `FLEET_WATCH_REPOS` | never read at all |
+| repo without the `dispatch` flag in `config/repos.conf` (plan 0134) | never read at all |
 | `main` unprotected, 0 required approvals, open direct pushes, or any lane an agent could use to push/approve/merge | repo **REFUSED** with a warning — a named lane to go and fix |
 | `main`'s protection could not be READ (broker unreachable, keyvault sealed, Forgejo down) | repo **UNDETERMINED**, not refused — nothing dispatched and nothing vouched for |
 | forgejo-broker unreachable at the pre-flight | no repo scanned, one page (ADR-0003 §6: page once, scan nothing) |
@@ -61,7 +61,7 @@ degradation:
 | a single plan file unreadable | that plan skipped, with a warning; the repo's other plans still dispatch |
 | dedupe scan unreadable or truncated | **never spawn** (cannot prove undispatched) |
 | no Forgejo token | not a single API call |
-| a marked PR exists in ANY state | plan is done — a closed PR does not re-arm it |
+| a marked PR exists in ANY state | plan is done — a closed PR does not re-arm it, unless the owner posts `redispatch` |
 | lease assign or spawn fails | lease released, `plan-failed`, push notification |
 
 The unprotected-`main` refusal is the one place this fleet does **not** degrade
@@ -72,8 +72,9 @@ open. Everywhere else an unknown means "allow and warn"; here it would mean
 
 A plan is considered dispatched when a **implbot-authored** PR in **any state**
 carries `Plan: <id>` in its body. Any state, because a closed work PR must not
-re-arm the plan — rejection is a human decision (set `status: abandoned`, or
-re-file under a new id), never an automatic retry. Implbot-authored, because
+re-arm the plan — rejection is a human decision (set `status: abandoned`, re-file under a new id,
+or post `redispatch` on the closed PR — see [redispatch.md](redispatch.md)),
+never an automatic retry. Implbot-authored, because
 the marker belongs to work PRs only: intakebot's plan PRs never emit it, so a plan
 PR can never look like completed work.
 
@@ -86,9 +87,36 @@ spend, so if a rename or a partial uid rollout makes historical work PRs
 invisible, every merged-and-still-`ready` plan reads as undispatched and
 re-dispatches: cap-throttled, but continuous and silent.
 
-The dedupe scan is bounded (`FLEET_PR_PAGE_CAP`, 20 pages × 50). Hitting the
-bound is treated as **unreadable**, not as "no PR found" — a truncated scan
-must never authorise a duplicate dispatch.
+**The scan reads the issues index, not `/pulls` (plan 0218).** Measured
+2026-11-08 against operator/eunomia (832 pull requests): `/pulls` took 23-33s a
+PAGE — a full 17-page walk, about 9 minutes, which is why `fleet-requeue` and
+Lynceus's Requeue button could never answer for a eunomia plan inside their
+own timeouts. `GET /issues?type=pulls` returns the same pull requests, same
+17 pages, in about 3s total — it carries every field the dedupe scan reads
+(`number`, `user`, `body`, `state`, `closed_at`, `created_at`, `updated_at`,
+and `merged`/`merged_at` nested under `pull_request`) but no `head`; a caller
+that needs the head SHA (`meeting_sweep`) fetches that one pull request with
+`get_pull` instead.
+
+The issues index returns **newest-created first** and has no `sort=oldest`
+equivalent — Forgejo cannot sort it oldest-first the way `/pulls` could. The
+scan is therefore ordered by an immutable key (creation order / PR number)
+rather than by page position: every reader (`marked_pr`,
+`newest_closed_marked_pr`, `_open_marked_plans`) walks to the END of the
+listing and picks by comparing numbers, not by which page an item landed on,
+so the answer is the same regardless of page order. A pull request opened
+MID-WALK can land on page 1 after page 1 was already read (missed this walk,
+seen the next one) and can push an older item onto a second page of the same
+walk (so the same PR can appear twice) — neither matters: older pull requests
+are never deleted, and a PR opened mid-walk belongs to an orchestrator that
+already holds the plan's lease, which already stops a second dispatch.
+
+The scan is bounded (`FLEET_PR_ISSUE_PAGE_CAP`, 200 pages × 50 = 10,000 PRs —
+a page now costs about 0.2s, not 30s, so the bound is 10x the old `/pulls`
+bound (`FLEET_PR_PAGE_CAP`, 20 pages × 50), which `bin/fleet-deps` still uses
+for its own, unrelated `/pulls` walk). Hitting the bound is treated as
+**unreadable**, not as "no PR found" — a truncated scan must never authorise
+a duplicate dispatch.
 
 ## Leases, death, and respawn
 
@@ -96,11 +124,57 @@ Each dispatch assigns a real `branch` lease on the branch the orchestrator will
 create, held by a generated session id and noted `plan:<id>`. That choice buys
 three things for free: row 6's pre-push hook enforces the lane, row 4's
 heartbeat makes a dead orchestrator *derive* orphaned, and the concurrency cap
-is just "how many of those leases are live."
+is just "how many plans have a live lease."
+
+**One implementation lease plus one lease per test lane** (plan 0104). Beside
+the `plan:<id>` lease the watcher assigns one `branch` lease per resolved
+`tester` row, on `agent/tests/<plan>/<runner>`, noted `lane:<plan-id>/<runner>`
+and held by `lane-<slug>-<runner>-<hex8>`. The notes differ on purpose:
+`dispatch_leases()` keys implementation leases `(repo, plan)` and lane leases
+`(repo, plan, runner)`, because a second `plan:<id>` lease would overwrite the
+first in the dict and hide it from the cap and the orphan sweep.
+
+**The cap counts plans, not leases.** `count_live` counts distinct
+`(repo, plan)` that hold a live lease which is spending: a steward waiting on a
+human merge does not count by itself (plan 0067), a live lane always does, and a
+plan whose only lease is an orphaned lane counts zero. `dispatch_cap` is set in
+features in flight, so one plan with two lanes is one.
+
+**A dead lane is paged once and never respawned.** The orphan sweep reads lane
+leases too: the first cycle one is orphaned it pages (`Test lane dead`, naming
+the repo, plan, runner and the dispatch sha) and emits `lane-ended` with outcome
+`dead`. It never respawns or re-dispatches it. A lane spends the owner's
+personal subscription and 0100's daily cap counts every run, so a retry loop
+is the exhaustion failure issue #483 names. Recovery, while the plan is still
+`ready`, is a person running `fleet-lane <repo> <plan> --sha <that sha>
+--runner <runner>` and then `fleet-release` on the dead lease. A `respawn` or
+`redispatch` restarts only the implementation lane. Once the plan itself has
+since finished, there is nothing left to wait for and the sweep releases the
+lane's lease itself (plan 0179 D2) — see below.
 
 When an orchestrator dies, the watcher **surfaces and stops** — one push
 notification (once, not once per cycle), naming the repo, plan, and open PR. It
-does not respawn: acting on staleness is exactly what SPEC Principle 4 forbids.
+does not respawn: acting on staleness is exactly what SPEC Principle 4 forbids,
+with the one exception described below.
+
+An orphaned lease whose plan is already `done` or `abandoned` on main is
+released, not left for the owner (plan 0179 D2, ADR-0029): the sweep makes no
+pull-request read for it, and releases it through `fleet-release --force
+--expect-orphaned`, recording `plan-done` or `plan-abandoned` as the reason.
+Before this, plan 0093 skipped it instead — no forge read, no page, no
+spawn, because re-reading it every cycle was what stalled a cycle for 26
+minutes — and left it for the owner to release by hand; that is the 51 leases
+ADR-0029's Context names, released by hand on 2026-11-02. A lease of a plan
+that is still `ready` is skipped exactly as before: nothing can tell a dead
+run's branch from a `redispatch`'s reused one, so the owner's page,
+`redispatch`, `respawn` or a status change is still the only path. A pending
+`plan-question`, an unconsumed `Answer:` or an unconsumed resume request does
+not hold a finished plan's lease either — nothing can act on it once the plan
+is not `ready` — but the release pages the owner once, saying so and that
+reopening the plan is how to act on it. The cycle's summary line counts a
+release instead of a skip. The dedupe listing of a repo's pull requests is
+likewise read once per repo per cycle, never across cycles, so a PR opened
+between cycles is seen by the next.
 
 Recovery is a human act with an automated hand: comment `respawn` on the marked
 PR and the next cycle spawns exactly one successor. That authorization is
@@ -115,6 +189,26 @@ is dry here too.
 Authorisation for that comment binds to a **numeric Forgejo user id**
 (`FLEET_OPERATOR_UID`), never a display name — a rename must not be able to
 grant it. With the id unset, respawn is simply disabled.
+
+**Resuming, not rebuilding** (plan 0091). A successor for a plan whose marked PR is open,
+and whose branch is on origin, is started as `orchestrator --resume`: it adopts the
+branch and re-enters the review loop. Before 0091, a successor tried to create the
+branch again and stopped at `branch … already exists ON ORIGIN`.
+
+**The one automated hand** (ADR-0016, plan 0090). A plan whose orchestrator failed in
+its review loop because the reviewer hit a usage limit is the single case recovery
+is not a human act. Once a probe shows the limit has reset, `bin/mopsus` records
+`review-requeued` and writes a resume request. The next cycle treats that request
+exactly as it treats a fresh `respawn`: it spawns one resumed successor under the cap,
+only while the lease still names the failed holder, and consumes the request. Every
+other death still waits for the owner's comment.
+
+**A question is not a death** (ADR-0027). An implementer whose plan does not decide
+something the work depends on may stop with a structured question instead of guessing.
+The orchestrator posts it on the marked PR, or on an issue when no PR exists, records
+`plan-question`, and holds the lease. An `Answer: <question id>` comment from the
+owner's uid, or the intakebot gateway's, resumes the plan once with the question and the
+answer quoted into the session. An unanswered question pages after the configured wait.
 
 ## What supervises a dispatch
 
@@ -157,9 +251,13 @@ nothing about what counts as authoritative evidence.
 ## Running it
 
 ```
-FLEET_WATCH_REPOS=operator/sniff FLEET_OPERATOR_UID=<id> \
-  bin/fleet-watch --dry-run
+FLEET_OPERATOR_UID=<id> bin/fleet-watch --dry-run
 ```
+
+The repositories scanned are the `dispatch` lines of `config/repos.conf` in the
+checkout the binary runs from (the eunomia pin when scheduled); there is no
+allowlist variable. If that file cannot be read the watcher scans nothing and
+pages once.
 
 `--dry-run` prints what it would dispatch and assigns nothing. Drop it to arm.
 Set `FLEET_NTFY_URL`: the runbook treats pushes as *the* failure channel, and
@@ -487,20 +585,73 @@ with an admin token can also `PATCH` it — weaken it, land a `status: ready`
 plan, restore it — and this guard inspects a rule's *content*, never who may
 rewrite it.
 
-### What ignition will do — none of this is built yet
+### What ignition does
 
-Stated in the future tense on purpose: the watcher today starts exactly one
-orchestrator, as the one-sentence model above says, and neither the gate nor a
-second lane exists.
+When the watcher dispatches a `ready` plan it reads `main`'s tip from the forge
+**once**, and reads the plan file at that sha. If the plan is no longer `ready`
+there, `main` moved under the read and the plan is skipped this cycle. The
+implementation lane is spawned first and is unchanged. Only if it started are
+the test lanes decided, each by an allowlist:
+
+- `zone` is exactly the string `public` (ADR-0006 §7): absent, `Private`,
+  `private` and a malformed value all skip;
+- the repo has at least one resolved, enabled `tester` row (the same
+  `resolve_testers` `fleet-lane` uses, imported);
+- `bin/fleet-lane` is executable.
+
+A failed check emits one `lane-skipped` (`zone`, `no-tester` or `unavailable`)
+and **never stops the implementation lane**: a check that can stop the thing it
+checks becomes a second way for a vendor outage to halt the fleet. Each tester
+row then gets its own lease, a supervised `org.eunomia.fleet-lane.<lease-id>`
+job running `fleet-lane <repo> <plan> --sha <dispatch sha> --runner <runner>
+--lease <lease-id>`, and a `lane-dispatched` event. Every lane of a plan gets
+the **same** sha. The watcher does not pre-judge `fleet-lane`'s own gates
+(wiring, settings, contract completeness, 0100's cap): a refusal lands as a
+`lane-ended`.
+
+The lane reads the dispatch sha, not the implementation head, deliberately. The
+contract then describes the surface before the feature, so the plan-versus-
+contract gaps ADR-0006 §4 makes mandatory will name every new flag; that is
+expected, not a defect. Divergence is caught at the meeting (0102) and
+classified at triage (0103).
+
+**What the owner can see.** The orchestrator renders one `Test-lane:` line per
+lane into the implementation PR's body, under a `<!-- eunomia:test-lanes -->`
+anchor, derived only from the forge, the `lane_run` record, the lease ledger and
+the event ledger (see `docs/test-lane.md` §Dispatched lanes). Silence about a
+lane is never a pass: `missing — no lane record` is a rendered state.
+
+**The meeting and the triage** run from the steward, never from the watcher.
+Each cycle it asks `fleet-meet <repo> <plan> --impl <pr>`; exit 75 means no lane
+has passed 0102's human-read precondition yet and it asks again later, exit 0
+leads to `fleet-triage <repo> <plan> --impl-sha <head>`, and exit 1 or 2 from
+either pages once for that head. `fleet-triage` posts its own comment once per
+findings digest; the steward posts none, and neither call is a commit status, a
+review, or the start of a fix round. Triage needs the owner step
+`fleet-models set default mediator sub-opus`; until then every triage refuses by
+name and pages.
+
+**The meeting sweep** covers the lanes the steward never reached. The steward
+ends when the implementation merges, and a lane read after that was never met.
+Once per cycle, after the dead-lane sweep, `fleet-watch` reads the `lane-ended`
+events of the last 14 days that ended `pr-opened`; for each plan whose
+implementation PR has **merged** and whose findings are missing or stale for the
+current pair of heads (`findings_current`), it starts one supervised job running
+`fleet-meet <repo> <plan> --impl <pr>` and, only on exit 0, `fleet-triage`. An
+open implementation is left to its steward. Exit 75 (no lane read yet) is retried
+no sooner than 30 minutes later for the same pair of heads; any other non-zero
+exit pages once and is not retried for that pair. One job per plan at a time: it
+holds a marker under `meeting-sweep/` in the fleet directory, released when the
+job exits; a marker older than an hour is a dead job's and is replaced, with a
+log line.
 
 **Planned (`plans/0015-ignition-gate.md`, not yet implemented):** a merged
 `status: ready` plan will be checked against the merged SHA — reviewed there, no
 open `question:`, and a declared `spec_impact` whose implied files the plan's own
 `paths` cover. ADR-0004 records that decision and the alternatives it rejected.
-
-**Planned separately:** a passing plan then spawns a second, independent test
-lane. That is its own plan and is not on `main` yet; it will be linked from here
-once it lands.
+This is a different question from what ignition starts: today's authority (a
+protected `main` plus a human's reviewed merge) is what the lanes dispatch from,
+with or without that gate.
 
 ## What the orchestrator owes this watcher
 
@@ -511,17 +662,78 @@ They are contracts, not preferences, and part 2a honours both:
    active; `EUNOMIA_ACTIVATE_TIMEOUT` (10 min) later an unactivated lease
    *derives orphaned*. An orchestrator that is alive but slow to activate
    invites a respawn — and two live processes on one branch.
-2. **Never release the lease without a marked PR existing.** Dedupe is
-   "a `Plan: <id>` PR exists in any state." A crash-then-release with no PR
-   turns "rejection is a human decision" into an automatic hot retry: the plan
-   is `ready`, unleased, undispatched, and re-dispatches every cycle — real
-   model spend, forever.
+2. **Release the lease only when the plan reads `done` or `abandoned` on
+   `main`.** Outside the steward's own end (it watched its pull request to a
+   terminal state itself, so it infers no run identity), every other exit
+   settles the lease the same way: it reads the plan file on `main` and
+   releases exactly when that reads `done` or `abandoned`, recording the fact
+   as the release's reason (plan 0179 D1, ADR-0029). It never reads a pull
+   request to decide — which pull request belongs to which run cannot be
+   recovered from a branch name or a pull request, and `redispatch` reuses
+   branch names. For a plan still `ready`, holding is the only safe answer: a
+   crash-then-release with no PR turns "rejection is a human decision" into an
+   automatic hot retry — the plan is `ready`, unleased, undispatched, and
+   re-dispatches every cycle, real model spend, forever.
 
 While the loop was partial the watcher **refused to arm** — it asks
 `orchestrator --ready`, which exited non-zero while any phase was unwired, so a
 part-built deployment was inert rather than a paging storm. Since 0032 that gate
 **passes**: nothing is unwired and the watcher arms. Merely existing at the path would satisfy the
 executable check, which is why the question is asked rather than inferred.
+
+## A red main is seen, and does not spread (plan 0144)
+
+`main`'s tip status is not `main`'s health. The `tests` job skips a push that
+only changes `plans/**`, so a plan merge carries only `Plans / lint`, and a red
+`main` looked green on every merge after it (2026-10-16, 2026-10-22).
+
+**Main's test state.** A *tests context* is a commit-status context whose name
+starts with the fleet-config key `main_tests_context_prefix` (default
+`CI / tests`). Each cycle `fleet-watch` reads `main`'s tip and walks its
+first-parent line, at most 50 commits, to the newest commit that carries a
+tests context. Plan-only commits carry none and are skipped, never read as
+green. The state is `green` (every tests context succeeded), `red` (any failed
+or errored), `running` (none failed, some pending), `none` (no commit in the
+walk has one; a repository whose CI has no tests context stays `none`, pages
+nothing and holds nothing) or `unknown` (a read failed). A tip whose state is
+`green`, `red` or `none` is not read again; a tip recorded `running` or
+`unknown` is read every cycle until it settles. The state, its commit, the
+failing contexts and the oldest commit of the current red run are written to
+`<fleet dir>/main-health/<owner>__<repo>.json`, rewritten every cycle.
+
+**Pages.** A change of *completed* state (`green` or `red`; `running`, `none`
+and `unknown` leave it unchanged) to `red` pages once, and the change back to
+`green` pages once, so red, running, red pages nothing new. `unknown` for more
+than six hours pages once. Every page `fleet-watch` sends goes through one
+`notify`: angelia first (`FLEET_ANGELIA_URL`, `FLEET_ANGELIA_APP`,
+`FLEET_ANGELIA_TOKEN_CMD`, the token fetched per page and never in the plist),
+then `FLEET_NTFY_URL`. The shipped plist keeps `FLEET_NTFY_URL` as the fallback
+until angelia is shown to deliver (`pages.jsonl` says `angelia`, `sent` >= 1).
+
+**Dispatch hold.** While a repository is `red`, or `running` after `red`,
+`fleet-watch` dispatches no new plan there and logs `deferred — main red at
+<sha8>` once per state change. `none` and `unknown` do not hold. Plans already
+in flight are not held; the review loop's wait below is how they wait.
+
+**Inherited-red wait.** Before a CI-fix round the orchestrator reads the state
+file. The red is *inherited* when the file is no older than ten minutes and
+`red`, every failing context of the pull request is one of `main`'s, and the
+pull request's merge base with `main` contains the oldest commit of the red
+run (a branch cut before `main` went red never inherits it). Otherwise the fix
+round runs as before, including on a missing, stale, `unknown`, `none` or
+`running` file: the wait fails open. When inherited, the loop starts no fix
+round, logs `ci-inherited` once (a waiting phase: it holds no dispatch slot),
+polls the file at the steward poll interval, and when `main` is `green` runs one
+session whose only instruction is to merge `origin/main` and push, then goes
+back to waiting for CI. A conflict stops the loop naming the files. The wait
+ends with `inherited red outlasted the wait` and one page after
+`inherited_red_wait_hours` (default 12, 1 to 72) or when the file goes stale. A
+pull request with any approval is frozen: the loop stops with `inherited red on
+a frozen pull request: re-run its CI` and pages once, and pushes nothing.
+
+Keys: `main_tests_context_prefix` (string, default `CI / tests`) and
+`inherited_red_wait_hours` (integer 1 to 72, default 12), set with
+`fleet-config set`.
 
 ## Telling whether it is working
 
@@ -532,6 +744,51 @@ executable check, which is why the question is asked rather than inferred.
   orchestrators, failed respawns, and a dedupe scan that outgrew its page
   bound all surface there rather than in a log nobody reads. Silence with armed plans and no live leases means the watcher is not
   running — check its launchd job, not its logs.
+- `watch.log` itself (plan 0187): every line carries a UTC timestamp with an
+  explicit `Z`. A failed dedupe listing names the repo, the operation
+  (`list_pull_issues`), the page it failed on, and either the HTTP status or
+  `transport error` (every timeout, DNS failure or connection refusal
+  `fleetforge.py` collapses into one value on purpose — the real exception
+  text is the one place a token could leak outside its header, so it is
+  never kept) — distinctly from a malformed 200 body. That line is logged
+  once per repo per cycle; every plan-level "dedupe unreadable" warning that
+  follows it in the same cycle points back to it rather than repeating it.
+
+### watch.log rotation (plan 0187)
+
+The resident watcher rotates its own `watch.log` — the file both
+`StandardOutPath` and `StandardErrorPath` name — to a dated, gzipped weekly
+archive once the active file is about seven days old, checked once between
+cycles (never mid-cycle: an active job is never restarted to make room for
+this).
+
+- **Where.** The active file stays `~/dev/.fleet/watch.log`. A rotated file
+  is renamed to `~/dev/.fleet/logs/watch-<start>-<end>.log` momentarily, then
+  gzipped to `~/dev/.fleet/logs/archive/watch-<start>-<end>.log.gz`. `<start>`
+  and `<end>` are UTC calendar dates (`YYYYMMDD`), both inclusive; a second
+  rotation landing on the same pair gets `-2`, `-3`, and so on. Nothing here
+  prunes an archive — every one is kept.
+- **Atomic publish.** The compressed file is written under a `.`-prefixed
+  name that does not match `watch-*.log.gz`, fsynced, and checked with
+  `gzip -t` before the final rename; the uncompressed intermediate is deleted
+  only once that rename succeeds. A crash at any point leaves either the
+  intermediate or a recoverable partial — never a truncated archive under
+  the published name — and the next rotation attempt finishes the job.
+- **Descriptor ownership.** launchd opens `StandardOutPath`/`StandardErrorPath`
+  exactly once, at process start, and hands this long-lived process that fd.
+  Renaming the path out from under it does not change what the fd itself
+  points to, so the watcher reopens its own fd 1 and fd 2 onto a fresh file
+  at the active path immediately after the rename — the one thing that makes
+  "the writer keeps writing into the now-archived inode forever" not happen.
+- **Following it.** `tail -f` does not survive a rotation — it follows the
+  open file descriptor, which after a rotation is the archived file, not the
+  new one. `tail -F` (capital F) re-opens by path and does follow across it.
+- **Backup.** `~/dev/.fleet/logs/archive/` is deliberately outside
+  `snapshots/`: operator/infra plan 0020 (infra#232) backs that directory up
+  under its own restic tag, `fleet-logs`, which `fleet-restic`'s thinning
+  pass (`forget --keep-daily 30 --keep-weekly 12 --prune`) never touches —
+  `snapshots/` is thinned under a different tag, `fleet-db`, and an archive
+  living there would eventually fall out of it.
 
 
 ## The orchestrator
@@ -598,6 +855,46 @@ must not re-run an instruction already in flight, and the thread is all it can
 read. The opposite window — a death between the ack and the push — loses that
 instruction, and its recovery is the ack-deletion gesture above.
 
+**Fix rounds read owner instructions too (plan 0147).** Every fix round of the
+review loop reads the thread once, quotes each pending owner instruction
+verbatim beside the findings, and acks each one before the session runs, under
+the same id-order and ack-before-work rules. An owner comment never starts a
+round by itself: it rides a round the loop was already going to run (a
+withholding review or a red build), and an approved head or any stop is
+unchanged. `unfreeze` comments are left for the steward, which owns the grant.
+Because that loop can ack instructions the steward still holds in its cycle's
+list, the steward re-reads the thread after any instruction whose review loop
+ran on its own PR and skips every instruction now acked; it does not stop the
+cycle, and a failed re-read ends the cycle's instruction walk until the next
+poll.
+
+**The owner may hint on the plan's own pull request (ADR-0032, plan 0206).**
+Before an implementation pull request even exists, the owner has nowhere to
+brief an implementer except by editing the plan text itself, which needs a
+re-review. A `Hint:` comment is the other channel: post it, first line
+exactly `Hint:`, from the owner's own account, on any merged pull request
+that changed the plan file on `main` — the one that filed it or any that
+amended it. Every implementer session for that plan gets every hint, oldest
+first, quoted verbatim in its own block right after the plan and before any
+`Answer:` block — including a session spawned to resume a stopped run,
+because a resumed session is a new process that remembers nothing. A hint
+posted after the implementation pull request has opened is not read here; by
+then the owner's guidance goes on that pull request instead (plan 0147,
+above). The one path that spawns no session — `--resume` adopting a branch
+whose implementer already ran — reads, quotes and acks no hint at all.
+
+Each hint is acked before the session runs, whatever becomes of it: `Lease
+<lease-id>: given to the implementer.`, `Lease <lease-id>: refused, not
+given — carries a credential shape (<names>).`, or `Lease <lease-id>: not
+given: past the cap.` — every note ending with `sha256: <hex of the body>`,
+the exact hash a reviewer checks the hint's current body against (ADR-0032
+§4; the reviewer side is talos plan 0051). A hint already acked by an earlier
+session is acked again, so its thread shows every session that read it. A
+hint never outranks the plan: where one conflicts with the plan, its ADRs or
+its flow spec, the implementer follows the plan and says so in the pull
+request, and a hint cannot widen the plan's paths, dependencies or
+boundaries.
+
 **Part 2d (shipped, plan 0032)** — **the post-approval freeze**. The invariant
 is a condition, not a counter: **pushes are refused whenever an approval stands
 at the branch head**, and it is enforced in the wrapper rather than declined by
@@ -642,13 +939,71 @@ in a branch nobody will look at.
 | runner registry | `RUNNERS` in `bin/orchestrator`: `sub-sonnet` (default), `sub-opus`, `api-sonnet`, `local-qwen`. A runner, not a model name — it declares the harness, whether it is local, and which credential kind it needs. |
 | `EUNOMIA_IMPL_RUNNER` | per-run override, which is what makes a bakeoff arm a one-liner. It is **subject to** the zone check, not a way past it: `route_implementer` resolves the override first and applies the zone rule last. |
 | zone rule | ADR-0006 §7 as an allowlist — `zone: public` may reach a cloud runner; private, absent, malformed or mis-cased may not. Nothing asks oracle: oracle is a completion gateway and has no surface naming an agentic harness (this supersedes plan 0004 §3 and reverts if that changes). `tier:` is never consulted — it is the risk tier, not a cost band. |
-| `EUNOMIA_INITIATOR` | who filed the run. **Unset means the operator**, which is the normal path and today's only credential (`local_cli`). Set-and-unrecognised stops the run: a run filed by someone else must bill someone else, so there is no fallback. |
-| credential kinds | a runner whose required kind the resolved credential does not provide is a hard stop. `api-sonnet` served by `local_cli` would spend the operator's subscription while every event called it metered. |
+| `EUNOMIA_INITIATOR` | who filed the run. **Unset means the operator**, which is the normal path and today's only credential (`oauth_token`, plan 0116). Set-and-unrecognised stops the run: a run filed by someone else must bill someone else, so there is no fallback. |
+| credential kinds | a runner whose required kind the resolved credential does not provide is a hard stop. `api-sonnet` served by `oauth_token` would spend the operator's subscription while every event called it metered. |
 | timeout | Per-repo minutes from `config/impl-bounds.conf` (plan 0042), not an environment knob — a missing or malformed conf is a Stop, never a quiet 90. Resolved once, at the start of the run, so a conf edited mid-run cannot change what a later comment quotes. The session is spawned in its own process group and the **group** is signalled — `subprocess`'s own timeout kills the direct child, and `claude -p` has grandchildren. A marked PR that appears after the kill is a failure, not a late success. |
 | tool allowlist | an explicit `--allowedTools` and a named `--permission-mode`; `--dangerously-skip-permissions` never. Treat this as surface reduction and **not** confinement — Claude Code matches Bash permissions on the command prefix, so even a git-scoped entry admits `git -c alias.x='!<anything>' x`. What bounds the damage is `verify_marked_pr`, branch protection, and the environment allowlist. |
 | environment | an **allowlist** in `bin/fleet-candidate:_candidate_env`'s shape (`PATH HOME LANG LC_ALL LC_CTYPE TMPDIR TZ USER LOGNAME SHELL TERM`, plus whatever the runner declares). Not a denylist: the child runs arbitrary shell. This removes `FLEET_TOKEN_CMD` — which on this fleet names the admin helper — and **not the recipe**: that helper is a fixed path any process running as the operator can execute, and this very document names it. Closing that needs the helper gated on the implementer host; it is not closed here. |
 | `EUNOMIA_SESSION` | deliberately **absent** from the child. It becomes required the day `fleet-install-hooks` runs against the orchestrator's store (`bin/fleet-prepush` would otherwise refuse the orchestrator's own push), and on that day `FLEET_PUSH_OVERRIDE` stays forbidden — it is the nearest fix a stuck session will find, and it disables row 6 entirely. |
 | the branch | `fleetlib.add_worktree` checks out `--detach` at `origin/main`; the wrapper creates the branch, learning its name **from the lease record** rather than recomputing the slug. A second copy of the slug rule drifts, and the drift lands as a push on a branch the lease does not cover. |
+
+### The implementer's credential (plan 0116)
+
+The implementer no longer runs "as the logged-in user". It spends the
+`claude setup-token` OAuth token held in the vault at `kv/claude/oauth`, which
+`~/bin/fetch-claude-oauth-token.sh` reads through the `claude-oauth-read`
+AppRole. `run_implementer` calls `claude_token()` once per run, immediately
+before spawning, and puts the value in that child's environment as
+`CLAUDE_CODE_OAUTH_TOKEN` — and nowhere else: not a plist, not `fleet-watch`'s
+environment, not `os.environ`, so the review command and every later spawn
+cannot inherit it. `FLEET_CLAUDE_TOKEN_CMD` overrides the helper path. A helper
+that does not run, fails or prints nothing is a `Stop`, never a fallback to the
+Keychain login: that login is what went dead unnoticed on 2026-10-05, when every
+implementer run on opshost exited `rc=1` after 0 seconds on `Failed to
+authenticate: OAuth session expired and could not be refreshed`.
+
+The first run whose credential is rejected closes the `credential` gate
+(`docs/quota-gate.md`), which holds dispatch fleet-wide until the owner reopens
+it. The variable is declared per runner (`extra_env`), never in `_ENV_ALLOW`, so
+`local-qwen`, `sub-codex` and `sub-antigravity` never receive it.
+
+### Which credential a run spends (plan 0125)
+
+A repository may belong to a principal other than the operator, in
+`config/principals.conf` (two line shapes, `#` comments, no nesting):
+
+```
+principal: <name>  kind: oauth_token|api_key  cmd: <token helper path>
+repo: <owner/repo>  principal: <name>
+```
+
+`resolve_credential(repo=...)` takes, in order, `EUNOMIA_INITIATOR` when set, the
+repository's principal, then the operator. A repository with no `repo:` line is the
+operator's and runs `FLEET_CLAUDE_TOKEN_CMD` exactly as before. `claude_token(principal)`
+runs that principal's `cmd`; `kind: oauth_token` puts the value in
+`CLAUDE_CODE_OAUTH_TOKEN`, `kind: api_key` in `ANTHROPIC_API_KEY` and only a runner
+whose `needs` is `api_key` (`api-sonnet`) will take it. The child holds one of the
+two, never both. The file names a helper and never a credential; a `repo:` line
+naming an undeclared principal, or any line that fits neither shape, is a `Stop`.
+
+A venture's helper that fails does not fall back to the operator's credential: that
+would route one person's usage through another's login. The run stops with
+`implementer credential rejected (principal <name>): ...`, and mopsus closes
+`credential:<name>` (`docs/quota-gate.md`). The reviewer (`dispatch-review.py`) and the
+tester (`fleet-lane`) still spend the operator's token; each needs the same lookup as
+its own plan.
+
+**It is not confined to the CLI.** `claude`'s Bash tool inherits the CLI's
+environment, so the implementer's shell can read the token with `env`. Plan
+0073's `sandbox.credentials.envVars` deny list must name
+`CLAUDE_CODE_OAUTH_TOKEN` as well as `ANTHROPIC_API_KEY`.
+
+**Renewal duty.** A setup-token lasts about a year and carries no expiry the CLI
+will report (`claude auth status` has no expiry field). The control is a
+calendar reminder to re-mint before it lapses; the `credential` gate is the
+backstop, not the plan. To re-mint: `claude setup-token`, store the value at
+`kv/claude/oauth` (see the `keyvault` skill), then `fleet-quota open credential
+--by owner`.
 
 ### Where a run leaves evidence
 
@@ -684,7 +1039,7 @@ For whoever picks up 0011, 0012 or a bakeoff:
   agent-bus worker consumes a task file from the bus, not a prompt on stdin, so
   reaching it is a hard stop with its own message rather than a spawn error.
   A bakeoff must not discover that mid-run.
-- **`resolve_credential` branches:** `local_cli` (exists), and two that do not —
+- **`resolve_credential` branches:** `oauth_token` (exists; `local_cli` is still a defined kind the gemini and codex runners name, but nothing resolves to it), and two that do not —
   a Forgejo-uid→person map is what an initiator-per-merger needs (0015), and an
   API key path (a keyvault pull at startup, never an inherited variable) is what
   `api_key` needs.
@@ -726,7 +1081,8 @@ the boundary later and none of them ever made it silent.
 | runner harness unwired or not installed | refuse, with the two cases distinguished by their reasons |
 | session exits 0 with no verified marked PR | `plan-failed` — the forge is the evidence, not the exit code |
 | session times out | process **group** killed; a marked PR appearing afterwards is not a late success |
-| any failure exit | **the lease is NOT released** — see below |
+| any failure exit, plan still `ready` on `main` | **the lease is NOT released** — see below |
+| any exit (failure or not) once the plan reads `done`/`abandoned` on `main` | the lease **is** released, with that fact as the reason (plan 0179 D1) |
 | any controlled exit | worktree removed; an uncontrolled death leaves it for the orphan sweep |
 
 ### Why a failing wrapper keeps its lease
@@ -749,6 +1105,19 @@ that survives. The watcher spawns the orchestrator with `stderr=DEVNULL`, so
 anything written there is gone. That is why the reason names the actual fault
 ("workspace setup failed: git clone failed …") rather than the phase.
 
+**The one exit where it does not keep the lease** (plan 0179 D1, ADR-0029).
+After every exit above — the failure paths and the verified-but-unreviewed
+path alike, once the lease activated — a last step reads the plan file on
+`main` and releases the lease exactly when that reads `done` or `abandoned`,
+recording the fact as the release's reason. Holding is still correct while
+the plan reads `ready`: everything this section says about re-dispatch loops
+and stranded successors applies. But a plan a human has since set `done` or
+`abandoned` is not `ready`, so none of those successor paths can act on its
+lease anyway — holding it would only make the overlap check in
+`docs/plan-dependencies.md` keep treating it as a running dispatch. The read
+never touches a pull request, and a plan file that cannot be read is treated
+as still `ready` (held), never as a fact.
+
 ### Workspaces
 
 One `git worktree` per lease, attached to a shared per-repo clone, keyed on the
@@ -757,6 +1126,13 @@ is on the *branch*, not the repo, so two plans in one repository dispatch
 concurrently — without this they would share one directory. `fleetlib`'s
 `orphan_worktrees()` reports trees whose lease is gone and deliberately does not
 delete them: the tree is the evidence of how the run died.
+
+The per-repo store is cloned from `FLEET_GIT_SSH_BASE`. Its default,
+`ssh://git@forge.example:2222`, names `operator` because that is the key
+authorised on the git-ssh daemon since 2026-09-22; the implementer inherits that
+remote rather than being told about it. Transport identity is not authorship:
+the pull request is still implbot's, because authorship is the commit author
+plus the API token that opens it (`forgejo-open-pr.sh`, `verify_marked_pr`).
 
 ### No approval code path
 

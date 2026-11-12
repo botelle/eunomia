@@ -15,7 +15,7 @@
           "path": {
             "type": "string",
             "minLength": 1,
-            "$comment": "relative, confined under tests/ — bin/fleet-lane enforces this; the schema only asks for a non-empty string"
+            "$comment": "relative, confined under tests/lane/ — bin/fleet-lane enforces this; the schema only asks for a non-empty string"
           },
           "content": {"type": "string"},
           "executable": {

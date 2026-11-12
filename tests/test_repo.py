@@ -388,12 +388,10 @@ def test_no_flag_has_a_written_negative(repo_mod, tmp_path, flag):
     (["list"], False),
     (["check", "operator/sniff"], True),
 ])
-def test_list_and_check_say_the_watcher_does_not_read_this_file(
+def test_list_and_check_no_longer_say_the_watcher_ignores_this_file(
         repo_mod, tmp_path, capsys, monkeypatch, argv, needs_check):
-    """`bin/fleet-watch:134` builds its allowlist from FLEET_WATCH_REPOS and
-    nothing else. `enable` has always said
-    so; `list` and `check` are the other two places an operator asks what the
-    fleet is doing, and 'eligible' with no caveat reads as 'it will dispatch'."""
+    """Plan 0134: the units read this file from the eunomia pin, so the old
+    "fleet-watch does not read this file yet" note is gone from every command."""
     conf = tmp_path / "repos.conf"
     conf.write_text("repo: operator/sniff dispatch\n")
     if needs_check:
@@ -401,20 +399,22 @@ def test_list_and_check_say_the_watcher_does_not_read_this_file(
                             lambda r, w=None: (repo_mod.EXIT_OK, "eligible"))
     repo_mod.main(["--conf", str(conf), *argv])
     err = capsys.readouterr().err
-    assert "FLEET_WATCH_REPOS" in err and "not yet a dispatch" in err
+    assert "does not read this file" not in err and "FLEET_WATCH_REPOS" not in err
 
 
-def test_the_caveat_is_one_string_not_three_copies(repo_mod):
-    """Three commands say it; a future edit must not be able to fix one and
-    leave two."""
-    src = (BIN / "fleet-repo").read_text()
-    assert src.count("FLEET_WATCH_REPOS (bin/fleet-watch:134)") == 1
+def test_enable_says_when_it_takes_effect_and_that_the_pin_is_owner_made(
+        repo_mod, tmp_path, capsys, monkeypatch):
+    conf = tmp_path / "repos.conf"
+    monkeypatch.setattr(repo_mod, "check",
+                        lambda r, w=None: (repo_mod.EXIT_OK, "eligible"))
+    repo_mod.main(["--conf", str(conf), "enable", "operator/sniff", "--dispatch"])
+    err = capsys.readouterr().err
+    assert "pull request merges" in err and "eunomia pin" in err
+    assert "fleet-pin-advance --create-missing" in err
 
 
-def test_an_empty_record_still_carries_the_caveat(repo_mod, tmp_path, capsys):
-    repo_mod.main(["--conf", str(tmp_path / "nope.conf"), "list"])
-    cap = capsys.readouterr()
-    assert "no repos enrolled" in cap.out and "FLEET_WATCH_REPOS" in cap.err
+def test_the_stale_note_is_gone_from_the_source():
+    assert "does not read this file" not in (BIN / "fleet-repo").read_text()
 
 
 # --- the shipped record ----------------------------------------------------

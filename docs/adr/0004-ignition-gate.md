@@ -11,11 +11,21 @@
   and its ruling that `fleet-watch` **cannot** be the authoritative spec-impact asker is
   what bounds check (c) below to an advisory one. `docs/plan-dispatch.md` §"Making a repo
   an ignition repo" is the operator procedure.
+- **Amended by:** [ADR-0026](0026-any-runner-may-hold-any-position.md) §7 (2026-11-05) — the 2026-09-09 revision: an owner-reviewed repository has no agent review to land first. *(Withdrawn 2026-11-05.)*
+- **Amended by:** [ADR-0019](0019-on-an-autonomous-repo-the-plan-is-the-human-approval.md),
+  2026-09-29 — on an autonomous repository the merge whitelist admits `mergebot`, and two
+  agents may reach `required_approvals` when the rule requires `eunomia/deps`; the human
+  requirement moves from the approval count to the merge whitelist.
+- **Amended 2026-10-07 by the owner** — Revision, "Approvals whitelist": where the merge
+  whitelist holds no agent, agents may reach `required_approvals`. The human gate is the
+  merge, and auto-merge cannot bypass it.
 - **Spec-impact:** **none for the gate.** It reads evidence and changes no lease, event
   or contract. The two-lease change belongs to `plans/0016-independent-test-lane.md`,
   which carries it: `docs/plan-dispatch.md` §"Leases, death, and respawn" today describes
   one lease per dispatched plan, and `SPEC.md` does not describe dispatch leases at all —
   which an earlier draft of this ADR got wrong.
+- **Amended by:** [ADR-0024](0024-no-review-requires-a-named-model.md), 2026-10-21 — steps
+  7a, 7b and 10 name configured runners, not Opus, Gemini or Fable.
 
 ## Context
 
@@ -93,6 +103,10 @@ than what this ADR first specified, and stating it plainly is the point: *the re
 approval must land before the owner decides.* Not so the merge is gated twice, but because
 the review routinely finds something the owner missed, and reviewing first is cheaper than
 reversing a position already taken.
+*(Amended by [ADR-0026](0026-any-runner-may-hold-any-position.md) §7, 2026-11-05: on a
+repository whose reviewer seats are all the owner's, there is no agent review to land first;
+the owner's merge is the review. Such a repository is not dispatched by the fleet, so this
+ignition rule does not reach it. This note was withdrawn by the owner, 2026-11-05, with ADR-0026 §7; nothing was built on it, and the text above binds as it did before.)*
 
 That is a claim about **merge**, where this ADR had moved the requirement to **dispatch**.
 Under the original decision a plan could be merged with no reviewer approval at all; it
@@ -139,6 +153,33 @@ rule below does not depend on the absence of auto-merge.
   promise a dispatch that cannot happen. The old rule never noticed this; a test fixture in
   this repo had carried exactly that configuration.
 
+*(Amended by [ADR-0019](0019-on-an-autonomous-repo-the-plan-is-the-human-approval.md),
+2026-09-29, for autonomous repositories only. The merge whitelist admits one agent,
+`mergebot`, which merges only what ADR-0019 §4 allows. The approvals whitelist may hold
+two agents that between them reach `required_approvals` (at least 2), provided the rule
+requires `eunomia/deps`, and unsatisfiability counts them. What survives:
+`apply_to_admins`, the absolute rule for every other agent, and both rules unchanged on
+critical repositories, whose merge whitelist never holds `mergebot`. A human is still
+required for every plan and ADR. That rests on mergebot's own checks, and on fleet-watch
+dispatching only a plan whose last change `operator` merged.)*
+
+*(Amended by the owner, 2026-10-07, for every repository whose merge whitelist holds no
+agent. There, agents on the approvals whitelist **may** reach `required_approvals`: two
+agent reviews (`revbot` and `rev2bot`) at `required_approvals: 2`. The human
+requirement is the merge itself, which only a non-agent can perform. Forgejo 15.0.2
+refuses to **schedule** an auto-merge for a user who is not merge-whitelisted
+(`CheckPullMergeable` → `IsUserAllowedToMerge` → `IsUserMergeWhitelisted`). It also
+re-checks the scheduler's permission when the merge **fires** (`services/automerge`),
+so no auto-merge can complete without a merge-whitelisted human having asked for it. The
+owner does not use auto-merge on critical repositories. "The reviewer's approval must
+land before the owner decides" still holds: the reviews are the approvals, and the
+owner's decision is the merge. Unsatisfiability counts every whitelisted account,
+agents included, on such a repository. What survives: the merge whitelist's absolute
+rule, `apply_to_admins`, ADR-0019's `eunomia/deps` condition wherever an agent can
+merge, and the sufficiency rule wherever the merge whitelist holds an agent. The
+broker's agent set must include `rev2bot` and `mergebot` before this rule is relied on
+(plan 0106).)*
+
 ### What does not change
 
 `apply_to_admins` must still be ON — an admin bypasses every lane above it, and that is the
@@ -162,11 +203,11 @@ Node kinds: **human**, **agent**, **service**, **artefact**, **decision**.
 | 5 | fleet-watch | gate: (a), (b), (c) issued **concurrently** against the merged SHA |
 | 6 | decision | any failure → refuse, reporting **all** failures at once; no dispatch |
 | 7 | fleet-watch | on pass, spawn **two** lanes in parallel |
-| 7a | implementation lane (Opus) | branch `agent/<plan>-impl`, own lease, own worktree |
-| 7b | test lane (Gemini via oracle) | receives the plan, ADR and flow spec **as text** — no repo, no branch, no clone, no credential; returns file content — **`zone: public` plans only** |
+| 7a | implementation lane (the configured implementer; *amended by ADR-0024, 2026-10-21, this read "Opus"*) | branch `agent/<plan>-impl`, own lease, own worktree |
+| 7b | test lane (the configured testers; *amended by ADR-0024, 2026-10-21, this read "Gemini via oracle"*) | receives the plan, ADR and flow spec **as text** — no repo, no branch, no clone, no credential; returns file content — **`zone: public` plans only** |
 | 8 | credentialed wrapper | commits the test lane's returned content to `agent/<plan>-test` and opens its PR. The test agent holds no write path at all — that is what makes "never receives credentials" architectural rather than configured |
 | 9 | — | the tests land as **their own PR with their own human merge**, never into 7a's branch: a feature carrying its own tests can pass by adjusting them |
-| 10 | mediator (Fable) | on divergence, reads the ADR and returns an adjudication and a `status: draft` follow-up plan **as content**; the wrapper posts them. The mediator holds no token and arms nothing |
+| 10 | mediator (a configured runner; *amended by ADR-0024, 2026-10-21, this read "Fable"*) | on divergence, reads the ADR and returns an adjudication and a `status: draft` follow-up plan **as content**; the wrapper posts them. The mediator holds no token and arms nothing |
 | 11 | **the operator (human)** | reviews and merges the implementation PR |
 
 The only edge between 7a and 7b is step 9, it is mechanical, and it is mediated by
@@ -216,6 +257,11 @@ TERM the wrong process, two of them the operator's own live session.
   of the option that owns it. Closing it needs a separate control — a required status
   check fed by the review, or a merge queue that refuses on an open REQUEST_CHANGES —
   and neither is in scope here.
+  *(Closed on autonomous repositories by [ADR-0019](0019-on-an-autonomous-repo-the-plan-is-the-human-approval.md)
+  §4, 2026-09-29: the only agent that merges requires both reviewers' approvals at head.
+  In the actors table, step 3 (plan merge) and step 9 (test PRs) stay human everywhere.
+  Step 11 stays human on critical repositories, and on autonomous ones becomes mergebot's
+  merge. Scheduled auto-merge (the Revision above) stays available to the owner only.)*
 - **A new refusal surface that is not the plan's fault.** An unreadable review list, a
   5xx, an expired token — none of these is a missing approval. They page; they must never
   refuse silently, which is the same distinction plan 0013 draws for the protections and

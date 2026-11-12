@@ -124,6 +124,10 @@ def _services_conf_path() -> Path:
 
 _ROW_RE = re.compile(r"^service:\s*(\S+)\s+(.*)$")
 _ROW_FIELDS = ("supervisor", "domain", "primary", "also", "config")
+# The same vocabularies _launchd_target and _systemd_scope_args accept —
+# checked at parse time so no verb, `audit` included, can act on a row whose
+# domain it would otherwise have to guess.
+_DOMAINS = {"launchd": ("system", "gui"), "systemd": ("system", "user")}
 
 
 def _parse_services_conf():
@@ -165,6 +169,11 @@ def _parse_services_conf():
         if fields["supervisor"] not in ("launchd", "systemd"):
             sys.exit(f"fleet-svc: {path}:{lineno}: supervisor must be "
                      f"launchd|systemd, got {fields['supervisor']!r}")
+        allowed = _DOMAINS[fields["supervisor"]]
+        if fields["domain"] not in allowed:
+            sys.exit(f"fleet-svc: {path}:{lineno}: domain for a "
+                     f"{fields['supervisor']} row must be "
+                     f"{'|'.join(allowed)}, got {fields['domain']!r}")
         config = None if fields["config"] == "-" else fields["config"]
         if config is not None and not config.startswith("/"):
             sys.exit(f"fleet-svc: {path}:{lineno}: config must be an absolute "
@@ -374,16 +383,30 @@ def _systemd_scope_args(domain: str):
     sys.exit(f"fleet-svc: unknown systemd domain {domain!r} (expected system|user)")
 
 
+def _installed_plist(row: dict) -> Path:
+    """The installed plist `launchctl bootstrap` loads — it takes a PATH, never
+    a label (passing the label fails `5: Input/output error`, 2026-09-28).
+    A gui unit lives in the LaunchAgents dir `audit` reads; a system unit in
+    /Library/LaunchDaemons. Refuses, without calling launchctl, when absent."""
+    path = _installed_plists_dir(row["domain"]) / f"{row['primary']}.plist"
+    if not path.is_file():
+        sys.exit(f"fleet-svc: cannot bootstrap {row['host']}:{row['unit']} — "
+                 f"no installed plist at {path}; install it first "
+                 "(launchctl bootstrap loads a plist path, not a label)")
+    return path
+
+
 def _build_argv(row: dict, verb: str):
     label = row["primary"]
     if row["supervisor"] == "launchd":
         target = _launchd_target(row["domain"], label)
+        if verb == "bootstrap":
+            return ["bootstrap", target.rsplit("/", 1)[0], str(_installed_plist(row))]
         return {
             "start": ["kickstart", target],
             "restart": ["kickstart", "-k", target],
             "kickstart": ["kickstart", "-k", target],
             "stop": ["kill", "SIGTERM", target],
-            "bootstrap": ["bootstrap", target.rsplit("/", 1)[0], label],
             "bootout": ["bootout", target],
             "enable": ["enable", target],
             "disable": ["disable", target],
@@ -513,11 +536,18 @@ def _config_sha_state(row: dict, binding):
 # another (§3 boundary — every one of them was individually "correct" while
 # mopsus sat undeployed): the repo's `launchd/*.plist` (shipped), this host's
 # rows in `config/services.conf` (enrolled), and what launchd actually has
-# installed under ~/Library/LaunchAgents and loaded (installed / loaded).
+# installed (LaunchAgents, or LaunchDaemons for a domain=system row) and
+# loaded in that row's own domain (installed / loaded).
 # Read-only: this never installs, loads, repairs or enrols anything.
 
 _FLEET_ORCH_RE = re.compile(r"^org\.eunomia\.fleet-orch\.")
 _OPERATOR_LABEL_RE = re.compile(r"^org\.eunomia\.")
+
+# Where a shipped plist with no config/services.conf row is meant to run.
+# Every launchd/*.plist this repo ships is an opshost LaunchAgent (the dispatcher
+# and ledger host); without this, `audit` on any other host counted each one
+# as shipped-but-not-installed and could never exit 0 there.
+SHIPPED_UNITS_HOST = "opshost"
 
 # Quoted verbatim from config/services.conf's own header — D4/boundary: an
 # audit that enrolled what it found would erase the distinction between the
@@ -540,6 +570,23 @@ def _launchd_dir() -> Path:
 def _launch_agents_dir() -> Path:
     env = os.environ.get("FLEET_LAUNCH_AGENTS_DIR")
     return Path(env) if env else Path.home() / "Library" / "LaunchAgents"
+
+
+def _launch_daemons_dir() -> Path:
+    env = os.environ.get("FLEET_LAUNCH_DAEMONS_DIR")
+    return Path(env) if env else Path("/Library/LaunchDaemons")
+
+
+def _installed_plists_dir(domain: str) -> Path:
+    """Where launchd's installed copy of a unit lives, by its services.conf
+    domain: a gui LaunchAgent in the LaunchAgents dir, a system LaunchDaemon
+    in /Library/LaunchDaemons. `bootstrap` and `audit` both pick it here, so
+    they can never disagree about where a unit is installed."""
+    if domain == "gui":
+        return _launch_agents_dir()
+    if domain == "system":
+        return _launch_daemons_dir()
+    sys.exit(f"fleet-svc: unknown launchd domain {domain!r} (expected system|gui)")
 
 
 def _describe_parse_error(exc: Exception) -> str:
@@ -575,9 +622,9 @@ def _load_shipped_plists(launchd_dir: Path):
     return out
 
 
-def _load_installed_plist(label: str, launch_agents_dir: Path):
+def _load_installed_plist(label: str, plists_dir: Path):
     """(path, data_or_None, error_or_None, installed:bool)."""
-    path = launch_agents_dir / f"{label}.plist"
+    path = plists_dir / f"{label}.plist"
     if not path.is_file():
         return path, None, None, False
     data, err = _load_plist_strict(path)
@@ -587,9 +634,10 @@ def _load_installed_plist(label: str, launch_agents_dir: Path):
 def _domain_loaded_labels(launchctl_argv, domain: str):
     """Every label in `launchctl print <domain>`'s `services = {...}` block,
     or None on any failure to ask. This is the only way to learn about a
-    loaded label this host never told us to expect (docs/unit-audit.md) —
-    D1c: the domain asked is gui/$UID, never the background domain a plain
-    `launchctl list` over ssh would land in."""
+    loaded label this host never told us to expect (docs/unit-audit.md).
+    `audit` asks gui/$UID — D1c: never the background domain a plain
+    `launchctl list` over ssh would land in — and `system` when this host
+    enrols a domain=system row."""
     try:
         res = subprocess.run(launchctl_argv + ["print", domain],
                              capture_output=True, text=True, timeout=15)
@@ -689,15 +737,46 @@ def audit_collect(*, host=None, uid=None, launchctl_argv=None):
         for key, row in all_rows.items()
         if row["host"] == host and row["supervisor"] == "launchd"
     }
+    # A shipped-only label has no row, so no domain: every plist this repo
+    # ships is a LaunchAgent, so it defaults to gui.
+    domain_for_label = {
+        row["primary"]: row["domain"]
+        for key, row in all_rows.items()
+        if row["host"] == host and row["supervisor"] == "launchd"
+    }
     other_host_rows = [
         {"key": key, "host": row["host"], "unit": row["unit"]}
         for key, row in sorted(all_rows.items())
         if row["host"] != host
     ]
+    # A shipped label belongs to the host that enrols it; one enrolled
+    # nowhere belongs to SHIPPED_UNITS_HOST. Anywhere else it is reported,
+    # never judged — the same rule as another host's services.conf row.
+    enrolled_host_for_label = {
+        row["primary"]: row["host"]
+        for row in all_rows.values() if row["supervisor"] == "launchd"
+    }
+    shipped_elsewhere = []
+    for label in sorted(shipped):
+        if label in enrolled_for_host:
+            continue
+        owner = enrolled_host_for_label.get(label, SHIPPED_UNITS_HOST)
+        if owner != host:
+            shipped_elsewhere.append({"label": label, "host": owner,
+                                      "enrolled": label in enrolled_host_for_label})
+    shipped_here = set(shipped) - {s["label"] for s in shipped_elsewhere}
 
     launch_agents_dir = _launch_agents_dir()
     domain_labels = _domain_loaded_labels(launchctl_argv, domain)
     loaded_query_ok = domain_labels is not None
+    # A domain=system row is loaded in the system domain, which a gui/$UID
+    # query never lists. Asked only when this host enrols one; readable
+    # without root.
+    system_labels = set()
+    if "system" in domain_for_label.values():
+        queried = _domain_loaded_labels(launchctl_argv, "system")
+        loaded_query_ok = loaded_query_ok and queried is not None
+        system_labels = queried or set()
     # Scope (D1b): only this repo's OWN convention, and never the
     # per-dispatch fleet-orch.<lease> jobs — those come and go with a
     # dispatch and this audit has no business judging them at all.
@@ -706,7 +785,16 @@ def audit_collect(*, host=None, uid=None, launchctl_argv=None):
         if _OPERATOR_LABEL_RE.match(l) and not _FLEET_ORCH_RE.match(l)
     }
 
-    in_scope_labels = sorted(set(shipped) | set(enrolled_for_host))
+    in_scope_labels = sorted(shipped_here | set(enrolled_for_host))
+
+    # Whether a shipped-elsewhere label is loaded HERE is worth a column: a
+    # second dispatcher on the wrong host is the case that matters. One
+    # enrolled elsewhere is already an other-host line, so it gets its own
+    # line only when it is loaded here.
+    for s in shipped_elsewhere:
+        s["loaded"] = s["label"] in (domain_labels or set())
+    shipped_elsewhere = [s for s in shipped_elsewhere
+                         if not s.pop("enrolled") or s["loaded"]]
 
     units = []
     for label in in_scope_labels:
@@ -714,8 +802,15 @@ def audit_collect(*, host=None, uid=None, launchctl_argv=None):
         is_shipped = label in shipped
         enrolled_key = enrolled_for_host.get(label)
         installed_path, installed_data, installed_err, is_installed = \
-            _load_installed_plist(label, launch_agents_dir)
-        is_loaded = label in loaded_operator
+            _load_installed_plist(
+                label, _installed_plists_dir(domain_for_label.get(label, "gui")))
+        # An in-scope label is in scope by name, so it is looked up in its
+        # own domain UNFILTERED — the org.eunomia.* filter decides only what
+        # the out-of-scope scan below may report. Filtering here made every
+        # org.eunomia.* row (forgejo-runner, keyvault) read loaded=no forever.
+        is_loaded = label in (system_labels
+                              if domain_for_label.get(label) == "system"
+                              else (domain_labels or set()))
 
         drifted = False
         drift_detail = []
@@ -764,12 +859,15 @@ def audit_collect(*, host=None, uid=None, launchctl_argv=None):
     # eunomia does not ship is not this audit's to judge, including its own
     # parse failures (the org.eunomia.lynceus case).
     out_of_scope = []
-    for label in sorted(loaded_operator - set(in_scope_labels)):
+    # Never a shipped label: shipped-for-other-host already reports it, and
+    # "shipped-by-eunomia=no" would be false.
+    for label in sorted(loaded_operator - set(in_scope_labels) - set(shipped)):
         _, _, err, _ = _load_installed_plist(label, launch_agents_dir)
         out_of_scope.append({"label": label, "parse_error": err})
 
     return {"host": host, "domain": domain, "units": units,
            "out_of_scope": out_of_scope, "other_host_rows": other_host_rows,
+           "shipped_elsewhere": shipped_elsewhere,
            "loaded_query_ok": loaded_query_ok}
 
 
@@ -815,6 +913,10 @@ def render_audit(data):
     for row in data["other_host_rows"]:
         lines.append(f"other-host {row['key']} host={row['host']} — not audited "
                      "here (this run only covers the local host)")
+    for s in data["shipped_elsewhere"]:
+        lines.append(f"shipped-for-other-host {s['label']} host={s['host']} "
+                     f"loaded={_yn(s['loaded'])} — not audited here (this run "
+                     "only covers the local host)")
     n_problem = sum(1 for u in data["units"] if u["problem"])
     lines.append(f"{len(data['units'])} unit(s) in scope, {n_problem} with a problem")
     return lines

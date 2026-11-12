@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-followups — scheduled triage of deferred review findings (plan 0083).
+
+  Fires hourly. Each repo has its own timer in config/followups.conf, and
+  every repo defaults to -1 (off): with none switched on a run reads nothing
+  from the forge. A run triages at most followup_triage_batch of the open
+  `Follow-ups from review of #N` issues (default 10, set with fleet-config; 0
+  pauses the job) and acts on the owner's close, keep and fix verbs. It posts
+  comments and, on the owner's close, closes an issue. It opens no pull
+  request. docs/followups.md is the lifecycle.
+
+  Install (opshost): fill FLEET_NTFY_URL (the Fleet-ops push URL) and
+  FLEET_OPERATOR_UID (the owner's numeric Forgejo id; unset disables every
+  verb), then
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-followups.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-followups.plist
+  Verify (PROVENANCE §8.3 — see it page before trusting it): set the batch to
+  1 with fleet-config, run the command once by hand, and confirm one triage
+  comment and one page. Then raise the batch.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the shared clone sits on
+  whatever branch a session last left it on (ADR-0005). The pin is a detached
+  worktree of this repo at ~/.local/share/pins/eunomia.
+
+  PATH carries /opt/homebrew/bin because the session runs the claude CLI, and
+  launchd's own default PATH does not reach it.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-followups</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-followups</string>
+    <string>triage</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- replace with the real Fleet-ops push URL at install; empty = print-only -->
+    <key>FLEET_NTFY_URL</key><string></string>
+    <!-- the owner's numeric Forgejo user id; empty = every verb disabled -->
+    <key>FLEET_OPERATOR_UID</key><string></string>
+  </dict>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/followups.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/followups.log</string>
+</dict>
+</plist>

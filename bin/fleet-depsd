@@ -1,0 +1,1482 @@
+#!/usr/bin/env python3
+"""fleet-depsd — the table owner for an owner attestation of an `external:`
+dependency (plan 0180), and (plan 0181) the resident service that re-checks
+every held plan when a watched repository's `main` moves or the owner attests
+an `external:`.
+
+THIS PROGRAM'S WRITE PATHS are `serve`'s authenticated POST and DELETE
+(the owner decided this, 2026-11-02 — a CLI here could not tell the owner from
+a dispatched agent, since `bin/orchestrator`'s `_ENV_ALLOW` strips
+`EUNOMIA_SESSION`), `serve`'s own `recompute()`, which owns
+`dependency_hold` and `dependency_scan` outright, and — plan 0189 — the
+`pull_request` webhook handler and the resident review loop, which write
+only through `bin/fleet-plan-review`'s own `_enqueue()`/`_claim_jobs()`/
+`_dispatch_one()`/`_fenced()` (never a restated writer of `plan_review_job`/
+`plan_review_job_change`) plus this file's own `plan_review_reconcile_cursor`
+row, the resumable cursor `_reconcile_plan_reviews` advances. There is no
+`attest` or `revoke` subcommand.
+
+  fleet-depsd attestations [--json]      every attested slug, read-only
+  fleet-depsd serve                      the resident service (plan 0181)
+  fleet-depsd serve --once [--dry-run]   one recompute pass, then exit
+
+`FLEET_DB` overrides the database path, as it does for every other owner.
+See docs/depsd.md for the full contract.
+"""
+import argparse
+import hashlib
+import hmac
+import importlib.machinery
+import importlib.util
+import json
+import os
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+_lib_loader = importlib.machinery.SourceFileLoader("fleetlib", str(BIN / "fleetlib.py"))
+_lib_spec = importlib.util.spec_from_loader("fleetlib", _lib_loader)
+lib = importlib.util.module_from_spec(_lib_spec)
+_lib_loader.exec_module(lib)
+
+# bin/fleet-watch, by path — the same SourceFileLoader shape it uses for
+# fleetlib/fleetforge/fleetjob/fleet-config, and for the same reason (plan
+# 0051/0053 boundary): this file is loaded from directories that are not on
+# sys.path. It is where `_plan_dependency_blocks` (plan 0180 D3), `plan_files`,
+# `conf_repos`/`repos`, `_run_token_helper`, `notify` and `is_external_slug`
+# live; this plan resolves dependencies only through that one definition of
+# "met" (Boundaries), never a restatement of its own.
+_watch_loader = importlib.machinery.SourceFileLoader("fleet_watch_lib", str(BIN / "fleet-watch"))
+_watch_spec = importlib.util.spec_from_loader("fleet_watch_lib", _watch_loader)
+watch = importlib.util.module_from_spec(_watch_spec)
+_watch_loader.exec_module(watch)
+
+# bin/fleet-plan-review, loaded the same way and for the same reason as
+# `watch` above — plan 0189's lease is THIS file, not that one, and its own
+# queue entry point (`_enqueue`, `_connect`, `_forge`, `_claim_jobs`,
+# `_dispatch_one`, `_fenced`, `changed_paths_for_position`,
+# `reviewer_position`, `_enrolled`, `fleet_repo`, `DEFAULT_CLAIM_TTL`) is
+# reused exactly as plan 0188 left it (Boundaries/Deliverables: "reuse the
+# worker entry point"). Eager, like `watch`, not lazy like that module's own
+# `_orch_mod()` — importing it alone costs nothing: it has no module-level
+# import of `bin/orchestrator`/`bin/mopsus`, exactly the reasoning its own
+# docstring gives for why those two ARE lazy.
+#
+# `_run_plan_review_worker` below additionally reaches through to
+# `planreview._orch_mod().review_quota_hold` — not in the list above, because
+# plan 0188's own `_dispatch_one` never calls it: `review_quota_hold` is the
+# gate `bin/orchestrator`'s OWN first-attempt review loop takes before a
+# `dispatch_review()` it already knows is attended (a human or a dispatched
+# session is the thing that would notice a page). This resident service's
+# worker wake has no such witness — it fires on a timer and on a webhook,
+# with nobody watching — so it is this file's own job to take the SAME gate
+# `bin/fleet-plan-review worker`'s own (likewise hand-run, likewise attended)
+# entry point has never needed.
+_planreview_loader = importlib.machinery.SourceFileLoader(
+    "fleet_plan_review_lib", str(BIN / "fleet-plan-review"))
+_planreview_spec = importlib.util.spec_from_loader("fleet_plan_review_lib", _planreview_loader)
+planreview = importlib.util.module_from_spec(_planreview_spec)
+_planreview_loader.exec_module(planreview)
+
+DB = os.path.expanduser(os.environ.get("FLEET_DB", str(lib.fleet_dir() / "fleet.db")))
+
+# `dependency_attestation` holds current state only, one row per slug;
+# `dependency_attestation_change` is the append-only history plan 0181's
+# writer appends to. Neither carries a `created_by`/`updated_by` column — the
+# change table carries the actor, and a last-writer column on the row itself
+# would be one overwritten cell dressed as an audit trail.
+#
+# `dependency_hold` and `dependency_scan` (plan 0181 D5) are derived tier:
+# written only by this program's `recompute()`, which rebuilds them whole from
+# `plan_files()` + `_plan_dependency_blocks()` every pass. They hold no actor
+# and no history for that reason.
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS dependency_attestation (
+  slug        TEXT NOT NULL PRIMARY KEY,
+  note        TEXT,
+  created_at  REAL NOT NULL,
+  updated_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dependency_attestation_change (
+  id          TEXT NOT NULL PRIMARY KEY,   -- ULID from the writer, not a sequence
+  slug        TEXT NOT NULL,
+  action      TEXT NOT NULL,               -- 'attest' | 'revoke'
+  note        TEXT,
+  actor       TEXT NOT NULL,
+  source      TEXT NOT NULL,
+  created_at  REAL NOT NULL,
+  updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS dependency_attestation_change_slug
+  ON dependency_attestation_change(slug, created_at);
+
+CREATE TABLE IF NOT EXISTS dependency_hold (
+  repo        TEXT NOT NULL,
+  plan        TEXT NOT NULL,
+  dep         TEXT NOT NULL,
+  form        TEXT NOT NULL,
+  reason      TEXT,
+  detail      TEXT,
+  created_at  REAL NOT NULL,
+  updated_at  REAL NOT NULL,
+  PRIMARY KEY (repo, plan, dep)
+);
+
+CREATE TABLE IF NOT EXISTS dependency_scan (
+  repo        TEXT NOT NULL PRIMARY KEY,
+  scanned_at  REAL NOT NULL,
+  ok          INTEGER NOT NULL,
+  detail      TEXT,
+  created_at  REAL NOT NULL,
+  updated_at  REAL NOT NULL
+);
+
+-- Plan 0189 D2: the resumable cursor the reconciliation sweep advances
+-- across the enrolled registry, one bounded slice per pass, so recovering a
+-- missed `pull_request` delivery never means walking every repo's every
+-- open PR in one burst (Deliverables: "avoid flooding the queue on initial
+-- enrollment"). One row (`id='default'`). Derived-tier in spirit — losing
+-- it merely restarts the walk from the registry's first repo, re-visiting
+-- ground `_enqueue`'s own idempotence already makes free — but it is NOT
+-- rebuilt by `recompute()`, so it gets its own row rather than living in
+-- `dependency_scan`.
+CREATE TABLE IF NOT EXISTS plan_review_reconcile_cursor (
+  id          TEXT NOT NULL PRIMARY KEY,
+  repo_index  INTEGER NOT NULL,
+  created_at  REAL NOT NULL,
+  updated_at  REAL NOT NULL
+);
+"""
+
+_LATEST_ACTOR = """
+SELECT c.slug, c.actor FROM dependency_attestation_change c
+WHERE c.created_at = (
+  SELECT MAX(c2.created_at) FROM dependency_attestation_change c2
+  WHERE c2.slug = c.slug)
+"""
+
+
+def warn(msg):
+    print(f"fleet-depsd: WARN {msg}", file=sys.stderr)
+
+
+class StoreUnreadable(Exception):
+    """The database, or its tables, could not be read — reported, never an
+    empty answer (the same rule `bin/fleet-ci`'s `_Absent` enforces)."""
+
+
+def _connect_ro(path):
+    """A read-only connection onto `path`'s `dependency_attestation` tables.
+    Raises `StoreUnreadable` rather than returning an empty result, so a
+    missing database or table is never told apart from "nothing attested"."""
+    if not os.path.exists(path):
+        raise StoreUnreadable(f"no database at {path} — run fleet-db-migrate")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    have = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "dependency_attestation" not in have:
+        raise StoreUnreadable(
+            f"{path} has no dependency_attestation table — run fleet-db-migrate")
+    return con
+
+
+def attestations(db_path=None):
+    """[{"slug", "note", "created_at", "updated_at", "actor"}, ...], newest
+    actor per slug, ordered by slug. `actor` is None when the row predates
+    any change record (plan 0181's writer always appends one)."""
+    con = _connect_ro(db_path or DB)
+    try:
+        actor_by_slug = dict(con.execute(_LATEST_ACTOR).fetchall())
+        rows = con.execute(
+            "SELECT slug, note, created_at, updated_at FROM dependency_attestation "
+            "ORDER BY slug").fetchall()
+    finally:
+        con.close()
+    return [{"slug": slug, "note": note, "created_at": created_at,
+             "updated_at": updated_at, "actor": actor_by_slug.get(slug)}
+            for slug, note, created_at, updated_at in rows]
+
+
+def cmd_attestations(args):
+    try:
+        rows = attestations(args.db)
+    except StoreUnreadable as e:
+        print(f"fleet-depsd: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(rows))
+        return 0
+    if not rows:
+        print("no dependency_attestation rows")
+        return 0
+    for row in rows:
+        print(f"{row['slug']:60} {row['actor'] or '?':20} {row['note'] or ''}")
+    return 0
+
+
+# --------------------------------------------------------------------- D5/D1
+
+def _connect_rw(db_path, set_wal=True):
+    con = sqlite3.connect(db_path)
+    # Set at every open, not by a one-off pragma (docs/fleet-db.md "WAL") —
+    # every other writer of this file does the same, so a reader (`api_holds`,
+    # the lynceus sibling) is never blocked behind this one's transaction.
+    # Skipped under `recompute(dry_run=True)`: switching journal mode writes
+    # the file's header even when nothing else here would, which is a write
+    # `--dry-run` promises not to make.
+    if set_wal:
+        try:
+            con.execute("PRAGMA journal_mode=WAL").fetchone()
+        except sqlite3.OperationalError as e:
+            warn(f"could not switch to WAL ({e}) — continuing in the current "
+                 "journal mode")
+    con.executescript(SCHEMA)
+    return con
+
+
+def record_attestation(con, slug, note, actor, source, action):
+    """The only writer of `dependency_attestation`/`_change` (Boundaries). Both
+    the POST and DELETE handlers below call this, and nothing else in this
+    file does — `test_fleet_depsd_serve.py` AST-walks for that."""
+    now = time.time()
+    if action == "attest":
+        row = con.execute(
+            "SELECT created_at FROM dependency_attestation WHERE slug=?",
+            (slug,)).fetchone()
+        if row is None:
+            con.execute(
+                "INSERT INTO dependency_attestation (slug, note, created_at, "
+                "updated_at) VALUES (?,?,?,?)", (slug, note, now, now))
+        else:
+            con.execute(
+                "UPDATE dependency_attestation SET note=?, updated_at=? "
+                "WHERE slug=?", (note, now, slug))
+    elif action == "revoke":
+        con.execute("DELETE FROM dependency_attestation WHERE slug=?", (slug,))
+    else:
+        raise ValueError(f"unknown action {action!r}")
+    change_id = watch.fleetconfig._ulid()
+    con.execute(
+        "INSERT INTO dependency_attestation_change (id, slug, action, note, "
+        "actor, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        (change_id, slug, action, note, actor, source, now, now))
+    con.commit()
+
+
+def wake_dir():
+    return lib.fleet_dir() / "wake"
+
+
+def _wake_name(repo, plan):
+    return hashlib.sha1(f"{repo}|{plan}".encode()).hexdigest() + ".json"
+
+
+def write_wake(repo, plan, reason):
+    """Plan 0181 D4. Written before the caller commits the hold deletion that
+    triggered it (recompute()'s own rule) — a temp file in the same directory,
+    then `os.replace`d, so `fleet-watch`'s `_take_wakes()` never sees a half
+    file. The same `(repo, plan)` always names the same file, so a burst of
+    triggers coalesces into one wake."""
+    d = wake_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".tmp-{uuid.uuid4().hex}"
+    tmp.write_text(json.dumps(
+        {"repo": repo, "plan": plan, "reason": reason, "at": time.time()}))
+    os.replace(tmp, d / _wake_name(repo, plan))
+
+
+def _mark_scan(con, repo, ok, detail, now):
+    con.execute(
+        "INSERT INTO dependency_scan (repo, scanned_at, ok, detail, "
+        "created_at, updated_at) VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(repo) DO UPDATE SET scanned_at=excluded.scanned_at, "
+        "ok=excluded.ok, detail=excluded.detail, updated_at=excluded.updated_at",
+        (repo, now, 1 if ok else 0, detail or "", now, now))
+
+
+def recompute(db_path=None, token_fn=None, dry_run=False):
+    """One full pass (plan 0181 D1). For every `dispatch` repository: read
+    `plan_files()` with the watcher's own read token, resolve every `ready`
+    plan's `depends_on` through `_plan_dependency_blocks` (no `plan_id`, so no
+    owner-met cache is written), and replace that repository's rows in
+    `dependency_hold` in one transaction. A repository whose `plans/` cannot
+    be read keeps its previous rows — never deleted on a read failure — and its
+    `dependency_scan` row is marked `ok=0`.
+
+    Returns {"holds": [(repo, plan, dep, form, reason, detail), ...],
+    "unreadable": [repo, ...], "wakes": [(repo, plan), ...]}. With
+    `dry_run=True` nothing is written — not the tables, not a wake file — and
+    `wakes` names what WOULD be written."""
+    db_path = db_path or DB
+    token_fn = token_fn or _token
+    con = _connect_rw(db_path, set_wal=not dry_run)
+    try:
+        dispatch_repos = watch.repos()
+        token, err = token_fn()
+        now = time.time()
+        holds_out = []
+        unreadable = []
+        wakes = []
+        if not dry_run:
+            # A repo dropped from `repos.conf` never comes up in the loop
+            # below, so its rows would otherwise survive every future pass —
+            # still listed in `/api/v1/holds`, and still able to satisfy the
+            # POST handler's "cited by a held plan" check for a slug nobody
+            # watches anymore. This is cleanup, not a scan outcome: no repo
+            # was read, so nothing here is a hold or a wake to report.
+            stale_repos = {r for (r,) in con.execute(
+                "SELECT DISTINCT repo FROM dependency_hold")}
+            stale_repos |= {r for (r,) in con.execute(
+                "SELECT repo FROM dependency_scan")}
+            stale_repos -= set(dispatch_repos)
+            if stale_repos:
+                for repo in sorted(stale_repos):
+                    con.execute("DELETE FROM dependency_hold WHERE repo=?", (repo,))
+                    con.execute("DELETE FROM dependency_scan WHERE repo=?", (repo,))
+                con.commit()
+        for repo in dispatch_repos:
+            plans = watch.plan_files(repo, token) if token else None
+            if plans is None:
+                unreadable.append(repo)
+                if not dry_run:
+                    _mark_scan(con, repo, False,
+                               err or f"{repo}: plans/ unreadable", now)
+                    con.commit()
+                continue
+            plans_by_id = {fm.get("id", ""): fm for _p, fm in plans}
+            new_holds = []     # (plan, dep, form, reason, detail)
+            for _path, fm in plans:
+                if fm.get("status") != "ready" or fm.get("repo", repo) != repo:
+                    continue
+                plan_id = fm.get("id", "")
+                for dep, form, reason, detail in watch._plan_dependency_blocks(
+                        repo, fm.get("depends_on") or [], plans_by_id, token):
+                    new_holds.append((plan_id, dep, form, reason, detail))
+            old_rows = con.execute(
+                "SELECT plan, dep, created_at FROM dependency_hold "
+                "WHERE repo=?", (repo,)).fetchall()
+            old_created = {(p, d): ca for p, d, ca in old_rows}
+            old_plans_held = {p for p, _d, _ca in old_rows}
+            new_plans_held = {p for p, _d, _f, _r, _dt in new_holds}
+            for plan_id in sorted(old_plans_held - new_plans_held):
+                fm = plans_by_id.get(plan_id)
+                if fm is None or fm.get("status") != "ready":
+                    continue
+                wakes.append((repo, plan_id))
+                if not dry_run:
+                    write_wake(repo, plan_id, "dependency-cleared")
+            holds_out.extend(
+                (repo, p, d, f, r, dt) for p, d, f, r, dt in new_holds)
+            if dry_run:
+                continue
+            con.execute("DELETE FROM dependency_hold WHERE repo=?", (repo,))
+            for plan_id, dep, form, reason, detail in new_holds:
+                created_at = old_created.get((plan_id, dep), now)
+                con.execute(
+                    "INSERT INTO dependency_hold (repo, plan, dep, form, "
+                    "reason, detail, created_at, updated_at) VALUES "
+                    "(?,?,?,?,?,?,?,?)",
+                    (repo, plan_id, dep, form, reason, detail,
+                     created_at, now))
+            _mark_scan(con, repo, True, "", now)
+            con.commit()
+        return {"holds": holds_out, "unreadable": unreadable, "wakes": wakes}
+    finally:
+        con.close()
+
+
+def api_holds(db_path):
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT repo, plan, dep, form, reason, detail, created_at FROM "
+            "dependency_hold ORDER BY repo, plan, dep").fetchall()
+        scans = con.execute(
+            "SELECT repo, scanned_at, ok FROM dependency_scan").fetchall()
+    finally:
+        con.close()
+    holds = [{"repo": repo, "plan": plan, "dep": dep, "form": form,
+              "reason": reason, "detail": detail, "since": since}
+             for repo, plan, dep, form, reason, detail, since in rows]
+    unreadable = sorted(repo for repo, _sa, ok in scans if not ok)
+    computed_at = min((sa for _r, sa, _ok in scans), default=0)
+    return {"computed_at": computed_at, "unreadable": unreadable, "holds": holds}
+
+
+def api_attestations(db_path):
+    """The wire shape plan 0181 D3 and `docs/depsd.md` promise the lynceus
+    sibling: `slug`/`note`/`attested_at`/`attested_by`. `attestations()`
+    itself keeps `created_at`/`updated_at`/`actor` — pinned by
+    `tests/test_dependency_attestation.py` (plan 0180, outside this plan's
+    lane) and by this file's own CLI output — so the rename happens only
+    here, at the one JSON response that makes the promise."""
+    return {"attestations": [
+        {"slug": row["slug"], "note": row["note"],
+         "attested_at": row["updated_at"], "attested_by": row["actor"]}
+        for row in attestations(db_path)]}
+
+
+def api_healthz(ctx):
+    con = sqlite3.connect(f"file:{ctx.db_path}?mode=ro", uri=True)
+    try:
+        row = con.execute("SELECT MIN(scanned_at) FROM dependency_scan").fetchone()
+    finally:
+        con.close()
+    return {"lease": ctx.lease_id, "webhook_secret": bool(ctx.secret),
+            "attest_token": bool(ctx.attest_token),
+            "last_scan": row[0] if row and row[0] is not None else None}
+
+
+# -------------------------------------------------------------- plan 0189
+
+# A `pull_request` delivery's `action` this route treats as "worth an
+# enqueue attempt". PROVISIONAL: capturing a real delivery from the deployed
+# Forgejo means subscribing a hook to `pull_request` first, which is an
+# owner rollout step (docs/depsd.md), not something an implementer session
+# may do — repository webhook configuration is outside this session's
+# permitted actions. Forgejo is a Gitea fork, and Gitea's own webhook struct
+# names a push onto an open PR's branch `synchronized` (api.HookIssueSynchronized),
+# not GitHub's `synchronize` — both spellings are accepted here so neither
+# lineage's naming silently drops the trigger. `opened`/`reopened` are common
+# to both. `ready_for_review` (Gitea's own name for taking a PR out of draft,
+# `api.HookIssuePullRequestReadyForReview`) is included for the same reason
+# `_enqueue_plan_review`'s own docstring already names it: draft and open/
+# closed are exactly the two attributes that can flip at the SAME head sha
+# with no new commit, and a delivery for that exact transition is the one
+# this filter exists to catch, not just `reopened`. Confirm the real
+# string(s) against a captured delivery before relying on this filter in
+# production, and narrow or widen this set in a follow-up commit if the
+# deployed instance disagrees (docs/depsd.md, "Enrolling pull_request
+# deliveries").
+_PR_LIFECYCLE_ACTIONS = frozenset({
+    "opened", "reopened", "synchronize", "synchronized", "ready_for_review"})
+
+# Bounded per reconciliation pass (D2: "avoid flooding the queue on initial
+# enrollment"). Modest on purpose: this is a backstop for a MISSED delivery,
+# not the primary path, and `_enqueue`'s own idempotence means a repeated
+# pass over the same PR costs one no-op write, never a duplicate job.
+_RECONCILE_REPOS_PER_PASS = 3
+_RECONCILE_PRS_PER_REPO = 10           # the forge's own page size for the listing below
+# A chosen repo's open-PR listing is PAGED, not truncated at the first page:
+# without this, a repository holding more than `_RECONCILE_PRS_PER_REPO` open
+# pull requests at once would never have its later pages visited AT ALL —
+# every future pass re-lists the same first page, since this sweep (unlike
+# the repo-level cursor above) does not otherwise remember where it left off
+# within one repo. Still bounded, so a repository with an unbounded number of
+# open pull requests cannot turn one pass into an unbounded number of forge
+# reads: `_RECONCILE_MAX_PAGES_PER_REPO` pages, generously sized for any
+# realistic backlog, caps it.
+_RECONCILE_MAX_PAGES_PER_REPO = 10
+_RECONCILE_CURSOR_ID = "default"
+
+# The worker wake's own claim size — independent of, and smaller than,
+# `fleet-plan-review worker`'s own `--limit` default (5): this runs
+# unattended, on a schedule, where that command's own module docstring
+# (plan 0188, "Automatic dispatch") only proved its coordination contracts
+# safe for an ON-DEMAND, human- or script-decided run. A smaller bound
+# here keeps any one pass's exposure to the uncovered races it documents
+# (a hand-run dispatch, the orchestrator's own first-attempt review loop,
+# a resumed `kind="plan"` retry) to a few jobs, never the whole queue.
+_REVIEW_WORKER_LIMIT = 3
+
+
+def _reconcile_cursor(con):
+    row = con.execute(
+        "SELECT repo_index FROM plan_review_reconcile_cursor WHERE id=?",
+        (_RECONCILE_CURSOR_ID,)).fetchone()
+    return row[0] if row else 0
+
+
+def _save_reconcile_cursor(con, repo_index):
+    now = time.time()
+    con.execute(
+        "INSERT INTO plan_review_reconcile_cursor (id, repo_index, created_at, "
+        "updated_at) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+        "repo_index=excluded.repo_index, updated_at=excluded.updated_at",
+        (_RECONCILE_CURSOR_ID, repo_index, now, now))
+    con.commit()
+
+
+_ENQUEUE_QUEUED = "queued"             # a job is persisted — wake the review thread
+_ENQUEUE_INELIGIBLE = "ineligible"     # draft/closed/merged/code — correctly nothing to queue
+_ENQUEUE_UNAVAILABLE = "unavailable"   # the forge or the db refused — retry the delivery
+
+
+def _enqueue_or_revive(con, repo, pr_number, head_sha, actor, reason):
+    """`_enqueue`'s own idempotent write — plus the one thing neither of
+    plan 0189's two callers (the webhook handler, through
+    `_enqueue_plan_review` below, and `_reconcile_plan_reviews`'s own sweep)
+    may skip: when `_enqueue` returns an EXISTING row for this exact
+    `(repo, pr, head_sha)` and that row is sitting in the terminal `skipped`
+    state, transition it back to `queued` rather than leave it unchanged.
+
+    `_claim_jobs` never reclaims a `skipped` row on its own, and `_enqueue`
+    is idempotent on `(repo, pr, head_sha)` (plan 0188) — so without this, a
+    row that went `skipped` for a reason that can flip with NO new commit
+    (the PR taken out of draft, reopened, or its repo becoming enrolled)
+    would make every later delivery or sweep pass for that identical head a
+    silent no-op forever. BOTH callers re-check eligibility — draft/closed/
+    merged, enrollment, and (plan-only) the changed-file position — through
+    the forge immediately before reaching this function, so a row this
+    function finds `skipped` here was always skipped for one of exactly
+    those flippable reasons, never a permanent one (the file set at a fixed
+    head cannot change without a new commit, which `_dispatch_one` answers
+    with `superseded`, not `skipped`) — reviving it unconditionally is
+    therefore always correct, not merely convenient. `expect_states` makes
+    the revival a no-op, not a double-write, if a concurrent pass has
+    already moved the row off `skipped` by the time this one reaches it.
+
+    One shared function rather than two restatements of the same rule — the
+    reconciliation sweep used to call `_enqueue` directly and silently never
+    revived a stale `skipped` row at all."""
+    job_id, created = planreview._enqueue(
+        con, repo, pr_number, head_sha, actor=actor, reason=reason)
+    if not created:
+        row = con.execute(
+            "SELECT state FROM plan_review_job WHERE id=?", (job_id,)).fetchone()
+        if row and row[0] == "skipped":
+            planreview._transition(
+                con, job_id, "queued", actor=actor, action="requeue",
+                reason=reason, expect_states=["skipped"])
+    return job_id, created
+
+
+def _enqueue_plan_review(db_path, repo, pr_number, actor, reason):
+    """Persist a `plan_review_job` row for `repo`#`pr_number`'s CURRENT head,
+    read fresh from the forge through plan 0188's own `_forge()`/`_enqueue()`
+    — never trusted from a webhook payload's own `head` field. Boundaries:
+    "the payload is a trigger, never a fact" (0181 D2, restated here for
+    pull_request deliveries) — this is also what makes a wrong or stale
+    `head` field in the payload harmless, so this file never needs to prove
+    the payload's own head semantics to be correct, only its `action`
+    filter.
+
+    Refuses to write a row at all when the PR is currently a draft, closed,
+    merged, or not a plan-only change — checked HERE, before any write,
+    rather than left for `_dispatch_one` to terminal-fence as `skipped` once
+    claimed. The changed-file check mirrors `_reconcile_plan_reviews`'s own
+    (`changed_paths_for_position`/`reviewer_position`): a webhook delivery
+    fires for EVERY pull request in an enrolled repository, code changes
+    included, and without this check this function would queue a job for
+    every one of them, spending one of the worker's bounded per-pass claims
+    (`_REVIEW_WORKER_LIMIT`) on a job `_dispatch_one` was always going to
+    terminal-fence `skipped` for "not a plan filing" the moment it was
+    claimed.
+
+    Draft/open/closed/enrollment and the changed-file position are exactly
+    the attributes that can flip at the SAME head sha with no new commit
+    (`ready_for_review`, `reopened`, a repo added to `config/repos.conf`):
+    `_enqueue` is idempotent on (repo, pr, head_sha) (plan 0188), so a
+    `skipped` row already on file for that head would otherwise make a
+    LATER, now-eligible delivery for that identical head a silent no-op
+    forever — see `_enqueue_or_revive`'s own docstring for why reviving it
+    is always correct once every one of those checks has just passed fresh,
+    here, immediately before.
+
+    Returns `_ENQUEUE_QUEUED` once the row is committed; `_ENQUEUE_INELIGIBLE`
+    when the PR is confirmed draft, closed, merged, or not a plan-only change
+    (correctly nothing to queue, and nothing to retry either);
+    `_ENQUEUE_UNAVAILABLE` if the forge or the database could not be reached,
+    so the caller answers Forgejo with something other than a `202` for a
+    delivery nothing was written for. Whether the deployed Forgejo itself
+    redelivers a non-2xx response is unconfirmed (docs/depsd.md) — the
+    actual recovery for a delivery answered this way is
+    `_reconcile_plan_reviews`'s own sweep, which finds the same pull request
+    again on its own cadence whether or not anything redelivers."""
+    try:
+        forge = planreview._forge()
+    except SystemExit as e:
+        warn(f"plan-review enqueue: forge unavailable ({e})")
+        return _ENQUEUE_UNAVAILABLE
+    st, pr_body = forge.get_pull(repo, pr_number)
+    if st != 200 or not isinstance(pr_body, dict):
+        warn(f"plan-review enqueue: {repo}#{pr_number} unreadable (status {st})")
+        return _ENQUEUE_UNAVAILABLE
+    if pr_body.get("state") != "open" or pr_body.get("merged") or pr_body.get("draft"):
+        return _ENQUEUE_INELIGIBLE
+    head_sha = ((pr_body.get("head") or {}).get("sha")) or None
+    if not head_sha:
+        warn(f"plan-review enqueue: {repo}#{pr_number} has no readable head sha")
+        return _ENQUEUE_UNAVAILABLE
+    paths, complete, detail = planreview.changed_paths_for_position(forge, repo, pr_number)
+    if not complete:
+        warn(f"plan-review enqueue: {repo}#{pr_number} changed-file list "
+             f"unavailable ({detail})")
+        return _ENQUEUE_UNAVAILABLE
+    if planreview.reviewer_position(paths) != "plan_reviewer":
+        return _ENQUEUE_INELIGIBLE
+    try:
+        con = planreview._connect(db_path)
+        try:
+            _enqueue_or_revive(con, repo, pr_number, head_sha, actor, reason)
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        warn(f"plan-review enqueue: {repo}#{pr_number} could not be persisted "
+             f"({e.__class__.__name__}: {e})")
+        return _ENQUEUE_UNAVAILABLE
+    return _ENQUEUE_QUEUED
+
+
+def _list_open_pulls(forge, repo, page_size, max_pages):
+    """Every open pull request in `repo`, PAGED rather than truncated at the
+    forge's own first page — a repository holding more than one page's
+    worth of open pull requests would otherwise never have its later pages
+    visited at all, silently dropping any plan PR that is not among the
+    first `page_size`. Stops at the first short (or empty, or unreadable)
+    page, the ordinary end-of-listing signal, or at `max_pages`, whichever
+    comes first — the latter is the backstop against an unbounded number of
+    forge reads in one pass, not something this sweep expects to hit."""
+    prs = []
+    for page in range(1, max_pages + 1):
+        st, batch = forge.list_pulls(repo, state="open", page=page, limit=page_size)
+        if st != 200 or not isinstance(batch, list):
+            break
+        prs.extend(batch)
+        if len(batch) < page_size:
+            break
+    else:
+        warn(f"plan-review reconcile: {repo} has more open pull requests than "
+             f"{max_pages} page(s) of {page_size} cover this pass — the rest "
+             "wait for a later pass")
+    return prs
+
+
+def _reconcile_plan_reviews(db_path, repos_per_pass=_RECONCILE_REPOS_PER_PASS,
+                            prs_per_repo=_RECONCILE_PRS_PER_REPO,
+                            max_pages_per_repo=_RECONCILE_MAX_PAGES_PER_REPO):
+    """Plan 0189 D2: the backstop for a missed `pull_request` delivery.
+    Walks a BOUNDED slice of the enrolled registry each pass — never the
+    whole thing at once — advancing a cursor persisted in `fleet.db`
+    (`plan_review_reconcile_cursor`) so the walk resumes where the last
+    pass left off rather than restarting, and so enrolling a backlog of
+    open plan PRs cannot flood the queue with one burst of forge reads.
+    Within a chosen repo, EVERY open pull request is visited (`_list_open_pulls`
+    pages through all of them, up to `max_pages_per_repo`) — not only the
+    first `prs_per_repo`, which would otherwise be a silent, permanent ceiling
+    on a repository with a larger backlog of open pull requests.
+
+    "Exclude completed current heads" is `_enqueue`'s own idempotence on
+    `(repo, pr, head_sha)` (plan 0188): a PR whose current head already has
+    ANY row — `done`, `held`, `claimed`, or still `queued` — is a no-op
+    write here, never a duplicate job. A row sitting `skipped` at that exact
+    head is the one exception `_enqueue_or_revive` exists for — see its own
+    docstring. Only a PR whose eligible, plan-only change has no row at all
+    for its current head gets a genuinely fresh one."""
+    repos_listed, _errs, _kept = planreview.fleet_repo.read_conf()
+    all_repos = sorted(repos_listed) if repos_listed else []
+    if not all_repos:
+        return
+    try:
+        forge = planreview._forge()
+    except SystemExit as e:
+        warn(f"plan-review reconcile: forge unavailable ({e})")
+        return
+    cur_con = _connect_rw(db_path)
+    try:
+        start = _reconcile_cursor(cur_con) % len(all_repos)
+        n = min(repos_per_pass, len(all_repos))
+        chosen = [all_repos[(start + i) % len(all_repos)] for i in range(n)]
+        _save_reconcile_cursor(cur_con, (start + n) % len(all_repos))
+    finally:
+        cur_con.close()
+    job_con = planreview._connect(db_path)
+    try:
+        for repo in chosen:
+            prs = _list_open_pulls(forge, repo, prs_per_repo, max_pages_per_repo)
+            for pr in prs:
+                if not isinstance(pr, dict) or pr.get("draft"):
+                    continue
+                number = pr.get("number")
+                head_sha = ((pr.get("head") or {}).get("sha")) or None
+                if not number or not head_sha:
+                    continue
+                paths, complete, _reason = planreview.changed_paths_for_position(
+                    forge, repo, number)
+                if not complete or planreview.reviewer_position(paths) != "plan_reviewer":
+                    continue
+                _enqueue_or_revive(
+                    job_con, repo, number, head_sha, actor="fleet-depsd",
+                    reason="reconcile: recovering a possibly missed delivery")
+    finally:
+        job_con.close()
+
+
+def _run_plan_review_worker(db_path, limit=_REVIEW_WORKER_LIMIT):
+    """Plan 0189 D2: the bounded worker wake. Calls straight into plan
+    0188's own `_claim_jobs()`/`_dispatch_one()` — the exact functions
+    `fleet-plan-review worker`'s own entry point calls — never a restated
+    claim or a second dispatch path. Exceptions are handled the same way
+    `cmd_worker` handles them: released back to `held`, fenced to this
+    holder, so one job's failure never strands the rest of the claimed
+    batch.
+
+    Claims ONE job at a time, immediately before dispatching it, rather
+    than claiming up to `limit` jobs in one batch and then dispatching
+    them in sequence. `DEFAULT_CLAIM_TTL` (`DISPATCH_TIMEOUT` + 600s) is
+    sized for exactly one in-flight dispatch's own headroom (its own
+    comment: "covers the forge reads `_dispatch_one` makes before it ever
+    reaches that call") — never for `limit` of them run back to back. A
+    batch claim of `limit=3` jobs, dispatched one after another, can run
+    up to 3 * `DISPATCH_TIMEOUT` (7200s) past the FIRST claim, while every
+    job's `claimed_at` is stamped at that same first moment: the second and
+    third jobs' claims go stale (past the 3000s TTL) while this worker is
+    still legitimately, sequentially working through them, and a
+    concurrent hand-run `fleet-plan-review worker` would then read them as
+    abandoned and reclaim them out from under this one. Claiming
+    immediately before each dispatch keeps every job's `claimed_at` fresh
+    relative to its own dispatch, so the TTL's one-dispatch margin holds
+    regardless of how many jobs this pass works through.
+
+    Never re-attempts the SAME job twice within one pass. `_claim_jobs`
+    orders by `updated_at` ascending, so a job this pass just held sinks
+    behind every job it has not touched yet — UNLESS it is the only
+    ready job there is, in which case the very next claim in this same
+    `while` loop would hand it straight back, immediately, with no real
+    time having passed. `MAX_DISPATCH_ATTEMPTS` (3) exists to give a
+    TRANSIENT dispatch failure more than one chance, spread across
+    separate passes with real time between them for whatever was
+    transient to clear; reclaiming the one outstanding job up to `limit`
+    times back to back in a single pass would instead burn every one of
+    those attempts in the same few seconds and mark it permanently
+    `failed` for a failure that may have cleared by the NEXT pass, which
+    this one never gave it the chance to reach. Tracked by job id, not by
+    count: two or more DISTINCT jobs may each be claimed once per pass
+    exactly as before (`test_the_worker_claims_one_job_at_a_time_not_a_batch`),
+    this only refuses to claim the one this very pass already attempted.
+
+    Resolves `planreview._forge()` BEFORE claiming anything — exactly
+    `cmd_worker`'s own ordering and its own stated reason (bin/fleet-plan-review:
+    "a token failure here must not strand jobs this process already claimed,
+    unworked, for the full `--claim-ttl`"). Without this, a token-helper
+    failure surfaces as `_forge()`'s own `sys.exit()` raised from inside
+    `_dispatch_one()` — a `SystemExit`, a `BaseException`. Caught here, once,
+    before any claim: the jobs claimed below are jobs this worker can
+    actually attempt.
+
+    Takes `planreview._orch_mod().review_quota_hold(repo, "plan_reviewer")`
+    immediately after claiming, before `_dispatch_one` ever reaches the
+    forge: `_dispatch_one` itself never calls it (see this file's own
+    module-header comment on why that gate belongs HERE, not there), and an
+    unattended wake — a timer, a webhook, nobody watching — is exactly the
+    caller `review_quota_hold` exists to stop from spending while the
+    owner's session/weekly/model gates are closed, the same way
+    `bin/orchestrator`'s own first-attempt review loop already stops before
+    its OWN call to `dispatch_review()`. Fenced back to `held` with no
+    attempt bump — a closed gate is not a dispatch failure `_dispatch_one`
+    ever saw, so it must not spend one of `MAX_DISPATCH_ATTEMPTS`.
+
+    Every per-job dispatch is wrapped in `except BaseException`, not
+    `except Exception`: `_dispatch_one` is loaded from `bin/fleet-plan-review`
+    and calls through it into `bin/orchestrator`/`bin/mopsus`, and nothing
+    guarantees every `sys.exit()` reachable from there is the one already
+    guarded above (`_forge()`'s own). An uncaught `SystemExit` from ANY of
+    those calls is a `BaseException` no `except Exception` stops — it would
+    propagate out of this daemon thread (via `_review_loop`'s own call to
+    this function) and kill it silently, stopping every future
+    reconciliation and worker pass on this resident service while
+    `/healthz` keeps reporting healthy and the webhook route keeps
+    answering `202`. `_review_loop` itself catches `BaseException` around
+    this call too, so a `SystemExit` raised here — before a job is even
+    claimed, or after `_claim_jobs` itself raises — still cannot kill the
+    thread."""
+    try:
+        planreview._forge()
+    except SystemExit as e:
+        warn(f"plan-review worker: forge unavailable ({e}) — "
+             "claiming no jobs this pass")
+        return
+    con = planreview._connect(db_path)
+    holder = f"fleet-depsd:{os.getpid()}"
+    claimed = 0
+    done = 0
+    attempted_ids = set()
+    # The reason text this worker itself last gave for holding a job,
+    # keyed by job id — the ONLY place that reason survives a same-pass
+    # reclaim: `_claim_jobs`'s own "claim" transition nulls `reason`
+    # unconditionally the instant it reclaims a `held` row, before this
+    # loop ever sees the row again, so there is nothing left in `fleet.db`
+    # to read it back from by the time the repeat is detected below.
+    held_reason = {}
+    while claimed < limit:
+        jobs = planreview._claim_jobs(con, holder, 1, planreview.DEFAULT_CLAIM_TTL)
+        if not jobs:
+            break
+        job = jobs[0]
+        if job["id"] in attempted_ids:
+            # The only ready job left is one this very pass already
+            # attempted. `_claim_jobs` has ALREADY flipped it to `claimed`
+            # by the time this is seen — that transition commits on its
+            # own — so this must release it back to `held` before
+            # stopping, rather than leave it stranded `claimed` (and so
+            # unreachable by anyone else) for the rest of
+            # `DEFAULT_CLAIM_TTL`. Reclaiming it again right now would not
+            # be a later, separately-timed retry, so stop here and let a
+            # future pass (the next poll, or a fresh wake) give it one —
+            # with the reason this worker actually saw restored, not the
+            # blank `_claim_jobs`'s own reclaim just left it with.
+            planreview._fenced(con, job, holder, "held", "hold",
+                               held_reason.get(job["id"]) or
+                               "already attempted once this pass — leaving "
+                               "it for a later, separately-timed pass")
+            break
+        attempted_ids.add(job["id"])
+        claimed += 1
+        hold = planreview._orch_mod().review_quota_hold(job["repo"], "plan_reviewer")
+        if hold:
+            held_reason[job["id"]] = hold
+            planreview._fenced(con, job, holder, "held", "hold", hold)
+            continue
+        try:
+            planreview._dispatch_one(con, job, holder)
+            done += 1
+        except BaseException as e:                          # noqa: BLE001
+            reason = f"the worker raised {e.__class__.__name__}: {e}"
+            held_reason[job["id"]] = reason
+            planreview._fenced(con, job, holder, "held", "hold", reason)
+        else:
+            # `_dispatch_one` holds for plenty of reasons of its own (CI
+            # pending, the mopsus slot held, an unreadable forge read) with
+            # no exception at all — read back whatever it just wrote so
+            # THAT reason, not a generic one, survives if this same job
+            # resurfaces as the only candidate later in this pass.
+            row = con.execute(
+                "SELECT reason FROM plan_review_job WHERE id=? AND state='held'",
+                (job["id"],)).fetchone()
+            if row:
+                held_reason[job["id"]] = row[0]
+    if claimed:
+        print(f"fleet-depsd: plan-review worker claimed {claimed} job(s), "
+              f"{done} completed without raising")
+
+
+# ------------------------------------------------------------------- D2/D3
+
+_MAX_WEBHOOK_BODY = 1024 * 1024   # 1 MiB (Boundaries: read at most this much)
+
+WEBHOOK_SECRET_CMD = os.environ.get(
+    "FLEET_DEPSD_WEBHOOK_SECRET_CMD",
+    str(Path.home() / "bin" / "fetch-fleet-depsd-webhook-secret.sh"))
+# bin/fetch-fleet-depsd-webhook-secret.sh (operator/hosttools 94cf3e3, PR #130,
+# 26a436b: "Prints the HMAC secret of the fleet push webhook on stdout, and
+# nothing else."). Logs into the fleet-depsd-webhook-read AppRole on vaulthost,
+# reads kv/forgejo/push-webhook, revokes its own login token, and prints the
+# secret on stdout; nothing lands on opshost disk.
+ATTEST_TOKEN_CMD = os.environ.get(
+    "FLEET_DEPSD_ATTEST_TOKEN_CMD",
+    str(Path.home() / "bin" / "fetch-fleet-depsd-attest-token.sh"))
+# bin/fetch-fleet-depsd-attest-token.sh (operator/hosttools 94cf3e3, PR #130,
+# 26a436b: "Prints the fleet-depsd attest bearer token on stdout, and nothing
+# else."). Logs into the fleet-depsd-attest-read AppRole on vaulthost, reads
+# kv/fleet-depsd/attest-token, revokes its own login token, and prints the
+# token the owner (via lynceus) authenticates attestation writes with;
+# nothing lands on opshost disk.
+
+
+def _token():
+    return watch._run_token_helper(watch.TOKEN_CMD)
+
+
+def _fetch_secret():
+    value, _err = watch._run_token_helper(WEBHOOK_SECRET_CMD)
+    return value or None
+
+
+def _fetch_attest_token():
+    value, _err = watch._run_token_helper(ATTEST_TOKEN_CMD)
+    return value or None
+
+
+class _Ctx:
+    """The mutable state one `serve` process shares between its HTTP handler
+    threads and its worker loop. Nothing here is a fact `fleet.db` does not
+    already hold except `secret`/`attest_token` (held in memory only,
+    Boundaries) and `dirty`/`review_dirty` — the in-memory state SPEC
+    Principle 2 tolerates, because losing either one costs at most one poll
+    interval, never a fact."""
+
+    def __init__(self, db_path, bind_host):
+        self.db_path = db_path
+        self.bind_host = bind_host
+        self.secret = None
+        self.attest_token = None
+        self.dirty = threading.Event()
+        # Plan 0189: a SEPARATE flag from `dirty`, woken by a `pull_request`
+        # delivery and the reconciliation poll. Kept apart from `dirty` on
+        # purpose (Boundaries: "do not replace dependency recomputation with
+        # review work") — the two run on two different threads in
+        # `cmd_serve`, so a slow or waiting review can never delay the
+        # dependency recompute a push triggers.
+        self.review_dirty = threading.Event()
+        self.lease_id = None
+
+
+def _peer_allowed(ctx, addr):
+    """Plan 0181 D3/Boundaries: the attestation write routes trust the
+    connection's peer address, not the token alone. A real remote peer cannot
+    complete a TCP handshake while claiming one of this host's own source
+    addresses, so this set is exactly "this host"."""
+    return addr in ("127.0.0.1", "::1", ctx.bind_host)
+
+
+def _send_json(handler, status, obj):
+    # RFC 7230 §3.3.2: a 204 MUST NOT carry a body or a Content-Length. On a
+    # keep-alive HTTP/1.1 connection, sending one anyway leaves bytes in the
+    # stream the client has no reason to read (204 by definition has none) —
+    # bytes a reusing client then parses as the START of the NEXT response.
+    if status == 204:
+        handler.send_response(204)
+        handler.end_headers()
+        return
+    body = json.dumps(obj).encode()
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _log_webhook(delivery, repo, outcome):
+    """Plan 0181 D2: the delivery id, the repository and the outcome code —
+    never a header value, never the body."""
+    print(f"fleet-depsd: webhook delivery={delivery} repo={repo} outcome={outcome}")
+
+
+def _log_attest_refused(peer):
+    print(f"fleet-depsd: attest write refused — peer={peer}")
+
+
+def _handle_webhook(handler, ctx):
+    delivery = handler.headers.get("X-Forgejo-Delivery", "?")
+    length = handler.headers.get("Content-Length")
+    try:
+        declared = int(length) if length is not None else None
+    except ValueError:
+        declared = None
+    # A negative value (`-1`, seen from a misbehaving proxy) parses as a
+    # valid int below `_MAX_WEBHOOK_BODY` and is never "too large" — but
+    # `rfile.read(n)` with a negative `n` means "read to EOF", unbounded,
+    # the exact read the length cap exists to prevent. Fold it into the
+    # "no usable length" case, which already reads a bounded amount.
+    if declared is not None and declared < 0:
+        declared = None
+    if declared is not None and declared > _MAX_WEBHOOK_BODY:
+        handler.close_connection = True
+        _log_webhook(delivery, "?", 413)
+        return _send_json(handler, 413, {"error": "payload too large"})
+    read_len = declared if declared is not None else _MAX_WEBHOOK_BODY + 1
+    try:
+        body = handler.rfile.read(read_len)
+    except (socket.timeout, TimeoutError):
+        # No usable Content-Length and the peer never finished sending (or
+        # never sends at all): `_Handler.timeout` (below) bounds the block,
+        # so this thread is freed rather than pinned forever. Nothing to
+        # answer — the peer may not even be reading.
+        handler.close_connection = True
+        warn(f"webhook delivery={delivery} body read timed out — closing")
+        return
+    if len(body) > _MAX_WEBHOOK_BODY:
+        handler.close_connection = True
+        _log_webhook(delivery, "?", 413)
+        return _send_json(handler, 413, {"error": "payload too large"})
+    secret = ctx.secret
+    if not secret:
+        _log_webhook(delivery, "?", 503)
+        return _send_json(handler, 503, {"error": "no webhook secret loaded"})
+    sig = handler.headers.get("X-Forgejo-Signature", "")
+    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    if not sig or not hmac.compare_digest(sig, expected):
+        _log_webhook(delivery, "?", 401)
+        return _send_json(handler, 401, {"error": "bad signature"})
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        payload = {}
+    event = handler.headers.get("X-Forgejo-Event", "")
+    repo = ((payload.get("repository") or {}).get("full_name") or "?")
+    if event == "push":
+        ref = payload.get("ref", "")
+        dispatch_repos = watch.repos()
+        if ref != "refs/heads/main" or repo not in dispatch_repos:
+            _log_webhook(delivery, repo, 204)
+            return _send_json(handler, 204, {})
+        ctx.dirty.set()
+        _log_webhook(delivery, repo, 202)
+        return _send_json(handler, 202, {})
+    if event == "pull_request":
+        return _handle_pull_request_webhook(handler, ctx, delivery, repo, payload)
+    _log_webhook(delivery, repo, 204)
+    return _send_json(handler, 204, {})
+
+
+def _handle_pull_request_webhook(handler, ctx, delivery, repo, payload):
+    """Plan 0189 D1: a PR lifecycle delivery PERSISTS a plan-review job
+    before this returns success, and never dispatches one — the dispatch
+    itself (a model call, through `_run_plan_review_worker`) runs only on
+    `_review_loop`'s own thread (Boundaries: "keep model calls outside the
+    HTTP request"). `ctx.review_dirty` only wakes that thread; it never
+    runs anything itself.
+
+    A delivery for a draft, closed, merged, or non-plan-only PR is 204, the
+    same "nothing to do" answer as an out-of-allowlist action —
+    `_enqueue_plan_review` refuses to write a row for one (see its own
+    docstring for how a LATER delivery at that same head, once the PR is
+    confirmed eligible again, revives rather than finds that `skipped` row
+    unchanged — except when it was skipped for being non-plan-only, which
+    cannot change at a fixed head)."""
+    action = payload.get("action") or ""
+    raw_number = payload.get("number")
+    if raw_number is None:
+        raw_number = (payload.get("pull_request") or {}).get("number")
+    try:
+        number = int(raw_number)
+    except (TypeError, ValueError):
+        number = None
+    if (action not in _PR_LIFECYCLE_ACTIONS or number is None
+            or not planreview._enrolled(repo)):
+        _log_webhook(delivery, repo, 204)
+        return _send_json(handler, 204, {})
+    outcome = _enqueue_plan_review(
+        ctx.db_path, repo, number, actor="fleet-depsd",
+        reason=f"webhook delivery: pull_request {action}")
+    if outcome == _ENQUEUE_UNAVAILABLE:
+        _log_webhook(delivery, repo, 503)
+        return _send_json(handler, 503, {"error": "could not persist the review job"})
+    if outcome == _ENQUEUE_INELIGIBLE:
+        _log_webhook(delivery, repo, 204)
+        return _send_json(handler, 204, {})
+    ctx.review_dirty.set()
+    _log_webhook(delivery, repo, 202)
+    return _send_json(handler, 202, {})
+
+
+def _handle_attest_write(handler, ctx, action, slug_from_path):
+    peer = handler.client_address[0]
+    if not _peer_allowed(ctx, peer):
+        # Peer check FIRST — Authorization and the body are never read on this
+        # path (Boundaries). The refusal log carries the peer only.
+        _log_attest_refused(peer)
+        handler.close_connection = True
+        return _send_json(handler, 403, {"error": "forbidden"})
+    length = handler.headers.get("Content-Length")
+    body = b""
+    if length:
+        try:
+            declared = int(length)
+        except ValueError:
+            declared = None
+        if declared is not None and 0 <= declared <= _MAX_WEBHOOK_BODY:
+            try:
+                body = handler.rfile.read(declared)
+            except (socket.timeout, TimeoutError):
+                handler.close_connection = True
+                warn("attest write body read timed out — closing")
+                return
+    token = ctx.attest_token
+    if not token:
+        return _send_json(handler, 503, {"error": "no attest token loaded"})
+    auth = handler.headers.get("Authorization", "")
+    want = f"Bearer {token}"
+    if not auth or not hmac.compare_digest(auth, want):
+        return _send_json(handler, 401, {"error": "unauthorized"})
+    if action == "attest":
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except (ValueError, UnicodeDecodeError):
+            payload = {}
+        slug = payload.get("slug") or ""
+        note = payload.get("note")
+    else:
+        slug = slug_from_path or ""
+        note = None
+    if not watch.is_external_slug(slug):
+        return _send_json(handler, 422, {"error": f"{slug!r} is not a slug"})
+    if note is not None and (not isinstance(note, str) or len(note) > 500):
+        return _send_json(
+            handler, 422, {"error": "note must be a string of at most 500 characters"})
+    con = _connect_rw(ctx.db_path)
+    try:
+        if action == "attest":
+            cited = con.execute(
+                "SELECT 1 FROM dependency_hold WHERE dep=? LIMIT 1",
+                (f"external:{slug}",)).fetchone()
+            if not cited:
+                return _send_json(
+                    handler, 422,
+                    {"error": f"no held plan cites external:{slug}"})
+            record_attestation(con, slug, note, "lynceus", "api", "attest")
+            row = con.execute(
+                "SELECT slug, note, created_at, updated_at FROM "
+                "dependency_attestation WHERE slug=?", (slug,)).fetchone()
+            ctx.dirty.set()
+            return _send_json(handler, 201, {
+                "slug": row[0], "note": row[1],
+                "created_at": row[2], "updated_at": row[3]})
+        existing = con.execute(
+            "SELECT 1 FROM dependency_attestation WHERE slug=?",
+            (slug,)).fetchone()
+        if not existing:
+            return _send_json(handler, 404, {"error": "not attested"})
+        record_attestation(con, slug, None, "lynceus", "api", "revoke")
+        ctx.dirty.set()
+        return _send_json(handler, 200, {"slug": slug, "revoked": True})
+    finally:
+        con.close()
+
+
+def _route(handler, method):
+    ctx = handler.ctx
+    path = handler.path
+    if path == "/webhook/forgejo":
+        if method != "POST":
+            return _send_json(handler, 405, {"error": "method not allowed"})
+        return _handle_webhook(handler, ctx)
+    if path == "/api/v1/holds":
+        if method != "GET":
+            return _send_json(handler, 405, {"error": "method not allowed"})
+        return _send_json(handler, 200, api_holds(ctx.db_path))
+    if path == "/api/v1/attestations":
+        if method == "GET":
+            return _send_json(handler, 200, api_attestations(ctx.db_path))
+        if method == "POST":
+            return _handle_attest_write(handler, ctx, "attest", None)
+        return _send_json(handler, 405, {"error": "method not allowed"})
+    if path.startswith("/api/v1/attestations/"):
+        slug = path[len("/api/v1/attestations/"):]
+        if method != "DELETE":
+            return _send_json(handler, 405, {"error": "method not allowed"})
+        return _handle_attest_write(handler, ctx, "revoke", slug)
+    if path == "/healthz":
+        if method != "GET":
+            return _send_json(handler, 405, {"error": "method not allowed"})
+        return _send_json(handler, 200, api_healthz(ctx))
+    return _send_json(handler, 404, {"error": "not found"})
+
+
+def make_handler_class(ctx):
+    """A `BaseHTTPRequestHandler` bound to one `_Ctx`. Factored out so tests
+    can stand up a server on `127.0.0.1:0` with a stubbed ctx, without going
+    through `cmd_serve`'s lease/signal machinery."""
+    bound_ctx = ctx
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        ctx = bound_ctx
+        # Bounds every blocking socket op this handler makes, including a
+        # body `read()` with no declared length (or one the peer never
+        # finishes sending) — without it, that read blocks forever and pins
+        # the thread handling it (Boundaries: the bind is LAN-reachable).
+        timeout = 30
+
+        def log_message(self, fmt, *args):   # noqa: A002 — stdlib's own name
+            pass        # this file logs explicitly (_log_webhook, _log_attest_refused)
+
+        def do_GET(self):
+            _route(self, "GET")
+
+        def do_POST(self):
+            _route(self, "POST")
+
+        def do_DELETE(self):
+            _route(self, "DELETE")
+
+    return _Handler
+
+
+# ------------------------------------------------------------------ D6/serve
+
+def _exit2(msg):
+    print(f"fleet-depsd: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _depsd_bind():
+    raw = os.environ.get("FLEET_DEPSD_BIND", "192.0.2.5:8797").strip()
+    host, _, port_s = raw.rpartition(":")
+    if not host or not port_s:
+        _exit2(f"FLEET_DEPSD_BIND={raw!r} is not host:port")
+    if host in ("0.0.0.0", "::", "*"):
+        _exit2(f"FLEET_DEPSD_BIND={raw!r} is a wildcard bind — refused")
+    try:
+        port = int(port_s)
+    except ValueError:
+        _exit2(f"FLEET_DEPSD_BIND={raw!r} has a non-numeric port")
+    return host, port
+
+
+def _depsd_poll():
+    raw = os.environ.get("FLEET_DEPSD_POLL", "600").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        _exit2(f"FLEET_DEPSD_POLL={raw!r} is not an integer")
+    if not 60 <= n <= 3600:
+        _exit2(f"FLEET_DEPSD_POLL={n} is outside 60..3600")
+    return n
+
+
+def _depsd_sid():
+    return os.environ.get("EUNOMIA_SESSION", "").strip() or "fleet-depsd"
+
+
+def _depsd_host():
+    """This machine's short hostname — `opshost`, never the bind address. The
+    service lease is keyed `<host>:fleet-depsd` (SPEC, `config/services.conf`'s
+    `opshost:fleet-depsd` enrolment), the same `socket.gethostname().split('.')[0]`
+    `fleet-watch`'s own `_service_resource` uses (plan 0029) — not
+    `FLEET_DEPSD_BIND`'s address, which is a LAN reachability choice with no
+    bearing on which host is running the process."""
+    return socket.gethostname().split(".")[0]
+
+
+def _service_resource(host):
+    return {"type": "service", "host": host, "service": f"{host}:fleet-depsd"}
+
+
+def _foreign_service_holder(host, sid):
+    """An ACTIVE service lease on this service held by someone else, or None
+    — the same check `fleet-watch`'s `acquire_service_lease` makes, for the
+    same reason (plan 0029)."""
+    want = json.dumps(_service_resource(host), sort_keys=True)
+    for rec in lib.all_leases():
+        if rec.get("state") != "active":
+            continue
+        if json.dumps(lib.resource_of(rec), sort_keys=True) != want:
+            continue
+        if (rec.get("holder") or "") != sid:
+            return rec
+    return None
+
+
+def acquire_service_lease(host, sid):
+    foreign = _foreign_service_holder(host, sid)
+    if foreign is not None:
+        warn(f"another session holds this service's lease "
+             f"({foreign.get('holder')}, lease {foreign.get('id')}) — "
+             "refusing to start a second fleet-depsd")
+        return None
+    env = dict(os.environ, EUNOMIA_SESSION=sid)
+    claim = [sys.executable, str(BIN / "fleet-claim"), "--assign",
+             json.dumps(_service_resource(host), sort_keys=True),
+             "--holder", sid, "--note", "depsd:serve",
+             "--ttl", str(lib.lease_ttl_minutes())]
+    r = subprocess.run(claim, capture_output=True, text=True, env=env)
+    lease_id = (r.stdout or "").strip().splitlines()[0] if r.stdout.strip() else ""
+    if r.returncode != 0 or not lease_id:
+        warn(f"service lease assign failed ({(r.stderr or '').strip()[:120]})")
+        return None
+    a = subprocess.run(
+        [sys.executable, str(BIN / "fleet-claim"), "--activate", lease_id],
+        capture_output=True, text=True, env=env)
+    if a.returncode != 0:
+        warn(f"service lease {lease_id} would not activate "
+             f"({(a.stderr or '').strip()[:120]}) — releasing it")
+        _release_lease(lease_id, env)
+        return None
+    return lease_id
+
+
+def _release_lease(lease_id, env):
+    r = subprocess.run(
+        [sys.executable, str(BIN / "fleet-release"), lease_id, "--force"],
+        capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        warn(f"service lease {lease_id} would not release "
+             f"({(r.stderr or '').strip()[:120]})")
+        return False
+    return True
+
+
+def _single_instance():
+    import fcntl
+    lock_dir = lib.locks_dir()
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_dir / "fleet-depsd.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _print_once(result, dry_run):
+    verb = "would record" if dry_run else "recorded"
+    print(f"fleet-depsd: {verb} {len(result['holds'])} hold(s); "
+          f"{len(result['unreadable'])} repo(s) unreadable; "
+          f"{len(result['wakes'])} wake(s)")
+    for repo, plan, dep, form, reason, detail in result["holds"]:
+        print(f"  HOLD {repo} {plan} {dep} ({form}:{reason}) — {detail}")
+    for repo in result["unreadable"]:
+        print(f"  UNREADABLE {repo}")
+    for repo, plan in result["wakes"]:
+        print(f"  WAKE {repo} {plan}")
+
+
+def _review_loop(ctx, stop, db_path, poll):
+    """Plan 0189 D2: the resident service's second worker loop — reconciles,
+    then drains a bounded worker pass, on its OWN thread, never the
+    recompute loop's (Boundaries: a waiting or slow reviewer must not
+    delay push processing). Woken by `ctx.review_dirty` (a `pull_request`
+    delivery already persisted its own job before setting it) and by the
+    same `poll` backstop cadence `cmd_serve`'s own loop uses for recompute,
+    for the same reason: this alone is enough to recover a missed delivery
+    eventually, with no webhook installed at all.
+
+    Each call is wrapped in `except BaseException`, not `except Exception`
+    — both `_reconcile_plan_reviews` and `_run_plan_review_worker` reach
+    into `bin/fleet-plan-review`/`bin/orchestrator`/`bin/mopsus`, and a
+    `sys.exit()` surfacing from anywhere in that call graph as an
+    unanticipated `SystemExit` is a `BaseException` no `except Exception`
+    stops. This is the PER-PASS backstop for that same hazard
+    `_run_plan_review_worker`'s own per-job catch already guards against —
+    either one alone would still let an exception raised OUTSIDE the
+    per-job loop (claiming the connection, resolving the forge a second
+    time, or inside `_reconcile_plan_reviews` itself) kill this thread
+    silently while `/healthz` keeps reporting healthy."""
+    last_pass = 0.0
+    while not stop["now"]:
+        now = time.time()
+        if ctx.review_dirty.is_set() or now - last_pass >= poll:
+            ctx.review_dirty.clear()
+            try:
+                _reconcile_plan_reviews(db_path)
+            except BaseException as e:                          # noqa: BLE001
+                warn(f"plan-review reconcile raised {e.__class__.__name__}: "
+                     f"{str(e)[:160]} — continuing")
+            try:
+                _run_plan_review_worker(db_path)
+            except BaseException as e:                          # noqa: BLE001
+                warn(f"plan-review worker raised {e.__class__.__name__}: "
+                     f"{str(e)[:160]} — continuing")
+            last_pass = time.time()
+        time.sleep(1)
+
+
+def cmd_serve(args):
+    host, port = _depsd_bind()
+    poll = _depsd_poll()
+    db_path = args.db or DB
+    if args.once:
+        result = recompute(db_path, dry_run=args.dry_run)
+        _print_once(result, args.dry_run)
+        return 0
+    lockfd = _single_instance()
+    if lockfd is None:
+        warn("another fleet-depsd holds the local lockfile — refusing to "
+             "start a second instance on this host")
+        return 1
+    sid = _depsd_sid()
+    lease_id = acquire_service_lease(_depsd_host(), sid)
+    if lease_id is None:
+        os.close(lockfd)
+        return 1
+    ctx = _Ctx(db_path, host)
+    ctx.lease_id = lease_id
+    ctx.dirty.set()                      # start-up triggers a recompute
+    ctx.review_dirty.set()               # start-up triggers a bounded review pass
+    server = ThreadingHTTPServer((host, port), make_handler_class(ctx))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    stop = {"now": False}
+    review_thread = threading.Thread(
+        target=_review_loop, args=(ctx, stop, db_path, poll), daemon=True)
+    review_thread.start()
+
+    def _stop(signum, _frame):
+        stop["now"] = True
+        warn(f"signal {signum} — shutting down")
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _stop)
+        except (ValueError, OSError):
+            pass
+    print(f"fleet-depsd: serving on {host}:{port}, service lease {lease_id}, "
+          f"poll {poll}s", flush=True)
+    paged_secret = {"done": False}
+    last_poll = 0.0
+    # D2: "Fetch it at start with backoff... Retry the fetch each poll." Each
+    # helper logs into an AppRole and revokes its own login token on vaulthost —
+    # trying it every second, forever, whenever the value is missing would
+    # hit that AppRole login/revoke once a second for as long as it stays
+    # unavailable. The first attempt runs immediately (`0.0`); every attempt
+    # after a failure waits out one more `poll` before trying again, the same
+    # cadence the recompute backstop already uses.
+    next_secret_try = 0.0
+    next_token_try = 0.0
+    try:
+        while not stop["now"]:
+            lib.touch_heartbeat(sid)
+            now = time.time()
+            if not ctx.secret and now >= next_secret_try:
+                secret = _fetch_secret()
+                if secret:
+                    ctx.secret = secret
+                    paged_secret["done"] = False
+                else:
+                    next_secret_try = now + poll
+                    if not paged_secret["done"]:
+                        watch.notify(
+                            "fleet-depsd: no webhook secret",
+                            f"{WEBHOOK_SECRET_CMD} produced no secret — the "
+                            "webhook route returns 503 until it does; the poll "
+                            "backstop still clears holds")
+                        paged_secret["done"] = True
+            if not ctx.attest_token and now >= next_token_try:
+                token = _fetch_attest_token()
+                if token:
+                    ctx.attest_token = token
+                else:
+                    next_token_try = now + poll
+            if ctx.dirty.is_set() or now - last_poll >= poll:
+                ctx.dirty.clear()
+                try:
+                    recompute(db_path)
+                except Exception as e:                      # noqa: BLE001
+                    warn(f"recompute raised {e.__class__.__name__}: "
+                         f"{str(e)[:160]} — continuing")
+                last_poll = time.time()
+            time.sleep(1)
+    finally:
+        server.shutdown()
+        server.server_close()
+        if not _release_lease(lease_id, dict(os.environ, EUNOMIA_SESSION=sid)):
+            warn(f"service lease {lease_id} would not release — a restart "
+                 "will refuse until it expires or is released by hand")
+        os.close(lockfd)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-depsd", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("attestations")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--db", default=None, help="override FLEET_DB for this call")
+    s = sub.add_parser("serve")
+    s.add_argument("--once", action="store_true",
+                    help="run one recompute() pass, with no bind and no lease, then exit")
+    s.add_argument("--dry-run", action="store_true",
+                    help="with --once: print the holds/wakes without writing")
+    s.add_argument("--db", default=None, help="override FLEET_DB for this call")
+    args = ap.parse_args(argv)
+    if args.cmd == "attestations":
+        return cmd_attestations(args)
+    if args.cmd == "serve":
+        return cmd_serve(args)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

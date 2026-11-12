@@ -6,7 +6,7 @@
 
   org.eunomia.fleet-pin-watch REPORTS when a pinned worktree falls behind its
   origin/main; this unit is the mover that closes the gap it reports on. Same
-  FLEET_PINS, same repos, deliberately: advancing a pin nobody is watching for
+  pin set as pin-watch (repos.conf plus FLEET_PINS), deliberately: advancing a pin nobody is watching for
   drift would be a mover with no report to check it against.
 
   IT DOES NOT RESTART fleet-watch, or anything else that reads a pin. A
@@ -56,8 +56,16 @@
   <dict>
     <!-- same pins fleet-pin-watch reports on; no default, so an unconfigured
          run advances nothing -->
+    <!-- Plan 0134: the pin for every repository in config/repos.conf is implied
+         (~/.local/share/pins/<name>, read from the eunomia pin this unit runs
+         from); FLEET_PINS lists only pins that are NOT a listed repository.
+         /Users/operator/agent is talos (dispatch-review.py, post-review.py), kept at
+         that path because bin/orchestrator and the review skill call it there.
+         It is a detached checkout like the pins above; on a branch it is refused
+         as `attached`. A talos change under reviewer-uid/ still needs a manual
+         sudo install: this moves the checkout, never the root-owned wrapper. -->
     <key>FLEET_PINS</key>
-    <string>/Users/operator/.local/share/pins/eunomia,/Users/operator/.local/share/pins/techne</string>
+    <string>/Users/operator/agent</string>
     <!-- the ssh forward from org.eunomia.fleet-broker-tunnel lands here -->
     <key>FLEET_BROKER_SOCKET</key><string>/Users/operator/run/forgejo-broker.sock</string>
     <!-- replace with the real Fleet-ops push URL at install; empty = log-only,

@@ -83,7 +83,7 @@ def _configure(fm, con):
     fm.set_runner(con, "operator/eunomia", "implementer", "local-qwen", actor="cli:t")
     fm.set_runner(con, "operator/eunomia", "tester", "sub-opus", actor="cli:t")
     fm.set_runner(con, "operator/eunomia", "tester", "api-sonnet", actor="cli:t")
-    fm.set_runner(con, "operator/eunomia", "tester", "local-qwen", actor="cli:t")
+    fm.set_runner(con, "operator/eunomia", "tester", "sub-sonnet-5", actor="cli:t")
     fm.disable(con, "operator/eunomia", "tester", 2, actor="cli:t")
     fm.set_runner(con, "operator/lynceus", "mediator", "sub-opus", actor="cli:t")
     fm.disable(con, "operator/lynceus", "mediator", 1, actor="cli:t")
@@ -345,7 +345,7 @@ def test_a_slot_that_predates_the_ledger_is_recovered_from_a_disable_event(fleet
                 "VALUES ('operator/old2', 'tester', 1, 'sub-opus')")  # no event
     con.commit()
     fm.disable(con, "operator/old", "tester", 1, actor="cli:t")
-    fm.set_runner(con, "operator/old2", "tester", "local-qwen", ordinal=1, actor="cli:t")
+    fm.set_runner(con, "operator/old2", "tester", "sub-sonnet-5", ordinal=1, actor="cli:t")
     con.close()
     _collect_events(fleet, monkeypatch)
     con = sqlite3.connect(fleet / "fleet.db")
@@ -353,7 +353,7 @@ def test_a_slot_that_predates_the_ledger_is_recovered_from_a_disable_event(fleet
     con.commit()
     report = fm.reconstruct_repo_model(con)
     assert _rows(con) == [("operator/old", "tester", 1, "sub-opus", 1),
-                          ("operator/old2", "tester", 1, "local-qwen", 0)]
+                          ("operator/old2", "tester", 1, "sub-sonnet-5", 0)]
     # only the slot whose disabled state was NOT stated is flagged as assumed
     assert report["predates"] == [("operator/old2", "tester", 1)]
 
@@ -882,7 +882,8 @@ def _full_schema(tmp_path):
     collector's views, which must never read as unclassified."""
     collect = _load("fleet-collect")
     con = sqlite3.connect(tmp_path / "all.db")
-    for mod in (collect, _load("fleet-models"), _load("fleet-config"), _load("fleet-reviews")):
+    for mod in (collect, _load("fleet-models"), _load("fleet-config"), _load("fleet-reviews"),
+                _load("fleet-lane")):
         con.executescript(mod.SCHEMA)
     for view in (collect.DISPATCH_VIEW, collect.CI_VIEW, collect.DISPATCH_SESSION_VIEW,
                  collect.DISPATCH_COST_VIEW):

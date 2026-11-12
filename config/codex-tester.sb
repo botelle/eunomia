@@ -1,0 +1,131 @@
+;; config/codex-tester.sb — the confinement for the `sub-codex` test lane (plan 0101).
+;;
+;; A template: the registry argv (`RUNNERS["sub-codex"]` in bin/orchestrator)
+;; passes the parameters with `/usr/bin/sandbox-exec -D`, and `bin/fleet-lane`
+;; fills the placeholders. Never fill it by string formatting.
+;;
+;;   LANE        the lane's own scratch directory: the cwd, the schema, `-o`,
+;;               and codex's redirected sqlite state (`-c sqlite_home`)
+;;   CODEX_HOME  the operator's real ~/.codex (the login lives there)
+;;
+;; This is NOT config/meeting-runner.sb: that one confines TESTS that reach
+;; nothing but loopback; this one confines a MODEL that must reach its vendor
+;; over TCP and read its own login. It starts from `(deny default)`: every
+;; allow below is an entry a real confined run was measured to need, and the
+;; dated line after it is the denial that proved it (codex-cli 0.153.4,
+;; macOS 27.2, 2026-10-11, and codex-cli 0.166.0, macOS 27.2, 2026-11-05, read
+;; from `log stream --predicate 'sender ==
+;; "Sandbox"' --info --debug`). Measurements: docs/measurements/adr-0006-blackbox-test-lanes.md.
+;;
+;; NEVER run a confined codex against the real login with the network allowed
+;; and `auth.json` read-only: it refreshes the ChatGPT token server-side, cannot
+;; persist it, and the owner's stored refresh token is then rejected
+;; (`refresh_token_reused`; this happened on 2026-10-11 while building this file).
+;;
+;; Codex's own per-command sandbox (`-s read-only`, itself a seatbelt profile)
+;; cannot start inside this one (`sandbox_apply: Operation not permitted`), so
+;; every shell command the model asks for fails before it runs. That is the
+;; posture, not a defect. This profile is the control; no codex flag is.
+(version 1)
+(deny default)
+
+;; ---------------------------------------------------------------- processes
+(allow process-exec*)
+(allow process-fork)
+(allow sysctl-read)                 ;; denied: sysctl-read kern.* at start-up
+(allow file-read-metadata)          ;; denied: file-read-metadata on every path walk (stat)
+
+;; ------------------------------------------------------------------ reads
+;; Denied under (deny default), 2026-10-11, each at start-up of `codex login status`:
+(allow file-read*
+  (literal "/")                                  ;; file-read-data /
+  (subpath "/usr/lib")                           ;; dyld, libSystem
+  (subpath "/usr/share/icu")                     ;; file-read-data /usr/share/icu/icudt78l.dat
+  (subpath "/System")                            ;; frameworks, dyld shared cache
+  (subpath "/private/var/db/dyld")               ;; file-read-data under /private/var/db/dyld
+  (subpath "/private/var/db/timezone")           ;; file-read-data /private/var/db/timezone/tz/*/zoneinfo/GMT
+  (subpath "/Library/Preferences")               ;; file-read-data under /Library/Preferences
+  (literal "/dev/urandom")                       ;; file-read-data /dev/urandom
+  (literal "/dev/random")
+  (literal "/dev/null")                          ;; file-read-data /dev/null
+  (literal "/dev/dtracehelper")                  ;; file-read-data /dev/dtracehelper
+  (subpath "/opt/homebrew/Caskroom/codex")       ;; the install: file-read-data under it
+  (subpath (param "LANE")))                      ;; the cwd, the schema, `-o`, sqlite state
+
+;; The part of ~/.codex a run needs, and no more. Measured 2026-10-11 by
+;; starting from `auth.json` alone and adding only what a denial named before
+;; codex could reach its vendor. Everything else in it — `sessions/`,
+;; `history.jsonl`, `session_index.jsonl`, `memories_1.sqlite`,
+;; `state_5.sqlite`, `logs_2.sqlite`, `goals_1.sqlite`, `queue_1.sqlite`,
+;; `thread_history_1.sqlite`, `shell_snapshots/`, `skills/`, `plugins/` — is
+;; the owner's other conversations and tooling and stays denied. Codex asked
+;; for `models_cache.json`, `cache/`, `skills/`, `sessions/` and
+;; `shell_snapshots/` and carried on when refused; whether a full model turn
+;; also carries on without them is what the live tier measures, and an entry
+;; is added here only with its dated denial.
+(allow file-read*
+  (literal (string-append (param "CODEX_HOME") "/auth.json"))         ;; the login: the whole point
+  (literal (string-append (param "CODEX_HOME") "/installation_id")))  ;; denied: file-read-data installation_id (init failed: "failed to initialize in-process app-server client")
+
+;; ----------------------------------------------------------------- writes
+;; The scratch directory (where `-o` lands) and the login. The login file is
+;; writable on purpose: a ChatGPT login refreshes itself, and a lane that
+;; refreshed server-side and then could not persist the new token STRANDS the
+;; owner's stored one (measured 2026-10-11: `refresh_token_reused`). Writes
+;; elsewhere in ~/.codex are denied; codex tolerates that (it warns that it
+;; "could not create PATH aliases" and carries on).
+(allow file-write*
+  (subpath (param "LANE"))
+  (literal (string-append (param "CODEX_HOME") "/auth.json"))
+  (literal (string-append (param "CODEX_HOME") "/installation_id"))  ;; denied: file-write-data installation_id (init failed without it)
+  (literal "/dev/null")
+  (literal "/dev/dtracehelper"))
+
+;; --------------------------------------------------------------- network
+;; The CLI's own request to the subscription backend leaves from this
+;; process, so outbound TCP is open to every address (residual reach).
+(allow system-socket)                                  ;; denied: system-socket at the first socket()
+(allow network-outbound (remote tcp))
+(allow network-outbound (remote udp))                  ;; DNS
+;; AF_UNIX connects: only inside the scratch directory, and the resolver.
+(allow network-outbound (remote unix-socket (subpath (param "LANE"))))
+(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+;; A client has no reason to listen. Measured with both denied.
+(deny network-bind)
+(deny network-inbound)
+
+;; ------------------------------------------------------ process escapes
+;; Each of these hands work to a process launchd, an app or Launch Services
+;; starts OUTSIDE the sandbox, with the real HOME (#663). They are already
+;; denied by `(deny default)`; they are written out so a later edit that
+;; moves to `(allow default)` does not lose them. docs/test-lane.md records
+;; which are load-bearing on this host.
+(deny job-creation)
+(deny appleevent-send)
+(deny lsopen)
+
+;; No signal reaches a process outside this sandbox (#705), but codex may
+;; still stop a command it started.
+(deny signal)
+(allow signal (target same-sandbox))
+
+;; No Mach service is reachable except the four named below: the Keychain,
+;; and three more codex-cli 0.166 needs (2026-11-05, see further down).
+;; Measured 2026-10-11 by dropping candidates one at a time from an
+;; allow-everything baseline: with this one absent codex cannot reach its
+;; vendor (`error sending request for url (https://auth.openai.com/oauth/token)`),
+;; with it present and every other name denied it can.
+;; THE KEYCHAIN IS REACHABLE FROM THE LANE AGAIN: com.apple.SecurityServer is
+;; the Keychain server. See "Residual reach" in docs/test-lane.md.
+(deny mach-lookup)
+(allow mach-lookup (global-name "com.apple.SecurityServer"))
+;; Measured on opshost, 2026-11-05, macOS 27.2, codex-cli 0.166.0 against 0.153.4:
+;; 0.166 reads managed preferences at start-up (denied: `failed to load
+;; configuration: Failed to synchronize managed preferences`); without it, it
+;; exits before reaching the vendor at all.
+(allow mach-lookup (global-name "com.apple.cfprefsd.daemon")
+                   (global-name "com.apple.cfprefsd.agent"))
+(allow ipc-posix-shm-read-data (ipc-posix-name-prefix "apple.cfprefs"))
+;; 0.166's workspace routing discovery TLS request is verified through the
+;; per-user trust agent (denied: `workspace routing discovery failed`).
+(allow mach-lookup (global-name "com.apple.trustd.agent"))

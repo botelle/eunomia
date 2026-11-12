@@ -34,17 +34,28 @@ from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
 PROJECTS = Path.home() / ".claude" / "projects"
+# Where the reviewer uid publishes its transcripts (talos plan 0014). The
+# reviewer's own home is drwx------ by design and is never read: this copy is the
+# only sanctioned path. Overridable; read at call time.
+DEFAULT_REVIEWER_TRANSCRIPTS = "/Users/Shared/dispatch-review/transcripts"
+# The two places bin/fleet-secret-guard appends when it FAILS OPEN (plan 0092 D3).
+DEFAULT_REVIEWER_GUARD_LOG = "/Users/Shared/dispatch-review/guard-log/secret-guard.log"
 NTFY_URL = os.environ.get("FLEET_NTFY_URL", "")   # e.g. http://vaulthost:3001/api/push/<id> or an ntfy topic URL
 
 UNIT = "fleet-leak-watch"
 TITLE = "fleet-leak-watch: secret shape"
+GUARD_TITLE = "fleet-leak-watch: secret-guard failed open"
 
+# FALLBACK credential SHAPES (plan 0071). The live lists are built from the
+# `content` rows of config/secret-patterns.conf by _load_findings() below; these
+# literals are only what the watcher uses when that conf cannot be read, and it
+# says so on stderr when it does. Never edit them to add a family: add a conf row.
 # Credential SHAPES in free text. Kept close to the collector's _SECRETISH plus
 # the token families the incidents actually involved.
 # High-signal shapes — structured credentials that are almost never anything else.
-# A dry-run over 855 real transcripts hit these ~10 times total; that is the whole
-# point of picking shapes with a prefix/structure rather than raw entropy.
-FINDINGS = [
+# Corpus figures move (855 files / ~10 hits 2026-09-10; 2790 files / 90 hits
+# 2026-09-29): see docs/secret-guard.md. The point stands: prefix/structure, not entropy.
+_FALLBACK_FINDINGS = [
     ("github-pat", re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}")),
     ("slack-token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{20,}")),
     ("openai-key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
@@ -57,7 +68,7 @@ FINDINGS = [
 # ~3000 hits, essentially all false. Behind --paranoid so the always-on watcher
 # stays trusted: a monitor that pages 3000 times gets muted, and a muted monitor
 # is the un-validated check §8.3 forbids relying on.
-PARANOID_FINDINGS = [
+_FALLBACK_PARANOID = [
     ("assignment", re.compile(
         r"(?i)\b(?:bearer|api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*\S{8,}")),
     # Bounded on the HEX CLASS, not on \b. `\b` asks "is the neighbour a word
@@ -75,6 +86,36 @@ PARANOID_FINDINGS = [
     # bare git SHA; it only adds the case `\b` was never able to see.
     ("long-hex", re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{40,}(?![A-Fa-f0-9])")),
 ]
+
+
+def _load_findings():
+    """(FINDINGS, PARANOID_FINDINGS) from the conf's `content` rows (plan 0071).
+
+    bin/orchestrator loads this module by SourceFileLoader and reads the two
+    attributes at import, with no error path, and redact() runs on every byte
+    written to a PR thread. So this must never raise: a conf that cannot be read
+    or parsed (fleetlib._content_rules exits loudly on those) falls back to the
+    literals above, and says so on stderr rather than quietly narrowing."""
+    try:
+        loader = importlib.machinery.SourceFileLoader(
+            "_fleetlib_for_leak_watch", str(BIN / "fleetlib.py"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        lib = importlib.util.module_from_spec(spec)
+        loader.exec_module(lib)
+        rules = lib._content_rules()
+    except (Exception, SystemExit) as e:
+        print(f"fleet-leak-watch: cannot load secret-patterns.conf "
+              f"({e.__class__.__name__}) — using the built-in fallback shapes",
+              file=sys.stderr)
+        return list(_FALLBACK_FINDINGS), list(_FALLBACK_PARANOID)
+    always = [(n, rx) for n, rx, tier in rules if tier == "always"]
+    paranoid = [(n, rx) for n, rx, tier in rules if tier == "paranoid"]
+    return always, paranoid
+
+
+FINDINGS, PARANOID_FINDINGS = _load_findings()
+
+
 
 
 def _synthetic(matched: str) -> bool:
@@ -107,6 +148,73 @@ def _synthetic(matched: str) -> bool:
 
 def _fleet_dir() -> Path:
     return Path(os.environ.get("EUNOMIA_FLEET_DIR", str(Path.home() / "dev" / ".fleet")))
+
+
+def _reviewer_root() -> Path:
+    return Path(os.environ.get("FLEET_REVIEWER_TRANSCRIPTS") or DEFAULT_REVIEWER_TRANSCRIPTS)
+
+
+def _guard_logs():
+    """The guard logs to watch: the operator's own and the reviewer's."""
+    return [_fleet_dir() / "secret-guard.log", Path(os.environ.get("FLEET_REVIEWER_GUARD_LOG") or DEFAULT_REVIEWER_GUARD_LOG)]
+
+
+def _transcript_files():
+    """Every transcript to scan, as (path, state key). A key is the path relative
+    to its root for PROJECTS (unchanged), and `reviewer/<name>` for the published
+    root, so a second root cannot collide with the first. A missing root is
+    skipped with one line, never an error."""
+    files = [(p, str(p.relative_to(PROJECTS)))
+             for p in sorted(PROJECTS.glob("*/*.jsonl")) + sorted(PROJECTS.glob("*/*/subagents/*.jsonl"))]
+    root = _reviewer_root()
+    if root.is_dir():
+        files += [(p, f"reviewer/{p.name}") for p in sorted(root.glob("*.jsonl"))]
+    else:
+        print(f"leak-watch: transcript root {root} absent, skipped")
+    return files
+
+
+def _page_guard_log(path, new_lines) -> bool:
+    # path and count only. NEVER a line of the log. Returns whether the page
+    # was actually delivered, so the caller can decide whether to advance the
+    # offset (plan 0092 §3: "the offset advances only after the page is sent").
+    return _notify(GUARD_TITLE, f"secret-guard failed open: {path} gained {new_lines} line(s)",
+                    f"{path}: {new_lines} new line(s)")
+
+
+def _scan_guard_logs(state, dry_run):
+    """One page per grown log per run. The offset advances only after the page is
+    SENT (delivered=True from _notify) -- a failed send or no channel configured
+    must not lose the growth: the next run pages again. A log that is absent is
+    skipped in quiet -- but one that exists and cannot be READ (permissions,
+    recreated with a stricter mode) gets a visible line, because its size delta
+    alone is enough to page on and silence there would hide a fail-open."""
+    offsets = state.setdefault("guard_offsets", {})
+    for log in _guard_logs():
+        try:
+            size = log.stat().st_size
+        except OSError:
+            continue
+        key = str(log)
+        start = offsets.get(key, 0)
+        if size < start:            # truncated or rotated: start over
+            start = 0
+        if size == start:
+            continue
+        try:
+            with log.open("rb") as fh:
+                fh.seek(start)
+                data = fh.read(size - start)
+        except OSError as e:
+            print(f"leak-watch: guard log {log} unreadable ({e.__class__.__name__}), skipped",
+                  file=sys.stderr)
+            continue
+        count = data.count(b"\n") + (0 if data.endswith(b"\n") else 1)
+        if dry_run:
+            print(f"leak-watch --dry-run: guard log {log} has {count} line(s) past offset {start}")
+            continue
+        if _page_guard_log(log, count):
+            offsets[key] = size
 
 
 def _state_path() -> Path:
@@ -165,17 +273,26 @@ def _alert(rel, lineno, finding):
     # This is the one pager whose subject matter is secrets, so the rule that
     # binds it is narrower than every other pager's.
     record_body = f"{rel} line {lineno}: {finding}"
+    _notify(TITLE, msg, record_body)
+
+
+def _notify(title, msg, record_body) -> bool:
+    """Send one page. Returns whether it was actually delivered -- False when
+    no channel is configured or the send itself failed. Callers that must not
+    lose an event on a failed send (the guard-log offset) key off this."""
     if not NTFY_URL:
         print("ALERT " + msg)
-        _record_page(TITLE, record_body, False, "no channel configured")
-        return
+        _record_page(title, record_body, False, "no channel configured")
+        return False
     try:
         req = urllib.request.Request(NTFY_URL, data=msg.encode(), method="POST")
         urllib.request.urlopen(req, timeout=5).read()
-        _record_page(TITLE, record_body, True)
+        _record_page(title, record_body, True)
+        return True
     except Exception as e:
         print(f"ALERT(ntfy-failed:{e.__class__.__name__}) " + msg, file=sys.stderr)
-        _record_page(TITLE, record_body, False, e.__class__.__name__)
+        _record_page(title, record_body, False, e.__class__.__name__)
+        return False
 
 
 def _result_text(line):
@@ -200,17 +317,34 @@ def _result_text(line):
 
 def _scan_file(path: Path, start: int, paranoid=False):
     """Yield (lineno, finding, matched) for content from byte `start`. Returns the
-    new end offset. A partial final line is not consumed (re-read next pass)."""
+    new end offset. A partial final line is not consumed (re-read next pass).
+
+    A file this uid cannot stat or open (a published transcript under another
+    uid's mode, e.g. the reviewer root) is skipped, not fatal: one visible line
+    on stderr, the offset for that file is left unchanged (so it is retried,
+    never counted as scanned), and the caller keeps going -- the rest of the
+    files still get scanned, state still saves, and the guard-log scan still
+    runs. This does NOT page: it mirrors the existing "missing root" skip
+    (plan 0092 §3, "don't treat a missing root as a fault") rather than the
+    "new secret shape" or "guard log grew" alerts, because an unreadable file
+    is an environment/permissions condition, not evidence of a leak or a
+    failed-open guard -- paging it would be noise on every host where the mode
+    contract in talos plan 0014 isn't (yet) satisfied."""
     hits = []
     try:
         size = path.stat().st_size
-    except OSError:
+    except OSError as e:
+        print(f"leak-watch: {path} unreadable ({e.__class__.__name__}), skipped", file=sys.stderr)
         return hits, start
     if size <= start:
         return hits, start
-    with path.open("rb") as fh:
-        fh.seek(start)
-        data = fh.read()
+    try:
+        with path.open("rb") as fh:
+            fh.seek(start)
+            data = fh.read()
+    except OSError as e:
+        print(f"leak-watch: {path} unreadable ({e.__class__.__name__}), skipped", file=sys.stderr)
+        return hits, start
     text = data.decode("utf-8", "replace")
     # don't consume a partial final line
     consumed = len(data)
@@ -246,14 +380,10 @@ def main(argv=None) -> int:
 
     state = {"offsets": {}, "alerted": []} if args.dry_run else _load_state()
     alerted = set(state.get("alerted", []))
-    files = sorted(PROJECTS.glob("*/*.jsonl")) + sorted(PROJECTS.glob("*/*/subagents/*.jsonl"))
+    files = _transcript_files()
     total_hits = new_alerts = suppressed = 0
 
-    for path in files:
-        try:
-            rel = str(path.relative_to(PROJECTS))
-        except ValueError:
-            rel = str(path)
+    for path, rel in files:
         start = 0 if args.dry_run else state["offsets"].get(rel, 0)
         hits, end = _scan_file(path, start, paranoid=args.paranoid)
         if not args.dry_run:
@@ -271,6 +401,8 @@ def main(argv=None) -> int:
             _alert(rel, lineno, finding)
             alerted.add(key)
             new_alerts += 1
+
+    _scan_guard_logs(state, args.dry_run)
 
     if not args.dry_run:
         state["alerted"] = sorted(alerted)

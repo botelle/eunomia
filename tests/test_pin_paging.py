@@ -54,6 +54,10 @@ def _load(fleet_dir, **env):
     spec = importlib.util.spec_from_loader("fleet_watch_pin_paging", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    # This suite is about paging behaviour, not fetch-retry timing -- a real
+    # unreachable remote (the `unfetchable` cases below) would otherwise pay
+    # the real PIN_FETCH_RETRY_SECS delay on every such call.
+    mod.PIN_FETCH_RETRY_SECS = 0
     return mod
 
 

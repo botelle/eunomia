@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-rebase — the comment gesture for rebasing a stale pull request (plan 0115).
+  Every 120s, reads the owner's `rebase` comments on open pull requests and, when
+  every check passes, rebases the branch onto main and pushes it so CI runs again
+  on the new head. Replies on the pull request either way. docs/rebase.md has the
+  refusals and what to do instead.
+
+  NOT INSTALLED BY THE PLAN THAT SHIPS IT. The owner installs it (opshost):
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-rebase.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-rebase.plist
+  Verify before trusting it: run it by hand once as the sweep in dry-run mode (the
+  dry-run flag of bin/fleet-rebase), with the same environment as below, and confirm the first line names a repository count
+  (for example "sweeping 1 repositories"). It pushes nothing and posts nothing.
+
+  ENVIRONMENT. This copies fleet-stalled's shape but NOT its environment, which
+  sets only a notify URL. FLEET_OPERATOR_UID is required:
+  empty, the sweep exits non-zero and names the variable, instead of becoming a
+  silent no-op that looks installed. Its value MUST MATCH the installed
+  org.eunomia.fleet-watch.plist's, which is the one the `respawn` comment already
+  uses. The repository list is config/repos.conf (plan 0134), no variable. FLEET_FORGEJO_URL must match it too. The author-role
+  token helper is FLEET_AUTHOR_TOKEN_CMD; fleet-watch.plist sets none, so it is
+  empty here and the default helper is used. If that file ever sets one, copy it.
+
+  SSH. The push goes over ssh, so this unit must be able to reach the ssh agent:
+  the same constraint bin/orchestrator's _ENV_ALLOW comment documents for
+  SSH_AUTH_SOCK. A launchd job does not inherit the login session's socket; if
+  the first real push fails with a permission error, that is the cause.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the shared clone sits on
+  whatever branch a session last left it on. The pin is a detached worktree of
+  this repo at ~/.local/share/pins/eunomia; fleet-watch reports when it falls
+  behind. The verb itself works only in a fresh temporary clone.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-rebase</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-rebase</string>
+    <string>--sweep</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- the sweep's repositories are config/repos.conf's `dispatch` lines (plan 0134) -->
+    <!-- numeric Forgejo user id of the owner; must match fleet-watch.plist -->
+    <key>FLEET_OPERATOR_UID</key><string></string>
+    <key>FLEET_FORGEJO_URL</key><string>http://forge.example:3000</string>
+    <!-- empty = the default author-role helper; see ENVIRONMENT above -->
+    <key>FLEET_AUTHOR_TOKEN_CMD</key><string></string>
+  </dict>
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/rebase.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/rebase.log</string>
+</dict>
+</plist>

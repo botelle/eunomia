@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""fleet-record — one change record per merge to a default branch (plan 0119, ADR-0020).
+
+  fleet-record once                      record every unrecorded merge since the
+                                         repo's backfill, then publish the spool
+  fleet-record backfill --since DATE     build records for older merges
+  fleet-record publish                   commit the attestation spool
+
+Runs as the recorder account (never the author, reviewer or merger) and reads
+the forge with that account's token only. It records what the forge shows and
+judges nothing; it calls no model. See docs/fleet-record.md.
+"""
+import argparse
+import base64
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+ROOT = BIN.parent
+
+
+def _load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+fleetlib = _load("fleetlib", BIN / "fleetlib.py")
+
+SCHEMA_PATH = ROOT / "config" / "change-record.schema.json"
+LABEL = "fleet-record"
+PLAN_MARKER = re.compile(r"^Plan: (\S+)[ \t]*$", re.M)
+# Copied from bin/fleet-reviews, which is a CLI and not importable as a library
+# without its DB side effects; the plan fixes these three expressions.
+_PROV = re.compile(r"Review-provenance:\s*model=([^;\s]+)\s*;?\s*(.*)")
+_PROV_LINE = re.compile(r"Review-provenance:[^\n]*")
+_PROV_SESSION = re.compile(r"[;:\s]\s*session=([0-9A-Fa-f-]{8,})\s*(?=;|$)")
+PUBLISH_PREFIXES = ("reports/", "protection/")
+REJECTED = "rejected"
+
+
+class ReadError(Exception):
+    """A forge or local read that could not tell. Never recorded as absence."""
+
+
+class Identity(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- environment
+def _env(key, default=""):
+    return os.environ.get(key, default)
+
+
+def _now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _iso(t):
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_ts(s):
+    t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc)
+
+
+# Plan 0136: the list is the eunomia pin's, wherever this is run from. A hand
+# run from ~/dev/eunomia would otherwise read whatever branch that shared clone
+# is on (ADR-0005); the pin is `main` as the broker vouched for it. A module
+# attribute, not an env var, so nothing can point a run at an unreviewed file.
+# Path and format checked against the eunomia pin at 71e6989 (main): the file is
+# config/repos.conf, `repo: <owner/name> [flags]` lines, last changed in 6e1a65d.
+PINNED_CONF = Path("~/.local/share/pins/eunomia/config/repos.conf")
+
+
+def pinned_conf():
+    return Path(os.path.expanduser(str(PINNED_CONF)))
+
+
+def _watch_reading_pin(name):
+    watch = _load(name, BIN / "fleet-watch")
+    watch.REPOS_CONF = pinned_conf()
+    return watch
+
+
+def repos():
+    """The `dispatch` repositories of the pinned config/repos.conf (plan 0134),
+    read by fleet-watch's one reader; [] when the file is unreadable."""
+    return _watch_reading_pin("fleet_watch_for_record_repos").repos()
+
+
+def window():
+    return dt.timedelta(minutes=float(_env("FLEET_RECORD_WINDOW", "15")))
+
+
+def clone_dir():
+    return Path(os.path.expanduser(
+        _env("FLEET_RECORD_CLONE", "~/dev/.fleet/recordstore")))
+
+
+def ssh_host():
+    return _env("FLEET_RECORD_SSH_HOST", "git-recordbot")
+
+
+def remote_url():
+    return _env("FLEET_RECORD_REMOTE",
+                f"ssh://{ssh_host()}/operator/recordstore.git")
+
+
+def recorder_account():
+    return _env("FLEET_RECORDER_ACCOUNT", "recordbot")
+
+
+def log(msg):
+    print(f"fleet-record: {msg}")
+
+
+def page(title, body):
+    """Page through fleet-watch's notify (never raises)."""
+    try:
+        watch = _load("fleet_watch_for_record", BIN / "fleet-watch")
+        watch.notify(title, body, LABEL)
+    except Exception as e:
+        print(f"fleet-record: NOTIFY(failed) {title} — {body} ({e.__class__.__name__})",
+              file=sys.stderr)
+
+
+def recorder_rev():
+    r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                       capture_output=True, text=True)
+    rev = r.stdout.strip()
+    if r.returncode != 0 or not rev:
+        raise ReadError("cannot read recorder revision")
+    return rev
+
+
+# ------------------------------------------------------------------- identity
+_GREETING = re.compile(r"Hi there, ([^!\s]+)!")
+
+
+def check_ssh_identity():
+    """Require the forge's ssh greeting to name the recorder account. The key,
+    chosen by the ssh alias, picks the account; this proves which one it picked.
+    There is no fallback to another key or remote."""
+    host, want = ssh_host(), recorder_account()
+    try:
+        r = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", host],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Identity(f"ssh -T {host} could not run ({e.__class__.__name__})")
+    m = _GREETING.search(r.stdout + "\n" + r.stderr)
+    if r.returncode != 0 or not m:
+        raise Identity(f"ssh -T {host} gave no greeting (exit {r.returncode}); "
+                       f"expected {want!r}")
+    if m.group(1) != want:
+        raise Identity(f"ssh -T {host} greeted {m.group(1)!r}, expected {want!r}")
+
+
+def make_forge():
+    """The recorder's forge handle. Token from FLEET_RECORD_TOKEN_CMD only."""
+    cmd = _env("FLEET_RECORD_TOKEN_CMD")
+    if not cmd:
+        raise Identity("FLEET_RECORD_TOKEN_CMD is not set")
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    lines = r.stdout.strip().splitlines()
+    if r.returncode != 0 or not lines:
+        raise Identity("the recorder token command failed")
+    forge = fleetforge.Forge(
+        _env("FLEET_FORGEJO_URL", "http://forge.example:3000"), lines[-1].strip())
+    status, body = forge._request("GET", "/user")
+    login = (body or {}).get("login") if status == 200 else None
+    want = recorder_account()
+    if login != want:
+        raise Identity(f"GET /user answered {login!r} (status {status}), "
+                       f"expected {want!r}")
+    check_ssh_identity()
+    roles = fleetlib.agent_roles()
+    taken = set(fleetlib.agent_accounts(roles))
+    for role in roles.values():
+        taken |= {role.account.lower()} | set(role.logins)
+    if want.lower() in {t.lower() for t in taken}:
+        raise Identity(f"{want!r} is an agent/merger account; the witness must "
+                       "hold no other role")
+    return forge
+
+
+# ----------------------------------------------------------------- validation
+def _type_ok(v, t):
+    if t == "null":
+        return v is None
+    if t == "boolean":
+        return isinstance(v, bool)
+    if t == "integer":
+        return isinstance(v, int) and not isinstance(v, bool)
+    if t == "string":
+        return isinstance(v, str)
+    if t == "array":
+        return isinstance(v, list)
+    if t == "object":
+        return isinstance(v, dict)
+    return False
+
+
+def validate(value, schema, path="$"):
+    """The subset of JSON Schema config/change-record.schema.json uses.
+    Returns a list of problems (empty when valid)."""
+    errs = []
+    if "const" in schema and (value != schema["const"] or isinstance(value, bool)):
+        errs.append(f"{path}: must be {schema['const']!r}")
+    if "enum" in schema and value not in schema["enum"]:
+        errs.append(f"{path}: {value!r} not in {schema['enum']}")
+    if "type" in schema:
+        types = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
+        if not any(_type_ok(value, t) for t in types):
+            return errs + [f"{path}: expected {types}, got {type(value).__name__}"]
+    if isinstance(value, str) and len(value) < schema.get("minLength", 0):
+        errs.append(f"{path}: shorter than {schema['minLength']}")
+    if isinstance(value, dict):
+        for k in schema.get("required", []):
+            if k not in value:
+                errs.append(f"{path}.{k}: required")
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            errs += [f"{path}.{k}: not allowed" for k in value if k not in props]
+        for k, sub in props.items():
+            if k in value:
+                errs += validate(value[k], sub, f"{path}.{k}")
+    if isinstance(value, list) and "items" in schema:
+        for i, item in enumerate(value):
+            errs += validate(item, schema["items"], f"{path}[{i}]")
+    return errs
+
+
+def load_schema():
+    return json.loads(SCHEMA_PATH.read_text())
+
+
+# ---------------------------------------------------------------- forge reads
+def _all(verb):
+    """Every item of a paged list read; a failed page is a ReadError."""
+    out = []
+    pages = fleetforge.paged(verb)
+    for items in pages:
+        out.extend(items)
+    if pages.outcome != fleetforge.EXHAUSTED:
+        raise ReadError(f"paged read ended {pages.outcome} "
+                        f"(status {pages.failed_status})")
+    return out
+
+
+def _login(u):
+    return (u or {}).get("login") or ""
+
+
+def _history(forge, repo, sha, limit=100):
+    status, body = forge.list_commits(repo, sha=sha, limit=limit)
+    if status != 200 or not isinstance(body, list):
+        raise ReadError(f"{repo} history of {sha[:8]} -> {status}")
+    return body
+
+
+def _carries(forge, repo, pr, sha):
+    """True when `pr` brought commit `sha` into main: it is the merge commit
+    (squash or rebase), the PR head, or, for a merge-commit merge, it is
+    reachable from the merge commit but not from its first parent."""
+    if sha in (pr.get("merge_commit_sha"), (pr.get("head") or {}).get("sha")):
+        return True
+    merge = _history(forge, repo, pr["merge_commit_sha"])
+    parents = (merge[0].get("parents") or []) if merge else []
+    if len(parents) < 2:
+        return False
+    base = {c["sha"] for c in _history(forge, repo, parents[0]["sha"])}
+    return any(c["sha"] == sha and sha not in base for c in merge)
+
+
+def _merger_of(forge, repo, sha, before=None):
+    """Login that merged the PR that carried commit `sha` into main, or None
+    when no merged PR did (a direct push). `before` bounds the scan to PRs
+    merged no later than that time; scanned most recently updated first."""
+    pages = fleetforge.paged(lambda page, limit: forge.list_pulls(
+        repo, state="closed", page=page, limit=limit, sort="recentupdate"))
+    for items in pages:
+        for pr in items:
+            if not (pr.get("merged") and pr.get("merge_commit_sha")):
+                continue
+            if before and _parse_ts(pr["merged_at"]) > before:
+                continue
+            if _carries(forge, repo, pr, sha):
+                return _login(pr.get("merged_by")) or None
+    if pages.outcome != fleetforge.EXHAUSTED:
+        raise ReadError(f"{repo} pulls scan for {sha[:8]} ended {pages.outcome}")
+    return None
+
+
+_DEFAULT_BRANCH = {}
+
+
+def default_branch(forge, repo):
+    """The repository's default branch, read once per process. A read that
+    cannot tell is a ReadError, never a guess of `main`."""
+    if repo not in _DEFAULT_BRANCH:
+        status, body = forge.get_repo(repo)
+        name = (body or {}).get("default_branch") if status == 200 else None
+        if not isinstance(name, str) or not name:
+            raise ReadError(f"{repo} default branch -> {status}")
+        _DEFAULT_BRANCH[repo] = name
+    return _DEFAULT_BRANCH[repo]
+
+
+def merged_prs(forge, repo, cutoff):
+    """PRs merged into the default branch at or after `cutoff`, oldest first. Listed by most
+    recent update: a PR's updated_at is never earlier than its merged_at, so
+    the scan stops at the first page that is entirely older than the cutoff."""
+    found = []
+    default = default_branch(forge, repo)
+    page_no = 1
+    while True:
+        status, body = forge.list_pulls(repo, state="closed", page=page_no,
+                                        limit=50, sort="recentupdate")
+        if status != 200 or not isinstance(body, list):
+            raise ReadError(f"{repo} pulls -> {status}")
+        if not body:
+            break
+        for pr in body:
+            if (pr.get("merged") and (pr.get("base") or {}).get("ref") == default
+                    and pr.get("merged_at") and pr.get("merge_commit_sha")
+                    and _parse_ts(pr["merged_at"]) >= cutoff):
+                found.append(pr)
+        if all(_parse_ts(p.get("updated_at") or p["created_at"]) < cutoff for p in body):
+            break
+        if len(body) < 50:
+            break
+        page_no += 1
+    found.sort(key=lambda p: _parse_ts(p["merged_at"]))
+    return found
+
+
+def record_path(repo, pr):
+    t = _parse_ts(pr["merged_at"])
+    return f"records/{repo}/{t:%Y}/{t:%m}/{pr['merge_commit_sha']}.json"
+
+
+def plan_section(forge, repo, pr):
+    m = PLAN_MARKER.search(pr.get("body") or "")
+    if not m:
+        return None
+    plan_id = m.group(1)
+    out = {"id": plan_id, "status_at_merge": None, "commit": None,
+           "commit_merged_by": None}
+    merge_sha = pr["merge_commit_sha"]
+    status, commits = forge.list_commits(repo, sha=merge_sha, limit=1)
+    if status != 200 or not isinstance(commits, list):
+        raise ReadError(f"{repo} commit {merge_sha[:8]} -> {status}")
+    parents = ((commits or [{}])[0].get("parents") or [])
+    if not parents:
+        raise ReadError(f"{repo} {merge_sha[:8]}: no first parent")
+    first_parent = parents[0]["sha"]
+    plan_file = f"plans/{plan_id}.md"
+    status, contents = forge.get_contents(repo, plan_file, ref=first_parent)
+    if status not in (200, 404):
+        raise ReadError(f"{repo} {plan_file}@{first_parent[:8]} -> {status}")
+    if status == 200 and isinstance(contents, dict) and contents.get("content"):
+        text = base64.b64decode(contents["content"]).decode("utf-8", "replace")
+        sm = re.search(r"^status:[ \t]*(\S+)", text, re.M)
+        out["status_at_merge"] = sm.group(1).strip("\"'") if sm else None
+    status, last = forge.list_commits(repo, sha=first_parent, path=plan_file, limit=1)
+    if status not in (200, 404):
+        raise ReadError(f"{repo} {plan_file} history -> {status}")
+    if status == 200 and last:
+        out["commit"] = last[0]["sha"]
+        out["commit_merged_by"] = _merger_of(forge, repo, out["commit"],
+                                          _parse_ts(pr["merged_at"]))
+    return out
+
+
+def review_section(forge, repo, n):
+    out = []
+    for rv in _all(lambda page, limit: forge.list_reviews(repo, n, page=page, limit=limit)):
+        body = rv.get("body") or ""
+        m = _PROV.search(body)
+        line = _PROV_LINE.search(body) if m else None
+        ms = _PROV_SESSION.search(line.group(0)) if line else None
+        out.append({
+            "id": rv["id"], "account": _login(rv.get("user")),
+            "state": rv.get("state") or "", "commit_id": rv.get("commit_id") or "",
+            "submitted_at": rv.get("submitted_at") or "",
+            "dismissed": bool(rv.get("dismissed")), "stale": bool(rv.get("stale")),
+            "model": m.group(1) if m else None,
+            "session_uuid": ms.group(1) if ms else None,
+        })
+    return out
+
+
+def status_section(forge, repo, sha):
+    status, body = forge.get_commit_status(repo, sha)
+    if status != 200 or not isinstance(body, dict):
+        raise ReadError(f"{repo} status {sha[:8]} -> {status}")
+    latest = {}
+    for s in body.get("statuses") or []:
+        ctx = s.get("context") or ""
+        if ctx not in latest or (s.get("created_at") or "") >= (latest[ctx].get("created_at") or ""):
+            latest[ctx] = s
+    return [{"context": c, "state": s.get("status") or s.get("state") or "",
+             "creator": _login(s.get("creator")), "created_at": s.get("created_at") or ""}
+            for c, s in sorted(latest.items())]
+
+
+def required_contexts(forge, repo):
+    default = default_branch(forge, repo)
+    status, body = forge.get_branch(repo, default)
+    if status != 200 or not isinstance(body, dict):
+        raise ReadError(f"{repo} branch {default} -> {status}")
+    if not body.get("enable_status_check"):
+        return []
+    return list(body.get("status_check_contexts") or [])
+
+
+def autonomy(repo):
+    cmd = _env("FLEET_RECORD_CONFIG_CMD", str(BIN / "fleet-config")).split()
+    r = subprocess.run(cmd + ["get", "autonomy", "--repo", repo, "--json"],
+                       capture_output=True, text=True)
+    try:
+        val = json.loads(r.stdout).get("value")
+    except (ValueError, AttributeError):
+        val = None
+    if r.returncode != 0 or not isinstance(val, str) or not val:
+        raise ReadError(f"fleet-config get autonomy --repo {repo} failed")
+    return val
+
+
+def build_record(forge, repo, pr, source_for, rev):
+    n = pr["number"]
+    recorded = _now()
+    files = [f.get("filename") or f.get("name") or "" for f in _all(
+        lambda page, limit: forge._request(
+            "GET", f"/repos/{repo}/pulls/{n}/files", query={"page": page, "limit": limit}))]
+    return {
+        "schema": 1, "repo": repo, "pr": n, "title": pr.get("title") or "",
+        "base_ref": pr["base"]["ref"], "head_sha": pr["head"]["sha"],
+        "merge_sha": pr["merge_commit_sha"], "merged_at": pr["merged_at"],
+        "merged_by": _login(pr.get("merged_by")), "author": _login(pr.get("user")),
+        "files": files, "plan": plan_section(forge, repo, pr),
+        "reviews": review_section(forge, repo, n),
+        "statuses": status_section(forge, repo, pr["head"]["sha"]),
+        "required_contexts": required_contexts(forge, repo),
+        "autonomy": autonomy(repo),
+        "recorded_at": _iso(recorded), "recorder_rev": rev,
+        "source": source_for(recorded, _parse_ts(pr["merged_at"])),
+        "supersedes": None,
+    }
+
+
+# -------------------------------------------------------------------- storage
+def git(*args, check=False):
+    env = dict(os.environ)
+    name = recorder_account()
+    env.update({"GIT_AUTHOR_NAME": name, "GIT_COMMITTER_NAME": name,
+                "GIT_AUTHOR_EMAIL": f"{name}@example.org",
+                "GIT_COMMITTER_EMAIL": f"{name}@example.org"})
+    r = subprocess.run(["git", "-C", str(clone_dir()), "-c", "commit.gpgsign=false", *args],
+                       capture_output=True, text=True, env=env)
+    if check and r.returncode != 0:
+        raise ReadError(f"git {args[0]} failed: {r.stderr.strip()[:200]}")
+    return r
+
+
+def sync_clone():
+    d = clone_dir()
+    if not (d / ".git").exists():
+        d.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["git", "clone", "-q", remote_url(), str(d)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise ReadError(f"clone failed: {r.stderr.strip()[:200]}")
+    git("fetch", "-q", "origin", "main", check=True)
+    git("checkout", "-q", "-B", "main", "origin/main", check=True)
+    git("clean", "-fdq", check=True)
+
+
+def upstream_has(path):
+    return git("cat-file", "-e", f"origin/main:{path}").returncode == 0
+
+
+def upstream_text(path):
+    r = git("show", f"origin/main:{path}")
+    return r.stdout if r.returncode == 0 else None
+
+
+def commit_and_push(files, message):
+    """Write `files` ({path: text}) not already on origin/main, commit once as
+    the recorder and push over ssh. A rejected push is fetched, loses any file
+    now upstream, and is retried once. Returns the paths pushed, or None when
+    the push was still rejected (and paged)."""
+    pending = dict(files)
+    for attempt in (1, 2):
+        pending = {p: t for p, t in pending.items() if not upstream_has(p)}
+        if not pending:
+            return set()
+        for p, t in pending.items():
+            dest = clone_dir() / p
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(t)
+        git("add", "--", *pending, check=True)
+        git("commit", "-q", "-m", message, check=True)
+        if git("push", "-q", "origin", "HEAD:main").returncode == 0:
+            return set(pending)
+        if attempt == 2:
+            break
+        git("fetch", "-q", "origin", "main", check=True)
+        git("reset", "-q", "--hard", "origin/main", check=True)
+        git("clean", "-fdq", check=True)
+    page("fleet-record: push rejected",
+         f"{len(pending)} file(s) not pushed after a retry; the next pass retries them")
+    return None
+
+
+# ------------------------------------------------------------------ passes
+def dump(rec):
+    return json.dumps(rec, indent=2, sort_keys=True) + "\n"
+
+
+def collect(forge, repo, cutoff, source_for, schema, rev, out):
+    """Add this repo's missing records to `out` ({path: text}). True when every
+    merge was read; False when any was not."""
+    ok = True
+    try:
+        prs = merged_prs(forge, repo, cutoff)
+    except ReadError as e:
+        page("fleet-record: cannot read repository", f"{repo}: {e}")
+        return False
+    for pr in prs:
+        path = record_path(repo, pr)
+        if path in out or upstream_has(path):
+            continue
+        try:
+            rec = build_record(forge, repo, pr, source_for, rev)
+        except ReadError as e:
+            page("fleet-record: cannot read repository", f"{repo}#{pr['number']}: {e}")
+            ok = False
+            continue
+        problems = validate(rec, schema)
+        if problems:
+            page("fleet-record: record failed validation",
+                 f"{repo}#{pr['number']}: {'; '.join(problems[:3])}")
+            ok = False
+            continue
+        out[path] = dump(rec)
+    return ok
+
+
+def _observed_or_late(recorded, merged):
+    return "observed" if recorded - merged <= window() else "late"
+
+
+def _backfill_source(recorded, merged):
+    return "backfill"
+
+
+def _announce(pushed):
+    for p in sorted(pushed):
+        if p.startswith("records/"):
+            log(f"recorded {p}")
+
+
+def cmd_once(forge):
+    schema, rev = load_schema(), recorder_rev()
+    sync_clone()
+    out = {}
+    for repo in repos():
+        marker = upstream_text(f"backfill/{repo}.json")
+        if marker is None:
+            log(f"skipping {repo}: no backfill file (run `fleet-record backfill`)")
+            continue
+        collect(forge, repo, _parse_ts(json.loads(marker)["ran_at"]),
+                _observed_or_late, schema, rev, out)
+    failed = False
+    if out:
+        pushed = commit_and_push(out, f"records: {len(out)} merge(s)")
+        if pushed is None:
+            failed = True
+        else:
+            _announce(pushed)
+    return 1 if (failed or cmd_publish(forge) != 0) else 0
+
+
+def cmd_backfill(forge, since):
+    cutoff = dt.datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+    schema, rev = load_schema(), recorder_rev()
+    sync_clone()
+    out, done = {}, {}
+    for repo in repos():
+        started = _now()
+        before = len(out)
+        if collect(forge, repo, cutoff, _backfill_source, schema, rev, out):
+            log(f"{repo}: {len(out) - before} merge(s) to record since {since}")
+            done[f"backfill/{repo}.json"] = json.dumps(
+                {"since": since, "ran_at": _iso(started)}, indent=2) + "\n"
+    pushed = commit_and_push({**out, **done}, f"backfill: {len(out)} merge(s) since {since}") \
+        if (out or done) else set()
+    if pushed is None:
+        return 1
+    _announce(pushed)
+    return 0
+
+
+def _reject(base, f, rel):
+    """Move a refused spool file under rejected/, keeping its path, so the next
+    pass neither re-reads it nor pages for it again."""
+    dest = base / REJECTED / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(f, dest)
+
+
+def cmd_publish(forge=None):
+    spool = _env("FLEET_ATTEST_SPOOL")
+    if not spool or not Path(spool).is_dir():
+        return 0
+    base = Path(spool)
+    sync_clone()
+    files, local, bad = {}, {}, False
+    for f in sorted(p for p in base.rglob("*") if p.is_file() or p.is_symlink()):
+        rel = f.relative_to(base).as_posix()
+        if rel.startswith(REJECTED + "/"):
+            continue
+        if (f.is_symlink() or ".." in rel.split("/")
+                or not rel.startswith(PUBLISH_PREFIXES)):
+            page("fleet-record: spool path refused",
+                 f"{rel}: only reports/** and protection/** may be published; "
+                 f"moved to {REJECTED}/")
+            _reject(base, f, rel)
+            bad = True
+        elif upstream_has(rel):
+            page("fleet-record: spool path refused",
+                 f"{rel}: already in recordstore, never overwritten; "
+                 f"moved to {REJECTED}/")
+            _reject(base, f, rel)
+            bad = True
+        else:
+            files[rel] = f.read_text()
+            local[rel] = f
+    if files:
+        pushed = commit_and_push(files, f"publish: {len(files)} attestation file(s)")
+        if pushed is None:
+            return 1
+        for rel in pushed:
+            local[rel].unlink()
+            log(f"published {rel}")
+    return 1 if bad else 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-record", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("once")
+    b = sub.add_parser("backfill")
+    b.add_argument("--since", required=True, help="YYYY-MM-DD (UTC)")
+    sub.add_parser("publish")
+    args = ap.parse_args(argv)
+    if args.cmd in ("once", "backfill"):
+        conf = pinned_conf()
+        log(f"repository list read from {conf}")
+        if _watch_reading_pin("fleet_watch_for_record_check").conf_repos() is None:
+            print(f"fleet-record: {conf} is missing, unreadable or lists no "
+                  "repositories; refusing to run (it does not fall back to "
+                  "this checkout's config/repos.conf)", file=sys.stderr)
+            return 1
+    try:
+        forge = make_forge()
+    except Identity as e:
+        page("fleet-record: identity check failed", str(e))
+        print(f"fleet-record: identity check failed: {e}", file=sys.stderr)
+        return 1
+    try:
+        if args.cmd == "once":
+            return cmd_once(forge)
+        if args.cmd == "backfill":
+            return cmd_backfill(forge, args.since)
+        return cmd_publish(forge)
+    except ReadError as e:
+        page("fleet-record: cannot read repository", str(e))
+        print(f"fleet-record: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

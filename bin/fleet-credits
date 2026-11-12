@@ -1,0 +1,993 @@
+#!/usr/bin/env python3
+"""fleet-credits — the owner's credits window and its ledger (plan 0146, ADR-0023).
+
+  fleet-credits on --days N [--note TEXT]   owner only (needs a terminal); N is 1-7
+  fleet-credits off                          close the window now; always succeeds
+  fleet-credits status [--json]
+  fleet-credits decide [--peek] --repo R --pr N --model M --json
+  fleet-credits record [--dry-run] --repo R --pr N --model M --usd X --session S
+  fleet-credits release ID                   owner only: free an expired reservation
+  fleet-credits refused --repo R --pr N --reason dispatcher   (mopsus: once per window)
+  fleet-credits grant PRINCIPAL --monthly-usd N [--note TEXT]   owner only (plan 0166)
+  fleet-credits revoke PRINCIPAL             owner only; stops new spend for one principal
+  fleet-credits decide-job [--peek] --job J --principal P --meter credits|subscription
+                           --model M --json
+  fleet-credits record-job [--dry-run] --job J --principal P --model M --usd X --session S
+
+A Fable review may bill API credits only while the `model:fable` gate is closed AND
+the owner has opened a window AND the per-PR and monthly caps (fleet-config
+`credits_per_pr_usd`, `credits_monthly_usd`) leave at least $1.00. This file is the
+ONLY writer of `credit_window`, `credit_reservation`, `credit_spend`, `credit_notice`,
+`credit_release`, `credit_grant`, `credit_job_reservation` and `credit_job_spend` (fleet.db, `$FLEET_DB` else `<fleet dir>/fleet.db`).
+
+`decide` hands out a budget and RESERVES it in the transaction that read the
+remainders, so concurrent callers can never be granted the same money. Only the
+dispatcher's own `decide` reserves; `decide --peek` (mopsus) reserves and emits
+nothing. `record` stores what the reviewer reported and settles the newest open
+reservation. A reservation nothing settled within 4 hours is booked at its full
+amount, not freed: nothing automatic gives the money back (`release` does, by hand).
+
+A intakebot job (plan 0166, ADR-0023 §6) has its own subject, tables and commands: a principal
+holding a grant bills credits with no window and no gate (`--meter credits`, never
+`subscription`); the owner's own jobs (`--meter subscription`) follow `decide`'s gate and
+window rule. Both draw on the one `credits_monthly_usd` month the reviews use.
+
+Nothing here reads or holds the API key. The dispatcher in operator/talos fetches it.
+Exit codes: 0 for any answer made; `decide` exits 1 when it cannot read the database
+or the gate (callers treat that as `hold`).
+"""
+import argparse
+import calendar
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+fquota = _load("fleet_quota", BIN / "fleet-quota")
+fconfig = _load("fleet_config", BIN / "fleet-config")
+
+MAX_DAYS = 7
+MIN_GRANT_USD = 1.0
+RESERVATION_TTL = 4 * 3600          # longer than the reviewer's own timeout
+DAY = 86400
+
+# Overridable page sender, like fleet-quota's: otherwise orchestrator's notify().
+NOTIFY = None
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS credit_window (
+  id INTEGER PRIMARY KEY, opened_at REAL NOT NULL, ends_at REAL NOT NULL,
+  closed_at REAL, note TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS credit_reservation (
+  id INTEGER PRIMARY KEY, window_id INTEGER NOT NULL REFERENCES credit_window(id),
+  repo TEXT NOT NULL, pr INTEGER NOT NULL, model TEXT NOT NULL,
+  usd REAL NOT NULL CHECK (usd > 0), settled_at REAL,
+  settled_by TEXT CHECK (settled_by IN ('record','expiry')),
+  created_at REAL NOT NULL, updated_at REAL NOT NULL);
+-- window_id NULL has one meaning: no window was open (or no reservation matched)
+-- when the spend was recorded. Spend that happened is never dropped.
+CREATE TABLE IF NOT EXISTS credit_spend (
+  id INTEGER PRIMARY KEY, window_id INTEGER REFERENCES credit_window(id),
+  repo TEXT NOT NULL, pr INTEGER NOT NULL, model TEXT NOT NULL,
+  usd REAL NOT NULL CHECK (usd >= 0), session_id TEXT NOT NULL,
+  created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS credit_notice (
+  id INTEGER PRIMARY KEY, window_id INTEGER NOT NULL REFERENCES credit_window(id),
+  kind TEXT NOT NULL, key TEXT NOT NULL,
+  created_at REAL NOT NULL, updated_at REAL NOT NULL,
+  UNIQUE (window_id, kind, key));
+CREATE TABLE IF NOT EXISTS credit_release (
+  id INTEGER PRIMARY KEY, spend_id INTEGER NOT NULL REFERENCES credit_spend(id),
+  old_usd REAL NOT NULL, note TEXT,
+  created_at REAL NOT NULL, updated_at REAL NOT NULL);
+-- plan 0166: intakebot jobs. Own tables, because SQLite cannot drop NOT NULL from
+-- credit_reservation without rebuilding the live review ledger.
+CREATE TABLE IF NOT EXISTS credit_grant (
+  id INTEGER PRIMARY KEY, principal TEXT NOT NULL UNIQUE,
+  monthly_usd REAL NOT NULL CHECK (monthly_usd >= 0), note TEXT, revoked_at REAL,
+  created_at REAL NOT NULL, updated_at REAL NOT NULL);
+-- a grant-billed row has grant_id, a window-billed (owner) row has window_id
+CREATE TABLE IF NOT EXISTS credit_job_reservation (
+  id INTEGER PRIMARY KEY, grant_id INTEGER REFERENCES credit_grant(id),
+  window_id INTEGER REFERENCES credit_window(id),
+  job TEXT NOT NULL, principal TEXT NOT NULL, model TEXT NOT NULL,
+  usd REAL NOT NULL CHECK (usd > 0), settled_at REAL,
+  settled_by TEXT CHECK (settled_by IN ('record','expiry')),
+  created_at REAL NOT NULL, updated_at REAL NOT NULL,
+  CHECK ((grant_id IS NULL) <> (window_id IS NULL)));
+CREATE TABLE IF NOT EXISTS credit_job_spend (
+  id INTEGER PRIMARY KEY, grant_id INTEGER REFERENCES credit_grant(id),
+  window_id INTEGER REFERENCES credit_window(id),
+  job TEXT NOT NULL, principal TEXT NOT NULL, model TEXT NOT NULL,
+  usd REAL NOT NULL CHECK (usd >= 0), session_id TEXT NOT NULL,
+  created_at REAL NOT NULL, updated_at REAL NOT NULL);
+"""
+
+PRINCIPAL_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+# --- plumbing ------------------------------------------------------------------
+
+
+def now():
+    return time.time()
+
+
+def db_path():
+    """`$FLEET_DB`, else `<fleet dir>/fleet.db`. talos's contract runs the
+    production argv in eunomia's CI against a temporary `FLEET_DB`."""
+    env = os.environ.get("FLEET_DB")
+    return Path(env).expanduser() if env else lib.fleet_dir() / "fleet.db"
+
+
+def _connect():
+    path = db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(path), timeout=30, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    con.executescript(SCHEMA)
+    con.executescript(fquota.SCHEMA)      # the gate is read here, written only by fleet-quota
+    return con
+
+
+def _insert(con, table, **cols):
+    """Every insert goes through here, so every row is stamped."""
+    t = now()
+    cols = dict(cols, created_at=t, updated_at=t)
+    names = ",".join(cols)
+    cur = con.execute(f"INSERT INTO {table} ({names}) VALUES ({','.join('?' * len(cols))})",
+                      tuple(cols.values()))
+    return cur.lastrowid
+
+
+def _update(con, table, row_id, **cols):
+    """Every update goes through here, so `updated_at` always moves."""
+    cols = dict(cols, updated_at=now())
+    sets = ",".join(f"{k}=?" for k in cols)
+    return con.execute(f"UPDATE {table} SET {sets} WHERE id=?",
+                       (*cols.values(), row_id)).rowcount
+
+
+def _iso(t):
+    return None if t is None else datetime.datetime.fromtimestamp(
+        t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _month_bounds(t):
+    """[start, end) of the UTC calendar month holding `t` — the Console's period."""
+    d = datetime.datetime.fromtimestamp(t, datetime.timezone.utc)
+    start = datetime.datetime(d.year, d.month, 1, tzinfo=datetime.timezone.utc)
+    last = calendar.monthrange(d.year, d.month)[1]
+    end = start + datetime.timedelta(days=last)
+    return start.timestamp(), end.timestamp(), start.strftime("%Y-%m")
+
+
+def _floor_cents(x):
+    return math.floor(x * 100 + 1e-9) / 100
+
+
+def caps():
+    """(per_pr, monthly), as fleet-config resolves them."""
+    out = []
+    for key in ("credits_per_pr_usd", "credits_monthly_usd"):
+        fallback, source = fconfig._env_fallback(key)
+        value, _, _ = fconfig.resolve_setting(key, fallback, source, db_path=str(db_path()))
+        out.append(float(value))
+    return out[0], out[1]
+
+
+def intakebot_caps():
+    """(per_job, monthly), as fleet-config resolves them."""
+    out = []
+    for key in ("credits_intakebot_job_usd", "credits_intakebot_monthly_usd"):
+        fallback, source = fconfig._env_fallback(key)
+        value, _, _ = fconfig.resolve_setting(key, fallback, source, db_path=str(db_path()))
+        out.append(float(value))
+    return out[0], out[1]
+
+
+# --- events and pages ----------------------------------------------------------
+
+
+def _notify(title, body):
+    global NOTIFY
+    if NOTIFY is None:
+        NOTIFY = _load("orchestrator", BIN / "orchestrator").notify
+    try:
+        NOTIFY(title, body)
+    except Exception as e:                       # a page must never undo a ledger write
+        sys.stderr.write(f"fleet-credits: page failed ({e.__class__.__name__})\n")
+
+
+def _emit(kind, detail, repo=None, pr=None):
+    env = dict(os.environ)
+    env.setdefault("EUNOMIA_SESSION", "fleet-credits")
+    # the event lands beside the database it describes, as fleet-config does
+    env["EUNOMIA_FLEET_DIR"] = str(db_path().parent if os.environ.get("FLEET_DB")
+                                   else lib.fleet_dir())
+    argv = [sys.executable, str(BIN / "fleet-emit"), kind, "--detail-json", json.dumps(detail)]
+    if repo:
+        argv += ["--repo", repo]
+    if pr is not None:
+        argv += ["--pr", str(pr)]
+    r = subprocess.run(argv, capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        sys.stderr.write(f"fleet-credits: {kind} not recorded: {(r.stderr or '').strip()}\n")
+
+
+class Effects:
+    """Events and pages gathered inside a transaction and fired after COMMIT, so
+    a rolled-back write announces nothing."""
+
+    def __init__(self):
+        self.items = []
+
+    def event(self, kind, detail, repo=None, pr=None):
+        self.items.append(("event", kind, detail, repo, pr))
+
+    def page(self, title, body):
+        self.items.append(("page", title, body))
+
+    def fire(self):
+        for it in self.items:
+            if it[0] == "event":
+                _emit(it[1], it[2], it[3], it[4])
+            else:
+                _notify(it[1], it[2])
+        self.items = []
+
+
+def _notice(con, window_id, kind, key):
+    """True the first time (window, kind, key) is seen — the once-per-window gate."""
+    if window_id is None:
+        return False
+    try:
+        _insert(con, "credit_notice", window_id=window_id, kind=kind, key=key)
+    except sqlite3.IntegrityError:
+        return False
+    return True
+
+
+def _notice_month(con, kind, key, label):
+    """Like `_notice` for a subject with no window (a grant): the cap's UTC month is the
+    period. window_id 0 means "no window"; foreign keys are not enforced here."""
+    try:
+        _insert(con, "credit_notice", window_id=0, kind=kind, key=f"{key}@{label}")
+    except sqlite3.IntegrityError:
+        return False
+    return True
+
+
+# --- reads ---------------------------------------------------------------------
+
+
+def open_window(con):
+    return con.execute("SELECT * FROM credit_window WHERE closed_at IS NULL "
+                       "ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def _sum(con, sql, args):
+    return float(con.execute(sql, args).fetchone()[0] or 0)
+
+
+def totals(con, t, repo=None, pr=None):
+    """(spent, reserved) in the UTC month of `t`: for the repo#pr when given, else
+    for the whole fleet. Reserved counts every reservation `record` has not settled;
+    an expired one is already a spend row."""
+    lo, hi, _ = _month_bounds(t)
+    where, args = "created_at >= ? AND created_at < ?", [lo, hi]
+    if repo is not None:
+        where += " AND repo=? AND pr=?"
+        args += [repo, pr]
+    spent = _sum(con, f"SELECT SUM(usd) FROM credit_spend WHERE {where}", args)
+    reserved = _sum(con, f"SELECT SUM(usd) FROM credit_reservation "
+                         f"WHERE settled_at IS NULL AND {where}", args)
+    if repo is None:
+        # one month, one total: a intakebot job and a review never get the same money
+        j_spent, j_res = job_totals(con, t)
+        spent, reserved = spent + j_spent, reserved + j_res
+    return spent, reserved
+
+
+def job_totals(con, t, grant_id=None):
+    """(spent, reserved) of intakebot jobs in the UTC month of `t`, for one grant or all."""
+    lo, hi, _ = _month_bounds(t)
+    where, args = "created_at >= ? AND created_at < ?", [lo, hi]
+    if grant_id is not None:
+        where += " AND grant_id=?"
+        args.append(grant_id)
+    spent = _sum(con, f"SELECT SUM(usd) FROM credit_job_spend WHERE {where}", args)
+    reserved = _sum(con, f"SELECT SUM(usd) FROM credit_job_reservation "
+                         f"WHERE settled_at IS NULL AND {where}", args)
+    return spent, reserved
+
+
+def live_grant(con, principal):
+    return con.execute("SELECT * FROM credit_grant WHERE principal=? AND revoked_at IS NULL",
+                       (principal,)).fetchone()
+
+
+# --- expiry (inside a BEGIN IMMEDIATE) ----------------------------------------
+
+
+def expire_reservations(con, t, fx):
+    """Book every reservation older than the TTL at its full amount."""
+    rows = con.execute("SELECT * FROM credit_reservation WHERE settled_at IS NULL "
+                       "AND created_at <= ? ORDER BY id", (t - RESERVATION_TTL,)).fetchall()
+    for r in rows:
+        _update(con, "credit_reservation", r["id"], settled_at=t, settled_by="expiry")
+        _insert(con, "credit_spend", window_id=r["window_id"], repo=r["repo"], pr=r["pr"],
+                model=r["model"], usd=r["usd"], session_id=f"expired:{r['id']}")
+        detail = {"window_id": r["window_id"], "reservation_id": r["id"], "repo": r["repo"],
+                  "pr": r["pr"], "model": r["model"], "usd": r["usd"]}
+        fx.event("credits-reservation-expired", detail, r["repo"], r["pr"])
+        fx.page("fleet credits",
+                f"reservation {r['id']} ({r['repo']}#{r['pr']}, ${r['usd']:.2f}) was never "
+                f"settled: booked at its full amount. Check the Console, then "
+                f"`fleet-credits release {r['id']}` if nothing was spent")
+
+
+def expire_job_reservations(con, t, fx):
+    """Book every job reservation older than the TTL at its full amount. No event: the
+    pinned `credits-job-spent` is what a run reported."""
+    rows = con.execute("SELECT * FROM credit_job_reservation WHERE settled_at IS NULL "
+                       "AND created_at <= ? ORDER BY id", (t - RESERVATION_TTL,)).fetchall()
+    for r in rows:
+        _update(con, "credit_job_reservation", r["id"], settled_at=t, settled_by="expiry")
+        sid = _insert(con, "credit_job_spend", grant_id=r["grant_id"], window_id=r["window_id"],
+                      job=r["job"], principal=r["principal"], model=r["model"], usd=r["usd"],
+                      session_id=f"expired:{r['id']}")
+        fx.page("fleet credits",
+                f"job reservation {r['id']} ({r['principal']}, job {r['job']}, "
+                f"${r['usd']:.2f}) was never settled: booked at its full amount. Check the "
+                f"Console, then `fleet-credits release --job {sid}` if nothing was spent")
+
+
+def expire_window(con, t, fx):
+    w = open_window(con)
+    if w is not None and w["ends_at"] <= t:
+        _update(con, "credit_window", w["id"], closed_at=w["ends_at"])
+        fx.event("credits-window-closed", {"window_id": w["id"], "by": "expiry"})
+        fx.page("fleet credits", f"credits window {w['id']} ended ({_iso(w['ends_at'])})")
+
+
+def _txn(con, fx, t, expire=True):
+    con.execute("BEGIN IMMEDIATE")
+    if expire:
+        expire_reservations(con, t, fx)
+        expire_job_reservations(con, t, fx)
+        expire_window(con, t, fx)
+
+
+def _tx(fn):
+    """Run fn(con, fx, t) inside one write transaction, then fire its effects."""
+    con = _connect()
+    fx = Effects()
+    t = now()
+    try:
+        _txn(con, fx, t)
+        try:
+            out = fn(con, fx, t)
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+        con.execute("COMMIT")
+    finally:
+        con.close()
+    fx.fire()
+    return out
+
+
+# --- decide --------------------------------------------------------------------
+
+
+def _answer(con, t, repo, pr, model):
+    """(answer dict, window row|None, grant) from what the database says now. Reads
+    only; the caller decides whether to reserve."""
+    scope = fquota.model_scope(model)
+    if scope is None:
+        return {"bill": "subscription", "budget_usd": None, "window_ends": None,
+                "reason": "model has no usage bucket"}, None, None
+    gate = con.execute("SELECT state FROM quota_gate WHERE scope=?", (scope,)).fetchone()
+    if gate is None or gate["state"] != "closed":
+        return {"bill": "subscription", "budget_usd": None, "window_ends": None,
+                "reason": f"{scope} gate is not closed"}, None, None
+
+    def hold(reason, w=None):
+        return {"bill": "hold", "budget_usd": None, "reason": reason,
+                "window_ends": _iso(w["ends_at"]) if w is not None else None}
+
+    w = open_window(con)
+    if w is None or w["ends_at"] <= t:
+        last = con.execute("SELECT ends_at FROM credit_window ORDER BY id DESC LIMIT 1").fetchone()
+        ended = (w is not None) or (last is not None and last["ends_at"] <= t)
+        return hold("window ended" if ended else "no window"), None, None
+    per_pr, monthly = caps()
+    pr_spent, pr_res = totals(con, t, repo, pr)
+    m_spent, m_res = totals(con, t)
+    pr_left = per_pr - pr_spent - pr_res
+    m_left = monthly - m_spent - m_res
+    grant = _floor_cents(min(pr_left, m_left))
+    if grant < MIN_GRANT_USD:
+        return hold("per-PR cap" if pr_left <= m_left else "monthly cap", w), w, None
+    return {"bill": "credits", "budget_usd": grant, "window_ends": _iso(w["ends_at"]),
+            "reason": "gate closed, window open, caps allow"}, w, grant
+
+
+def decide(repo, pr, model, peek=False):
+    if peek:
+        con = _connect()
+        try:
+            con.execute("BEGIN")
+            return _answer(con, now(), repo, pr, model)[0]
+        finally:
+            con.close()
+
+    def work(con, fx, t):
+        ans, w, grant = _answer(con, t, repo, pr, model)
+        if ans["bill"] == "credits":
+            _insert(con, "credit_reservation", window_id=w["id"], repo=repo, pr=pr,
+                    model=model, usd=grant)
+        elif ans["bill"] == "hold" and w is not None:
+            # a gate-closed review refused while a window is open; once per window
+            if _notice(con, w["id"], "refused", f"{repo}#{pr}:{ans['reason']}"):
+                fx.event("credits-refused", {"repo": repo, "pr": pr, "reason": ans["reason"]},
+                         repo, pr)
+        return ans
+    return _tx(work)
+
+
+# --- record --------------------------------------------------------------------
+
+
+def _valid_usd(raw):
+    try:
+        usd = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"--usd {raw!r} is not a number")
+    if not math.isfinite(usd) or usd < 0:
+        raise ValueError("--usd must be a finite number >= 0")
+    return usd
+
+
+def record(repo, pr, model, usd, session):
+    def work(con, fx, t):
+        res = con.execute(
+            "SELECT * FROM credit_reservation WHERE settled_at IS NULL AND repo=? AND pr=? "
+            "AND model=? ORDER BY id DESC LIMIT 1", (repo, pr, model)).fetchone()
+        window_id = None
+        if res is not None:
+            window_id = res["window_id"]
+            _update(con, "credit_reservation", res["id"], settled_at=t, settled_by="record")
+        _insert(con, "credit_spend", window_id=window_id, repo=repo, pr=pr, model=model,
+                usd=usd, session_id=session)
+        lo, hi, _ = _month_bounds(t)
+        pr_total = _sum(con, "SELECT SUM(usd) FROM credit_spend WHERE repo=? AND pr=? "
+                             "AND created_at >= ? AND created_at < ?", (repo, pr, lo, hi))
+        month_total = _sum(con, "SELECT SUM(usd) FROM credit_spend WHERE created_at >= ? "
+                                "AND created_at < ?", (lo, hi)) + job_totals(con, t)[0]
+        fx.event("credits-spent", {"window_id": window_id, "repo": repo, "pr": pr,
+                                   "model": model, "usd": usd, "pr_total": pr_total,
+                                   "month_total": month_total}, repo, pr)
+        if window_id is not None and usd > 0:
+            per_pr, monthly = caps()
+            for cap, total, limit, key in (("pr", pr_total, per_pr, f"pr:{repo}#{pr}"),
+                                           ("month", month_total, monthly, "month")):
+                if total >= limit and _notice(con, window_id, "cap-reached", key):
+                    fx.event("credits-cap-reached",
+                             {"window_id": window_id, "cap": cap, "repo": repo, "pr": pr,
+                              "total": total, "limit": limit}, repo, pr)
+                    what = f"{repo}#{pr}" if cap == "pr" else "the month"
+                    fx.page("fleet credits", f"credits cap reached for {what}: "
+                            f"${total:.2f} of ${limit:.2f}")
+    _tx(work)
+
+
+# --- intakebot jobs (plan 0166) ------------------------------------------------------
+
+
+def _hold_job(reason, w=None):
+    return {"bill": "hold", "budget_usd": None, "reason": reason, "grant": False,
+            "window_ends": _iso(w["ends_at"]) if w is not None else None}
+
+
+def _smallest(options):
+    """(left, name) of the tightest cap; the first listed wins a tie."""
+    return min(options, key=lambda o: o[0])
+
+
+def _answer_job(con, t, principal, meter, model):
+    """(answer dict, grant row|None, window row|None, budget). Reads only."""
+    per_job, intakebot_monthly = intakebot_caps()
+    _, monthly = caps()
+    j_spent, j_res = job_totals(con, t)
+    m_spent, m_res = totals(con, t)
+    intakebot_left = intakebot_monthly - j_spent - j_res
+    month_left = monthly - m_spent - m_res
+    if meter == "credits":
+        g = live_grant(con, principal)
+        if g is None:
+            return _hold_job("no grant"), None, None, None
+        g_spent, g_res = job_totals(con, t, g["id"])
+        left, name = _smallest([(per_job, "per-job cap"),
+                                (g["monthly_usd"] - g_spent - g_res, "grant cap"),
+                                (intakebot_left, "intakebot monthly cap"),
+                                (month_left, "monthly cap")])
+        budget = _floor_cents(left)
+        if budget < MIN_GRANT_USD:
+            return _hold_job(name), g, None, None
+        return {"bill": "credits", "budget_usd": budget, "window_ends": None, "grant": True,
+                "reason": "grant held, caps allow"}, g, None, budget
+    # the owner's own job: the same gate and window rule as a review
+    scope = fquota.model_scope(model)
+    if scope is None:
+        return {"bill": "subscription", "budget_usd": None, "window_ends": None,
+                "grant": False, "reason": "model has no usage bucket"}, None, None, None
+    gate = con.execute("SELECT state FROM quota_gate WHERE scope=?", (scope,)).fetchone()
+    if gate is None or gate["state"] != "closed":
+        return {"bill": "subscription", "budget_usd": None, "window_ends": None,
+                "grant": False, "reason": f"{scope} gate is not closed"}, None, None, None
+    w = open_window(con)
+    if w is None or w["ends_at"] <= t:
+        last = con.execute("SELECT ends_at FROM credit_window ORDER BY id DESC LIMIT 1").fetchone()
+        ended = (w is not None) or (last is not None and last["ends_at"] <= t)
+        return _hold_job("window ended" if ended else "no window"), None, None, None
+    left, name = _smallest([(per_job, "per-job cap"), (intakebot_left, "intakebot monthly cap"),
+                            (month_left, "monthly cap")])
+    budget = _floor_cents(left)
+    if budget < MIN_GRANT_USD:
+        return _hold_job(name, w), None, w, None
+    return {"bill": "credits", "budget_usd": budget, "window_ends": _iso(w["ends_at"]),
+            "grant": False, "reason": "gate closed, window open, caps allow"}, None, w, budget
+
+
+def decide_job(job, principal, meter, model, peek=False):
+    if peek:
+        con = _connect()
+        try:
+            con.execute("BEGIN")
+            return _answer_job(con, now(), principal, meter, model)[0]
+        finally:
+            con.close()
+
+    def work(con, fx, t):
+        ans, g, w, budget = _answer_job(con, t, principal, meter, model)
+        if ans["bill"] == "credits":
+            _insert(con, "credit_job_reservation",
+                    grant_id=g["id"] if g is not None else None,
+                    window_id=w["id"] if w is not None else None,
+                    job=job, principal=principal, model=model, usd=budget)
+        return ans
+    return _tx(work)
+
+
+def _job_cap_notices(con, fx, t, g, window_id, principal, job):
+    """The cap-reached notice for the grant, the intakebot month and the overall month."""
+    lo, hi, label = _month_bounds(t)
+    per_job, intakebot_monthly = intakebot_caps()
+    _, monthly = caps()
+    checks = []
+    if g is not None:
+        checks.append(("grant", job_totals(con, t, g["id"])[0], g["monthly_usd"],
+                       f"grant:{principal}"))
+    checks.append(("intakebot-month", job_totals(con, t)[0], intakebot_monthly, "intakebot-month"))
+    checks.append(("month", _sum(con, "SELECT SUM(usd) FROM credit_spend WHERE created_at >= ? "
+                                      "AND created_at < ?", (lo, hi)) + job_totals(con, t)[0],
+                   monthly, "month"))
+    for cap, total, limit, key in checks:
+        if total < limit:
+            continue
+        if cap == "month" and window_id is not None:
+            first = _notice(con, window_id, "cap-reached", key)
+        else:
+            first = _notice_month(con, "cap-reached", key, label)
+        if first:
+            fx.event("credits-cap-reached",
+                     {"window_id": window_id, "cap": cap, "principal": principal,
+                      "job": job, "total": total, "limit": limit})
+            what = {"grant": f"the grant for {principal}", "intakebot-month": "intakebot jobs this month",
+                    "month": "the month"}[cap]
+            fx.page("fleet credits", f"credits cap reached for {what}: "
+                    f"${total:.2f} of ${limit:.2f}")
+
+
+def record_job(job, principal, model, usd, session):
+    def work(con, fx, t):
+        res = con.execute(
+            "SELECT * FROM credit_job_reservation WHERE settled_at IS NULL AND job=? "
+            "AND principal=? AND model=? ORDER BY id DESC LIMIT 1",
+            (job, principal, model)).fetchone()
+        if res is not None:
+            grant_id, window_id = res["grant_id"], res["window_id"]
+            _update(con, "credit_job_reservation", res["id"], settled_at=t, settled_by="record")
+        else:
+            # spend that happened is never dropped: it lands under the principal's grant
+            g = con.execute("SELECT id FROM credit_grant WHERE principal=?",
+                            (principal,)).fetchone()
+            grant_id, window_id = (g["id"] if g is not None else None), None
+        _insert(con, "credit_job_spend", grant_id=grant_id, window_id=window_id, job=job,
+                principal=principal, model=model, usd=usd, session_id=session)
+        fx.event("credits-job-spent", {"job": job, "principal": principal, "model": model,
+                                       "usd": usd,
+                                       "billing": "grant" if grant_id is not None else "window"})
+        if usd > 0:
+            g = (con.execute("SELECT * FROM credit_grant WHERE id=?", (grant_id,)).fetchone()
+                 if grant_id is not None else None)
+            _job_cap_notices(con, fx, t, g, window_id, principal, job)
+    _tx(work)
+
+
+def cmd_grant(principal, monthly_usd, note):
+    def work(con, fx, t):
+        _, intakebot_monthly = intakebot_caps()
+        if monthly_usd > intakebot_monthly:
+            raise ValueError(f"--monthly-usd {monthly_usd:g} is above credits_intakebot_monthly_usd "
+                             f"({intakebot_monthly:g})")
+        g = con.execute("SELECT * FROM credit_grant WHERE principal=?", (principal,)).fetchone()
+        if g is None:
+            _insert(con, "credit_grant", principal=principal, monthly_usd=monthly_usd, note=note)
+        else:
+            _update(con, "credit_grant", g["id"], monthly_usd=monthly_usd, revoked_at=None,
+                    note=note if note is not None else g["note"])
+        fx.event("credits-grant-given", {"principal": principal, "monthly_usd": monthly_usd})
+        fx.page("fleet credits", f"credits grant for {principal}: ${monthly_usd:.2f} a month")
+    try:
+        _tx(work)
+    except ValueError as e:
+        sys.stderr.write(f"fleet-credits: {e}\n")
+        return 1
+    print(f"grant for {principal}: ${monthly_usd:.2f} a month")
+    return 0
+
+
+def cmd_revoke(principal):
+    def work(con, fx, t):
+        g = live_grant(con, principal)
+        if g is not None:
+            _update(con, "credit_grant", g["id"], revoked_at=t)
+            fx.event("credits-grant-revoked", {"principal": principal})
+            fx.page("fleet credits", f"credits grant for {principal} revoked")
+        n = con.execute("SELECT COUNT(*) FROM credit_job_reservation WHERE settled_at IS NULL "
+                        "AND principal=?", (principal,)).fetchone()[0]
+        return g, n
+    g, n = _tx(work)
+    print("grant revoked" if g is not None else "no live grant")
+    print(f"{n} reservation(s) of {principal} still open; a job already running finishes "
+          f"within its own budget")
+    return 0
+
+
+def cmd_release_job(sid):
+    who = os.environ.get("USER") or "owner"
+
+    def work(con, fx, t):
+        sp = con.execute("SELECT * FROM credit_job_spend WHERE id=?", (sid,)).fetchone()
+        if sp is None or not sp["session_id"].startswith("expired:"):
+            raise ValueError(f"job spend {sid} is not an expired reservation")
+        if sp["usd"] == 0:
+            raise ValueError(f"job spend {sid} has nothing booked to release")
+        # credit_release has no job column: the note names the job spend row
+        _insert(con, "credit_release", spend_id=sp["id"], old_usd=sp["usd"],
+                note=f"job spend by {who}")
+        _update(con, "credit_job_spend", sp["id"], usd=0)
+        return sp["usd"]
+    try:
+        old = _tx(work)
+    except ValueError as e:
+        sys.stderr.write(f"fleet-credits: {e}\n")
+        return 1
+    print(f"released job spend {sid}: ${old:.2f} freed")
+    return 0
+
+
+# --- the owner's commands --------------------------------------------------------
+
+
+def _require_owner(what):
+    """Cooperative guard, not a security boundary: launchd, mopsus, the watcher,
+    the orchestrator and an agent harness run commands on a pipe, not a terminal.
+    There is no override flag or variable, on purpose."""
+    if not sys.stdin.isatty():
+        sys.stderr.write(f"fleet-credits: {what} is the owner's command and needs a terminal\n")
+        return False
+    return True
+
+
+def dispatcher_accepts_credits():
+    """True when the deployed dispatcher takes `--bill credits`."""
+    orch = _load("orchestrator", BIN / "orchestrator")
+    # A call into operator/talos: ~/agent/dispatch-review.py's `--bill credits` mode,
+    # talos plan 0029, carried by operator/talos#173 (approved). It may land after this
+    # plan. The probe passes a choice no parser accepts, BEFORE `--help`: a parser with
+    # `--bill subscription|credits` exits 2 with "invalid choice", while one without
+    # `--bill` collects it as unrecognised, reaches `--help` and exits 0 (eunomia#968).
+    try:
+        r = subprocess.run(orch.review_command() + ["--bill", "__probe__", "--help"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 2 and "invalid choice" in r.stderr
+
+
+def cmd_on(days, note):
+    def work(con, fx, t):
+        w = open_window(con)
+        ends = t + days * DAY
+        if w is not None:
+            ends = min(ends, w["opened_at"] + MAX_DAYS * DAY)
+            _update(con, "credit_window", w["id"], ends_at=ends,
+                    **({"note": note} if note else {}))
+            wid, verb = w["id"], "extended"
+        else:
+            wid = _insert(con, "credit_window", opened_at=t, ends_at=ends, note=note)
+            verb = "opened"
+        fx.event("credits-window-opened", {"window_id": wid, "ends_at": _iso(ends),
+                                           "days": days})
+        fx.page("fleet credits", f"credits window {wid} {verb}, ends {_iso(ends)}")
+        return wid, ends, verb
+    wid, ends, verb = _tx(work)
+    print(f"window {wid} {verb}: ends {_iso(ends)}")
+    if not dispatcher_accepts_credits():
+        sys.stderr.write("fleet-credits: warning: the deployed dispatch-review.py does not "
+                         "accept `--bill credits` (talos plan 0029); mopsus will hold "
+                         "reviews instead of billing credits until it does\n")
+    return 0
+
+
+def cmd_off():
+    def work(con, fx, t):
+        w = open_window(con)
+        if w is not None:
+            _update(con, "credit_window", w["id"], closed_at=t)
+            fx.event("credits-window-closed", {"window_id": w["id"], "by": "owner"})
+            fx.page("fleet credits", f"credits window {w['id']} closed by the owner")
+        n = con.execute("SELECT COUNT(*) FROM credit_reservation "
+                        "WHERE settled_at IS NULL").fetchone()[0]
+        usd = _sum(con, "SELECT SUM(usd) FROM credit_reservation WHERE settled_at IS NULL", ())
+        return w, n, usd
+    w, n, usd = _tx(work)
+    print("window closed" if w is not None else "no window was open")
+    print(f"{n} reservation(s) still open, ${usd:.2f} that may still be spent; only "
+          f"revoking the key in the Console stops a run already going")
+    return 0
+
+
+def cmd_status(as_json):
+    def work(con, fx, t):
+        w = open_window(con)
+        per_pr, monthly = caps()
+        m_spent, m_res = totals(con, t)
+        lo, hi, label = _month_bounds(t)
+        prs = [dict(r) for r in con.execute(
+            "SELECT repo, pr, SUM(usd) AS spent_usd FROM credit_spend WHERE created_at >= ? "
+            "AND created_at < ? GROUP BY repo, pr ORDER BY repo, pr", (lo, hi))]
+        for p in prs:
+            p["reserved_usd"] = totals(con, t, p["repo"], p["pr"])[1]
+        n = con.execute("SELECT COUNT(*) FROM credit_reservation "
+                        "WHERE settled_at IS NULL").fetchone()[0]
+        per_job, intakebot_monthly = intakebot_caps()
+        grants = []
+        for g in con.execute("SELECT * FROM credit_grant WHERE revoked_at IS NULL "
+                             "ORDER BY principal"):
+            g_spent, g_res = job_totals(con, t, g["id"])
+            grants.append({"principal": g["principal"], "monthly_usd": g["monthly_usd"],
+                           "note": g["note"], "spent_usd": g_spent, "reserved_usd": g_res})
+        j_spent, j_res = job_totals(con, t)
+        intakebot = {"grants": grants, "month_spent_usd": j_spent, "month_reserved_usd": j_res,
+                 "credits_intakebot_monthly_usd": intakebot_monthly, "credits_intakebot_job_usd": per_job,
+                 "open_reservations": con.execute(
+                     "SELECT COUNT(*) FROM credit_job_reservation "
+                     "WHERE settled_at IS NULL").fetchone()[0]}
+        return {
+            "window": None if w is None else {
+                "id": w["id"], "opened_at": _iso(w["opened_at"]), "ends_at": _iso(w["ends_at"]),
+                "note": w["note"]},
+            "month": label, "month_spent_usd": m_spent, "month_reserved_usd": m_res,
+            "credits_monthly_usd": monthly, "credits_per_pr_usd": per_pr,
+            "credits_intakebot_monthly_usd": intakebot_monthly, "credits_intakebot_job_usd": per_job,
+            "prs": prs, "open_reservations": n, "intakebot": intakebot,
+        }
+    out = _tx(work)
+    if as_json:
+        print(json.dumps(out, indent=1, sort_keys=True))
+        return 0
+    w = out["window"]
+    print(f"window: {'none' if w is None else 'open until ' + w['ends_at']}")
+    print(f"{out['month']}: ${out['month_spent_usd']:.2f} spent + "
+          f"${out['month_reserved_usd']:.2f} reserved of ${out['credits_monthly_usd']:.2f}")
+    for p in out["prs"]:
+        print(f"  {p['repo']}#{p['pr']}: ${p['spent_usd']:.2f} spent, "
+              f"${p['reserved_usd']:.2f} reserved (cap ${out['credits_per_pr_usd']:.2f})")
+    j = out["intakebot"]
+    print(f"intakebot: ${j['month_spent_usd']:.2f} spent + ${j['month_reserved_usd']:.2f} reserved "
+          f"of ${j['credits_intakebot_monthly_usd']:.2f}; {j['open_reservations']} open reservation(s)")
+    for g in j["grants"]:
+        print(f"  {g['principal']}: ${g['spent_usd']:.2f} spent, ${g['reserved_usd']:.2f} "
+              f"reserved (cap ${g['monthly_usd']:.2f})")
+    return 0
+
+
+def cmd_release(rid):
+    who = os.environ.get("USER") or "owner"
+
+    def work(con, fx, t):
+        res = con.execute("SELECT * FROM credit_reservation WHERE id=?", (rid,)).fetchone()
+        if res is None or res["settled_by"] != "expiry":
+            raise ValueError(f"reservation {rid} is not an expired reservation")
+        sp = con.execute("SELECT * FROM credit_spend WHERE session_id=?",
+                         (f"expired:{rid}",)).fetchone()
+        if sp is None or sp["usd"] == 0:
+            raise ValueError(f"reservation {rid} has nothing booked to release")
+        _insert(con, "credit_release", spend_id=sp["id"], old_usd=sp["usd"], note=f"by {who}")
+        _update(con, "credit_spend", sp["id"], usd=0)
+        return sp["usd"]
+    try:
+        old = _tx(work)
+    except ValueError as e:
+        sys.stderr.write(f"fleet-credits: {e}\n")
+        return 1
+    print(f"released reservation {rid}: ${old:.2f} freed")
+    return 0
+
+
+def cmd_refused(repo, pr, reason):
+    def work(con, fx, t):
+        w = open_window(con)
+        if w is not None and _notice(con, w["id"], "refused", f"{repo}#{pr}:{reason}"):
+            fx.event("credits-refused", {"repo": repo, "pr": pr, "reason": reason}, repo, pr)
+    _tx(work)
+    return 0
+
+
+# --- CLI -----------------------------------------------------------------------
+
+
+def _days(raw):
+    try:
+        n = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer")
+    if not 1 <= n <= MAX_DAYS:
+        raise argparse.ArgumentTypeError(f"--days is 1 to {MAX_DAYS}, got {n}")
+    return n
+
+
+def _principal(raw):
+    if not PRINCIPAL_RE.fullmatch(raw):
+        raise argparse.ArgumentTypeError(f"{raw!r} is not a principal id "
+                                         f"({PRINCIPAL_RE.pattern})")
+    return raw
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-credits", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    o = sub.add_parser("on")
+    o.add_argument("--days", type=_days, required=True)
+    o.add_argument("--note")
+    sub.add_parser("off")
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    for name in ("decide", "record", "refused"):
+        p = sub.add_parser(name)
+        p.add_argument("--repo", required=True)
+        p.add_argument("--pr", type=int, required=True)
+        if name != "refused":
+            p.add_argument("--model", required=True)
+        if name == "decide":
+            p.add_argument("--peek", action="store_true")
+            p.add_argument("--json", action="store_true")
+        elif name == "record":
+            p.add_argument("--dry-run", action="store_true")
+            p.add_argument("--usd", required=True)
+            p.add_argument("--session", required=True)
+        else:
+            p.add_argument("--reason", required=True)
+    r = sub.add_parser("release")
+    r.add_argument("id", type=int)
+    r.add_argument("--job", action="store_true",
+                   help="ID is a credit_job_spend id, not a review reservation id")
+    g = sub.add_parser("grant")
+    g.add_argument("principal", type=_principal)
+    g.add_argument("--monthly-usd", required=True)
+    g.add_argument("--note")
+    rv = sub.add_parser("revoke")
+    rv.add_argument("principal", type=_principal)
+    for name in ("decide-job", "record-job"):
+        p = sub.add_parser(name)
+        p.add_argument("--job", required=True)
+        p.add_argument("--principal", type=_principal, required=True)
+        p.add_argument("--model", required=True)
+        if name == "decide-job":
+            p.add_argument("--peek", action="store_true")
+            p.add_argument("--meter", choices=("credits", "subscription"), required=True)
+            p.add_argument("--json", action="store_true")
+        else:
+            p.add_argument("--dry-run", action="store_true")
+            p.add_argument("--usd", required=True)
+            p.add_argument("--session", required=True)
+    args = ap.parse_args(argv)
+
+    if args.cmd == "on":
+        return cmd_on(args.days, args.note) if _require_owner("on") else 1
+    if args.cmd == "off":
+        return cmd_off()
+    if args.cmd == "status":
+        return cmd_status(args.json)
+    if args.cmd == "release":
+        if not _require_owner("release"):
+            return 1
+        return cmd_release_job(args.id) if args.job else cmd_release(args.id)
+    if args.cmd == "grant":
+        try:
+            usd = _valid_usd(args.monthly_usd)
+        except ValueError as e:
+            ap.error(str(e).replace("--usd", "--monthly-usd"))
+        return cmd_grant(args.principal, usd, args.note) if _require_owner("grant") else 1
+    if args.cmd == "revoke":
+        return cmd_revoke(args.principal) if _require_owner("revoke") else 1
+    if args.cmd == "decide-job":
+        try:
+            ans = decide_job(args.job, args.principal, args.meter, args.model, peek=args.peek)
+        except (sqlite3.Error, OSError) as e:
+            sys.stderr.write(f"fleet-credits: cannot decide ({e.__class__.__name__}: {e})\n")
+            return 1
+        print(json.dumps(ans, sort_keys=True))
+        return 0
+    if args.cmd == "record-job":
+        try:
+            usd = _valid_usd(args.usd)
+        except ValueError as e:
+            ap.error(str(e))
+        row = {"job": args.job, "principal": args.principal, "model": args.model,
+               "usd": usd, "session_id": args.session}
+        if not args.dry_run:
+            record_job(args.job, args.principal, args.model, usd, args.session)
+        print(json.dumps(row, sort_keys=True))
+        return 0
+    if args.cmd == "refused":
+        return cmd_refused(args.repo, args.pr, args.reason)
+    if args.cmd == "record":
+        try:
+            usd = _valid_usd(args.usd)
+        except ValueError as e:
+            ap.error(str(e))
+        if args.dry_run:
+            print(json.dumps({"repo": args.repo, "pr": args.pr, "model": args.model,
+                              "usd": usd, "session_id": args.session}, sort_keys=True))
+            return 0
+        record(args.repo, args.pr, args.model, usd, args.session)
+        print(json.dumps({"repo": args.repo, "pr": args.pr, "model": args.model,
+                          "usd": usd, "session_id": args.session}, sort_keys=True))
+        return 0
+    try:
+        ans = decide(args.repo, args.pr, args.model, peek=args.peek)
+    except (sqlite3.Error, OSError) as e:
+        sys.stderr.write(f"fleet-credits: cannot decide ({e.__class__.__name__}: {e})\n")
+        return 1
+    print(json.dumps(ans, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

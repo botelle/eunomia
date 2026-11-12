@@ -129,7 +129,57 @@ class Db:
         return self.path
 
 
+class _NullFleetlib:
+    """No lease of these pre-0196 tests' synthetic ids is ever live: `ledger()`
+    now always builds the plan 0196 stage timeline, which means it always
+    needs a `fleetlib_mod` to ask about a non-terminal dispatch's lease — and
+    the REAL `fleetlib` reads THIS HOST's `~/dev/.fleet/leases/`, the same
+    risk `tests/test_plan_ledger_stages.py`'s own `FakeFleetlib` avoids
+    (finding, review of #1472: before this, every test here that passed no
+    `fleetlib_mod` loaded the real module and read real host state for any
+    dispatch with no terminal record)."""
+
+    def read_lease(self, lease_id):
+        return None
+
+    def is_orphaned(self, rec):
+        return True
+
+    def all_leases(self):
+        return []
+
+    def resource_of(self, rec):
+        return {}
+
+
+class _DefaultOrch:
+    """`impl_bound`/`review_position`/`_review_dispatch_timeout`, each a fixed
+    answer — these pre-0196 tests assert nothing about stage budgets, only
+    that building them does not reach the real `bin/orchestrator` (which
+    reads this repo's own `config/impl-bounds.conf` and, for a cihost seat,
+    this host's `fleet-models` database)."""
+
+    REVIEW_DISPATCH_TIMEOUT = 2400
+
+    def impl_bound(self, repo):
+        return 90, "conf-default"
+
+    def review_position(self, plan_text):
+        return "plan_reviewer"
+
+    def _review_dispatch_timeout(self, repo, position):
+        return 2400
+
+
 def _ledger(files, db, **kw):
+    # plan 0196: `verdict`/`with_filings` also enable the filing-PR forge read
+    # (Boundary 5); these pre-0196 tests fake only `pr_lookup`/`probe`, so a
+    # real-forge fallback here would be a live network call on every one of
+    # them. A fake that finds nothing keeps their own assertions unaffected.
+    if (kw.get("verdict") or kw.get("with_filings")) and "filing_lookup" not in kw:
+        kw["filing_lookup"] = lambda *a: []
+    kw.setdefault("fleetlib_mod", _NullFleetlib())
+    kw.setdefault("orch_mod", _DefaultOrch())
     return fp.ledger(files, db=db, repo=REPO, **kw)
 
 
@@ -280,9 +330,17 @@ class _FakeForge:
         hit = [p for p in self.pulls if p["number"] == n]
         return (200, hit[0]) if hit else (404, None)
 
-    def list_pulls(self, repo, state="all", page=1, limit=50, sort=None):
-        self.calls.append(("list_pulls", page))
-        return (200, self.pulls) if page == 1 else (200, [])
+    def list_pull_issues(self, repo, state="all", page=1, limit=50):
+        """The listing `marked_pr`'s scan reads since plan 0218: `self.pulls`
+        reshaped into the issues index's own item shape (`merged`/
+        `merged_at` nested under `pull_request`)."""
+        self.calls.append(("list_pull_issues", page))
+        if page != 1:
+            return 200, []
+        rows = [{**{k: v for k, v in p.items() if k not in ("merged", "merged_at")},
+                "pull_request": {"merged": p.get("merged"), "merged_at": p.get("merged_at")}}
+               for p in self.pulls]
+        return 200, rows
 
 
 def _watch(tmp_path, monkeypatch, pulls):
@@ -338,7 +396,7 @@ def test_a_stored_pr_without_this_plans_marker_falls_back_to_the_scan(tmp_path, 
         watch = _watch(tmp_path, monkeypatch, pulls)
         got = fp._marker_lookup(watch, "tok")(REPO, "0009-auth", stored)
         assert got["number"] == 31, stored
-        assert ("list_pulls", 1) in watch.fake_forge.calls, stored
+        assert ("list_pull_issues", 1) in watch.fake_forge.calls, stored
 
 
 def test_the_marker_lookup_writes_nothing(tmp_path, monkeypatch):
@@ -347,7 +405,7 @@ def test_the_marker_lookup_writes_nothing(tmp_path, monkeypatch):
     watch = _watch(tmp_path, monkeypatch, [])
     leases = tmp_path / "fleet" / "leases"
     leases.mkdir(parents=True)
-    key = watch._safe_lease_key(f"pagecap-operator-eunomia-{watch.PAGE_CAP}")
+    key = watch._safe_lease_key(f"pagecap-operator-eunomia-{watch.ISSUE_PAGE_CAP}")
     marker = leases / f"{key}.watch-notified"
     marker.write_text("")
     assert fp._marker_lookup(watch, "tok")(REPO, "0009-auth") is None
@@ -410,9 +468,14 @@ def test_the_database_is_opened_read_only(tmp_path, monkeypatch):
 # --------------------------------------------------------------- the two formats
 
 def _cli(tmp_path, files, db, *extra):
+    # plan 0196: the ledger always builds the stage timeline now, which always
+    # loads the real fleetlib — a subprocess cannot take a fake one, so this
+    # points it at an empty, per-test directory instead of the real
+    # `~/dev/.fleet/leases` (the same host this suite itself runs on).
+    env = dict(os.environ, EUNOMIA_FLEET_DIR=str(tmp_path / "no-such-fleet-dir"))
     return subprocess.run([sys.executable, str(FLEET_PLAN), "ledger", "--db", str(db),
                            "--repo", REPO, *extra, *map(str, files)],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=env)
 
 
 def _parse_table(text):
@@ -641,7 +704,8 @@ def test_verdict_runs_audits_probe_for_the_two_classes_only(tmp_path):
     assert all(r["probe"] is None for r in plain.values())          # opt-in
 
     rows = _rows(fp.ledger(plan_files, db=path, repo=REPO, repo_root=repo, ref="main",
-                           verdict=True, pr_lookup=lambda r, p, n=None: None))
+                           verdict=True, pr_lookup=lambda r, p, n=None: None,
+                           filing_lookup=lambda *a: []))
     assert rows["0003-fine"]["probe"] is None
     for pid in ("0001-claimed", "0002-stalled"):
         # declared path bin/x exists nowhere in this checkout: audit's own answer,
@@ -656,7 +720,8 @@ def test_the_probe_refuses_on_a_shallow_clone_rather_than_grading(tmp_path, monk
     path = Db(tmp_path).commit()
     monkeypatch.setattr(fp, "_is_shallow", lambda repo: True)
     row = _rows(fp.ledger(files, db=path, repo=REPO, verdict=True,
-                          pr_lookup=lambda r, p, n=None: None))["0001-claimed"]
+                          pr_lookup=lambda r, p, n=None: None,
+                          filing_lookup=lambda *a: []))["0001-claimed"]
     assert row["probe"]["state"] == "refused"
 
 

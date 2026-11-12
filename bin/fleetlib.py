@@ -25,6 +25,7 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 
 def fleet_dir() -> Path:
@@ -57,6 +58,29 @@ _ID_RE = re.compile(r"^[a-z]+--[A-Za-z0-9._-]+--\d{3,}\Z")
 # Session/holder ids also become path components (sessions/<sid>/hb), so the
 # library must hold the same line fleet-heartbeat's _SID_RE does (1522 r9 L1).
 _SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+# The owner's `respawn` control word: a whole LINE reading `respawn` (optionally
+# in backticks), anywhere in the comment. fleet-watch consumes it to resume a
+# run; the orchestrator's steward must not also run it as an instruction.
+RESPAWN_RE = re.compile(r"(?im)^\s*`?respawn`?\s*$")
+# Minos appends `_via minos (<id>.access)_` to every comment it posts.
+_MINOS_SIGNATURE_RE = re.compile(r"(?im)^\s*_via minos \([^()\n]*\)_\s*$")
+
+
+def is_control_comment(body) -> bool:
+    """True when the comment is the `respawn` control word and nothing else.
+
+    The only other text allowed is Minos's one signature line, which matches
+    `_via minos (<anything without parens>)_` on a line of its own. Any other
+    text, even beside a `respawn` line, makes it an instruction, because
+    dropping an instruction is worse than a duplicate review."""
+    body = body or ""
+    if not RESPAWN_RE.search(body):
+        return False
+    rest = RESPAWN_RE.sub("", body, count=0)
+    rest = _MINOS_SIGNATURE_RE.sub("", rest, count=1)
+    return not rest.strip()
+
 
 ACTIVATE_TIMEOUT_MIN = int(os.environ.get("EUNOMIA_ACTIVATE_TIMEOUT", "10"))
 
@@ -254,7 +278,7 @@ def liveness(record: dict):
         return parse_ts(record.get("activated"))
 
 
-def is_orphaned(record: dict, at: datetime = None) -> bool:
+def is_orphaned(record: dict, at: Optional[datetime] = None) -> bool:
     """DERIVED, never stored. Pool rows (holder null) are queued work, never
     orphans — without the holder qualifier every aging pool row would
     spuriously orphan (SPEC review 1314)."""
@@ -293,12 +317,17 @@ def emit(event_type, lease_id, actor, detail=None):
     src = Path(__file__).resolve().parent / "fleet-emit"
     loader = importlib.machinery.SourceFileLoader("_fleet_emit", str(src))
     spec = importlib.util.spec_from_loader("_fleet_emit", loader)
+    if spec is None:
+        # Unreachable with a SourceFileLoader; module_from_spec(None) used to
+        # raise AttributeError here, so keep that kind of failure.
+        raise AttributeError("could not build an import spec for fleet-emit")
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
-    # fleet-emit resolves its tree at import; align it to ours.
-    mod.FLEET_DIR = fleet_dir()
-    mod.EVENTS = fleet_dir() / "events.jsonl"
-    mod.LOCK = fleet_dir() / "locks" / "events.lock"
+    # fleet-emit resolves its tree at import; align it to ours. The names exist
+    # on the module fleet-emit defines, which pyright cannot see (dynamic load).
+    mod.FLEET_DIR = fleet_dir()  # pyright: ignore[reportAttributeAccessIssue] -- defined by fleet-emit at import
+    mod.EVENTS = fleet_dir() / "events.jsonl"  # pyright: ignore[reportAttributeAccessIssue] -- defined by fleet-emit at import
+    mod.LOCK = fleet_dir() / "locks" / "events.lock"  # pyright: ignore[reportAttributeAccessIssue] -- defined by fleet-emit at import
     mod.emit(event_type, actor, lease=lease_id, detail=detail)
 
 
@@ -492,7 +521,13 @@ def resource_lock_path(resource: dict) -> Path:
 def _content_rules():
     """kind=content rows of config/secret-patterns.conf — the same versioned
     file fleet-secret-guard reads (it ignores this kind), so "what a secret
-    looks like" has one source of truth. Extending the list is a PR."""
+    looks like" has one source of truth. Extending the list is a PR.
+
+    Returns (name, compiled_regex, tier) with tier `always` or `paranoid`. The
+    fourth column is optional and a row without it reads as `always`, so the
+    file stays parseable by a reader that predates the column. `validate_cr`
+    uses the always tier only (a CR patch may carry a git SHA, which is what
+    `long-hex` matches); fleet-leak-watch builds both of its lists from this."""
     conf = Path(__file__).resolve().parent.parent / "config" / "secret-patterns.conf"
     rules = []
     try:
@@ -506,20 +541,28 @@ def _content_rules():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        try:
-            kind, name, rx = line.split("\t", 2)
-        except ValueError:
-            # The conf is versioned and fixed-format: a non-comment line that
-            # doesn't parse is a DEFECT (a tabs->spaces accident on one line
-            # would silently un-enforce one rule while the rest keep the parse
-            # non-empty — 1522 #11 r3 low). Loud, like the invalid-regex branch.
+        fields = line.split("\t")
+        # The conf is versioned and fixed-format: a non-comment line that
+        # doesn't parse is a DEFECT (a tabs->spaces accident on one line
+        # would silently un-enforce one rule while the rest keep the parse
+        # non-empty — 1522 #11 r3 low). Loud, like the invalid-regex branch.
+        # Only `content` rows may carry the tier column; path/cmd regexes keep
+        # the guard's `split("\t", 2)` reading of them unchanged.
+        if len(fields) < 3 or (len(fields) > 3 and not (
+                fields[0] == "content" and len(fields) == 4)):
             sys.exit(f"fleet: unparseable rule line in {conf}: a non-comment "
-                     "line must be KIND<TAB>NAME<TAB>REGEX")
+                     "line must be KIND<TAB>NAME<TAB>REGEX "
+                     "(content rows: optionally <TAB>TIER)")
+        kind, name, rx = fields[:3]
+        tier = fields[3] if len(fields) == 4 else "always"
         if kind == "content":
+            if tier not in ("always", "paranoid"):
+                sys.exit(f"fleet: secret rule '{name}' has an unknown tier — "
+                         "must be `always` or `paranoid`")
             try:
                 # re.I: the conf header promises case-insensitive rules; this
                 # reader honors the same contract the guard does (#11 L1).
-                rules.append((name, re.compile(rx, re.I)))
+                rules.append((name, re.compile(rx, re.I), tier))
             except re.error as e:
                 sys.exit(f"fleet: secret rule '{name}' is not a valid regex "
                          f"({e}) — fix config/secret-patterns.conf")
@@ -579,7 +622,9 @@ def validate_cr(record) -> dict:
                      "reference the material instead of inlining it")
     # target included (#11 M2): it rides the rendered cr/ tree, cr-filed
     # detail in events.jsonl, and list output — it is a text field.
-    rules = _content_rules()      # hoisted: one read per validation (#11 r2 L3)
+    # hoisted: one read per validation (#11 r2 L3). Always tier only: the
+    # paranoid tier is `long-hex`, which is every git SHA a patch may carry.
+    rules = [(n, rx) for n, rx, tier in _content_rules() if tier == "always"]
     for field in ("intent", "patch", "target"):
         text = record.get(field)
         if text is None:
@@ -683,8 +728,17 @@ def work_root() -> Path:
 
 
 def git_ssh_base() -> str:
-    return os.environ.get("FLEET_GIT_SSH_BASE",
-                          "ssh://implbot@forge.example:2222").rstrip("/")
+    # The default names `operator` because that is the key authorised on the
+    # git-ssh daemon since 2026-09-22 (implbot's was retired) and the only one
+    # the dispatch host holds. Transport identity is not authorship: authorship
+    # is the commit author plus the implbot token that opens the PR
+    # (forgejo-open-pr.sh; verify_marked_pr checks it). Do not "fix" this back
+    # to implbot@, and do not drop the user: a bare host resolves to whatever
+    # the local login is, per host.
+    return os.environ.get(
+        "FLEET_GIT_SSH_BASE",
+        f"ssh://{_ROLE_ACCOUNT_DEFAULTS['merger'][1]}@forge.example:2222",
+    ).rstrip("/")
 
 
 # ------------------------------------------------------------- agent roles (0056)
@@ -732,11 +786,16 @@ _ROLE_ACCOUNT_DEFAULTS = {
     "author": ("FLEET_AUTHOR_ACCOUNT", "implbot"),
     "reviewer": ("FLEET_REVIEWER_ACCOUNT", "revbot"),
     "merger": ("FLEET_MERGER_ACCOUNT", "operator"),
+    # ADR-0019: the second agent reviewer and the agent merger. `merger` stays
+    # the human; `agent_merger` is a different position and never the same one.
+    "second_reviewer": ("FLEET_SECOND_REVIEWER_ACCOUNT", "rev2bot"),
+    "agent_merger": ("FLEET_AGENT_MERGER_ACCOUNT", "mergebot"),
 }
 
 
 def agent_roles():
-    """The one role table (plan 0056): author, reviewer, merger -> Role.
+    """The one role table (plan 0056): author, reviewer, merger -> Role, plus
+    (plan 0106, ADR-0019) second_reviewer and agent_merger.
 
     Extends plan 0055's per-role configuration (`_TOKEN_ROLES`: an env key
     plus a documented default, keyed by role) from credentials to identity.
@@ -755,16 +814,21 @@ def agent_roles():
                         commit_identity),
         "reviewer": _role("reviewer", account["reviewer"], {account["reviewer"]}),
         "merger": _role("merger", account["merger"], {account["merger"]}),
+        "second_reviewer": _role("second_reviewer", account["second_reviewer"],
+                                 {account["second_reviewer"]}),
+        "agent_merger": _role("agent_merger", account["agent_merger"],
+                              {account["agent_merger"]}),
     }
 
 
 def agent_accounts(roles=None):
     """Accounts that must never be able to push or merge main unsupervised
-    (fleet-watch's AGENT_ACCOUNTS): author + reviewer + FLEET_AGENT_ACCOUNTS'
-    extras. Never merger — merger is this fleet's one human position, the
-    account the merge whitelist exists FOR."""
+    (fleet-watch's AGENT_ACCOUNTS): author + reviewer + second_reviewer +
+    agent_merger + FLEET_AGENT_ACCOUNTS' extras. Never merger — merger is this
+    fleet's one human position, the account the merge whitelist exists FOR."""
     roles = roles if roles is not None else agent_roles()
-    return ({roles["author"].account, roles["reviewer"].account} |
+    return ({roles[r].account for r in
+             ("author", "reviewer", "second_reviewer", "agent_merger")} |
             _extra_names("FLEET_AGENT_ACCOUNTS"))
 
 
@@ -826,7 +890,7 @@ def _git(args, cwd, check=True, timeout=900):
     return r
 
 
-def ensure_store(repo: str, ssh_base: str = None) -> Path:
+def ensure_store(repo: str, ssh_base: Optional[str] = None) -> Path:
     """The per-repo backing clone. Worktrees share its object store, so the Nth
     concurrent feature costs a working tree rather than another full history."""
     store = store_path(repo)
@@ -843,7 +907,7 @@ def ensure_store(repo: str, ssh_base: str = None) -> Path:
     return store
 
 
-def add_worktree(repo: str, key: str, ref: str, ssh_base: str = None,
+def add_worktree(repo: str, key: str, ref: str, ssh_base: Optional[str] = None,
                  refspecs=()) -> Path:
     """Attach a worktree for `key` at `ref`. Replaces an existing one for the
     same key: a stale tree from a dead run must never be silently reused as if

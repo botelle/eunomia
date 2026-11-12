@@ -40,11 +40,11 @@ restarting it is a supervised operation gated by `bin/fleet-svc` under a
 could reach for on its own. Every successful advance says so, once, in its
 notification: report the restart is due, never perform one.
 
-FLEET_PINS — same syntax as `fleet-watch` reads (`bin/fleet-watch:pins()`):
-comma list of `path` or `path=ref` DETACHED worktree entries, e.g.
-"~/.local/share/pins/eunomia,~/.local/share/pins/techne=origin/release". No
-default: an unconfigured run advances nothing, the same rule FLEET_WATCH_REPOS
-and FLEET_PINS itself already follow on the watcher.
+The pin set (plan 0134) is `~/.local/share/pins/<name>` for every repository in
+config/repos.conf, read from the checkout this runs from (the eunomia pin), plus
+FLEET_PINS: comma list of `path` or `path=ref` DETACHED worktree entries for pins
+that are NOT a listed repository, e.g. "/Users/operator/agent". Same reader as
+`fleet-watch` (`bin/fleet-watch:pins()`).
 """
 import argparse
 import importlib.machinery
@@ -55,6 +55,11 @@ import sys
 from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
+EUNOMIA_REPO = "operator/eunomia"
+REPOS_CONF = BIN.parent / "config" / "repos.conf"
+# The fleet's git transport is ssh (the HTTP transport is retired); the base is
+# an env seam only so a test can clone from a local bare repo.
+CLONE_BASE = "ssh://git@forge.example:2222"
 
 
 def _load_module(name, path):
@@ -213,9 +218,14 @@ def _do_advance(path, ref, facts, dry_run=False):
              f"{(new_head or '?')[:7]}, not {target[:7]} -- treating as a "
              "failed advance, not a partial success")
         return False
-    print(f"advanced {path} {head[:7]} -> {target[:7]} ({ref})")
+    retry_note = ("" if not facts.get("fetch_retried") else
+                 " (fetch retried once, succeeded)" if facts.get("fetch_retry_ok")
+                 else " (fetch retried once, still failed before this checkout)")
+    print(f"advanced {path} {head[:7]} -> {target[:7]} ({ref}){retry_note}")
     emit(repo, {"path": path, "ref": ref, "state": "current", "previous": "stale",
-               "action": "advanced", "from": head, "to": target})
+               "action": "advanced", "from": head, "to": target,
+               "fetch_retried": facts.get("fetch_retried", False),
+               "fetch_retry_ok": facts.get("fetch_retry_ok")})
     watch.notify(
         "Pin advanced",
         f"{path}: {head[:7]} -> {target[:7]}. If a resident process reads "
@@ -224,7 +234,35 @@ def _do_advance(path, ref, facts, dry_run=False):
         "commit -- between cycles, never mid-dispatch (plan 0040). "
         "fleet-pin-advance does not restart anything itself.",
         LABEL)
+    if repo == EUNOMIA_REPO:
+        _migrate_schema(path)
     return True
+
+
+def _migrate_schema(path):
+    """Plan 0096: after a verified advance of the eunomia pin, run the PIN's
+    `bin/fleet-db-migrate` (never BIN's -- this process may be older code than
+    the commit it just checked out) so every table the new code reads exists.
+    A failure pages once and never un-advances the pin: the commit was reviewed
+    and merged, and the fix goes forward."""
+    tool = os.path.join(path, "bin", "fleet-db-migrate")
+    try:
+        r = subprocess.run([tool], capture_output=True, text=True, timeout=120)
+        out = (r.stdout or "") + (r.stderr or "")
+        rc = r.returncode
+    except (OSError, subprocess.SubprocessError) as e:
+        out, rc = f"FAILED {tool}: {e}", 1
+    if rc == 0:
+        return
+    first = next((l for l in out.splitlines() if l.startswith("FAILED")),
+                 (out.strip().splitlines() or [f"exit {rc}"])[0])
+    warn(f"{path}: schema migrate failed -- {first}")
+    watch.notify(
+        "Pin advanced but schema migrate failed",
+        f"Pin advanced but schema migrate failed: {first}. Readers of the "
+        "new tables will refuse until it is fixed. The pin stays advanced "
+        f"(it was verified and reviewed); run {tool} by hand.",
+        LABEL)
 
 
 def _deploy_owned():
@@ -240,9 +278,75 @@ def _deploy_owned():
         return None
 
 
-def run(dry_run=False):
+def _conf_repos():
+    """`owner/repo` names from config/repos.conf's `repo:` lines, or None when
+    the file cannot be read (then nothing is created)."""
+    try:
+        lines = Path(REPOS_CONF).read_text().splitlines()
+    except OSError:
+        return None
+    out = set()
+    for line in lines:
+        parts = line.split("#", 1)[0].split()
+        if len(parts) >= 2 and parts[0] == "repo:":
+            out.add(parts[1])
+    return out
+
+
+def plan_create(path):
+    """(action, detail, repo) for a `missing` pin under --create-missing.
+    `create` only when the pin's name is a repo in config/repos.conf AND the
+    broker vouches for that repo's main -- the verdict an advance needs, so a
+    created pin adds no authority. Everything else is `refuse`."""
+    name = os.path.basename(path.rstrip("/"))
+    repo = f"operator/{name}"
+    known = _conf_repos()
+    if known is None or repo not in known:
+        return "refuse", (f"missing: {path}: {repo} is not in config/repos.conf "
+                          "-- only a listed repository is ever created"), repo
+    code, why, _lane = watch.broker_verdict(repo)
+    if code == watch.PROT_UNKNOWN:
+        return "refuse", (f"missing: {path}: broker could not determine {repo}'s "
+                          f"protection -- {why} -- could-not-tell is never "
+                          "create-anyway"), repo
+    if code == watch.PROT_REFUSED:
+        return "refuse", (f"missing: {path}: {repo}'s main is not protected "
+                          f"-- {why}"), repo
+    return "create", f"{path}: missing, {repo} is vouched for", repo
+
+
+def _do_create(path, ref, repo, dry_run=False):
+    """Clone with no checkout, then detach at the vouched ref. True on success."""
+    if dry_run:
+        print(f"DRY-RUN would create {path} from {repo} ({ref})")
+        return True
+    base = os.environ.get("FLEET_PIN_CLONE_BASE", CLONE_BASE)
+    url = f"{base}/{repo}.git"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        r = subprocess.run(["git", "clone", "--quiet", "--no-checkout", url, path],
+                           capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        warn(f"{path}: clone failed ({e.__class__.__name__}) -- not created")
+        return False
+    if r.returncode != 0:
+        warn(f"{path}: clone of {repo} failed rc={r.returncode} -- not created")
+        return False
+    ok, _ = _git(path, "checkout", "--quiet", "--detach", ref)
+    ok_head, head = _git(path, "rev-parse", "HEAD")
+    ok_ref, target = _git(path, "rev-parse", ref)
+    if not (ok and ok_head and ok_ref and head == target):
+        warn(f"{path}: cloned but could not detach at {ref} -- left as is, "
+             "refused (it is not a pin yet)")
+        return False
+    print(f"created {path} at {head[:7]} ({repo} {ref})")
+    return True
+
+
+def run(dry_run=False, create_missing=False):
     """(advanced, refused) -- lists of (path, detail). Never raises; every
-    pin is independent, so one bad pin must not stop the rest."""
+    pin is independent, so one bad pin must not stop the rest. Created pins
+    are reported in `advanced`."""
     advanced, refused = [], []
     owned = _deploy_owned()
     for path, ref in watch.pins():
@@ -255,6 +359,16 @@ def run(dry_run=False):
                       "whether a deployment owns this pin is unknown -- refusing")
             warn(detail)
             refused.append((path, detail))
+            continue
+        if create_missing and not os.path.lexists(path):
+            action, detail, repo = plan_create(path)
+            if action == "refuse":
+                warn(detail)
+                refused.append((path, detail))
+            elif _do_create(path, ref, repo, dry_run=dry_run):
+                advanced.append((path, detail))
+            else:
+                refused.append((path, "create attempt failed -- see the WARN above"))
             continue
         action, detail, facts = plan_pin(path, ref)
         if action == "current":
@@ -277,10 +391,15 @@ def main(argv=None):
                     "the Forgejo protection broker. See FLEET_PINS.")
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would advance; write nothing")
+    ap.add_argument("--create-missing", action="store_true",
+                    help="owner-run only, never in a plist: clone a MISSING pin "
+                         "whose repository is in config/repos.conf and vouched "
+                         "for by the broker; nothing else changes")
     args = ap.parse_args(argv)
 
     if not watch.pins():
-        print("fleet-pin-advance: FLEET_PINS is empty -- nothing to advance")
+        print("fleet-pin-advance: no pins (config/repos.conf unreadable and "
+              "FLEET_PINS empty) -- nothing to advance")
         return 0
 
     fd = _single_instance()
@@ -289,7 +408,7 @@ def main(argv=None):
              file=sys.stderr)
         return 0
     try:
-        advanced, refused = run(dry_run=args.dry_run)
+        advanced, refused = run(dry_run=args.dry_run, create_missing=args.create_missing)
     finally:
         os.close(fd)
     print(f"fleet-pin-advance: {len(advanced)} advanced, {len(refused)} refused")

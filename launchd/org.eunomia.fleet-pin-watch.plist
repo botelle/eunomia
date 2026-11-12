@@ -3,17 +3,13 @@
 <!--
   fleet-pin-watch — report pinned worktrees that stopped receiving merged work.
 
-  THIS UNIT ARMS NOTHING, two ways. It passes the pins-only flag, which checks pins and
-  returns before cycle() is reached at all; and FLEET_WATCH_REPOS is deliberately
-  ABSENT, so even without that flag cycle() warns "nothing to scan" and returns 0
-  before any lease, spawn or spend.
-  That flag also keeps this out of the dispatch watcher's cycle lock, which it
-  would otherwise hold across two network fetches. That is the watcher's own rule — an unconfigured
-  allowlist dispatches nothing — used on purpose here. Verified before shipping by
-  running the watcher in dry-run with FLEET_WATCH_REPOS unset and FLEET_PINS set:
-      -> "FLEET_WATCH_REPOS is empty — nothing to scan" / "0 would dispatch"
-  If you ever add FLEET_WATCH_REPOS to THIS unit you have armed plan dispatch on
-  a 30-minute timer. Don't; give dispatch its own unit and its own decision.
+  THIS UNIT ARMS NOTHING. It passes the pins-only flag, which checks pins and
+  returns before cycle() is reached at all. Since plan 0134 the dispatch list is
+  config/repos.conf, which every unit running from the eunomia pin can read, so
+  that early return is the ONLY guard: tests/test_enrolment_is_one_list.py proves
+  it with the list present. Do not remove the flag from ProgramArguments.
+  The flag also keeps this out of the dispatch watcher's cycle lock, which it
+  would otherwise hold across two network fetches.
 
   It runs from the PINNED eunomia worktree, not ~/dev/eunomia. fleet-collect and
   fleet-leak-watch were installed from the shared clone until 2026-09-07 and so
@@ -59,11 +55,18 @@
   </array>
   <key>EnvironmentVariables</key>
   <dict>
+    <!-- Plan 0134: the pin for every repository in config/repos.conf is implied
+         (~/.local/share/pins/<name>, read from the eunomia pin this unit runs
+         from); FLEET_PINS lists only pins that are NOT a listed repository.
+         /Users/operator/agent is talos (dispatch-review.py, post-review.py), kept at
+         that path because bin/orchestrator and the review skill call it there.
+         It is a detached checkout like the pins above; on a branch it is refused
+         as `attached`. A talos change under reviewer-uid/ still needs a manual
+         sudo install: this moves the checkout, never the root-owned wrapper. -->
     <key>FLEET_PINS</key>
-    <string>/Users/operator/.local/share/pins/eunomia,/Users/operator/.local/share/pins/techne</string>
+    <string>/Users/operator/agent</string>
     <!-- replace with the real Fleet-ops push URL at install; empty = log-only -->
     <key>FLEET_NTFY_URL</key><string></string>
-    <!-- FLEET_WATCH_REPOS is ABSENT ON PURPOSE. See the comment above. -->
   </dict>
   <key>StartInterval</key><integer>1800</integer>
   <key>RunAtLoad</key><true/>

@@ -79,6 +79,22 @@ def test_fleet_lane_constructs_no_forge_url_and_has_no_open_coded_call():
     assert "http.client" not in text
 
 
+def test_fleet_meet_only_reads_the_forge_through_fleetforge():
+    """plan 0102: `bin/fleet-meet` makes no forge call outside `fleetforge` and
+    has no write verb — no comment, no status, no review. Posting is the
+    steward's job, after triage, and a failing status blocks review dispatch."""
+    import re
+    text = (BIN / "fleet-meet").read_text()
+    for banned in ("api/v1", "urlopen(", "http.client", "urllib.request", "_api(", "_get("):
+        assert banned not in text, banned
+    verbs = set(re.findall(r"\bforge\.(\w+)\(", text))
+    assert verbs <= {"get_pull", "list_pulls", "list_reviews"}, verbs
+    assert verbs, "the program reads the forge through fleetforge.Forge verbs"
+    for write in ("create_pull", "create_issue_comment", "edit_pull_body", "post_status",
+                  "POST", "PATCH", "PUT", "DELETE"):
+        assert write not in text, write
+
+
 def test_fleet_watch_makes_no_urllib_request_call_against_the_forge():
     """The only `urllib.request.urlopen` call site left in bin/fleet-watch is
     the ntfy notification POST inside `notify()` — not a forge call. Every

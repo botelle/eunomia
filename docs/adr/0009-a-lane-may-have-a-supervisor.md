@@ -8,6 +8,7 @@
   opted-in one.
 - **Amended by:** [ADR-0014](0014-a-pull-request-changes-one-kind-of-thing.md), 2026-09-25 — §1 gains ADR-PR, docs-PR and deploy-PR
   review, all agentic.
+- **Amended by:** [ADR-0025](0025-a-style-only-change-may-take-a-style-review-inside-declared-paths-with-screenshots.md), 2026-10-22 — §1 gains style-PR review, agentic.
 - **Relates:** [ADR-0006](0006-blackbox-test-lanes.md) (§3 amended by this ADR;
   §7's zone allowlist governs which runners a plan may reach),
   `plans/0004-plan-dispatcher.md` (the wrapper this makes optionally
@@ -110,6 +111,10 @@ opt-in, so "at least one required" applies to every repository: one required
 tester, any number of additional ones. The reviewer paragraph is unchanged,
 and ADR-0013 §4 relies on it — additional reviewers annotate, which is how a
 reviewer A/B arm runs.)*
+
+*(Amended 2026-09-28 by ADR-0013 §4, for the reviewer positions only: an
+additional reviewer no longer only annotates. It runs before the verdict, and
+its HIGH withholds the approval. Additional testers are unchanged.)*
 
 ## The baseline any supervisor must beat
 

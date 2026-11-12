@@ -66,12 +66,23 @@ zone: public | private          # routing: `public` DISPATCHES to a cloud backen
 tier: 0 | 1 | 2 | 3             # PROVENANCE.md §3 risk tier -> review depth
 paths: ["bin/fleet-emit", "tests/**"]   # the lane; becomes the path lease
 depends_on: [0002-fleet-emit-events, path:bin/fleet-claim, external:oracle-sub-backend]
+repairs: [0057-ci-logs-ingested-and-served:sequencing]   # optional; see below
+review: full | style            # optional; absent means full (ADR-0025)
 ---
 ```
 
+`review:` asks for the style review (`docs/style-review.md`). `fleet-plan lint`
+accepts exactly `full` or `style`, and for `style` it refuses a plan whose repository
+declares no style paths in `config/style-review.json`, whose `paths` lack the plan's
+evidence lease, or whose other `paths` entries fall outside the declared patterns.
+`tier:` plays no part. What `review: style` does **not** do is grant anything: it is
+only the plan's request. Whether a pull request actually takes the lighter review is
+decided later, mechanically, from its diff by `bin/fleet-style route`, and any doubt
+means the full review. The field is read from the plan on the base branch, never the head.
+
 `depends_on` gates dispatch (`docs/plan-dependencies.md`, plan 0039):
 `fleet-watch` does not dispatch a `ready` plan until every entry is satisfied.
-Three forms:
+The forms:
 
 - a **plan id** (`0002-fleet-emit-events`) — satisfied when that plan's
   `status` is `done` **on `main`**;
@@ -79,11 +90,39 @@ Three forms:
   that path exists **on `main`**, regardless of any plan's status. **Prefer
   this form**: a plan's status is a claim about work, a path is the work
   (`docs/plan-triage.md`);
-- **`external:<text>`** — a prerequisite that is not a plan and never will be
-  (a service change in another repo, an infra step applied by hand). It
-  **blocks dispatch** exactly like the other two, and nothing automatic can
-  ever satisfy it: the attestation is a human deleting the entry in a
-  reviewed pull request.
+- **`plan:<owner/repo>:<id>`** (plan 0180) — the plan-id form for a plan in
+  another repository: satisfied when that repository's own `plans/<id>.md`
+  reads `status: done` **on its `main`**;
+- **`external:<slug>`** (plan 0180) — a prerequisite that is not a plan and
+  never will be (a service change in another repo, an infra step applied by
+  hand). It **blocks dispatch** exactly like the other forms, and nothing
+  automatic can satisfy it until an owner attests `<slug>` — a row in
+  `fleet.db`'s `dependency_attestation` table, written only by plan 0181's
+  authenticated service, never by editing the plan.
+
+`repairs` (plan 0089) is a separate list, and it **never gates dispatch** —
+`fleet-watch` does not read it. Each entry is `<plan-id>:<class>`, naming an
+earlier plan this one fixes, reverses or completes, and the kind of defect
+that made it necessary:
+
+| class | meaning |
+|---|---|
+| `sequencing` | built in the wrong order, or an edge was missing or pointed the wrong way |
+| `contract` | two plans disagreed about an interface, a schema or a shared constant |
+| `scope` | the plan's deliverables or lease left out something it needed |
+| `decision` | the plan's decision was reversed or superseded |
+| `code` | the plan was right and the implementation was wrong |
+
+The class set is closed — `fleet-plan lint` refuses anything else. `code` is
+an ordinary, expected class, not an admission: most defects start in code, and
+a repair plan for one is the baseline the other classes are compared against.
+`lint` also refuses a malformed entry, one naming the plan's own id, or one
+whose id resolves nowhere in this repo — at any status, since a repair record
+is history, not something dispatch waits on. `fleet-plan graph` draws it as a
+separate `repairs` list, never folded into `edges`; `fleet-plan ledger` counts
+it on the plan that was repaired, as `repaired_by`. Whether an existing plan
+should carry this field is the owner's judgment — nothing infers it from
+prose, and nothing backfills it.
 
 Then six sections, in this order:
 
@@ -112,6 +151,15 @@ reviewer already caught a mistake near this lane, its lesson belongs here.
 ### 4. Definition of done
 Verifiable, and runnable by the session itself. "Tests pass" is not enough; name
 which properties the tests must actually prove.
+
+A plan that adds or changes a route or a screen leases **and updates** the spec
+its repository's `governance.yaml` names for that kind of surface (`spec_watch:`,
+speakhush plan 0073 §2) — the declared-behaviour document for a route, the flow
+spec for a screen — in this same plan, never deferred to a later handoff note.
+`fleet-plan lint` refuses a plan whose lease reaches a declared route or screen
+file without reaching the matching spec too (plan 0177); the cross-repo status
+`eunomia/plan-lint` runs the same check on every fleet repository's plan pull
+requests, not only eunomia's own.
 
 ### 5. Handoff
 What to write when finished, for whoever picks up next: decisions taken and their
@@ -157,45 +205,20 @@ Use `draft` when the plan genuinely is not a decision: the scope is still being
 argued, or it was written to think with. Say which, in the pull request, along
 with what would make it ready.
 
-**Waiting is not undecided.** A plan that depends on unbuilt work — another
-plan's deliverable or a step only the owner can do — is still filed at `ready`,
-and **the merge is the hold** (owner, 2026-09-11). Nothing ignites until a plan
-is merged, so the owner leaves it unmerged until the prerequisite is done. Put
-the hold in the **title**, where the merger sees it, and the check in the body:
-
-    title: plans: 0099 example-consumer (HOLD until plan 0098 is built)
-    body:  Merge after: plan 0098 — done when bin/fleet-example is on main
-
-Both are invented; neither plan nor path exists.
-
-Whether the merge surface shows a pull request's body has not been checked, so a
-hold that lives only in the body is not relied on. The record for titles is
-thin. #291 (0014) carried "HOLD until #290 is built" in its title, was never
-merged, and nothing dispatched early. But it was closed because review found
-defects in the plan text (#294), so the hold was not overridden, not proven under
-pressure.
-
-**Whether the pinned watcher enforces `depends_on` decides the rest.** Check the
-pin, not `main`: `grep -c depends_on ~/.local/share/pins/eunomia/bin/fleet-watch`
-prints 0 when it does not. Enforcement (#327) reached the pin on 2026-09-11.
-While it is absent, the title hold is the only hold, and it is not optional.
-Once it is present, also declare plan and `path:` edges in `depends_on`; the
-watcher satisfies those itself, and merge order stops mattering.
-
-**Do not also declare a merge-held owner step as `external:`.** `external:` is
-cleared only by a second reviewed pull request deleting the line
-(`docs/plan-dependencies.md`). A plan held at the merge *and* carrying
-`external:` sits blocked after the merge that already decided it, until that
-second pull request lands.
+**Waiting is not undecided.** A plan that depends on unbuilt work is still
+filed at `ready`, and a plan pull request is merged once it is approved. Every
+hold is a `depends_on` edge, which `fleet-watch` enforces: a plan id, `path:`
+(this repository, or `path:<owner/repo>:<path>` for another's `main`),
+`plan:<owner/repo>:<id>` for another repository's plan, or `owner:<script>`.
+The title never carries HOLD. An owner step is an `owner:`
+edge on a script in `operator/hosttools` `bin/` whose `--check` the fleet reads
+and whose `--apply` the owner runs; file the script in hosttools first.
+`external:` is for a prerequisite no script can check
+(`docs/plan-dependencies.md`). This replaces the 2026-09-11 rule that held a
+plan by leaving its pull request unmerged under a HOLD title.
 
 Filing a waiting plan at `draft` instead needs a second pull request to flip it
-later: a second authorisation for a decision the merge already made. Holding is
-not free either. If building the prerequisite changes what the held plan should
-say, its branch needs a push, `forgejo-safe-push.sh` refuses an approved branch,
-and the plan is re-landed. The orchestrator's one-shot `unfreeze`
-(`docs/plan-dispatch.md` Part 2d) does not help, because it covers only the
-implementation pull requests the orchestrator stewards, and a plan pull request
-is not one of them.
+later; the `depends_on` edge needs none.
 
 `status` in the front matter is the state, and only these four values are written.
 **"In flight" is derived, never stored**: a plan is in flight exactly when a PR

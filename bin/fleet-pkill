@@ -274,8 +274,8 @@ def _scan_reason(reason: str, lib) -> None:
     the scan exists to stop, moved three lines later."""
     if len(reason.encode("utf-8")) > _REASON_CAP_BYTES:
         sys.exit(f"fleet-pkill: --reason exceeds {_REASON_CAP_BYTES} bytes — trim it")
-    for name, rx in lib._content_rules():
-        if rx.search(reason):
+    for name, rx, tier in lib._content_rules():
+        if tier == "always" and rx.search(reason):
             sys.exit(f"fleet-pkill: --reason matches secret rule {name!r} — "
                      "refusing before signalling anything; secrets never ride "
                      "the event log")

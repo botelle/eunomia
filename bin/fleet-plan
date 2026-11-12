@@ -129,6 +129,13 @@ def parse_depends_on(fm_raw: str) -> list:
     return parse_list_field(fm_raw, "depends_on") or []
 
 
+def parse_repairs(fm_raw: str) -> list:
+    """`repairs` as a list of raw `<plan-id>:<class>` strings, defaulting to
+    `[]` when absent — same absent-vs-empty rule as `depends_on` above: a plan
+    that repairs nothing is a valid, ordinary plan, not a malformed one."""
+    return parse_list_field(fm_raw, "repairs") or []
+
+
 def parse(path: Path):
     """(front_matter, body, errors). Never raises on malformed input — a half-written
     draft in plans/ must not make the whole tool unusable."""
@@ -149,6 +156,7 @@ def parse(path: Path):
         k, v = line.split(":", 1)
         fm[k.strip()] = v.strip()
     fm["depends_on"] = parse_depends_on(fm_raw)
+    fm["repairs"] = parse_repairs(fm_raw)
     # Overwrite the scalar loop's raw text for `paths` with the real list, in
     # both shapes — but ONLY when `paths:` actually has a line (parse_list_field
     # returns None then), so a plan that omits `paths` entirely still fails the
@@ -253,10 +261,12 @@ def _repo_plan_index(path: Path) -> dict:
 
 
 def _plan_id_deps(fm: dict) -> list:
-    """The subset of `depends_on` that names another PLAN — never a `path:` or
-    `external:` entry, neither of which is a node in the dependency graph."""
+    """The subset of `depends_on` that names another PLAN in THIS repo — never
+    a `path:`, `external:`, `owner:`, `pin:` or `plan:` entry (the last names a
+    plan in another repository — plan 0180 D5 — and is no more a node in this
+    graph than a cross-repo `path:` is)."""
     return [d for d in fm.get("depends_on", [])
-            if not d.startswith("path:") and not d.startswith("external:")]
+            if not d.startswith(("path:", "external:", "owner:", "pin:", "plan:"))]
 
 
 def _resolved_deps(fm: dict, index: dict) -> list:
@@ -267,6 +277,49 @@ def _resolved_deps(fm: dict, index: dict) -> list:
         entry = index.get(dep)
         out.append((dep, entry[1] if entry else None))
     return out
+
+
+# Plan 0089: which class of defect a `repairs` entry names. Closed — an open
+# field cannot be counted (spec_impact's free text, plan 0015 §"the real #42
+# defect", is the lesson). A defect that fits none of these is a reason to
+# amend this set in a reviewed PR, not to work around it.
+REPAIR_CLASSES = {"sequencing", "contract", "scope", "decision", "code"}
+
+
+def _split_repair(entry: str):
+    """(plan_id, class) from one raw `repairs` entry, or None when it is
+    malformed: no `:`, or either side empty after stripping. Never raises —
+    a malformed entry is `lint`'s finding to report, not this parser's to
+    crash on."""
+    if ":" not in entry:
+        return None
+    pid, cls = entry.split(":", 1)
+    pid, cls = pid.strip(), cls.strip()
+    if not pid or not cls:
+        return None
+    return pid, cls
+
+
+def _lint_repair_entry(path: Path, fm: dict, entry: str, index: "dict | None") -> list:
+    """D2's four checks for one `repairs` entry, every one of them at any
+    status — a repair record is history, not a dispatch gate (Boundaries:
+    "repairs never gates dispatch"), so there is no draft/ready split here
+    the way §3 Boundaries has."""
+    split = _split_repair(entry)
+    if split is None:
+        return [f"{path.name}: repairs entry {entry!r} is malformed — expected "
+                "'<plan-id>:<class>'"]
+    pid, cls = split
+    errs = []
+    if cls not in REPAIR_CLASSES:
+        errs.append(f"{path.name}: repairs entry {entry!r} names class {cls!r}, "
+                    f"not one of {sorted(REPAIR_CLASSES)}")
+    if fm.get("id") and pid == fm["id"]:
+        errs.append(f"{path.name}: repairs entry {entry!r} names the plan itself")
+    elif index is not None and pid not in index:
+        errs.append(f"{path.name}: repairs entry {entry!r} names {pid!r}, "
+                    "which is not the id of any plan in this repo")
+    return errs
 
 
 def _dependency_cycle(plan_id: str, index: dict):
@@ -298,13 +351,475 @@ def dependency_warnings(path: Path) -> list:
     history would break it on day one without protecting anything.
     """
     fm, _, errs = parse(path)
-    if fm is None or errs or fm.get("status") not in ("done", "abandoned"):
+    if fm is None or errs:
         return []
+    warns = _pin_warnings(path.name, fm)
+    if fm.get("status") not in ("done", "abandoned"):
+        return warns
     index = _repo_plan_index(path)
-    return [f"{path.name}: depends_on {dep!r}, which is abandoned — the edge "
-            "is history, not a live hazard"
-            for dep, dep_fm in _resolved_deps(fm, index)
-            if dep_fm is not None and dep_fm.get("status") == "abandoned"]
+    return warns + [f"{path.name}: depends_on {dep!r}, which is abandoned — the edge "
+                    "is history, not a live hazard"
+                    for dep, dep_fm in _resolved_deps(fm, index)
+                    if dep_fm is not None and dep_fm.get("status") == "abandoned"]
+
+
+def _pin_warnings(name: str, fm: dict) -> list:
+    """Plan 0167: a `pin:` edge onto a repository with no pin today is a warning,
+    not an error: the pin can be created later."""
+    out = []
+    for dep in fm.get("depends_on", []):
+        pm = _CROSS_REPO_PATH.match(dep[len("pin:"):]) if dep.startswith("pin:") else None
+        if not pm:
+            continue
+        try:
+            watch = _load_watch()
+            got = watch.conf_repos()
+            known = bool(got) and pm.group(1) in got[1]
+            has_pin = watch._pin_for(pm.group(1)) is not None
+        except Exception:                                # noqa: BLE001
+            continue
+        if known and not has_pin:
+            out.append(f"{name}: depends_on {dep!r}: {pm.group(1)} has no pin today")
+    return out
+
+
+REVIEWS = ("full", "style")
+_STYLE = None
+
+
+def _style():
+    """bin/fleet-style, loaded by path from beside this file — the same module the
+    review dispatch calls, so lint and routing cannot disagree (ADR-0025 §3)."""
+    global _STYLE
+    if _STYLE is None:
+        loader = importlib.machinery.SourceFileLoader(
+            "_fleet_plan_style", str(Path(__file__).resolve().parent / "fleet-style"))
+        spec = importlib.util.spec_from_loader("_fleet_plan_style", loader)
+        _STYLE = importlib.util.module_from_spec(spec)
+        loader.exec_module(_STYLE)
+    return _STYLE
+
+
+def _lint_review(name: str, fm: dict) -> list:
+    """`review:` is `full` or `style` (ADR-0025 §1). A style plan needs a declared
+    repo, the evidence lease, and a lease inside the declared patterns. `tier`
+    plays no part: style is style, whatever the tier."""
+    if "review" not in fm:
+        return []
+    if fm["review"] not in REVIEWS:
+        return [f"{name}: review '{fm['review']}' not in {list(REVIEWS)}"]
+    if fm["review"] != "style":
+        return []
+    style = _style()
+    try:
+        entry = style.declared(fm.get("repo", ""))
+    except style.Malformed as e:
+        return [f"{name}: review: style, but the style declaration is malformed: {e}"]
+    if entry is None:
+        return [f"{name}: review: style, but repo '{fm.get('repo')}' declares no style "
+                "paths in config/style-review.json"]
+    errs, pid = [], fm.get("id", "")
+    paths = fm.get("paths") if isinstance(fm.get("paths"), list) else []
+    lease = f"{entry['evidence_dir']}/*-{pid}/**"
+    if lease not in paths:
+        errs.append(f"{name}: review: style, but paths lacks the evidence lease '{lease}'")
+    declared = entry["paths"] + entry["binary_paths"]
+    for p in paths:
+        if p in (lease, f"plans/{pid}.md") or p in declared:
+            continue
+        if not re.search(r"[*?]", p) and style.matches_any(declared, p):
+            continue
+        errs.append(f"{name}: paths entry '{p}' is outside the declared style paths "
+                    f"of {fm.get('repo')}")
+    return errs
+
+
+_CROSS_REPO_PATH = re.compile(r"^([A-Za-z0-9._-]+/[A-Za-z0-9._-]+):(.+)$")
+_OWNER_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*\.sh$")
+_HOSTTOOLS = "operator/hosttools"
+
+
+def _load_watch():
+    loader = importlib.machinery.SourceFileLoader(
+        "fleet_watch_for_plan", str(Path(__file__).resolve().parent / "fleet-watch"))
+    spec = importlib.util.spec_from_loader("fleet_watch_for_plan", loader)
+    watch = importlib.util.module_from_spec(spec)
+    loader.exec_module(watch)
+    return watch
+
+
+def _owner_script_on_main(name: str) -> "bool | None":
+    """Whether `bin/<name>` exists on hosttools main, read from the forge. None
+    when the forge cannot say (no token, 5xx): lint then does not guess."""
+    try:
+        watch = _load_watch()
+        token, _ = watch._token()
+        if not token:
+            return None
+        st, _ = watch._forge(token).get_contents(_HOSTTOOLS, f"bin/{name}", ref="main")
+    except Exception:                                    # noqa: BLE001
+        return None
+    return True if st == 200 else False if st == 404 else None
+
+
+def _plan_on_main(repo: str, plan_id: str) -> "bool | None":
+    """Whether `plans/<plan_id>.md` exists on `repo`'s main, read from the
+    forge. None when the forge cannot say (no token, 5xx): lint then does not
+    guess (plan 0180 D5)."""
+    try:
+        watch = _load_watch()
+        token, _ = watch._token()
+        if not token:
+            return None
+        st, _ = watch._forge(token).get_contents(repo, f"plans/{plan_id}.md", ref="main")
+    except Exception:                                    # noqa: BLE001
+        return None
+    return True if st == 200 else False if st == 404 else None
+
+
+def _lint_forge_deps(name: str, fm: dict) -> list:
+    """Plan 0159: `path:<owner/repo>:<path>` names a repository in
+    config/repos.conf; `owner:<script>` names a well-formed script that exists
+    in hosttools `bin/` on main. `plan:<owner/repo>:<id>` (plan 0180) names a
+    repository in config/repos.conf, other than this plan's own, holding a
+    `plans/<id>.md` on main. `external:<text>` (plan 0180), at `ready` or
+    `draft` only, must be a slug an owner can attest. Unmet at lint time is
+    fine; absent is not."""
+    errs = []
+    for dep in fm.get("depends_on", []):
+        m = _CROSS_REPO_PATH.match(dep[len("path:"):]) if dep.startswith("path:") else None
+        if m:
+            try:
+                got = _load_watch().conf_repos()
+            except Exception:                            # noqa: BLE001
+                got = None
+            if got and m.group(1) not in got[1]:
+                errs.append(f"{name}: depends_on {dep!r}: {m.group(1)!r} is not a "
+                            "repository in config/repos.conf")
+        elif dep.startswith("pin:"):
+            pm = _CROSS_REPO_PATH.match(dep[len("pin:"):])
+            if not pm or pm.group(2).startswith("/") or ".." in pm.group(2).split("/"):
+                errs.append(f"{name}: depends_on {dep!r}: expected pin:<owner/repo>:<path>, "
+                            "a relative path without '..'")
+                continue
+            try:
+                got = _load_watch().conf_repos()
+            except Exception:                            # noqa: BLE001
+                got = None
+            if got and pm.group(1) not in got[1]:
+                errs.append(f"{name}: depends_on {dep!r}: {pm.group(1)!r} is not a "
+                            "repository in config/repos.conf")
+        elif dep.startswith("owner:"):
+            script = dep[len("owner:"):]
+            if not _OWNER_NAME.match(script):
+                errs.append(f"{name}: depends_on {dep!r}: script name must match "
+                            f"{_OWNER_NAME.pattern}")
+            elif _owner_script_on_main(script) is False:
+                errs.append(f"{name}: depends_on {dep!r}: no bin/{script} on "
+                            f"{_HOSTTOOLS} main — file the script there first")
+        elif dep.startswith("plan:"):
+            pm = _CROSS_REPO_PATH.match(dep[len("plan:"):])
+            if not pm:
+                errs.append(f"{name}: depends_on {dep!r}: expected "
+                            "plan:<owner/repo>:<id>")
+                continue
+            other, other_id = pm.groups()
+            if other == fm.get("repo"):
+                errs.append(f"{name}: depends_on {dep!r}: names this repository "
+                            f"— use the bare id {other_id!r}")
+                continue
+            try:
+                got = _load_watch().conf_repos()
+            except Exception:                            # noqa: BLE001
+                got = None
+            if got and other not in got[1]:
+                errs.append(f"{name}: depends_on {dep!r}: {other!r} is not a "
+                            "repository in config/repos.conf")
+                continue
+            if _plan_on_main(other, other_id) is False:
+                errs.append(f"{name}: depends_on {dep!r}: no plans/{other_id}.md "
+                            f"on {other} main")
+        elif dep.startswith("external:") and fm.get("status") in ("ready", "draft"):
+            slug = dep[len("external:"):]
+            try:
+                is_slug = _load_watch().is_external_slug(slug)
+            except Exception:                            # noqa: BLE001
+                is_slug = True                            # cannot tell: do not guess an error
+            if not is_slug:
+                errs.append(f"{name}: depends_on {dep!r}: {slug!r} is not a slug "
+                            "— use external:<slug> for an attestation, owner: for "
+                            "a step a script can check, or plan: for another "
+                            "repository's plan")
+    return errs
+
+
+# ------------------------------------------------------------- spec_watch
+#
+# Plan 0177: a plan whose lease reaches a repo's declared API or screen files
+# must also lease and update the spec those files are checked against. The
+# shape `governance.yaml`'s `spec_watch:` key carries is defined by speakhush
+# plan 0073 §2 (operator/speakhush#454), which this parser is the other reader
+# of — not a second definition of it, so its five keys (`name`, `kind`,
+# `code`, `exclude`, `specs`; `diff_pattern` is read and ignored, this lint
+# has no diff) are read exactly as named there.
+#
+# NOT a general YAML reader. `_spec_watch_entries` below understands only a
+# top-level `spec_watch:` block sequence of flat mappings, each mapping's
+# list-valued keys in either the inline `[a, b]` or block `- item` shape
+# `parse_list_field` already reads for plan front matter — reused here on
+# each entry's own (dedented) text rather than written a second time. There
+# is deliberately no PyYAML dependency: `.forgejo/workflows/plans.yml` runs
+# `fleet-plan lint` with the bare system `python3`, no venv and no pip
+# install step, for every push that touches `plans/` in THIS repository —
+# adding an import this interpreter cannot satisfy would break that gate for
+# every plan, including the ones that never touch `governance.yaml` at all.
+
+_GOVERNANCE_NAME = "governance.yaml"
+_SPEC_WATCH_KINDS = {"api", "screen"}
+_GLOB_CHARS = re.compile(r"[*?\[]")
+
+
+def _is_glob(entry: str) -> bool:
+    return bool(_GLOB_CHARS.search(entry))
+
+
+def _glob_fixed_prefix(entry: str) -> str:
+    """The part of a glob before its first wildcard character — the whole
+    string when it has none."""
+    m = _GLOB_CHARS.search(entry)
+    return entry[:m.start()] if m else entry
+
+
+def _prefix_overlap(a: str, b: str) -> bool:
+    return a.startswith(b) or b.startswith(a)
+
+
+def _spec_watch_entries(text: str) -> "list[str] | None":
+    """The text of each item under a top-level `spec_watch:` key, each
+    dedented so it reads like an ordinary flat block (its own keys at column
+    0, any nested list under one of them still indented relative to it) —
+    exactly the shape `parse_list_field` reads, reused on each entry below
+    rather than parsed a second way. `None` when there is no `spec_watch:`
+    key at all; `[]` when the key is present but names no items."""
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if re.match(r"^spec_watch\s*:\s*$", line):
+            start = i
+            break
+    if start is None:
+        return None
+    block = []
+    for line in lines[start + 1:]:
+        if not line.strip():
+            continue
+        if len(line) - len(line.lstrip(" ")) == 0:
+            break                               # back to a top-level key
+        block.append(line)
+    marker_indents = [len(l) - len(l.lstrip(" ")) for l in block
+                      if l.lstrip(" ").startswith("- ")]
+    if not marker_indents:
+        return []
+    item_indent = min(marker_indents)
+    base_col = item_indent + 2                   # column of the mapping's own keys
+    entries, cur = [], None
+    for line in block:
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.lstrip(" ")
+        if indent == item_indent and stripped.startswith("- "):
+            if cur is not None:
+                entries.append("\n".join(cur))
+            cur = [line[base_col:]]
+        elif cur is not None:
+            cur.append(line[base_col:] if len(line) >= base_col else "")
+    if cur is not None:
+        entries.append("\n".join(cur))
+    return entries
+
+
+def _parse_spec_watch_entry(text: str) -> "tuple[dict | None, str | None]":
+    """One rule from its dedented entry text, or (None, reason)."""
+    scalars = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            continue
+        v = v.strip()
+        if v and not v.startswith("["):
+            scalars[k] = v.strip('"').strip("'")
+    name, kind = scalars.get("name"), scalars.get("kind")
+    code = parse_list_field(text, "code")
+    exclude = parse_list_field(text, "exclude") or []
+    specs = parse_list_field(text, "specs")
+    if not name:
+        return None, "a spec_watch entry is missing 'name'"
+    if kind not in _SPEC_WATCH_KINDS:
+        return None, f"spec_watch {name!r}: kind {kind!r} not in {sorted(_SPEC_WATCH_KINDS)}"
+    if not code:
+        return None, f"spec_watch {name!r} is missing 'code'"
+    if not specs:
+        return None, f"spec_watch {name!r} is missing 'specs'"
+    return {"name": name, "kind": kind, "code": code, "exclude": exclude,
+            "specs": specs}, None
+
+
+def _governance_path(path: Path) -> Path:
+    """`<repo root>/governance.yaml`, beside `plans/` — the plan's
+    grandparent directory, the same directory-scoped way `_repo_plan_index`
+    finds its siblings."""
+    return path.parent.parent / _GOVERNANCE_NAME
+
+
+def _spec_watch_rules(path: Path) -> "tuple[list, str | None]":
+    """([rule, ...], None) from `governance.yaml`'s `spec_watch:` list.
+    ([], None) — no new problems — when there is no `governance.yaml` or no
+    `spec_watch` key: the check is off for that repo, that repo's own choice
+    (Boundaries: eunomia never hard-codes another repo's paths). ([], a
+    message) when `governance.yaml` exists but cannot be read as this
+    restricted subset."""
+    gpath = _governance_path(path)
+    if not gpath.is_file():
+        return [], None
+    try:
+        text = gpath.read_text()
+    except OSError as e:
+        return [], f"governance.yaml: {e.strerror or e}"
+    entries = _spec_watch_entries(text)
+    if entries is None:
+        return [], None
+    rules = []
+    for i, entry_text in enumerate(entries):
+        rule, err = _parse_spec_watch_entry(entry_text)
+        if err:
+            return [], f"governance.yaml: spec_watch[{i}]: {err}"
+        rules.append(rule)
+    return rules, None
+
+
+def _repo_file_list(repo_root: Path) -> frozenset:
+    """Every file path, repo-root-relative with forward slashes, currently
+    in this checkout — `.git` excluded, filesystem-only (no git call), so
+    this works the same in a shallow or git-less checkout. Empty when
+    `repo_root` holds nothing but what a caller wrote there on purpose — the
+    `eunomia/plan-lint` sandbox holds only `plans/*.md` and
+    `governance.yaml` (Boundaries: nothing else is read from a PR's
+    checkout), so only the literal-path and new-file forms of `_rule_reached`
+    below ever fire there; the existing-file form needs a real checkout."""
+    out = []
+    try:
+        for p in repo_root.rglob("*"):
+            if ".git" in p.parts or not p.is_file():
+                continue
+            out.append(str(p.relative_to(repo_root)).replace(os.sep, "/"))
+    except OSError:
+        pass
+    return frozenset(out)
+
+
+def _rule_reached(rule: dict, leases: list, repo_files: frozenset) -> list:
+    """The lease entries that reach `rule`'s `code` globs, by any of the
+    three forms plan 0177 §2 names: a literal lease path matching `code`
+    (and no `exclude`); a lease glob matching a file that exists in this
+    checkout and matches `code` (and no `exclude`); or — for a lease that
+    creates a new file nothing in the tree has yet — a lease glob's fixed
+    prefix overlapping a `code` glob's fixed prefix (and not an `exclude`
+    glob's)."""
+    code, excl = rule["code"], rule.get("exclude") or []
+    hits = []
+    for entry in leases:
+        if not isinstance(entry, str):
+            continue
+        if not _is_glob(entry):
+            if (any(fnmatch.fnmatchcase(entry, c) for c in code)
+                    and not any(fnmatch.fnmatchcase(entry, e) for e in excl)):
+                hits.append(entry)
+            continue
+        if any(fnmatch.fnmatchcase(f, entry) and fnmatch.fnmatchcase(f, c)
+               and not any(fnmatch.fnmatchcase(f, e) for e in excl)
+               for f in repo_files for c in code):
+            hits.append(entry)
+            continue
+        prefix = _glob_fixed_prefix(entry)
+        if (any(_prefix_overlap(prefix, _glob_fixed_prefix(c)) for c in code)
+                and not any(_prefix_overlap(prefix, _glob_fixed_prefix(e)) for e in excl)):
+            hits.append(entry)
+    return hits
+
+
+def _lease_covers_spec(entry: str, specs: list) -> bool:
+    """Does this one lease entry match, or lie under, one of `specs`'
+    globs?"""
+    if not _is_glob(entry):
+        return any(fnmatch.fnmatchcase(entry, s) for s in specs)
+    prefix = _glob_fixed_prefix(entry)
+    for s in specs:
+        if not _is_glob(s):
+            if fnmatch.fnmatchcase(s, entry):
+                return True
+        elif _prefix_overlap(prefix, _glob_fixed_prefix(s)):
+            return True
+    return False
+
+
+_PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)+")
+
+
+def _mentions_spec(text: str, specs: list) -> bool:
+    """Does `text` (meant to be §4 Definition of done) name one of `specs`?
+    A literal spec is looked for as a plain substring, inside backticks or
+    not; a spec glob is matched against every path-shaped token in `text`."""
+    for s in specs:
+        if not _is_glob(s):
+            if s in text:
+                return True
+            continue
+        if any(fnmatch.fnmatchcase(tok, s) for tok in _PATH_TOKEN.findall(text)):
+            return True
+    return False
+
+
+def _lint_spec_watch(path: Path, fm: dict, body: str) -> list:
+    rules, err = _spec_watch_rules(path)
+    if err:
+        return [f"{path.name}: {err}"]
+    exempt_val = fm.get("spec_exempt")
+    # `parse()`'s scalar loop (above, in this file) does not strip quotes from
+    # an arbitrary front-matter value the way `parse_list_field` does for a
+    # list item — `spec_exempt: ""` would otherwise read as the two-character
+    # string '""', which is truthy.
+    if isinstance(exempt_val, str):
+        exempt_val = exempt_val.strip().strip('"').strip("'")
+    exempt_ok = isinstance(exempt_val, str) and bool(exempt_val.strip())
+    errs = []
+    if "spec_exempt" in fm and not exempt_ok:
+        errs.append(f"{path.name}: spec_exempt must be a non-empty string naming "
+                    "why no route or screen changed")
+    if not rules:
+        return errs
+    leases = fm.get("paths") if isinstance(fm.get("paths"), list) else []
+    dod = section(body, "4. Definition of done")
+    repo_files = _repo_file_list(path.parent.parent)
+    for rule in rules:
+        hits = _rule_reached(rule, leases, repo_files)
+        if not hits:
+            continue
+        if exempt_ok:
+            continue
+        specs = rule["specs"]
+        covered = any(_lease_covers_spec(e, specs) for e in leases
+                      if isinstance(e, str))
+        mentioned = _mentions_spec(dod, specs)
+        if covered and mentioned:
+            continue
+        need = ("mentioned in §4 Definition of done" if covered
+                else "leased and mentioned in §4 Definition of done")
+        errs.append(f"{path.name}: paths {hits} reach spec_watch rule "
+                    f"{rule['name']!r} ({rule['kind']}) but its spec {specs} is not "
+                    f"{need} — update the spec in this plan, not a later handoff note")
+    return errs
 
 
 def lint(path: Path) -> list:
@@ -322,6 +837,7 @@ def lint(path: Path) -> list:
     for s in SECTIONS:
         if not re.search(rf"^##\s+{re.escape(s)}\s*$", body, re.M):
             errs.append(f"{path.name}: missing section '## {s}'")
+    errs.extend(_lint_review(path.name, fm))
 
     # `if fm.get("id")` would exempt an EMPTY value: the key is present so
     # REQUIRED_FM is satisfied, and "" != stem never fires. A blanked id then
@@ -340,8 +856,9 @@ def lint(path: Path) -> list:
                       "`fleet-plan show <id>` returns whichever file it finds first, "
                       "so a duplicate resolves silently to the wrong plan")
 
-    if fm.get("id"):
-        index = _repo_plan_index(path)
+    index = _repo_plan_index(path) if (fm.get("id") or fm.get("repairs")) else None
+
+    if fm.get("id") and index is not None:
         cyc = _dependency_cycle(fm["id"], index)
         if cyc:
             errs.append(f"{path.name}: depends_on cycle: " + " -> ".join(cyc))
@@ -352,6 +869,13 @@ def lint(path: Path) -> list:
             elif dep_fm.get("status") == "abandoned" and fm.get("status") in ("ready", "draft"):
                 errs.append(f"{path.name}: depends_on {dep!r}, which is "
                             "abandoned and will never be done — edit the edge")
+
+    errs.extend(_lint_forge_deps(path.name, fm))
+
+    for entry in fm.get("repairs", []):
+        errs.extend(_lint_repair_entry(path, fm, entry, index))
+
+    errs.extend(_lint_spec_watch(path, fm, body))
 
     if path.stem == "0000-template":
         return errs  # the template is meant to be placeholders
@@ -589,8 +1113,31 @@ def _dep_edges(fm: dict, index: dict, tree_now: "frozenset | None",
             edges.append({"to": dep[len("external:"):], "form": "external",
                           "satisfied": None, "reason": "external"})
             continue
+        if dep.startswith("owner:"):
+            edges.append({"to": dep[len("owner:"):], "form": "owner",
+                          "satisfied": None, "reason": "owner"})
+            continue
+        if dep.startswith("pin:"):
+            edges.append({"to": dep[len("pin:"):], "form": "pin", "satisfied": None,
+                          "reason": "pin",
+                          "detail": "HEAD of another repository's pin; read by "
+                                    "fleet-watch, not this checkout"})
+            continue
+        if dep.startswith("plan:"):
+            p = dep[len("plan:"):]
+            edges.append({"to": p, "form": "plan", "satisfied": None,
+                          "reason": "cross_repo",
+                          "detail": "another repository's main; read by "
+                                    "fleet-watch, not this checkout"})
+            continue
         if dep.startswith("path:"):
             p = dep[len("path:"):]
+            if _CROSS_REPO_PATH.match(p):
+                edges.append({"to": p, "form": "path", "satisfied": None,
+                              "reason": "cross_repo",
+                              "detail": "another repository's main; read by "
+                                        "fleet-watch, not this checkout"})
+                continue
             plan_repo = fm.get("repo")
             # `_plan_dependency_block` (fleet-watch) resolves `path:` against
             # the DEPENDENT plan's own repo, never the repo this graph is run
@@ -741,7 +1288,7 @@ def _unreachable_ids(index: dict) -> set:
                 if dep.startswith("external:"):
                     blocked[node] = True
                     continue
-                if dep.startswith("path:"):
+                if dep.startswith(("path:", "owner:", "pin:", "plan:")):
                     continue
                 dep_fm = index.get(dep)
                 if dep_fm is None:
@@ -766,14 +1313,34 @@ def _unreachable_ids(index: dict) -> set:
     return {pid for pid, v in blocked.items() if v}
 
 
+def _repair_edges(index: dict) -> list:
+    """One `{"from", "to", "class"}` per valid `repairs` entry, in declared
+    order — plan 0089 D3. Never in `edges`: layering, unreachability and cycle
+    detection all walk `edges`, and a repair edge in there would change every
+    one of them (Boundaries: "repairs never gates dispatch"). A malformed
+    entry contributes nothing here; `lint` is what reports it."""
+    out = []
+    for pid, fm in index.items():
+        for entry in fm.get("repairs", []):
+            split = _split_repair(entry)
+            if split is None:
+                continue
+            target, cls = split
+            out.append({"from": pid, "to": target, "class": cls})
+    return out
+
+
 def graph(files, repo: Path = REPO_ROOT, ref: str = "origin/main") -> dict:
-    """{"nodes": [...], "edges": [...], "cycles": [...], "errors": [...]}.
+    """{"nodes": [...], "edges": [...], "repairs": [...], "cycles": [...],
+    "errors": [...]}.
 
     One node per parseable plan (`id`, `status`, `repo`, `paths`, `unreachable`
     — D2, D5); one edge per `depends_on` entry, tagged with its form (D2/D3).
-    A plan that fails to parse is reported in `errors`, never silently
-    dropped (matching `audit`'s own rule). Read-only: no plan file, index, or
-    working tree is written (Boundaries: "report, never write").
+    `repairs` is a separate top-level list (plan 0089 D3), never folded into
+    `edges` — see `_repair_edges`. A plan that fails to parse is reported in
+    `errors`, never silently dropped (matching `audit`'s own rule). Read-only:
+    no plan file, index, or working tree is written (Boundaries: "report,
+    never write").
     """
     own_repo = _own_repo(repo)
     tree_now = _tree_files(repo, ref)
@@ -797,7 +1364,7 @@ def graph(files, repo: Path = REPO_ROOT, ref: str = "origin/main") -> dict:
         for e in _dep_edges(fm, index, tree_now, own_repo):
             edges.append({"from": pid, **e})
 
-    return {"nodes": nodes, "edges": edges,
+    return {"nodes": nodes, "edges": edges, "repairs": _repair_edges(index),
             "cycles": _find_cycles(index), "errors": errors}
 
 
@@ -809,7 +1376,9 @@ def _mermaid(data: dict) -> str:
     flatten them") — a plain arrow for a satisfied plan-id edge, a dashed one
     for an unmet plan-id or missing/cross-repo path, and a thick one into a
     diamond for `external:`, which nothing but a human deleting the line ever
-    clears.
+    clears. `repairs` (plan 0089 D3) gets a fourth, dotted style, labelled
+    with its class, between the two plan nodes directly — it is not a
+    `depends_on` form and carries no `satisfied` state to draw.
     """
     def nid(s: str) -> str:
         return "n_" + re.sub(r"[^A-Za-z0-9_]", "_", s)
@@ -837,10 +1406,21 @@ def _mermaid(data: dict) -> str:
             note = e["reason"] or "ok"
             lines.append(f'  {tag}(["path: {esc(e["to"])}"])')
             lines.append(f'  {src} -.->|{note}| {tag}')
+        elif e["form"] == "pin":
+            tag = nid(f"pin_{counter}")
+            lines.append(f'  {tag}[/"pin: {esc(e["to"])}"/]')
+            lines.append(f'  {src} -.->|pin| {tag}')
+        elif e["form"] == "owner":
+            tag = nid(f"owner_{counter}")
+            lines.append(f'  {tag}{{{{"owner: {esc(e["to"])}"}}}}')
+            lines.append(f'  {src} ==>|owner| {tag}')
         else:
             tag = nid(f"ext_{counter}")
             lines.append(f'  {tag}{{"external: {esc(e["to"])}"}}')
             lines.append(f'  {src} ==>|external| {tag}')
+
+    for r in data.get("repairs", []):
+        lines.append(f'  {nid(r["from"])} -.->|repairs: {esc(r["class"])}| {nid(r["to"])}')
     return "\n".join(lines) + "\n"
 
 
@@ -873,7 +1453,8 @@ def _svg(data: dict) -> str:
              f'<rect class="bg" x="0" y="0" width="{width}" height="{height}" fill="white"/>',
              f'<text x="{MARGIN}" y="20">fleet-plan graph</text>',
              f'<text x="{MARGIN}" y="36">Legend: solid=satisfied plan-id dep, '
-             'dashed=unmet, red outline=unreachable (D5)</text>']
+             'dashed=unmet, red outline=unreachable (D5)</text>',
+             f'<text x="{MARGIN}" y="50">blue dotted=repairs (plan 0089)</text>']
 
     pos = {}
     for li in sorted(by_layer):
@@ -897,6 +1478,15 @@ def _svg(data: dict) -> str:
         dash = '' if e["satisfied"] else ' stroke-dasharray="5,4"'
         parts.append(f'<path class="edge" d="M{x0 + BOX_W / 2},{y0} '
                      f'L{x1 + BOX_W / 2},{y1 + BOX_H}" stroke="#333" fill="none"{dash}/>')
+
+    for r in data.get("repairs", []):
+        if r["from"] not in pos or r["to"] not in pos:
+            continue
+        x0, y0 = pos[r["from"]]
+        x1, y1 = pos[r["to"]]
+        parts.append(f'<path class="repair-edge" d="M{x0 + BOX_W / 2},{y0} '
+                     f'L{x1 + BOX_W / 2},{y1 + BOX_H}" stroke="#06c" fill="none" '
+                     'stroke-dasharray="2,2"/>')
 
     parts.append("</svg>")
     return "\n".join(parts) + "\n"
@@ -929,6 +1519,10 @@ LEDGER_NOTES = (
     "classes and prints its answer in its own column.",
     "fleet.db indexes the forge and does not poll it: a pull request state with "
     "source `fleet.db` is as of `pr_as_of`. Only source `forge` was read just now.",
+    "`repaired_by` (JSON) names every OTHER plan in this repo whose own `repairs` "
+    "front matter points at this row, with its class; the table shows the count "
+    "and the classes under the row instead of a column. It is never written to "
+    "this plan's own file.",
 )
 
 LEDGER_COLUMNS = ("id", "status", "runs", "outcome", "pr", "pr_state", "pr_source",
@@ -1007,8 +1601,9 @@ def _read_costs(con, repo: str) -> dict:
             "rounds": rounds}
 
 
-def _read_dispatches(db: Path, repo: str) -> "tuple[dict, dict | None, int, dict | None]":
-    """(db_status, {plan_id: [run, ...]} or None, unattributed, costs).
+def _read_dispatches(db: Path, repo: str, plan_ids: "set | None" = None
+                     ) -> "tuple[dict, dict | None, int, dict | None, dict]":
+    """(db_status, {plan_id: [run, ...]} or None, unattributed, costs, stage_sources).
 
     None for the runs means "no dispatch data" — the database is absent, not
     yet built, or unreadable — and every caller must carry that as `unknown`.
@@ -1016,18 +1611,23 @@ def _read_dispatches(db: Path, repo: str) -> "tuple[dict, dict | None, int, dict
     no runs in it. Collapsing the two is the error this function exists to
     prevent: the absence of a record is not evidence that nothing ran.
 
-    Opened `mode=ro` and `query_only`: the database is derived, can be
-    mid-rebuild, and is not this tool's to touch. `unattributed` counts leases
-    the view could not tie to a repo or plan; they are counted, never joined.
+    Opened `mode=ro` and `query_only`, ONE connection for everything this
+    function reads (plan 0196's stage sources included — a second `connect`
+    here would be a second read against a database the ledger has no business
+    opening twice per invocation). `unattributed` counts leases the view could
+    not tie to a repo or plan; they are counted, never joined.
     """
+    empty_sources = {"phases": {}, "review_rounds": {}, "review_attempts": {},
+                     "lane_runs": {}, "impl_tokens": {}, "round_tokens": {}}
     status = {"state": "absent", "path": str(db), "detail": "no such file"}
     if not db.is_file():
-        return status, None, 0, None
+        return status, None, 0, None, empty_sources
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
     except sqlite3.Error as e:
-        return {**status, "state": "unreadable", "detail": str(e)}, None, 0, None
+        return {**status, "state": "unreadable", "detail": str(e)}, None, 0, None, empty_sources
     costs = None
+    stage_sources = empty_sources
     try:
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA query_only = ON")
@@ -1036,8 +1636,11 @@ def _read_dispatches(db: Path, repo: str) -> "tuple[dict, dict | None, int, dict
             "SELECT COUNT(*) FROM dispatch WHERE repo IS NULL OR plan_id IS NULL"
         ).fetchone()[0]
         costs = _read_costs(con, repo)
+        leases = {r["lease"] for r in rows}
+        prs = {r["pr"] for r in rows if r["pr"] is not None}
+        stage_sources = _stage_sources_from_con(con, repo, leases, prs, plan_ids or set())
     except sqlite3.Error as e:
-        return {**status, "state": "unreadable", "detail": str(e)}, None, 0, None
+        return {**status, "state": "unreadable", "detail": str(e)}, None, 0, None, empty_sources
     finally:
         con.close()
     runs = {}
@@ -1045,15 +1648,19 @@ def _read_dispatches(db: Path, repo: str) -> "tuple[dict, dict | None, int, dict
         runs.setdefault(r["plan_id"], []).append(dict(r))
     for lst in runs.values():
         lst.sort(key=lambda r: (r["started_ts"] or "", r["lease"]))
-    return {"state": "ok", "path": str(db), "detail": ""}, runs, unattributed, costs
+    return {"state": "ok", "path": str(db), "detail": ""}, runs, unattributed, costs, stage_sources
 
 
-def _ledger_row(pid: str, fm: dict, runs: "list | None") -> dict:
-    """One plan's row. `runs` is None when there is no dispatch data at all."""
+def _ledger_row(pid: str, fm: dict, runs: "list | None", repaired_by: "list | None" = None) -> dict:
+    """One plan's row. `runs` is None when there is no dispatch data at all.
+    `repaired_by` (plan 0089 D4) is derived from OTHER plans in this repo's
+    `repairs` front matter, never from this plan's own file — this row never
+    writes it back (Boundaries: "never write to the repaired plan's file")."""
     row = {"id": pid, "status": fm.get("status"), "runs": None, "outcome": "unknown",
            "pr": None, "pr_state": None, "pr_source": None, "pr_as_of": None,
            "rounds": None, "impl_seconds": None, "class": None, "reason": None,
-           "probe": None, "dispatches": None, "review_rounds": None, "total": None}
+           "probe": None, "dispatches": None, "review_rounds": None, "total": None,
+           "repaired_by": list(repaired_by or [])}
     if runs is None:
         return row
     row["runs"] = len(runs)
@@ -1209,9 +1816,803 @@ def _probe_lookup(index: dict, repo: Path, ref: str):
     return probe
 
 
+def _repaired_by_index(index: dict) -> dict:
+    """target plan id -> [{"id", "class"}] naming every plan in `index` whose
+    `repairs` names it, in ascending repairing-plan-id order. Malformed
+    entries and repairs naming a plan outside `index` (another repo, or a
+    typo `lint` would already have refused on `main`) are skipped rather than
+    guessed at — plan 0089 D4, read-only over the same front matter `lint`
+    already validated."""
+    out = {}
+    for pid, (_f, fm) in sorted(index.items()):
+        for entry in fm.get("repairs", []):
+            split = _split_repair(entry)
+            if split is None:
+                continue
+            target, cls = split
+            if target not in index:
+                continue
+            out.setdefault(target, []).append({"id": pid, "class": cls})
+    return out
+
+
+# ------------------------------------------------------------- plan 0196: stages
+
+STAGE_NAMES = ("submitted", "approved", "implementation", "review", "test", "merged")
+
+# operator/intakebot `lab/file.py:300`, introduced in commit
+# 23686beb756e3d7191a97f85f7d4fea394576369 and unchanged since (quoted in plan
+# 0196 Resources as `lab/file.py:298`; the line has since moved as unrelated
+# code was added above it, the text has not) — a cross-repo read, not a
+# dependency: nothing here imports intakebot.
+INTAKEBOT_MARKER = "Filed by intakebot from an accepted business plan"
+
+# bin/fleet-meet's MEET_TIMEOUT_SECONDS, near line 86 — a constant there, cited
+# by number rather than imported, the same way plan 0196 D2 names it.
+_TEST_LANE_BUDGET_SECONDS = 900
+
+_NO_TOKENS = {"input": None, "output": None, "cache_read": None, "source": "not recorded"}
+
+
+def _parse_dt(value: "str | None"):
+    if not value:
+        return None
+    try:
+        return __import__("datetime").datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _dt_diff(start: "str | None", end: "str | None") -> "float | None":
+    a, b = _parse_dt(start), _parse_dt(end)
+    return (b - a).total_seconds() if (a and b) else None
+
+
+def _tok3(d: "dict | None") -> "dict | None":
+    """A `dispatch_cost`/session-sum row -> `{input, output, cache_read}`, or
+    None when there is nothing linked. Never `0` for a field SQL summed over
+    zero rows (`SUM` of nothing is NULL, which `sqlite3.Row` gives as None —
+    kept as None here too, never coerced)."""
+    if d is None:
+        return None
+    if d.get("in_tok") is None and d.get("out_tok") is None and d.get("cache_read_tok") is None:
+        return None
+    return {"input": d.get("in_tok"), "output": d.get("out_tok"),
+            "cache_read": d.get("cache_read_tok")}
+
+
+def _lane_tokens(usage_json_text: "str | None") -> "dict | None":
+    """`{input, output, cache_read}` from a Claude lane's own `usage` object
+    inside `lane_run.usage_json` (`bin/fleet-lane`'s `_claude_usage`). Other
+    vendors' shapes (codex's `cached_input_tokens`-as-subset, antigravity's,
+    muse's) are not parsed here — a deliberate, documented bound given plan
+    0196's time budget; such a run's tokens are `None`, read by the caller as
+    not recorded rather than guessed."""
+    if not usage_json_text:
+        return None
+    try:
+        obj = json.loads(usage_json_text)
+    except (ValueError, TypeError):
+        return None
+    usage = obj.get("usage") if isinstance(obj, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    try:
+        return {"input": int(usage.get("input_tokens") or 0),
+                "output": int(usage.get("output_tokens") or 0),
+                "cache_read": int(usage.get("cache_read_input_tokens") or 0)}
+    except (TypeError, ValueError):
+        return None
+
+
+def _sum_tokens(parts: list, source: str) -> dict:
+    """Sum `{input,output,cache_read}` dicts (or None) over FINISHED attempts
+    only — a live attempt contributes nothing (plan 0196 D2). `source` is the
+    tag to report when every part that exists is recorded; a part present on
+    some attempts and missing on others reports `partial`."""
+    if not parts:
+        return dict(_NO_TOKENS)
+    recorded = [p for p in parts if p is not None]
+    if not recorded:
+        return dict(_NO_TOKENS)
+    out = {"input": 0, "output": 0, "cache_read": 0}
+    for p in recorded:
+        for k in ("input", "output", "cache_read"):
+            out[k] += p.get(k) or 0
+    out["source"] = source if len(recorded) == len(parts) else "partial"
+    return out
+
+
+def _combine_token_objs(parts: list) -> dict:
+    """Like `_sum_tokens`, over already-combined token OBJECTS (each carrying
+    its own `source`) — the test stage's per-lane combine, folded into one."""
+    recorded = [p for p in parts if p and p.get("source") != "not recorded"]
+    if not recorded:
+        return dict(_NO_TOKENS)
+    out = {"input": 0, "output": 0, "cache_read": 0}
+    for p in recorded:
+        for k in ("input", "output", "cache_read"):
+            out[k] += p.get(k) or 0
+    uniform = len(recorded) == len(parts) and all(p.get("source") == "lane" for p in recorded)
+    out["source"] = "lane" if uniform else "partial"
+    return out
+
+
+def _combine_stage(name: str, attempts: list, budget_seconds: "int | None",
+                   now=None) -> dict:
+    """The one rule for every stage with more than one attempt (plan 0196 D2).
+
+    `attempts` is oldest-first; each is `{started_at, end_at, live, ok, reason,
+    seconds, tokens, token_source}`. `live` may be True only on the LAST entry.
+    State and reason come from the newest attempt; times span every attempt;
+    seconds/tokens sum the FINISHED ones only."""
+    if not attempts:
+        return {"name": name, "started_at": None, "completed_at": None,
+                "failed_at": None, "state": "empty", "reason": None,
+                "attempts": 0, "attempt_started_at": None,
+                "budget_seconds": budget_seconds, "over_budget": None,
+                "seconds": None, "tokens": dict(_NO_TOKENS)}
+    newest = attempts[-1]
+    started_at = attempts[0]["started_at"]
+    attempt_started_at = newest["started_at"]
+    completed_at = failed_at = reason = None
+    if newest["live"]:
+        state = "running"
+    elif newest["ok"]:
+        state = "completed"
+        completed_at = newest["end_at"]
+    else:
+        state = "failed"
+        failed_at = newest["end_at"]
+        reason = newest["reason"]
+    finished = [a for a in attempts if not a["live"]]
+    if not finished:
+        seconds = None
+    elif any(a["seconds"] is None for a in finished):
+        seconds = None
+    else:
+        seconds = sum(a["seconds"] for a in finished)
+    sources = {a["token_source"] for a in finished if a["tokens"] is not None}
+    tokens = _sum_tokens([a["tokens"] for a in finished],
+                        sources.pop() if len(sources) == 1 else "partial")
+    over_budget = None
+    if state == "running" and budget_seconds and attempt_started_at and now is not None:
+        started = _parse_dt(attempt_started_at)
+        if started is not None:
+            over_budget = (now - started).total_seconds() > budget_seconds
+    return {"name": name, "started_at": started_at, "completed_at": completed_at,
+            "failed_at": failed_at, "state": state, "reason": reason,
+            "attempts": len(attempts), "attempt_started_at": attempt_started_at,
+            "budget_seconds": budget_seconds, "over_budget": over_budget,
+            "seconds": seconds, "tokens": tokens}
+
+
+def _point_stage(name: str, ts: "str | None", error_reason: "str | None" = None) -> dict:
+    """`approved`/`merged`: a single instant, never a duration (plan 0196 D2)."""
+    if ts is not None:
+        return {"name": name, "started_at": ts, "completed_at": ts, "failed_at": None,
+                "state": "completed", "reason": None, "attempts": 1,
+                "attempt_started_at": None, "budget_seconds": None,
+                "over_budget": None, "seconds": None, "tokens": dict(_NO_TOKENS)}
+    return {"name": name, "started_at": None, "completed_at": None, "failed_at": None,
+            "state": "unknown" if error_reason else "empty", "reason": error_reason,
+            "attempts": 0, "attempt_started_at": None, "budget_seconds": None,
+            "over_budget": None, "seconds": None, "tokens": dict(_NO_TOKENS)}
+
+
+def _fleetlib_module():
+    loader = importlib.machinery.SourceFileLoader(
+        "fleetlib_for_ledger", str(Path(__file__).resolve().parent / "fleetlib.py"))
+    spec = importlib.util.spec_from_loader("fleetlib_for_ledger", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _lease_is_live(fleetlib_mod, lease_id: str) -> bool:
+    """The heartbeat liveness verdict (Boundary 4), never a lease's own `state`
+    field or a dispatch's lack of a terminal record: the 0179 incident is
+    exactly a lease whose own fields said nothing was wrong for 14 hours after
+    its holder died.
+
+    `state` in `(assigned, active)` (finding, review of #1472), the same pair
+    `derive_lanes` in bin/orchestrator reads for a lane lease: `assigned` is a
+    dispatch handed out but not yet activated, still live until
+    `is_orphaned`'s own `ACTIVATE_TIMEOUT_MIN` window passes. Reading only
+    `active` called an `assigned` dispatch dead the instant it was handed
+    out, before it ever got the chance to activate."""
+    try:
+        rec = fleetlib_mod.read_lease(lease_id)
+    except SystemExit:
+        return False
+    if not rec or rec.get("state") not in ("assigned", "active"):
+        return False
+    return not fleetlib_mod.is_orphaned(rec)
+
+
+def _orchestrator_module():
+    loader = importlib.machinery.SourceFileLoader(
+        "orchestrator_for_ledger", str(Path(__file__).resolve().parent / "orchestrator"))
+    spec = importlib.util.spec_from_loader("orchestrator_for_ledger", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _impl_budget_seconds(orch_mod, repo: str) -> "int | None":
+    try:
+        minutes, _source = orch_mod.impl_bound(repo)
+    except Exception:
+        return None
+    return minutes * 60
+
+
+def _review_round_budget_seconds(orch_mod, repo: str, plan_text: str) -> "int | None":
+    """`orch_mod._review_dispatch_timeout(repo, position)`'s own answer —
+    never the flat `REVIEW_DISPATCH_TIMEOUT` (finding, review of #1472): a
+    cihost reviewer seat gets `REVIEW_DISPATCH_TIMEOUT_CIHOST` (9600s, not
+    6000s), the same widening `review_loop` applies before calling
+    `dispatch_review`, and reading the flat constant here reported a live
+    cihost round `over_budget` while it was still within its real bound.
+    `position` is `orch_mod.review_position(plan_text)` — right for the
+    ordinary `plan_reviewer`/`code_reviewer` routing every round not routed
+    to `style_reviewer` uses; a style-routed round is not distinguishable
+    from `plan_text` alone and is read under the ordinary position's budget,
+    a narrower approximation than a wrong flat constant, never a wider one."""
+    try:
+        position = orch_mod.review_position(plan_text)
+        return orch_mod._review_dispatch_timeout(repo, position)
+    except Exception:
+        return getattr(orch_mod, "REVIEW_DISPATCH_TIMEOUT", None)
+
+
+def _stage_sources_from_con(con, repo: str, leases: set, prs: set, plan_ids: set) -> dict:
+    """Everything D2/D3 need beyond `_read_dispatches`'s own aggregates: every
+    phase row of these leases, the review rounds and `review_attempt` stops of
+    these pull requests, the `lane_run` rows of these plan ids, and the Claude
+    session tokens linked to a lease or a review round.
+
+    Takes an ALREADY-OPEN connection — `_read_dispatches` is the only caller,
+    and this must not be a second `sqlite3.connect` against a database the
+    ledger opens exactly once per invocation. A table that is absent (an
+    older install) or unreadable degrades that one source to empty, never the
+    whole read; only `sqlite3.Error` from the dispatch_phase read (required,
+    unlike the rest) propagates to the caller's own except."""
+    out = {"phases": {}, "review_rounds": {}, "review_attempts": {},
+           "lane_runs": {}, "impl_tokens": {}, "round_tokens": {}}
+    if leases:
+        qs = ",".join("?" * len(leases))
+        for r in con.execute(
+                f"SELECT lease, seq, ts, phase, detail_json FROM dispatch_phase "
+                f"WHERE lease IN ({qs}) ORDER BY lease, seq", tuple(leases)):
+            out["phases"].setdefault(r["lease"], []).append(dict(r))
+    if prs:
+        qs = ",".join("?" * len(prs))
+        try:
+            for r in con.execute(
+                    f"SELECT pr, round, verdict, submitted_at, session_uuid "
+                    f"FROM review WHERE lower(repo)=? AND pr IN ({qs}) "
+                    f"ORDER BY pr, round", (repo, *prs)):
+                out["review_rounds"].setdefault(r["pr"], []).append(dict(r))
+        except sqlite3.OperationalError:
+            pass
+        try:
+            for r in con.execute(
+                    f"SELECT pr, outcome, started_at, stopped_at, ordinal, "
+                    f"session_uuid FROM review_attempt WHERE lower(repo)=? "
+                    f"AND pr IN ({qs}) ORDER BY pr, started_at", (repo, *prs)):
+                out["review_attempts"].setdefault(r["pr"], []).append(dict(r))
+        except sqlite3.OperationalError:
+            pass
+    if plan_ids:
+        qs = ",".join("?" * len(plan_ids))
+        try:
+            for r in con.execute(
+                    f"SELECT plan, runner, started_at, ended_at, outcome, "
+                    f"usage_json FROM lane_run WHERE lower(repo)=? "
+                    f"AND plan IN ({qs}) ORDER BY plan, runner, started_at",
+                    (repo, *plan_ids)):
+                out["lane_runs"].setdefault(r["plan"], []).append(dict(r))
+        except sqlite3.OperationalError:
+            pass
+    try:
+        collect = _load_collect()
+        collect.register_functions(con)
+        for r in con.execute(
+                "SELECT ds.lease AS lease, SUM(se.in_tok) AS in_tok, "
+                "SUM(se.out_tok) AS out_tok, SUM(se.cache_read_tok) AS cache_read_tok "
+                "FROM dispatch_session ds JOIN session se "
+                "ON se.session_uuid = ds.session_uuid AND se.parent_uuid IS NULL "
+                "GROUP BY ds.lease"):
+            out["impl_tokens"][r["lease"]] = dict(r)
+        for r in con.execute(
+                "SELECT r.pr AS pr, r.round AS round, se.in_tok AS in_tok, "
+                "se.out_tok AS out_tok, se.cache_read_tok AS cache_read_tok "
+                "FROM review r JOIN session se "
+                "ON se.session_uuid = r.session_uuid AND se.parent_uuid IS NULL "
+                "WHERE lower(r.repo) = ?", (repo,)):
+            out["round_tokens"][(r["pr"], r["round"])] = dict(r)
+    except Exception:
+        pass
+    return out
+
+
+def _implementation_attempts(runs: list, impl_tokens: dict, fleetlib_mod) -> list:
+    attempts = []
+    for r in runs:
+        lease, pr, outcome = r["lease"], r["pr"], r["outcome"]
+        started, end = r["started_ts"], r["current_phase_ts"]
+        if pr is not None:
+            ok, live, reason = True, False, None
+        elif outcome == "failed":
+            ok, live, reason = False, False, r["failure_reason"]
+        elif outcome in ("merged", "closed"):
+            ok, live, reason = True, False, None            # reached a PR earlier, defensive
+        elif _lease_is_live(fleetlib_mod, lease):
+            ok, live, reason = None, True, None
+        else:
+            ok, live, reason = False, False, (
+                "dispatch has no terminal record and its lease is not live")
+        secs = None if live else r["impl_seconds"]
+        tokens = None if live else _tok3(impl_tokens.get(lease))
+        attempts.append({"started_at": started, "end_at": None if live else end,
+                         "live": live, "ok": ok, "reason": reason,
+                         "seconds": secs, "tokens": tokens, "token_source": "session"})
+    return attempts
+
+
+def _review_attempts(runs: list, pr: "int | None", phases: dict, review_rounds: dict,
+                     review_attempts_tbl: dict, round_tokens: dict, fleetlib_mod) -> list:
+    """Plan 0196 D2: round verdicts (`review` rows) and dispatcher stops
+    (`review_attempt` rows, and the orchestrator's own `review-stopped` phase)
+    merged in time order, newest wins. A synthetic `live` entry is appended
+    only when the newest real entry has not already approved and the
+    dispatch holding the marked PR is neither terminal nor dead."""
+    items = []
+    for rd in review_rounds.get(pr, []) if pr is not None else []:
+        ok = (rd["verdict"] == "APPROVED")
+        ts = rd["submitted_at"]
+        items.append((ts or "", {"started_at": ts, "end_at": ts, "live": False,
+                                 "ok": ok, "reason": None if ok else (rd["verdict"] or "?"),
+                                 "seconds": None,
+                                 "tokens": _tok3(round_tokens.get((pr, rd["round"]))),
+                                 "token_source": "session"}))
+    for ra in review_attempts_tbl.get(pr, []) if pr is not None else []:
+        ts = ra["stopped_at"] or ra["started_at"]
+        items.append((ts or "", {"started_at": ra["started_at"] or ts, "end_at": ts,
+                                 "live": False, "ok": False, "reason": ra["outcome"],
+                                 "seconds": None, "tokens": None, "token_source": None}))
+    for r in runs:
+        if r["pr"] != pr:
+            continue
+        for ph in phases.get(r["lease"], []):
+            if ph["phase"] == "review-stopped":
+                try:
+                    detail = json.loads(ph["detail_json"] or "{}")
+                except ValueError:
+                    detail = {}
+                reason = str(detail.get("detail") or "review-stopped")
+                items.append((ph["ts"] or "", {"started_at": ph["ts"], "end_at": ph["ts"],
+                                               "live": False, "ok": False, "reason": reason,
+                                               "seconds": None, "tokens": None,
+                                               "token_source": None}))
+    items.sort(key=lambda t: t[0])
+    attempts = [d for _, d in items]
+    holder = next((r for r in runs if r["pr"] == pr), None) if pr is not None else None
+    unresolved = not attempts or not attempts[-1]["ok"]
+    if (holder is not None and unresolved and holder["outcome"] not in ("merged", "closed", "failed")
+            and _lease_is_live(fleetlib_mod, holder["lease"])):
+        # The CURRENT round's own start, never the previous attempt's END
+        # (finding, review of #1472): `attempts[-1]["end_at"]` is when the
+        # PRIOR round's verdict landed or stopped, and everything between
+        # that and the next round's own `dispatch_review` call — a fix
+        # session, CI — is not review time. `orchestrator.dispatch_review`
+        # logs `review-dispatch` right before it runs the review command
+        # (bin/orchestrator:4277), so the newest such phase on this lease is
+        # this round's real start; only when none exists (no phase log for
+        # this dispatch) does this fall back to the old, wider bound.
+        dispatch_starts = [ph["ts"] for ph in phases.get(holder["lease"], [])
+                           if ph["phase"] == "review-dispatch" and ph["ts"]]
+        last_end = attempts[-1]["end_at"] if attempts else None
+        started_at = (max(dispatch_starts) if dispatch_starts
+                     else (last_end or holder["current_phase_ts"]))
+        attempts.append({"started_at": started_at,
+                         "end_at": None, "live": True, "ok": None, "reason": None,
+                         "seconds": None, "tokens": None, "token_source": None})
+    return attempts
+
+
+def _lane_leases(fleetlib_mod, plan_id: str, repo: str) -> set:
+    """The runners of this plan whose lane lease is live right now (Boundary
+    4) — the same shape bin/orchestrator's `derive_lanes` reads: a lease
+    noted `lane:<plan_id>/<runner>`, `state` `assigned` or `active`, this
+    repo's own resource, and not `is_orphaned`. `lane_run` carries no lease
+    column of its own (fleet-lane's schema), so a stored row's `outcome`
+    cannot be checked against ITS OWN lease directly; this is the lease a
+    runner's row would be holding if it really were still running."""
+    live = set()
+    for rec in fleetlib_mod.all_leases():
+        note = rec.get("note") or ""
+        if not note.startswith(f"lane:{plan_id}/"):
+            continue
+        if rec.get("state") not in ("assigned", "active"):
+            continue
+        if fleetlib_mod.resource_of(rec).get("repo") != repo:
+            continue
+        if not fleetlib_mod.is_orphaned(rec):
+            live.add(note.rsplit("/", 1)[-1])
+    return live
+
+
+def _lane_attempt(row: dict, lease_live: bool) -> dict:
+    """One `lane_run` row as an attempt. `lease_live` is Boundary 4's
+    heartbeat verdict for the lease a `running` row would be holding: a row
+    stored `outcome='running'` is only `live` while that lease still is, so
+    a lane whose holder died uncontrolled reads as a dead, failed attempt
+    rather than `running` (and `over_budget`) forever (review of #1472)."""
+    outcome = row["outcome"]
+    live = (outcome == "running" and lease_live)
+    if outcome == "running" and not lease_live:
+        ok, reason = False, "dispatch has no terminal record and its lease is not live"
+    else:
+        ok = True if outcome == "pr-opened" else (None if live else False)
+        reason = None if (ok or live) else outcome
+    seconds = None if live else _dt_diff(row["started_at"], row["ended_at"])
+    tokens = None if live else _lane_tokens(row["usage_json"])
+    return {"started_at": row["started_at"], "end_at": None if live else row["ended_at"],
+            "live": live, "ok": ok, "reason": reason,
+            "seconds": seconds, "tokens": tokens, "token_source": "lane"}
+
+
+def _test_stage(lane_rows: list, budget_seconds: "int | None", plan_id: str, repo: str,
+                fleetlib_mod, now=None) -> dict:
+    if not lane_rows:
+        return _combine_stage("test", [], budget_seconds, now)
+    live_leases = _lane_leases(fleetlib_mod, plan_id, repo)
+    by_runner = {}
+    for row in lane_rows:
+        by_runner.setdefault(row["runner"], []).append(row)
+    lanes = {}
+    for runner, rows in by_runner.items():
+        rows = sorted(rows, key=lambda r: r["started_at"] or "")
+        lease_live = runner in live_leases
+        lanes[runner] = _combine_stage(
+            "test", [_lane_attempt(r, lease_live) for r in rows], budget_seconds, now)
+    names = sorted(lanes)
+    failing = [n for n in names if lanes[n]["state"] == "failed"]
+    running = [n for n in names if lanes[n]["state"] == "running"]
+    if failing:
+        state, reason = "failed", f"lane {failing[0]}: {lanes[failing[0]]['reason']}"
+    elif running:
+        state, reason = "running", None
+    elif all(lanes[n]["state"] == "completed" for n in names):
+        state, reason = "completed", None
+    else:
+        state, reason = "unknown", "mixed or empty lane state"
+    starts = [lanes[n]["started_at"] for n in names if lanes[n]["started_at"]]
+    ends = [lanes[n]["completed_at"] or lanes[n]["failed_at"] for n in names]
+    ends = [e for e in ends if e]
+    attempt_starts = [lanes[n]["attempt_started_at"] for n in names
+                      if lanes[n]["attempt_started_at"]]
+    secs_list = [lanes[n]["seconds"] for n in names]
+    seconds = None if any(s is None for s in secs_list) else (sum(secs_list) if secs_list else None)
+    over_budgets = [lanes[n]["over_budget"] for n in names if lanes[n]["over_budget"] is not None]
+    return {"name": "test", "started_at": min(starts) if starts else None,
+            "completed_at": max(ends) if (state == "completed" and ends) else None,
+            "failed_at": max(ends) if (state == "failed" and ends) else None,
+            "state": state, "reason": reason,
+            "attempts": sum(lanes[n]["attempts"] for n in names),
+            "attempt_started_at": max(attempt_starts) if attempt_starts else None,
+            "budget_seconds": budget_seconds,
+            "over_budget": (any(over_budgets) if (state == "running" and over_budgets) else None),
+            "seconds": seconds,
+            "tokens": _combine_token_objs([lanes[n]["tokens"] for n in names])}
+
+
+def _submitted_attempts(filing_prs: list) -> list:
+    attempts = []
+    for pr in filing_prs:
+        merged = bool(pr.get("merged") or pr.get("merged_at"))
+        started = pr.get("created_at")
+        state = (pr.get("state") or "").lower()
+        if merged:
+            end, ok, live = pr.get("merged_at"), True, False
+        elif state == "closed":
+            end, ok, live = pr.get("closed_at"), False, False
+        else:
+            end, ok, live = None, None, True
+        attempts.append({"started_at": started, "end_at": end, "live": live,
+                         "ok": ok, "reason": None if (ok or live) else "closed unmerged",
+                         "seconds": None if live else _dt_diff(started, end),
+                         "tokens": None, "token_source": None})
+    return attempts
+
+
+def _submitted_by(filing_prs: list) -> "str | None":
+    """intakeapp when the (merged, or else newest) filing PR's body starts with
+    intakebot's marker, cli otherwise, null when none was found (plan 0196 D1)."""
+    if not filing_prs:
+        return None
+    merged = [p for p in filing_prs if p.get("merged") or p.get("merged_at")]
+    pr = merged[-1] if merged else filing_prs[-1]
+    return "intakeapp" if (pr.get("body") or "").startswith(INTAKEBOT_MARKER) else "cli"
+
+
+def _filing_pr_lookup(repo_root: Path, ref: str) -> "tuple[object | None, str]":
+    """(lookup, error). `lookup(repo, plan_id, relpath)` -> list of pull
+    request dicts (any state, oldest first) whose changed files include
+    `relpath`, or `"unreadable"`.
+
+    `relpath`'s own filing commit (git, free) answers `get_commit_pull` in
+    ONE request and names the PR that actually landed the file — but a
+    refiled plan (an earlier filing PR closed unmerged, never reachable from
+    `ref` at all) is invisible to that commit lookup by construction, and D2
+    requires it counted (finding, review of #1472: a fast path that returned
+    on the commit hit alone reported a refiled plan's `submitted` as a single
+    attempt). So the full, paginated PR listing always runs too — fleet-
+    watch's own `_pull_items`, the same one `marked_pr` reads — walked and
+    cached ONCE per repo for this whole `ledger()` call, never once per plan:
+    a per-plan walk against operator/eunomia's own 1400+ pull requests did not
+    finish inside a 100s budget (measured 2026-11-10); cached, one walk
+    answers every plan. A candidate from that walk is confirmed with one
+    `list_pull_files` call, asked only for a PR whose body mentions the
+    plan's full id slug (never the bare 4-digit prefix alone: that matched
+    dozens of unrelated pull requests discussing the same plan number,
+    measured at 2026-11-10 to turn one plan's lookup into ~70 confirmation
+    calls). The commit hit is unioned in when the listing missed it (an older
+    filing style whose body does not carry the full slug) rather than relied
+    on alone."""
+    try:
+        loader = importlib.machinery.SourceFileLoader(
+            "fleet_watch_for_filings", str(Path(__file__).resolve().parent / "fleet-watch"))
+        spec = importlib.util.spec_from_loader("fleet_watch_for_filings", loader)
+        watch = importlib.util.module_from_spec(spec)
+        loader.exec_module(watch)
+        token, err = watch._token()
+    except Exception as e:
+        return None, f"could not load fleet-watch: {e.__class__.__name__}: {e}"
+    if not token:
+        return None, err or "no forge token"
+
+    pulls_cache = {}          # repo -> list of pull dicts, or "unreadable"
+    files_cache = {}          # (repo, number) -> changed-file list, or None
+
+    def via_commit(repo, relpath):
+        sha = _filing_commit(repo_root, ref, relpath)
+        if not sha:
+            return None
+        st, pr = watch._forge(token).get_commit_pull(repo, sha)
+        return pr if (st == 200 and isinstance(pr, dict)) else None
+
+    def via_listing(repo, plan_id, relpath):
+        if repo not in pulls_cache:
+            pulls = []
+            for item in watch._pull_items(repo, token):
+                if item in ("end", "capped"):
+                    break
+                if item == "unreadable":
+                    pulls = "unreadable"
+                    break
+                pulls.extend(item)
+            pulls_cache[repo] = pulls
+        pulls = pulls_cache[repo]
+        if pulls == "unreadable":
+            return "unreadable"
+        needle = re.compile(re.escape(plan_id))
+        out = []
+        for pr in pulls:
+            if not needle.search(pr.get("body") or ""):
+                continue
+            key = (repo, pr["number"])
+            if key not in files_cache:
+                st, pfiles = watch._forge(token).list_pull_files(repo, pr["number"])
+                files_cache[key] = pfiles if (st == 200 and isinstance(pfiles, list)) else None
+            pfiles = files_cache[key]
+            if pfiles and any((f.get("filename") or f.get("path")) == relpath for f in pfiles):
+                out.append(pr)
+        return out
+
+    def lookup(repo, plan_id, relpath):
+        direct = via_commit(repo, relpath)
+        found = via_listing(repo, plan_id, relpath)
+        if found == "unreadable":
+            return [direct] if direct is not None else "unreadable"
+        if direct is not None and not any(p.get("number") == direct.get("number")
+                                          for p in found):
+            found = found + [direct]
+        found.sort(key=lambda p: p.get("number") or 0)
+        return found
+    return lookup, ""
+
+
+def _open_unmarked_filings(repo: str, known_ids: set) -> "list | str":
+    """D4: plan files added by an open PR that `marked_pr` would not itself
+    recognise (no `Plan: <id>` line — this is a FILING pr, not an
+    implementation one). Returns `[{"id", "pr"}]` or `"unreadable"`.
+
+    A direct `list_pulls(repo, state="open", ...)` read, not fleet-watch's
+    `_pull_items`/issues-index walk (finding, review of #1472): that walk is
+    `state="all"` — `marked_pr` and `_filing_pr_lookup`'s own `via_listing`
+    need every pull request ever opened, but a client-side `state == "open"`
+    filter AFTER that walk still pays for every merged and closed pull
+    request the repository has ever had, the opposite of "bounded to the
+    open set" the old docstring here claimed, and it shares no cache with
+    `_filing_pr_lookup` either — each loads fleet-watch fresh, so the
+    `_pulls_memo` that caching depends on is `None` both times. `state="open"`
+    at the forge is genuinely bounded: the same `cap=5` (250 pull requests)
+    `_prefer_open_on_branch` in bin/orchestrator already trusts for an
+    open-only read, far more headroom than this repo's open count has ever
+    needed."""
+    try:
+        loader = importlib.machinery.SourceFileLoader(
+            "fleet_watch_for_open_filings", str(Path(__file__).resolve().parent / "fleet-watch"))
+        spec = importlib.util.spec_from_loader("fleet_watch_for_open_filings", loader)
+        watch = importlib.util.module_from_spec(spec)
+        loader.exec_module(watch)
+        token, err = watch._token()
+    except Exception as e:
+        return "unreadable"
+    if not token:
+        return "unreadable"
+    forge = watch._forge(token)
+    pages = watch.fleetforge.paged(forge.list_pulls, repo, state="open", cap=5)
+    pulls = []
+    for page in pages:
+        pulls.extend(page)
+    if pages.outcome != watch.fleetforge.EXHAUSTED:
+        return "unreadable"
+    out = []
+    for pr in pulls:
+        if watch.MARKER in (pr.get("body") or ""):
+            continue                 # an implementer's work PR, not a filing
+        st, pfiles = forge.list_pull_files(repo, pr["number"])
+        if st != 200 or not isinstance(pfiles, list):
+            continue
+        for f in pfiles:
+            path = f.get("filename") or f.get("path") or ""
+            if (path.startswith("plans/") and path.endswith(".md")
+                    and f.get("status") == "added"):
+                st2, head = forge.get_pull(repo, pr["number"])
+                sha = (head or {}).get("head", {}).get("sha") if st2 == 200 else None
+                st3, body = forge.get_contents(repo, path, ref=sha or "")
+                if st3 != 200 or not isinstance(body, dict):
+                    continue
+                import base64
+                try:
+                    text = base64.b64decode(body.get("content") or "").decode(
+                        "utf-8", "replace")
+                except Exception:
+                    continue
+                fm = watch.front_matter(text)
+                pid = fm.get("id")
+                if pid and pid not in known_ids:
+                    out.append({"id": pid, "pr": pr})
+    return out
+
+
+def _in_review_row(pid: str, pr: dict, now) -> dict:
+    """D4: a plan file added by an open, unmarked pull request, with its
+    `submitted` stage running and every other stage empty."""
+    row = {"id": pid, "status": "in-review", "runs": None, "outcome": "unknown",
+           "pr": pr.get("number"), "pr_state": (pr.get("state") or "").lower() or None,
+           "pr_source": "forge", "pr_as_of": None, "rounds": None, "impl_seconds": None,
+           "class": None, "reason": None, "probe": None, "dispatches": None,
+           "review_rounds": None, "total": None, "repaired_by": []}
+    empty = {name: {"name": name, "started_at": None, "completed_at": None,
+                    "failed_at": None, "state": "empty", "reason": None,
+                    "attempts": 0, "attempt_started_at": None, "budget_seconds": None,
+                    "over_budget": None, "seconds": None, "tokens": dict(_NO_TOKENS)}
+             for name in STAGE_NAMES}
+    empty["submitted"] = _combine_stage("submitted", _submitted_attempts([pr]), None, now)
+    row["stages"] = {name: empty[name] for name in STAGE_NAMES}
+    row["submitted_by"] = _submitted_by([pr])
+    return row
+
+
+def _approved_timestamps(repo_root: Path, ref: str, relpaths: set) -> dict:
+    """{relpath: committer-date} for the oldest commit on `ref` that added
+    each of these plan files — ONE `git log` for every plan this ledger
+    reads, not a `_filing_commit` + `git show` pair per plan.
+
+    `--first-parent` (finding, review of #1472): without it, `git log`
+    reports the filing branch's own commit — the plan file's author time,
+    before it reached `main` at all — because the pathspec's default history
+    simplification is satisfied by that commit wherever it is reachable from
+    `ref`, branch commit included. `--first-parent --diff-filter=A` instead
+    walks only `main`'s own mainline, where the merge commit that actually
+    brought the file in is the one that "adds" it (default simplification
+    still shows a merge when it is the commit that changes the path relative
+    to the first parent) — the real time the plan reached `main` (D2's
+    `approved`), not when its author committed it on a branch."""
+    if not relpaths:
+        return {}
+    out = _run_git(repo_root, "log", ref, "--first-parent", "--diff-filter=A",
+                   "--name-only", "--format=\x01%cI", "--", "plans/")
+    if out is None:
+        return {}
+    result, current_ts = {}, None
+    for line in out.splitlines():
+        if line.startswith("\x01"):
+            current_ts = line[1:]
+        elif line.strip() and line in relpaths:
+            result[line] = current_ts     # overwritten by every older commit seen
+    return result
+
+
+def _unknown_submitted(reason: str) -> dict:
+    return {"name": "submitted", "started_at": None, "completed_at": None,
+            "failed_at": None, "state": "unknown", "reason": reason,
+            "attempts": 0, "attempt_started_at": None, "budget_seconds": None,
+            "over_budget": None, "seconds": None, "tokens": dict(_NO_TOKENS)}
+
+
+def _plan_stages(pid: str, fm: dict, path: Path, row: dict, runs: "list | None",
+                 sources: dict, repo: str, repo_root: Path, ref: str,
+                 fleetlib_mod, orch_mod, now, forge_asked: bool,
+                 filing_lookup, approved_ts: "dict | None" = None,
+                 forge_merged_at: "str | None" = None) -> "tuple[dict, str | None]":
+    """(stages-dict, submitted_by) for one plan. `row` is this plan's own
+    ledger row, already carrying `pr`/`pr_state`/`pr_as_of`. `approved_ts` is
+    `ledger()`'s own one-git-call-for-every-plan batch (Boundary: a dispatcher
+    read must stay bounded; a `git log`/`git show` pair PER PLAN measured
+    at ~2s added to a 45-plan test fixture). `forge_merged_at` is the merge
+    time `--verdict`'s own forge read already found for this row (never
+    `row["pr_as_of"]`, which that same read nulls on purpose — see
+    `ledger()`)."""
+    pr = row["pr"]
+    runs = runs or []
+    relpath = f"plans/{path.name}"
+
+    submitted_by = None
+    if not forge_asked or filing_lookup is None:
+        submitted = _unknown_submitted("forge not read")
+    else:
+        found = filing_lookup(repo, pid, relpath)
+        if found == "unreadable":
+            submitted = _unknown_submitted("forge unreadable")
+        elif not found:
+            submitted = _unknown_submitted("no filing pull request found by forge search")
+        else:
+            submitted = _combine_stage("submitted", _submitted_attempts(found), None, now)
+            submitted_by = _submitted_by(found)
+
+    merge_ts = (approved_ts or {}).get(relpath)
+    approved = _point_stage("approved", merge_ts,
+                            error_reason=None if merge_ts else "could not read git history")
+
+    impl_budget = _impl_budget_seconds(orch_mod, repo)
+    implementation = _combine_stage(
+        "implementation", _implementation_attempts(runs, sources["impl_tokens"], fleetlib_mod),
+        impl_budget, now)
+
+    try:
+        plan_text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        plan_text = ""
+    review_budget = _review_round_budget_seconds(orch_mod, repo, plan_text)
+    review = _combine_stage(
+        "review", _review_attempts(runs, pr, sources["phases"], sources["review_rounds"],
+                                   sources["review_attempts"], sources["round_tokens"],
+                                   fleetlib_mod),
+        review_budget, now)
+
+    test = _test_stage(sources["lane_runs"].get(pid, []), _TEST_LANE_BUDGET_SECONDS,
+                       pid, repo, fleetlib_mod, now)
+
+    merged_ts = None
+    if row.get("pr_state") == "merged":
+        merged_ts = forge_merged_at if forge_merged_at is not None else row.get("pr_as_of")
+    merged = _point_stage("merged", merged_ts)
+
+    stages = {s["name"]: s for s in (submitted, approved, implementation, review, test, merged)}
+    return {name: stages[name] for name in STAGE_NAMES}, submitted_by
+
+
 def ledger(files, db: "Path | None" = None, repo: "str | None" = None,
            verdict: bool = False, cost: bool = False, pr_lookup=None, probe=None,
-           repo_root: Path = REPO_ROOT, ref: str = "origin/main") -> dict:
+           repo_root: Path = REPO_ROOT, ref: str = "origin/main",
+           with_filings: bool = False, filing_lookup=None, open_filings_lookup=None,
+           fleetlib_mod=None, orch_mod=None, now=None) -> dict:
     """One row per plan of `repo`, joined to its dispatches. Never raises for a
     missing database, never writes.
 
@@ -1219,8 +2620,6 @@ def ledger(files, db: "Path | None" = None, repo: "str | None" = None,
     built from the real forge / `audit` when `verdict` is set.
     """
     repo = (repo or _own_repo(repo_root) or "").lower()
-    db_status, runs_by_plan, unattributed, costs = _read_dispatches(
-        _ledger_db_path(db), repo)
 
     index, errors, out_of_scope = {}, [], 0
     for f in files:
@@ -1233,8 +2632,12 @@ def ledger(files, db: "Path | None" = None, repo: "str | None" = None,
             continue
         index[fm["id"]] = (f, fm)
 
+    db_status, runs_by_plan, unattributed, costs, sources = _read_dispatches(
+        _ledger_db_path(db), repo, set(index))
+
+    repaired_by = _repaired_by_index(index)
     rows = [_ledger_row(pid, fm, None if runs_by_plan is None
-                        else runs_by_plan.get(pid, []))
+                        else runs_by_plan.get(pid, []), repaired_by.get(pid))
             for pid, (_f, fm) in sorted(index.items())]
 
     if costs is not None and costs["state"] == "ok":
@@ -1244,7 +2647,8 @@ def ledger(files, db: "Path | None" = None, repo: "str | None" = None,
                 row.update(dispatches=block["dispatches"],
                            review_rounds=block["rounds"], total=block["total"])
 
-    forge = {"asked": False, "unreadable": 0, "error": ""}
+    forge = {"asked": False, "unreadable": 0, "error": "", "filings_error": ""}
+    forge_merged_at = {}
     if verdict:
         forge["asked"] = True
         if pr_lookup is None:
@@ -1259,19 +2663,70 @@ def ledger(files, db: "Path | None" = None, repo: "str | None" = None,
                 elif found is None:
                     row.update(pr_state="no-marked-pr", pr_source="forge", pr_as_of=None)
                 else:
+                    state = _forge_state(found)
+                    # `pr_as_of` stays null here on purpose (LEDGER_COLUMNS'
+                    # own meaning: `fleet.db` is as of `pr_as_of`, the forge
+                    # is live) — the merge time a fresh forge read just gave
+                    # goes to `forge_merged_at`, which `_plan_stages` reads
+                    # for `merged` instead (finding, review of #1472: reusing
+                    # `pr_as_of` for this made `merged` read `empty` for
+                    # every plan `--verdict` confirmed merged).
                     row.update(pr=found.get("number", row["pr"]),
-                               pr_state=_forge_state(found),
-                               pr_source="forge", pr_as_of=None)
+                               pr_state=state, pr_source="forge", pr_as_of=None)
+                    if state == "merged":
+                        forge_merged_at[row["id"]] = found.get("merged_at")
             if row["class"]:
                 row["probe"] = probe(row["id"])
 
+    # plan 0196: the stage timeline, on top of everything above.
+    forge_asked = verdict or with_filings
+    if forge_asked and filing_lookup is None:
+        filing_lookup, _filing_err = _filing_pr_lookup(repo_root, ref)
+    if fleetlib_mod is None:
+        fleetlib_mod = _fleetlib_module()
+    if orch_mod is None:
+        orch_mod = _orchestrator_module()
+    if now is None:
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+    approved_ts = _approved_timestamps(
+        repo_root, ref, {f"plans/{path.name}" for path, _fm in index.values()})
+    for row in rows:
+        pid = row["id"]
+        path, fm = index[pid]
+        plan_runs = None if runs_by_plan is None else runs_by_plan.get(pid, [])
+        stages, submitted_by = _plan_stages(
+            pid, fm, path, row, plan_runs, sources, repo, repo_root, ref,
+            fleetlib_mod, orch_mod, now, forge_asked, filing_lookup, approved_ts,
+            forge_merged_at.get(pid))
+        row["stages"] = stages
+        row["submitted_by"] = submitted_by
+
     # Same-repo dispatches whose plan is not among these files: named, so a
     # plan that was renamed or removed does not vanish from the join.
+    # Counted on `rows` BEFORE `--with-filings` appends its own rows below:
+    # those are plans still in their filing pull request, never built on
+    # `main` at all, and folding them into `counts.plans`/`counts.unknown`
+    # would move pre-0196 readers' numbers under a flag that is documented
+    # to leave the default output "unchanged" (finding, review of #1472).
     unmatched = sorted(set(runs_by_plan or {}) - set(index))
     counts = {"plans": len(rows),
               "claimed": sum(r["class"] == "claimed" for r in rows),
               "stalled": sum(r["class"] == "stalled" for r in rows),
-              "unknown": sum(r["outcome"] == "unknown" for r in rows)}
+              "unknown": sum(r["outcome"] == "unknown" for r in rows),
+              "repaired": sum(bool(r["repaired_by"]) for r in rows)}
+
+    filings = []
+    if with_filings:
+        lookup = open_filings_lookup or (lambda: _open_unmarked_filings(repo, set(index)))
+        found = lookup()
+        if found == "unreadable":
+            forge["filings_error"] = ("could not read open pull requests for "
+                                      "--with-filings")
+        else:
+            for item in found:
+                filings.append(_in_review_row(item["id"], item["pr"], now))
+    rows = rows + filings
     cost_status = {"asked": cost, "state": "unavailable" if costs is None else costs["state"],
                    "detail": "no dispatch data" if costs is None else costs["detail"]}
     return {"scope": repo, "db": db_status, "verdict": verdict, "cost": cost_status,
@@ -1357,11 +2812,16 @@ def _ledger_table(data: dict) -> str:
     out.append("-+-".join("-" * w for w in widths))
     for t, row in zip(table, data["rows"]):
         out.append(" | ".join(v.ljust(w) for v, w in zip(t, widths)).rstrip())
+        if row["repaired_by"]:
+            classes = ", ".join(r["class"] for r in row["repaired_by"])
+            out.append(f"    repaired by {len(row['repaired_by'])} ({classes})")
         if row["dispatches"] and (data["cost"]["asked"] or _has_linked(row)):
             out += _cost_block(row)
 
     c = data["counts"]
     out += ["", f"{c['claimed']} claimed, {c['stalled']} stalled, {c['unknown']} unknown"]
+    if c["repaired"]:
+        out.append(f"{c['repaired']} repaired")
     if data["unmatched"]:
         out.append(f"{len(data['unmatched'])} plan id(s) in this repo's dispatches with no "
                    "plan file here: " + ", ".join(data["unmatched"]))
@@ -1374,20 +2834,23 @@ def _ledger_table(data: dict) -> str:
     if data["forge"]["unreadable"]:
         out.append(f"forge unreadable for {data['forge']['unreadable']} pull request(s); "
                    "their state stays as-of the dispatch record")
+    if data["forge"]["filings_error"]:
+        out.append(f"--with-filings: {data['forge']['filings_error']}")
     out.append("")
     out += [f"* {n}" for n in data["notes"]]
     return "\n".join(out) + "\n"
 
 
 def cmd_ledger(files, fmt: str, db: "str | None", repo: "str | None",
-               verdict: bool, cost: bool = False) -> int:
+               verdict: bool, cost: bool = False, with_filings: bool = False) -> int:
     scope = (repo or _own_repo(REPO_ROOT) or "").lower()
     if not scope:
         print("ledger: cannot tell which repository this checkout is — pass --repo "
               "owner/name. A ledger over every repository's plan ids would list other "
               "repositories' plans as this one's.", file=sys.stderr)
         return 2
-    data = ledger(files, db=db, repo=scope, verdict=verdict, cost=cost)
+    data = ledger(files, db=db, repo=scope, verdict=verdict, cost=cost,
+                  with_filings=with_filings)
     sys.stdout.write(json.dumps(data, indent=2) + "\n" if fmt == "json"
                      else _ledger_table(data))
     return 0                    # a missing database is not a finding about plans
@@ -1418,6 +2881,10 @@ def main() -> int:
     p_ledger.add_argument("--verdict", action="store_true",
                           help="read the forge for each PR's current state and run audit's "
                                "path probe for claimed/stalled rows (costs forge reads)")
+    p_ledger.add_argument("--with-filings", action="store_true",
+                          help="also read the forge for each plan's filing pull request "
+                               "(fills submitted_by and the submitted stage) and list plans "
+                               "still in an open, unmarked filing PR")
     a = ap.parse_args()
 
     files = ([Path(p) for p in a.paths] if getattr(a, "paths", None)
@@ -1477,7 +2944,7 @@ def main() -> int:
             sys.stdout.write(out)
         return 1 if data["cycles"] else 0
     if a.cmd == "ledger":
-        return cmd_ledger(files, a.format, a.db, a.repo, a.verdict, a.cost)
+        return cmd_ledger(files, a.format, a.db, a.repo, a.verdict, a.cost, a.with_filings)
     return 0
 
 

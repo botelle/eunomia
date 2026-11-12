@@ -105,7 +105,7 @@ def _bounds(tmp_path, text):
 
 def _review(state, body=""):
     return {"id": 1, "state": state, "body": body, "stale": False,
-            "dismissed": False}
+            "dismissed": False, "user": {"login": "revbot"}}
 
 
 # ------------------------------------------------------------------- bounds
@@ -461,10 +461,10 @@ def test_waiting_for_ci_is_bounded(tmp_path):
 
 def test_an_unreadable_status_is_retried_then_refused(tmp_path):
     """None is never success. But one bad response is not fatal either —
-    read_pulls in the same file retries a flaky forge, and ending the whole loop
-    on a single unreadable status was an inconsistency rather than a policy
-    (review 2441). A generous bound is used deliberately: with `bound=0` this
-    test would pass even if unreadable were treated as pending."""
+    read_pull_by_branch in the same file retries a flaky forge, and ending the
+    whole loop on a single unreadable status was an inconsistency rather than
+    a policy (review 2441). A generous bound is used deliberately: with
+    `bound=0` this test would pass even if unreadable were treated as pending."""
     mod = _load(tmp_path)
     slept = []
     forge = CIForge(["unreadable"])

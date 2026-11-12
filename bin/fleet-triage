@@ -1,0 +1,2147 @@
+#!/usr/bin/env python3
+"""fleet-triage — a meeting failure is triaged by a step that can read the code
+(plan 0103; ADR-0006 §8).
+
+    fleet-triage <repo> <plan-id> --impl-sha <sha> [--dry-run] [--no-post]
+
+Reads the findings document `fleet-meet` wrote,
+
+    <work root>/meetings/<plan>/<impl-sha12>/findings.json
+
+hands every test that did not pass to a runner that can READ the implementation
+(and nothing else), checks every piece of evidence it cites against the files,
+and posts the result ONCE as a comment on the implementation pull request. The
+comment never starts a fix round and is never a commit status or a review.
+
+Gates, in order. Every refusal is logged, paged once, spawns nothing and posts
+nothing (exit 1):
+  1. findings.json exists, validates against 0102's schema, and names this plan
+     and this implementation sha
+  2. the plan file on `main` (NEVER `--impl-sha` — that tree is implementer-
+     authored) says `zone: public` (an allowlist — this step sends SOURCE to a
+     cloud backend)
+  3. `<repo>` resolves a `mediator` at ordinal 1 (there is no built-in triager)
+  4. that runner is in ADAPTERS below (one entry: `sub-opus`)
+  5. nothing to triage: every test passed -> zero-item triage.json, exit 0
+     (posts no comment on THIS pull request, but an open, marked defect
+     issue for this plan still gets its one "no defect" notice — plan 0176)
+  6. already done for this findings digest -> exit 0, no spawn (a comment
+     marked `status=failed` does NOT count as done: a failed triage is
+     re-run for the same digest, no new fleet-meet run required)
+
+Exit codes: 0 posted / already posted / nothing to triage / --dry-run /
+--no-post; 1 refused; 2 usage; 3 the triager did not produce valid output (the
+untriaged comment was still posted).
+
+The triager's answer is a set of CLAIMS. Every citation is resolved against the
+files this program built for it, and every class has an evidence rule (D3). A
+verified citation proves the cited text exists. It does not prove the class is
+right: the class stays the triager's judgment, and the owner's.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import posixpath
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.parse
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+ROOT = BIN.parent
+
+
+def _load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+# The one validator, the one PR-body renderer, the spawner and the fleetlib and
+# fleetforge loaders live in bin/fleet-lane; this program imports them read-only
+# the way bin/fleet-meet does, rather than keeping a second copy.
+lane = _load("fleet_lane_for_triage", BIN / "fleet-lane")
+lib = lane.lib
+fleetforge = lane.fleetforge
+
+FINDINGS_SCHEMA_PATH = ROOT / "config" / "meeting-findings.schema.json"
+TRIAGE_SCHEMA_PATH = ROOT / "config" / "meeting-triage.schema.json"
+TRIAGE_SCHEMA_NAME = "meeting-triage/1"
+
+# The triager's argv: a PINNED LITERAL owned by this program and asserted by
+# equality in tests/test_fleet_triage.py. Not `RUNNERS["sub-opus"].argv` (the
+# implementer's, which carries `--allowedTools` and a permission mode).
+#   --tools Read,Grep,Glob  the code-aware grant. No Bash: 0102 already ran the
+#                           tests in a confined runner, and this step only reads.
+#                           No Write, Edit or web tool.
+#   --restricted            PINNED, not just relied on: `claude --help` on
+#                           2.1.284 documents that `--restricted` "confines the
+#                           file tools to the working directories", refuses
+#                           bypassPermissions and ignores user/project/local
+#                           settings — exactly the property this program needs
+#                           and previously only got from an unmeasured default.
+#                           Measured on 2.1.284 with a discriminating probe: a
+#                           marker file inside the working directory was found
+#                           by Grep; the identical marker in a sibling
+#                           directory was refused (a `permission_denials` entry
+#                           named the exact Grep call). ADR-0006 §6 (plan 0070):
+#                           a pin where the CLI has a flag for it. There is
+#                           never a permission-mode flag and never
+#                           --allowedTools: either would reopen exactly what
+#                           --restricted closes.
+#   --strict-mcp-config     with no --mcp-config: no MCP server
+#   --setting-sources ""    belt-and-suspenders with --restricted: keeps the
+#                           operator's ~/.claude/CLAUDE.md out even if that
+#                           flag's settings-file behaviour ever narrows
+#   --disable-slash-commands, --no-session-persistence
+#                           no skills; no transcript left behind
+TRIAGE_ARGV = ("claude", "-p", "--output-format", "json", "--model", "opus",
+               "--tools", "Read,Grep,Glob", "--restricted", "--strict-mcp-config",
+               "--setting-sources", "", "--disable-slash-commands",
+               "--no-session-persistence")
+# fleet-lane's measured minimum for the CLI to find its own login, and nothing
+# that is a credential.
+TRIAGE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR")
+
+# The adapter table. ONE entry. This step sends SOURCE: sub-opus goes to
+# Anthropic, which already holds the code through the implementer, so it is the
+# only runner that discloses nothing new. Widening this table needs an ADR and
+# a measurement, not a table edit (plan 0103 Boundaries).
+#
+# Plan 0185 tried to add `sub-codex` here, confined by codex's native
+# `-s read-only`. Review caught what that plan's own measurement never
+# checked: `-s read-only` stops writes, not reads (ADR-0006 §6, already
+# measured there — "reachable from such a session: ~/dev, the CLI's own
+# subscription token, and ~/bin/fetch-forgejo-token.sh"), so a mediator spawn
+# with no outer confinement hands codex's shell the operator's whole host,
+# not "an exported copy and no other tool" as that plan's docs claimed. The
+# one outer confinement that exists (`sandbox-exec -f config/codex-tester.sb`,
+# plan 0101) denies reads outside a lane's own scratch directory, but codex's
+# own per-command seatbelt cannot start nested inside it at all (measured,
+# docs/measurements/adr-0006-blackbox-test-lanes.md "Fact 3") — so wrapping
+# the mediator in it kills its shell outright, which is exactly why plan 0185
+# ran it unwrapped instead. Real confinement for a mediator that reads real
+# source needs isolation outside codex entirely (ADR-0006 §6: "a container, a
+# VM, or an account whose home holds only the bundle"), which is new
+# infrastructure in config/ and bin/fleet-lane or bin/orchestrator — outside
+# this program's own paths, and not attempted here. Reopening sub-codex as a
+# mediator needs that infra measured and wired first, tracked on eunomia #1271.
+ADAPTERS = {"sub-opus": {"argv": TRIAGE_ARGV, "env": TRIAGE_ENV}}
+MEDIATOR_FIX = "fleet-models set default mediator sub-opus"
+
+# One timeout, no retry: the run spends the owner's Claude subscription.
+TRIAGE_TIMEOUT_SECONDS = 1800
+
+CLASSES = ("implementation-defect", "spec-or-contract-defect", "test-harness-gap",
+           "skip-needs-contract", "undetermined")
+QUOTE_MIN_CHARS = 8
+RATIONALE_CAP = 1500
+QUOTE_CAP = 600
+COMMENT_CAP = 60000
+_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+class Refuse(Exception):
+    """A refusal, with the reason as its message. `main` is the one place that
+    catches it, logs it, pages it and exits 1."""
+
+
+class _LazyForge:
+    """`orch._implbot_token()` shells out to a token helper and can fail. A
+    run that never actually touches the forge — gate 5's `--dry-run`, or
+    gate 6's already-done return under `--dry-run`/`--no-post`, both of
+    which print and return before any forge call — must not refuse on a
+    broken token helper it was never going to use (round-3 review of
+    PR #1334). Built once, on the first real use, never at `run()`'s top."""
+
+    def __init__(self, orch):
+        self._orch = orch
+        self._forge = None
+
+    def __call__(self):
+        if self._forge is None:
+            self._forge = fleetforge.Forge(self._orch._forgejo_base_url(),
+                                           self._orch._implbot_token(),
+                                           timeout=self._orch.forge_timeout())
+        return self._forge
+
+
+# ------------------------------------------------------------------- run log
+# Keys whose values this program defines: written verbatim. The shape of the
+# hashes is checked, not scrubbed — the same idiom as fleet-lane's RunLog, so
+# a full sha or digest is never turned into `[redacted:long-hex]`.
+STRUCTURED_KEYS = frozenset({"repo", "plan", "runner", "sha", "digest", "sha256",
+                             "bytes", "rc", "timed_out", "items", "classified",
+                             "unverified", "untriaged", "gaps", "comment", "zone",
+                             "exit"})
+_SHAPES = {"sha": re.compile(r"[0-9a-f]{40}\Z"), "digest": re.compile(r"[0-9a-f]{64}\Z"),
+           "sha256": re.compile(r"[0-9a-f]{64}\Z")}
+
+
+class TriageLog:
+    def __init__(self, plan_id, orch_mod):
+        self.path = lib.work_root() / "logs" / f"triage--{plan_id}.log"
+        self._orch = orch_mod
+        self._fh = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "a", encoding="utf-8")
+        except OSError:
+            pass
+
+    def _value(self, key, value):
+        if key in STRUCTURED_KEYS:
+            text = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+            shape = _SHAPES.get(key)
+            if shape is not None and not shape.match(text):
+                return "invalid"
+            return text.replace("\n", " ")
+        clean, _ = self._orch.redact_transcript(str(value))
+        return clean.replace("\n", " ")
+
+    def note(self, phase, **facts):
+        if self._fh is None:
+            return
+        parts = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), phase]
+        parts += [f"{k}={self._value(k, v)}" for k, v in facts.items()]
+        try:
+            self._fh.write(" ".join(parts) + "\n")
+            self._fh.flush()
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------- git
+def _git_bytes(args, cwd, timeout=300):
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, timeout=timeout)
+
+
+def _has_commit(store, sha):
+    return _git_bytes(["cat-file", "-e", f"{sha}^{{commit}}"], store).returncode == 0
+
+
+def _ensure_commit(repo, store, sha, what):
+    """`sha` present in the shared store, fetched by name when the store's own
+    fetch did not bring it. A refusal, never a guess at another commit."""
+    if not _has_commit(store, sha):
+        with lib.store_lock(repo):
+            _git_bytes(["fetch", "--quiet", "origin", sha], store, timeout=900)
+    if not _has_commit(store, sha):
+        raise Refuse(f"{what} {sha} is not in the object store and could not be fetched")
+
+
+def _show(store, sha, path):
+    r = _git_bytes(["show", f"{sha}:{path}"], store)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _blob_mode(store, sha, path):
+    r = _git_bytes(["ls-tree", "-z", sha, "--", path], store)
+    if r.returncode != 0 or not r.stdout:
+        return None
+    return r.stdout.split(b" ", 1)[0].decode("ascii", "replace")
+
+
+# --------------------------------------------------------------------- gates
+def _digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def gate_findings(repo, plan_id, impl_sha, meet_dir):
+    """Gate 1. (document, raw bytes)."""
+    fpath = meet_dir / "findings.json"
+    try:
+        raw = fpath.read_bytes()
+    except OSError:
+        raise Refuse(f"no findings document at {fpath} — run fleet-meet first")
+    try:
+        doc = json.loads(raw)
+        schema = json.loads(FINDINGS_SCHEMA_PATH.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        raise Refuse(f"findings or their schema are unreadable ({e.__class__.__name__})")
+    errors = lane.validate_schema(doc, schema)
+    if errors:
+        raise Refuse(f"{fpath} fails {FINDINGS_SCHEMA_PATH.name}: {errors[:3]}")
+    if doc["plan"] != plan_id:
+        raise Refuse(f"findings are for plan {doc['plan']!r}, not {plan_id!r}")
+    if doc["repo"] != repo:
+        raise Refuse(f"findings are for repo {doc['repo']!r}, not {repo!r}")
+    if doc["impl"]["head_sha"] != impl_sha:
+        raise Refuse(f"findings were made at implementation head {doc['impl']['head_sha']}, "
+                     f"not --impl-sha {impl_sha}")
+    return doc, raw
+
+
+def gate_zone(repo, plan_id, orch, store):
+    """Gate 2. ADR-0006 §7: an allowlist — anything but `public` refuses.
+
+    Read at `origin/main`, NEVER at `--impl-sha`. The implementation branch is
+    implementer-authored (plans/<id>.md is inside its own lease and its own
+    commit), so a copy at `--impl-sha` is attacker-writable input to an
+    allowlist gate: a private-zone implementer could flip `zone: private` to
+    `zone: public` on its own branch and have gate 2 wave the whole tree
+    through to a cloud backend. `origin/main` is the human-merged copy —
+    the same fix fleet-watch's `_plan_by_id` already applies, for the same
+    reason ("NEVER reconstructed ... blank reads as 'unconstrained'"), and the
+    same source fleet-lane's own zone gate reads for a plan that has not yet
+    been implemented. `store` is `lib.ensure_store(repo)`'s ordinary clone, so
+    `origin/main` is a real remote-tracking ref refreshed by that clone's own
+    `git fetch --prune origin` — never a local branch a caller could have left
+    pointed anywhere.
+    """
+    text = _show(store, "origin/main", f"plans/{plan_id}.md")
+    if text is None:
+        raise Refuse(f"plans/{plan_id}.md is not readable on {repo}@main — a plan "
+                     "absent from main is not zone: public")
+    with tempfile.TemporaryDirectory(prefix="fleet-triage-plan-") as td:
+        p = Path(td) / "plans" / f"{plan_id}.md"
+        p.parent.mkdir(parents=True)
+        p.write_bytes(text)
+        try:
+            fm, _ = orch.read_plan(Path(td).resolve(), f"plans/{plan_id}.md")
+        except (OSError, ValueError) as e:
+            raise Refuse(f"could not read plans/{plan_id}.md on {repo}@main ({e.__class__.__name__})")
+    zone = (fm.get("zone") or "").strip()
+    if zone != "public":
+        raise Refuse(f"plan zone {zone!r} is not 'public' (ADR-0006 §7 is an allowlist) — "
+                     "refusing to send this repository's source to a cloud backend")
+    return zone
+
+
+def gate_mediator(repo):
+    """Gates 3 and 4. The `mediator` row resolves through fleet-models and is
+    never defaulted here: a constant in code would be a setting nobody wrote."""
+    models = lane._models_module()
+    none = Refuse(f"{repo!r} resolves no mediator at ordinal 1 (there is no built-in "
+                  f"triager) — set one with: {MEDIATOR_FIX}")
+    try:
+        runner, _layer = models.resolve_repo(repo, "mediator", 1)
+    except models.NotConfigured:
+        raise none
+    except (models.UnknownRunner, sqlite3.Error) as e:
+        raise Refuse(f"could not resolve {repo!r}'s mediator ({e.__class__.__name__}: {e})")
+    if runner is None:
+        raise none
+    if runner not in ADAPTERS:
+        raise Refuse(f"mediator {runner!r} is not in this program's adapter table "
+                     f"({', '.join(sorted(ADAPTERS))}) — this step sends source, and only "
+                     "a runner whose read confinement has been measured may receive it")
+    return runner
+
+
+def nonpass_tests(findings):
+    out = []
+    for ln in findings["lanes"]:
+        for t in ln["tests"]:
+            if t["outcome"] != "pass":
+                out.append({"lane": ln["runner"], "test": t["id"], "outcome": t["outcome"],
+                            "reason": t.get("reason"), "source_path": t["source_path"]})
+    return out
+
+
+def marker_for(digest, failed=False):
+    """The comment's own marker. `failed=True` marks a comment posted after the
+    triager itself failed (timeout, non-zero exit, unparseable or invalid
+    output) with a DISTINCT status, so gate 6's "already done" check — which
+    only matches the default (`status=ok`) marker — never treats a failure as
+    done. Without this, a failed run's comment carried the same marker as a
+    success and a by-hand re-run for the same findings digest was a silent
+    no-op (exit 0, nothing spawned, nothing new posted)."""
+    status = "failed" if failed else "ok"
+    return f"<!-- eunomia:meeting-triage findings={digest} status={status} -->"
+
+
+def _login(c):
+    return (((c or {}).get("user") or {}).get("login") or "").lower()
+
+
+def _has_marker_line(body, marker):
+    """Whether `marker` is a whole line of `body` (exact-line, not substring,
+    to avoid a shorter marker matching inside a longer one that merely shares
+    its prefix — e.g. plan `0176` inside `0176-foo`). `\\r\\n` is normalised
+    to `\\n` first: a CRLF body — a web edit on the issue or the triage
+    comment's own thread writes it that way — splits into lines carrying a
+    trailing `\\r`, which would never equal the marker and silently miss it
+    (round-3 review of PR #1334)."""
+    return marker in (body or "").replace("\r\n", "\n").split("\n")
+
+
+# ------------------------------------------------------------------ the gaps
+def parse_gaps(body):
+    """The lane's gaps, parsed from its PR body's `gaps:` block, or None when
+    the block is missing or does not parse. None is never "no gaps".
+
+    The block is the one `fleet-lane.build_pr_body()` renders: `gaps:`, a
+    fence, each vendor line prefixed `> `, a fence. A gap that spans lines
+    comes back as one gap per line: the renderer keeps no boundary between
+    them, and this program does not touch it."""
+    lines = (body or "").replace("\r\n", "\n").split("\n")
+    try:
+        i = lines.index("gaps:")
+    except ValueError:
+        return None
+    if i + 1 >= len(lines) or lines[i + 1] != "```":
+        return None
+    out = []
+    for line in lines[i + 2:]:
+        if line == "```":
+            return [] if out == ["(none)"] else out
+        if line.startswith("> "):
+            out.append(line[2:])
+        elif line == ">":
+            out.append("")
+        else:
+            return None
+    return None
+
+
+# ---------------------------------------------------------- the built directory
+def _rmtree_force(path):
+    for dirpath, dirnames, filenames in os.walk(path):
+        try:
+            os.chmod(dirpath, 0o700)
+        except OSError:
+            pass
+        for n in filenames:
+            try:
+                os.chmod(os.path.join(dirpath, n), 0o600)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _safe_rel(rel):
+    """`rel` normalised, or None when it is absolute, climbs, or carries a
+    control character (a filename with a newline is a way to start a comment
+    line)."""
+    if not isinstance(rel, str) or not rel or rel.startswith("/"):
+        return None
+    if any(ord(ch) < 32 or ch == "\x7f" for ch in rel):
+        return None
+    if any(seg == ".." for seg in rel.split("/")):
+        return None
+    norm = posixpath.normpath(rel)
+    return None if norm in (".", "") else norm
+
+
+def export_tree(store, sha, dest):
+    """`git archive` of `sha` into `dest`, with every symlink and hard link
+    dropped. Returns the omitted names. Not a worktree: there is no `.git`
+    pointer into a store that holds every other branch."""
+    omitted = []
+    proc = subprocess.Popen(["git", "archive", "--format=tar", sha], cwd=str(store),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+            for m in tar:
+                if m.issym() or m.islnk():
+                    omitted.append(m.name)
+                    continue
+                rel = _safe_rel(m.name)
+                if rel is None or rel == ".git" or rel.startswith(".git/"):
+                    continue
+                target = dest / rel
+                if m.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif m.isfile():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(tar.extractfile(m).read())
+    finally:
+        proc.stdout.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise Refuse(f"git archive {sha} failed (exit {rc})")
+    return sorted(omitted)
+
+
+def _lock_readonly(top):
+    for dirpath, dirnames, filenames in os.walk(top, topdown=False):
+        for n in filenames:
+            os.chmod(os.path.join(dirpath, n), stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        os.chmod(dirpath, stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP
+                 | stat.S_IROTH | stat.S_IXOTH)
+
+
+def build_directory(repo, findings, raw, impl_sha, nonpass, lane_gaps, store):
+    """The read-only tree the triager works in, under the system temp root (the
+    CLI loads instructions from every ancestor of its working directory).
+
+    impl/     the tree at `impl_sha`, exported, symlinks removed
+    lanes/    each non-pass test's source, at the LANE's head (not main's)
+    meeting/  findings.json and the parsed gaps — input, never citable
+
+    Returns (top, omitted symlinks, [lane files not available])."""
+    top = Path(tempfile.mkdtemp(prefix="fleet-triage-")).resolve()
+    try:
+        impl = top / "impl"
+        impl.mkdir()
+        omitted = export_tree(store, impl_sha, impl)
+        unavailable = []
+        by_lane = {ln["runner"]: ln for ln in findings["lanes"]}
+        for np_ in nonpass:
+            ln = by_lane[np_["lane"]]
+            rel = _safe_rel(np_["source_path"])
+            if rel is None:
+                unavailable.append(f"{np_['lane']}: {np_['source_path']!r} is not a safe relative path")
+                continue
+            dest = top / "lanes" / np_["lane"] / rel
+            if dest.exists():
+                continue
+            _ensure_commit(repo, store, ln["head_sha"], "lane head")
+            mode = _blob_mode(store, ln["head_sha"], rel)
+            data = _show(store, ln["head_sha"], rel) if mode in ("100644", "100755") else None
+            if data is None:
+                unavailable.append(f"{np_['lane']}: {rel} is not a regular file at the lane head")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+        meeting = top / "meeting"
+        meeting.mkdir()
+        (meeting / "findings.json").write_bytes(raw)
+        (meeting / "gaps.json").write_text(json.dumps(
+            {r: (g if g is not None else "unreadable") for r, g in lane_gaps.items()},
+            indent=2), encoding="utf-8")
+        _lock_readonly(top)
+        return top, omitted, unavailable
+    except BaseException:
+        _rmtree_force(top)
+        raise
+
+
+# ------------------------------------------------------------------ the prompt
+EVIDENCE_RULES = """\
+EVIDENCE RULES — the wrapper checks every citation against the files, mechanically.
+
+A citation is {"root": "impl" | "lanes/<runner>", "path": "...", "lines": [start, end],
+"quote": "..."}. Paths are relative to the root, lines are 1-based and inclusive, and
+`quote` must be text that really appears in those lines (whitespace is collapsed before
+the comparison) and be at least 8 non-space characters. meeting/ is NOT a root you may
+cite: a gap, a reason text or a note is a claim, never evidence.
+
+  implementation-defect    needs a citation in impl/ that is not a lane test file
+  test-harness-gap         needs a citation in THAT TEST'S OWN lanes/<runner>/ — never
+                           another lane's directory
+  spec-or-contract-defect  needs two citations at different locations (e.g. the doc
+                           that says one thing and the code that does another)
+  skip-needs-contract      needs a citation in that lane's own files, at the skip
+  undetermined             needs none. Use it when you cannot tell: a guess is worse
+                           than "could not tell, and here is why".
+
+An item whose evidence does not verify is shown to the owner as unverified. Do not
+describe code you have not read. Quote the line; do not paraphrase it.
+"""
+
+OUTPUT_SHAPE = """\
+Reply with exactly one JSON document and nothing else:
+
+  {"items": [{"lane": "<runner>", "test": "<test id, exactly as listed>",
+              "class": "implementation-defect" | "spec-or-contract-defect"
+                     | "test-harness-gap" | "skip-needs-contract" | "undetermined",
+              "evidence": [{"root": "...", "path": "...", "lines": [a, b], "quote": "..."}],
+              "rationale": "..."}],
+   "gaps":  [{"lane": "<runner>", "index": <gap number as listed>, "verdict": "contradiction",
+              "evidence": [...], "rationale": "..."}]}
+
+One item per listed test. `gaps` lists ONLY the gaps you judge to be real
+contradictions between the documents and the code; a gap that merely says the plan and
+the contract differ (the lane read the dispatch commit) is not one, and is not listed.
+"""
+
+
+def _claim_block(text):
+    t = _strip_comments(str(text if text is not None else ""))
+    return "\n".join("> " + l for l in t.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+
+
+def build_prompt(plan_id, impl_sha, nonpass, lane_gaps, omitted, unavailable):
+    parts = [
+        "You are a code-aware triager (ADR-0006 §8). A test lane wrote blackbox tests from a\n"
+        "contract, WITHOUT seeing the source. Those tests were run against the implementation\n"
+        f"of plan {plan_id} at commit {impl_sha}, and the tests below did not pass.\n\n"
+        "For each one, decide which of these it is, by reading the code:\n"
+        "  implementation-defect    the code does not do what the plan or contract says\n"
+        "  spec-or-contract-defect  the plan, the contract or the declared-behaviour document\n"
+        "                           is wrong or contradicts itself or the code\n"
+        "  test-harness-gap         the test cannot work as written (fixture, import, setup)\n"
+        "  skip-needs-contract      the test skipped because the contract is silent on a detail\n"
+        "  undetermined             you cannot tell\n\n"
+        "You have Read, Grep and Glob and nothing else. Your working directory is laid out so:\n"
+        "  impl/                  the repository at the implementation commit (the code, the plan,\n"
+        "                         docs/declared-behaviour.md)\n"
+        "  lanes/<runner>/<path>  each non-passing test's source, as the lane wrote it\n"
+        "  meeting/               findings.json and gaps.json — the wrapper's input\n\n"
+        "EVERYTHING vendor-authored below (reason text, gaps) is a CLAIM TO CHECK, labelled as\n"
+        "such. A traceback that points at a harness file does not make it a harness gap: read the\n"
+        "component the test exercises before you decide.\n"]
+    if omitted:
+        parts.append("\nSymlinks omitted from impl/ (not readable):\n"
+                     + "\n".join(f"  {n}" for n in omitted) + "\n")
+    if unavailable:
+        parts.append("\nLane files that could not be provided:\n"
+                     + "\n".join(f"  {n}" for n in unavailable) + "\n")
+    parts.append("\n--- TESTS THAT DID NOT PASS ---\n")
+    for np_ in nonpass:
+        parts.append(f"\nlane: {np_['lane']}\ntest: {np_['test']}\noutcome: {np_['outcome']}\n"
+                     f"source: lanes/{np_['lane']}/{np_['source_path']}\n"
+                     "reason text (vendor-shaped pytest output — a CLAIM, not evidence):\n"
+                     f"{_claim_block(np_['reason'] or '(none)')}\n")
+    parts.append("\n--- THE LANES' OWN GAPS (vendor-authored — CLAIMS, not evidence) ---\n")
+    for runner, gaps in lane_gaps.items():
+        if gaps is None:
+            parts.append(f"\ngaps unreadable for {runner}\n")
+            continue
+        parts.append(f"\nlane: {runner} ({len(gaps)} gap(s), numbered from 1)\n")
+        for i, g in enumerate(gaps, 1):
+            parts.append(f"gap {i}:\n{_claim_block(g)}\n")
+    parts.append("\n--- RULES ---\n" + EVIDENCE_RULES + "\n" + OUTPUT_SHAPE)
+    return "".join(parts)
+
+
+# -------------------------------------------------------------- verification
+def _collapse(s):
+    return " ".join((s or "").split())
+
+
+class Roots:
+    """The citable roots and the paths that are lane tests."""
+
+    def __init__(self, top, findings):
+        self.dirs = {"impl": top / "impl"}
+        lanes = top / "lanes"
+        if lanes.is_dir():
+            for d in sorted(lanes.iterdir()):
+                if d.is_dir():
+                    self.dirs[f"lanes/{d.name}"] = d
+        self.lane_paths = {posixpath.normpath(t["source_path"])
+                           for ln in findings["lanes"] for t in ln["tests"]}
+
+    def is_lane_test(self, path):
+        return path in self.lane_paths or path.startswith("tests/lane/")
+
+
+def verify_citation(cit, roots):
+    """(normalised citation, None) when it resolves, else (None, why).
+
+    Proves the cited text exists in the cited lines. It does not prove the
+    class the triager hung on it is right."""
+    root = cit.get("root")
+    if root not in roots.dirs:
+        if root == "meeting" or str(root).startswith("meeting/"):
+            return None, "meeting/ is not a citable root: a gap, a reason text or a note is a claim, never evidence"
+        return None, f"root {root!r} does not exist (only impl and lanes/<runner> are citable)"
+    rel = _safe_rel(cit.get("path"))
+    if rel is None:
+        return None, f"path {cit.get('path')!r} is absolute, climbs with '..', or carries a control character"
+    base = roots.dirs[root]
+    real = os.path.realpath(base / rel)
+    basereal = os.path.realpath(base)
+    if not (real == basereal or real.startswith(basereal + os.sep)):
+        return None, f"path {rel!r} resolves outside {root}"
+    if not os.path.isfile(real):
+        return None, f"{root}/{rel} does not exist"
+    lines = cit.get("lines")
+    if (not isinstance(lines, list) or len(lines) != 2
+            or not all(isinstance(n, int) and not isinstance(n, bool) for n in lines)):
+        return None, f"lines {lines!r} is not [start, end]"
+    a, b = lines
+    text = Path(real).read_text(encoding="utf-8", errors="replace").splitlines()
+    if not (1 <= a <= b <= len(text)):
+        return None, f"lines {a}-{b} are outside {root}/{rel} ({len(text)} lines)"
+    quote = _collapse(cit.get("quote"))
+    if len(quote.replace(" ", "")) < QUOTE_MIN_CHARS:
+        return None, f"quote is shorter than {QUOTE_MIN_CHARS} non-space characters"
+    if quote not in _collapse(" ".join(text[a - 1:b])):
+        return None, f"the quote does not occur in {root}/{rel} lines {a}-{b}"
+    return {"root": root, "path": rel, "lines": [a, b], "quote": quote}, None
+
+
+def _distinct_locations(cits):
+    locs = []
+    for c in cits:
+        for o in locs:
+            if o["root"] == c["root"] and o["path"] == c["path"] \
+                    and not (c["lines"][1] < o["lines"][0] or o["lines"][1] < c["lines"][0]):
+                break
+        else:
+            locs.append(c)
+    return len(locs)
+
+
+def check_rule(cls, cits, roots, lane_name=None):
+    """None when `cls`'s evidence rule holds for the (already verified)
+    citations, else why not."""
+    if cls == "undetermined":
+        return None
+    if cls == "implementation-defect":
+        if any(c["root"] == "impl" and not roots.is_lane_test(c["path"]) for c in cits):
+            return None
+        return "implementation-defect needs a verified impl citation outside every lane test path"
+    if cls == "test-harness-gap":
+        # That LANE's own files, never another lane's: a citation into a
+        # different runner's directory proved that OTHER lane's gap, not
+        # this one's, and would otherwise be enough to close a lane whose
+        # own failing test was never actually read.
+        if any(c["root"] == f"lanes/{lane_name}" for c in cits):
+            return None
+        return "test-harness-gap needs a verified lanes/<runner> citation in that lane's own files"
+    if cls == "skip-needs-contract":
+        if any(c["root"] == f"lanes/{lane_name}" for c in cits):
+            return None
+        return "skip-needs-contract needs a verified citation in that lane's own files"
+    if _distinct_locations(cits) >= 2:      # spec-or-contract-defect, contradiction
+        return None
+    return f"{cls} needs two verified citations at different locations"
+
+
+def verify_claim(cls, evidence, roots, lane_name):
+    """(verified citations, failure or None). Every citation must resolve; an
+    unresolved one fails the claim, whatever its class."""
+    cits = []
+    for i, cit in enumerate(evidence, 1):
+        norm, why = verify_citation(cit, roots)
+        if why:
+            return cits, f"citation {i}: {why}"
+        cits.append(norm)
+    return cits, check_rule(cls, cits, roots, lane_name)
+
+
+def verify_document(doc, nonpass, lane_gaps, roots):
+    """The wrapper's verdict on the triager's document (D3)."""
+    expected = {(n["lane"], n["test"]) for n in nonpass}
+    seen, items, notes = set(), [], []
+    for it in doc["items"]:
+        key = (it["lane"], it["test"])
+        if key not in expected:
+            notes.append(f"dropped an item for {it['lane']}/{it['test']}: not a non-pass in findings.json")
+            continue
+        if key in seen:
+            notes.append(f"dropped a repeated item for {it['lane']}/{it['test']}")
+            continue
+        seen.add(key)
+        cits, failure = verify_claim(it["class"], it["evidence"], roots, it["lane"])
+        items.append({"lane": it["lane"], "test": it["test"], "class": it["class"],
+                      "rationale": it["rationale"], "evidence": cits,
+                      "claimed_evidence": it["evidence"],
+                      "verified": failure is None, "failure": failure})
+    untriaged = [{"lane": n["lane"], "test": n["test"], "outcome": n["outcome"],
+                  "reason": n["reason"], "why": "the triager returned no entry for it"}
+                 for n in nonpass if (n["lane"], n["test"]) not in seen]
+    gaps, gseen = [], set()
+    for g in doc["gaps"]:
+        known = lane_gaps.get(g["lane"])
+        if known is None or not (1 <= g["index"] <= len(known)):
+            notes.append(f"dropped a gap verdict for {g['lane']} #{g['index']}: no such gap")
+            continue
+        if (g["lane"], g["index"]) in gseen:
+            notes.append(f"dropped a repeated gap verdict for {g['lane']} #{g['index']}")
+            continue
+        gseen.add((g["lane"], g["index"]))
+        cits, failure = verify_claim("contradiction", g["evidence"], roots, g["lane"])
+        gaps.append({"lane": g["lane"], "index": g["index"], "text": known[g["index"] - 1],
+                     "rationale": g["rationale"], "evidence": cits,
+                     "claimed_evidence": g["evidence"],
+                     "verified": failure is None, "failure": failure})
+    return {"items": items, "gaps": gaps, "untriaged": untriaged, "notes": notes}
+
+
+# ------------------------------------------------- lane disposition (plan 0176)
+# After the triage comment is decided, every lane PR in this meeting gets a
+# disposition: closed (every non-pass is the lane's own fault), kept open with
+# an issue (a defect was found), kept open with a contract-needed note, or
+# kept open and paged (nobody could tell). docs/meeting-triage.md, "What
+# happens to the lane".
+DISPOSITION_PENDING = {"close": ["comment", "close", "confirm"], "defect": ["issue", "comment"],
+                       "contract": ["comment"], "undetermined": ["comment"]}
+
+_RETRY_DELAYS = (2, 8)
+
+DEFECT_ISSUE_MARKER = "Lane-defects-for: "
+
+
+def lane_closed_marker(plan_id, lane_head):
+    """The first line of the closing comment itself — identifies what
+    happened, for a human reading the thread. Carries no gating weight of
+    its own: a comment that merely carries this line proves a close was
+    ATTEMPTED, never that it completed (round-4 review of PR #1334 found the
+    opposite assumption — reading this marker alone as proof of a completed
+    close — unsound). `lane_close_confirmed_marker` below is the one the
+    reopen guard actually trusts."""
+    return f"<!-- eunomia:lane-closed plan={plan_id} head={lane_head} -->"
+
+
+def lane_close_confirmed_marker(plan_id, lane_head):
+    """Posted in its OWN comment, and only after the close PATCH itself has
+    already returned success (never before, and never merged into the
+    closing comment's own text, which is written and sent beforehand) — so
+    finding this marker anywhere on the lane PR's thread is proof, read
+    straight off the forge, that a close for this exact lane head really
+    completed at some point. That is the one fact the reopen guard needs:
+    the PR is open now only because a person reopened it since.
+
+    This replaces a local bookkeeping scheme (`close_guard_exempt`, carried
+    forward from `triage.json`) that inferred the same fact from whichever
+    implementation head's meeting directory happened to still be on disk.
+    D2 is explicit the closed state "lives on the forge, not in
+    `triage.json`" — `triage.json` for one implementation head is rewritten
+    by every new digest at that head (D2), so relying on it for "was this
+    EVER confirmed closed" silently lost that fact the moment a later
+    digest's write overwrote the one record that held it, and a THIRD
+    digest at the same head then re-closed a lane a person had reopened in
+    between (round-4 review of PR #1334). A marker living in a comment on
+    the lane PR itself has no such expiry."""
+    return f"<!-- eunomia:lane-closed-confirmed plan={plan_id} head={lane_head} -->"
+
+
+def lane_disposition_marker(plan_id, digest, lane_head, action):
+    """The dedup key for a lane's disposition COMMENT (any action), embedded
+    as the body's first line and passed to `_post_comment_once` as its
+    needle. Keyed on the findings digest, not on the triage comment's own
+    URL: a hand rerun of a FAILED digest re-spawns the triager (gate 6 never
+    treats a `status=failed` marker as done) and posts a brand-new triage
+    comment each time, so a needle built from THAT url differs on every
+    retry and never finds the lane comment an earlier retry already posted
+    — which re-sent the undetermined page and posted a near-duplicate lane
+    comment on every hand rerun of the same failed digest (round-5 review of
+    PR #1334, finding 3). Digest, lane head and action together are stable
+    across retries of the SAME digest (nothing about the decision changed)
+    and distinct for a genuinely new digest (a new meeting's own comment is
+    always posted, never silently recovered from an old one — finding 4, the
+    same review: an old digest's comment cites that digest's own rationale
+    and triage comment, which is wrong once a DIFFERENT meeting is the one
+    actually performing the disposition)."""
+    return f"<!-- eunomia:lane-disposition plan={plan_id} digest={digest} head={lane_head} action={action} -->"
+
+
+def lane_disposition(ln, nonpass, verdict, triager_failed):
+    """D1's table, for one lane: (action, per-test classes). `action` is
+    `None` (nothing — every test passed), `"close"`, `"defect"`, `"contract"`
+    or `"undetermined"`. A non-pass absent from `verdict`'s verified items —
+    because the triager never answered it (`untriaged`) or its evidence did
+    not verify — counts as `undetermined`, never as whatever class it was
+    (mis)claimed under.
+
+    A lane whose run outcome was never `"ran"` (refused, timed out, or a
+    collection error) is always `"undetermined"`, so it is paged (D4) and
+    never closed on a lane the triager never saw. This is checked FIRST,
+    ahead of and regardless of `lane_nonpass`: `config/meeting-findings.schema.json`
+    constrains `run.outcome` and `tests` independently of each other — it
+    nowhere requires `tests` to be empty when `outcome` is not `"ran"` — so
+    "a lane that did not run contributes no entries to `nonpass`" is an
+    assumption about `fleet-meet`'s behaviour this program does not own and
+    the schema does not enforce (round-4 review of PR #1334). Deciding on
+    `outcome` alone, before `lane_nonpass` is even examined, means a stray
+    test entry under that shape can never be read as ordinary evidence and
+    walk a lane that never properly ran into a close or a defect filing."""
+    lane_name = ln["runner"]
+    lane_nonpass = [n for n in nonpass if n["lane"] == lane_name]
+    if ln["run"]["outcome"] != "ran":
+        return "undetermined", [{"test": n["test"], "class": "undetermined"} for n in lane_nonpass]
+    if not lane_nonpass:
+        return None, []
+    if triager_failed or verdict is None:
+        return "undetermined", [{"test": n["test"], "class": "undetermined"} for n in lane_nonpass]
+    verified = {(i["lane"], i["test"]): i["class"] for i in verdict["items"] if i["verified"]}
+    classes = [{"test": n["test"], "class": verified.get((lane_name, n["test"]), "undetermined")}
+              for n in lane_nonpass]
+    uniq = {c["class"] for c in classes}
+    if uniq == {"test-harness-gap"}:
+        return "close", classes
+    if uniq & {"implementation-defect", "spec-or-contract-defect"}:
+        return "defect", classes
+    if "skip-needs-contract" in uniq and "undetermined" not in uniq:
+        return "contract", classes
+    return "undetermined", classes
+
+
+def _drain(pages):
+    out = []
+    for page in pages:
+        out.extend(page)
+    if pages.outcome != fleetforge.EXHAUSTED:
+        return None
+    return out
+
+
+def _lane_gate(forge, repo, lane_pr, expected_head):
+    """D1's own re-read, right before acting on a lane: (pull body, None) when
+    it is open and at `expected_head`; else (pull body, reason), reason one of
+    "unreadable", "not-open" or "moved". The body is returned even on a
+    "not-open"/"moved" refusal (only "unreadable" has none) — unlike every
+    other caller, which only ever reads `reason`, `_check_lane_gate`'s own
+    "not-open" handling for a close needs the body's `state`, `merged` and
+    `head` to tell "we found it genuinely closed at the exact head we
+    expected" apart from "someone closed, merged or moved it for unrelated
+    reasons" (round-5 review of PR #1334)."""
+    st, body = forge.get_pull(repo, lane_pr)
+    if st != 200 or not isinstance(body, dict):
+        return None, "unreadable"
+    state = (body.get("state") or "").lower()
+    if state != "open" or body.get("merged"):
+        return body, "not-open"
+    head_sha = ((body.get("head") or {}).get("sha") or "")
+    if head_sha != expected_head:
+        return body, "moved"
+    return body, None
+
+
+def _find_lane_comment(forge, repo, pr, needle):
+    """Every fleet-authored comment on `pr` whose body contains `needle`
+    (not necessarily a whole line — `needle` may be a URL embedded in prose);
+    (None, "unreadable") when the thread could not be read in full. A
+    truncated read is never taken as "no comment": the caller must not post
+    over a write it could not confirm."""
+    out = _drain(fleetforge.paged(forge.list_issue_comments, repo, pr))
+    if out is None:
+        return None, "unreadable"
+    authors = lib.agent_roles()["author"].logins
+    return [c for c in out if _login(c) in authors and needle in (c.get("body") or "")], None
+
+
+def _retry_hint(failed):
+    """D2a's retry command, worded for what THIS digest's rerun actually
+    does. `run`'s own already-done checks only skip the spawn when the
+    digest has NO recorded failure (a `status=failed` marker, or a record
+    with `failure` set, is not "done" — the doc is explicit a person's
+    rerun for a FAILED digest spawns the triager again). A page that always
+    claimed "it does not re-spawn the triager" was simply wrong for that
+    case, and the owner would discover it only by spending the subscription
+    (review of PR #1334)."""
+    if failed:
+        return ("this digest's triage previously failed (exit 3); the same command "
+                "re-spawns the triager and decides afresh, spending the subscription again")
+    return "this replays only this digest's pending disposition steps; it does not re-spawn the triager"
+
+
+def _post_comment_once(forge, repo, pr, body, marker, log, phase):
+    """A comment POST is not idempotent, and 0102's confined runner has
+    measured a response that reports failure for a write that landed (D2a).
+    So before every attempt, including the first, the thread is checked for
+    a fleet-authored comment that already carries `marker` (a string unique
+    to this exact post — a comment url or a notice's own wording): found,
+    that comment is returned instead of a second one ever being sent.
+    (status, comment-or-None, reason) — `reason` is `"unreadable"` only when
+    a check could not complete; nothing is posted in that case."""
+    status, comment = None, None
+    for attempt in range(3):
+        existing, reason = _find_lane_comment(forge, repo, pr, marker)
+        if reason is not None:
+            log.note(phase, attempt=attempt + 1, status="unreadable")
+            return None, None, "unreadable"
+        if existing:
+            return 200, existing[0], None
+        status, comment = forge.create_issue_comment(repo, pr, body)
+        log.note(phase, attempt=attempt + 1, status=status)
+        if not _retryable_status(status):
+            return status, comment, None
+        if attempt < 2:
+            time.sleep(_RETRY_DELAYS[attempt])
+    return status, comment, None
+
+
+def _check_lane_gate(d, repo, plan_id, impl_sha, forge, orch, log, failed=False):
+    """D1's re-read, right before acting on a lane. True — nothing more to do
+    here this run — when `d` has no pending step, when the gate already
+    found (on an earlier call, this run or a past one) that this lane is a
+    genuine skip, or when the gate finds one now (closed, merged or moved:
+    permanent for this lane head, so `pending` is cleared and never
+    retried). Also true, but NOT a permanent skip, when the gate's own read
+    failed: `pending` is left untouched so a later run retries it, and this
+    paperwork is paged once per (lane, digest) like any other failed step —
+    an unreadable prerequisite must reach the owner exactly as a failed
+    write does, never silently drop the disposition.
+
+    One exception to the open-and-at-this-head requirement: a close whose
+    only step still owed is `"confirm"` already completed the PATCH itself
+    (in this run or an earlier one) — the PR being open now proves nothing
+    either way, since that is exactly the state a later human reopen would
+    also leave it in. The confirmation comment records a plain fact (a
+    close really happened at this exact lane head) and is owed regardless
+    of whether the PR has since been reopened, or even merged.
+
+    A second exception, for the SAME reason: a close whose `"close"` step is
+    still pending, but whose `"comment"` step is ALREADY DONE (so this exact
+    disposition really did attempt the close — never a lane found closed on
+    the very first look, which stays the ordinary "already closed" skip:
+    plan Boundaries and the DoD both require that a lane closed before this
+    program ever touched it gets nothing at all), and the gate finds the PR
+    already closed (not merged) at EXACTLY the expected lane head is D2a's
+    measured lie — the close PATCH we attempted landed even though the write
+    that attempted it reported failure. Read generically, "not-open" here
+    used to be treated as terminal (someone else closed or merged it,
+    nothing more to do), which abandoned the "confirm" step forever: no
+    confirmed marker was ever posted, so a later owner reopen at this same
+    head had nothing on record to stop a future digest re-closing it
+    (round-5 review of PR #1334, findings 1 and 6). `merged` is excluded
+    deliberately: a MERGE is never this program's own doing (Boundaries:
+    "never merge"), so it stays a genuine, terminal skip."""
+    if d.get("skip") or not d["pending"]:
+        return True
+    if d["action"] == "close" and d["pending"] == ["confirm"]:
+        return False
+    body, reason = _lane_gate(forge, repo, d["pr"], d["lane_head"])
+    if reason is None:
+        return False
+    if reason == "unreadable":
+        log.note("lane-gate-unreadable", repo=repo, pr=d["pr"])
+        if "lane-gate" not in d["paged"]:
+            orch.notify(f"meeting triage: could not read {repo}#{d['pr']} before acting on it",
+                        f"retry: fleet-triage {repo} {plan_id} --impl-sha {impl_sha} "
+                        f"({_retry_hint(failed)})")
+            d["paged"].append("lane-gate")
+        return True
+    if (reason == "not-open" and d["action"] == "close" and "close" in d["pending"]
+            and "comment" not in d["pending"]):
+        state = (body.get("state") or "").lower() if isinstance(body, dict) else ""
+        head_sha = ((body.get("head") or {}).get("sha") or "") if isinstance(body, dict) else ""
+        merged = bool(body.get("merged")) if isinstance(body, dict) else False
+        if not merged and state == "closed" and head_sha == d["lane_head"]:
+            log.note("lane-close-measured-lie", repo=repo, pr=d["pr"])
+            d["closed"] = True
+            d["pending"] = [s for s in d["pending"] if s != "close"]
+            return False
+    log.note("lane-skip", repo=repo, pr=d["pr"], reason=reason)
+    d["pending"] = []
+    d["skip"] = True
+    return True
+
+
+def find_defect_issue(forge, repo, plan_id, log=None):
+    """(issue, None) for the one issue, by the fleet's author account,
+    carrying `Lane-defects-for: <plan>`; (None, None) when there is none;
+    (None, "unreadable") when the listing could not be read in full — never
+    read as "none", because creating one on a failed read is how duplicates
+    happen (D3). `fleetforge` holds no `list_issues` verb, so this goes
+    through its transport directly, the `fleet-rebase` `_close_relanded`
+    precedent.
+
+    This single listing read is never retried in-run (unlike the writes
+    D2a describes): a failed page here pages once through the CALLER and is
+    retried only by a later run, the same as a lane-gate or close-guard read
+    that could not complete — `docs/meeting-triage.md`'s "A write that
+    fails" section is worded to say so.
+
+    More than one marked issue is a data problem this program did not
+    cause (D3 only ever creates one, but a human could file a second, or a
+    duplicate could predate this plan's own de-duplication). Silently
+    picking whichever page order happened to surface first would be
+    non-deterministic; instead every match is logged (when `log` is given)
+    and the lowest-numbered — the oldest — is returned, deterministically.
+
+    `cap=20` (the same bound `orchestrator` already uses for its own
+    `state="all"` issue/pull listings): this call runs on every meeting that
+    keeps no lane for a defect, including every all-pass one, and an
+    unbounded scan of a long-lived repository's full issue history on that
+    cadence is the kind of cost this program should not impose unnoticed
+    (round-5 review of PR #1334, finding 5). Hitting the cap reads as
+    `_drain`'s own "unreadable" (`Paged.outcome` is `CAP_HIT`, not
+    `EXHAUSTED`) — the same page-and-retry path an actual transport failure
+    already takes, never silently "no issue"."""
+    def verb(page, limit):
+        return forge._request("GET", f"/repos/{repo}/issues",
+                              query={"state": "all", "type": "issues", "page": page, "limit": limit})
+    out = _drain(fleetforge.paged(verb, cap=20))
+    if out is None:
+        return None, "unreadable"
+    authors = lib.agent_roles()["author"].logins
+    marker = DEFECT_ISSUE_MARKER + plan_id
+    matches = [it for it in out if _login(it) in authors and _has_marker_line(it.get("body"), marker)]
+    if not matches:
+        return None, None
+    matches.sort(key=lambda it: it.get("number") if isinstance(it.get("number"), int) else 0)
+    if len(matches) > 1 and log is not None:
+        nums = ",".join(str(it.get("number")) for it in matches)
+        log.note("defect-issue-duplicate", repo=repo, plan=plan_id, issues=nums)
+    return matches[0], None
+
+
+def _retryable_status(status):
+    return status == 0 or (isinstance(status, int) and 500 <= status <= 599)
+
+
+def _retry_write(call, log, phase, **facts):
+    """Up to 3 attempts, 2s then 8s backoff, on a transport failure or a 5xx
+    (D2a). A 4xx is not retried."""
+    status, body = None, None
+    for attempt in range(3):
+        status, body = call()
+        log.note(phase, attempt=attempt + 1, status=status, **facts)
+        if not _retryable_status(status):
+            return status, body
+        if attempt < 2:
+            time.sleep(_RETRY_DELAYS[attempt])
+    return status, body
+
+
+def render_defect_issue_body(plan_id, repo, defect_entries, comment_url):
+    """D3: built once per run, for the plan, from every lane kept for a
+    defect in THIS digest — never accumulated across meetings."""
+    lines = [DEFECT_ISSUE_MARKER + plan_id, "",
+             "Meeting triage found a defect in one or more lanes' failing tests for this "
+             "plan. Closing this issue is the owner's call.", "",
+             f"Triage comment: {comment_url}", ""]
+    for d in defect_entries:
+        lines.append(f"### {repo}#{d['pr']}")
+        lines.append("")
+        for t in d["tests"]:
+            if t["class"] in ("implementation-defect", "spec-or-contract-defect"):
+                lines.append(f"- `{_cell(t['test'])}` — {t['class']}: {_oneline(t['rationale'])}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _render_lane_comment(d, repo, plan_id, impl_sha, comment_url, issue_number):
+    # The dedup marker is this comment's own first line, for every action —
+    # not the triage `comment_url`, which a failed digest's hand rerun
+    # changes every retry (a new triage comment each time), breaking the
+    # idempotency check that used it as a needle (round-5 review of PR
+    # #1334, finding 3).
+    lines = [lane_disposition_marker(plan_id, d.get("digest"), d["lane_head"], d["action"]), ""]
+    if d["action"] == "close":
+        lines += [lane_closed_marker(plan_id, d["lane_head"]), "",
+                 f"Closing: meeting triage ({comment_url}) classified every one of this "
+                 f"lane's non-passing tests `test-harness-gap`, for implementation "
+                 f"`{_cell(impl_sha)}` at lane head `{_cell(d['lane_head'])}`:", ""]
+        for t in d["tests"]:
+            lines.append(f"- `{_cell(t['test'])}` — {t['class']}: {_oneline(t['rationale'])}")
+        lines += ["", "Reopen this pull request to bring it back; it will not be closed "
+                 "again at this head."]
+    elif d["action"] == "defect":
+        lines.append(f"Kept open: meeting triage ({comment_url}) found a defect in this "
+                     f"lane's failing tests, filed as {repo}#{issue_number}.")
+    elif d["action"] == "contract":
+        lines += [f"Kept open: meeting triage ({comment_url}) found this lane needs a "
+                 "contract decision on:", ""]
+        for t in d["tests"]:
+            if t["class"] == "skip-needs-contract":
+                lines.append(f"- `{_cell(t['test'])}` — {_oneline(t['rationale'])}")
+    else:
+        lines.append(f"Kept open: meeting triage ({comment_url}) could not classify one or "
+                     "more of this lane's failing tests.")
+    return "\n".join(lines)
+
+
+def _carry_forward_same_digest(dispositions, prior_dispositions):
+    """A hand rerun for the SAME findings digest — the triager re-spawned
+    after an earlier failure (gate 6 never treats a `status=failed` marker
+    as done), or the triager's own output reused after only the comment POST
+    failed to land — recomputes every lane's disposition from scratch, with
+    a fresh, empty `paged` list each time. Carried forward here from
+    `prior_dispositions` (THIS run's own `meet_dir/triage.json`, already
+    filtered by its caller to this exact `findings_digest` before it ever
+    reaches here) is only the `paged` list, for a lane whose action is
+    unchanged: a page is sent through `notify()`, which has no forge-side
+    marker a retry can check before sending another, so D4's "once per
+    (plan, digest)" has to be kept by hand here. A lane whose action changed
+    starts with an empty `paged`: that is new information the owner has not
+    been told yet.
+
+    Nothing else is carried forward. An earlier version of this also carried
+    forward a close's `comment_id` from EVERY prior digest ever recorded for
+    the plan, across every implementation head — but the comment it
+    recovered that way cited the EARLIER digest's own triage comment and
+    rationale, not the meeting that was actually performing the close
+    (round-5 review of PR #1334, finding 4). `lane_disposition_marker` now
+    makes that unnecessary: a genuinely new digest posts its own, accurate
+    comment, and a retry of the SAME digest finds its own earlier comment by
+    that marker without any local bookkeeping at all."""
+    by_pr = {p["pr"]: p for p in prior_dispositions or []}
+    for d in dispositions:
+        old = by_pr.get(d["pr"])
+        if old is not None and old.get("action") == d["action"]:
+            d["paged"] = list(old.get("paged") or [])
+
+
+def decide_dispositions(repo, plan_id, findings, nonpass, verdict, failure, orch, digest,
+                        nothing_ran=False):
+    """D1's decision, for every lane, made once per findings digest and
+    recorded before the triage comment is posted (D2a). Touches no forge at
+    all: the no-defect notice's own issue lookup is deferred to
+    `_maybe_notify_no_defect`'s execution, never done here (round-3 review of
+    PR #1334) — so deciding is local, and a run whose only forge-needing work
+    turns out to be none (`--dry-run`, or already fully done) never has to
+    mint a token for it.
+
+    Every rationale is run through `orch.redact_transcript` before it is kept
+    here, because from this point on it is headed for a durable forge
+    surface this plan adds (a lane comment, the shared defect issue) — never
+    only a log line, which is the one place this program already redacted
+    free triager text (review of PR #1334: the wrapper's own rendering of
+    the SAME rationale into the main triage comment, plan 0103, is unchanged
+    by this lease, but a NEW surface gets no less care than the log does).
+
+    `digest` is recorded on every disposition it builds: `lane_disposition_marker`
+    needs it to tell a retry of THIS digest (the same decision, posted at
+    most once) apart from a genuinely new one (its own comment, never an old
+    digest's — round-5 review of PR #1334, finding 4)."""
+    dispositions = []
+    for ln in findings["lanes"]:
+        action, classes = lane_disposition(ln, nonpass, verdict, bool(failure))
+        if action is None:
+            continue
+        rationale_by_test = {}
+        if verdict:
+            for i in verdict["items"]:
+                if i["lane"] == ln["runner"] and i["verified"]:
+                    rationale_by_test[i["test"]] = orch.redact_transcript(i["rationale"])[0]
+        tests = [{"test": c["test"], "class": c["class"], "rationale": rationale_by_test.get(c["test"])}
+                 for c in classes]
+        dispositions.append({"pr": ln["pr"], "lane_head": ln["head_sha"], "runner": ln["runner"],
+                             "action": action, "tests": tests, "digest": digest, "comment_id": None,
+                             "closed": False, "issue": None, "pending": list(DISPOSITION_PENDING[action]),
+                             "paged": [], "skip": False})
+    # The lookup itself is deferred to `_maybe_notify_no_defect`'s own
+    # execution, never done here: an unreadable listing at THIS point would
+    # otherwise just be read as "no issue" and the notice silently dropped,
+    # with no retry recorded and no page — the gap a failed lane write never
+    # has (round-3 review of PR #1334).
+    #
+    # Gated on `failure is None`, not merely on there being no defect lane:
+    # `failure` is set only when the triager itself genuinely failed (timed
+    # out, exited non-zero, or produced invalid output), in which case
+    # NOTHING was classified — every lane just reads `undetermined` — and
+    # that is not the same claim as "no defect was found" the notice makes
+    # (review of PR #1334).
+    #
+    # Also gated on `not nothing_ran`: the caller for gate 5's "nothing to
+    # triage" branch passes this true whenever `findings["all_passed"]` is
+    # false — a lane refused, timed out or failed to collect, contributing
+    # no test entries either way, the same empty shape as "every test
+    # passed". That lane's own disposition reads `undetermined`
+    # (`lane_disposition` checks its `run.outcome` before `lane_nonpass` is
+    # even examined), which is "nothing was classified", not "no defect was
+    # found" — exactly the claim gated above for a triager failure. The
+    # notice used to fire anyway whenever no lane's action was `defect`,
+    # which is true of this case too (round-5 review of PR #1334, finding
+    # 2). Only a genuine all-pass meeting (`nothing_ran=False`, the default)
+    # still gets the notice.
+    notice = None
+    if failure is None and not nothing_ran and not any(d["action"] == "defect" for d in dispositions):
+        notice = {"issue": None, "pending": True, "comment_id": None, "paged": []}
+    return dispositions, notice
+
+
+def _page_issue_failure(orch, repo, plan_id, impl_sha, phase, defect_entries, failed=False):
+    """D2a for the shared issue: pages once per (plan, digest) regardless of
+    how many lanes are waiting on it — a lookup or write that only `log`s
+    leaves the owner with nothing to act on, exactly the gap a failed lane
+    comment or close does not have."""
+    if any("issue-write-failed" in d["paged"] for d in defect_entries):
+        return
+    orch.notify(f"meeting triage: defect issue {phase} failed for {plan_id}",
+                f"retry: fleet-triage {repo} {plan_id} --impl-sha {impl_sha} ({_retry_hint(failed)})")
+    for d in defect_entries:
+        d["paged"].append("issue-write-failed")
+
+
+def _create_defect_issue(forge, repo, plan_id, body_text, log):
+    """The create side of D3, alone: issue creation is not idempotent, and
+    0102's confined runner has measured a response that reports failure for a
+    write that landed (D2a) — the same hazard `_post_comment_once` guards
+    against. The CALLER has already confirmed no issue exists before calling
+    this, so the first attempt POSTs directly; every RETRY (a prior attempt
+    returned 0 or a 5xx) first repeats the lookup, so a POST that actually
+    landed is found by its marker rather than retried into a second issue.
+    (number-or-None, "unreadable"-or-None)."""
+    status, obj = None, None
+    for attempt in range(3):
+        if attempt > 0:
+            found, reason = find_defect_issue(forge, repo, plan_id, log)
+            if reason == "unreadable":
+                log.note("defect-issue-create", attempt=attempt + 1, status="unreadable")
+                return None, "unreadable"
+            if found is not None:
+                return found.get("number"), None
+        status, obj = forge._request("POST", f"/repos/{repo}/issues",
+                                     body={"title": f"lane tests for {plan_id} found a defect",
+                                           "body": body_text})
+        log.note("defect-issue-create", attempt=attempt + 1, status=status)
+        number = obj.get("number") if isinstance(obj, dict) else None
+        if status in (200, 201) and isinstance(number, int):
+            return number, None
+        if not _retryable_status(status):
+            return None, None
+        if attempt < 2:
+            time.sleep(_RETRY_DELAYS[attempt])
+    return None, None
+
+
+def _ensure_defect_issue(forge, repo, plan_id, impl_sha, defect_entries, comment_url, orch, log,
+                         failed=False):
+    """The shared issue (D3): found and edited, or created. `None` — and
+    nothing written — when the lookup could not be read in full, the body
+    is too large to post, or the write itself failed after retries; every
+    one of those failures pages once (D2a), never only logged.
+
+    An issue the owner closed stays closed, whatever this run found: D3
+    grants this rule no issue-close capability ("Closing this issue is the
+    owner's call") and Boundaries grants it no REOPEN capability either, by
+    the same reasoning the plan states for a lane PR ("reopening is a
+    person's decision that this rule must not undo"). An earlier version of
+    this function flipped a closed issue back open on a new defect, reasoning
+    that a silent edit would otherwise hide the defect from the owner's
+    open-issues view — but that is itself a state change the plan's own text
+    never grants, and the PR that added it never named it either (round-4
+    review of PR #1334). The body is still rebuilt and still edited onto a
+    closed issue — keeping the record accurate costs nothing and changes no
+    state — but its `state` field is never touched here."""
+    found, reason = find_defect_issue(forge, repo, plan_id, log)
+    if reason == "unreadable":
+        log.note("issue-lookup-unreadable", repo=repo, plan=plan_id)
+        _page_issue_failure(orch, repo, plan_id, impl_sha, "lookup", defect_entries, failed)
+        return None
+    body_text = render_defect_issue_body(plan_id, repo, defect_entries, comment_url)
+    if len(body_text) > COMMENT_CAP:
+        # Unlike the main triage comment (`run`'s own `COMMENT_CAP` check,
+        # which refuses the whole run), this body is built from however many
+        # lanes this plan's meeting kept for a defect, and an oversized body
+        # must not crash the run or silently go out truncated — a failed
+        # write pages once and is retried, exactly like one the forge itself
+        # rejected (review of PR #1334).
+        log.note("issue-body-too-large", repo=repo, plan=plan_id, bytes=len(body_text))
+        _page_issue_failure(orch, repo, plan_id, impl_sha, "body-too-large", defect_entries, failed)
+        return None
+    if found is None:
+        number, reason = _create_defect_issue(forge, repo, plan_id, body_text, log)
+        if number is not None:
+            return number
+        _page_issue_failure(orch, repo, plan_id, impl_sha, "create", defect_entries, failed)
+        return None
+    number = found.get("number")
+    patch_body = {"body": body_text}
+    status, obj = _retry_write(
+        lambda: forge._request("PATCH", f"/repos/{repo}/issues/{number}", body=patch_body),
+        log, "defect-issue-edit", repo=repo, plan=plan_id, issue=number)
+    if status in (200, 201):
+        return number
+    _page_issue_failure(orch, repo, plan_id, impl_sha, "edit", defect_entries, failed)
+    return None
+
+
+def _run_disposition_steps(d, repo, plan_id, impl_sha, forge, orch, log, comment_url, issue_number,
+                           failed=False):
+    """The write side of D1's decision for one lane, assuming `_check_lane_gate`
+    already found it still applicable this run."""
+    if d["action"] == "close" and "close" in d["pending"]:
+        # Checked whenever the close itself is still outstanding — not only
+        # while the COMMENT is still pending. `_check_lane_gate`'s own
+        # measured-lie recovery can remove "close" from `pending` (and set
+        # `d["closed"]`) without ever reaching here at all when the comment
+        # is also still owed; when "comment" has ALREADY been recovered by
+        # that same marker-based lookup and only "close" remains, gating
+        # this check on "comment" in pending would skip the reopen guard
+        # entirely and risk re-closing a lane the owner had reopened at
+        # this exact head (review of PR #1334) — the very thing D2 exists
+        # to stop.
+        #
+        # The ONE marker this guard trusts is `lane_close_confirmed_marker`,
+        # never `lane_closed_marker` (which only proves a close was
+        # ATTEMPTED) and never a local `close_guard_exempt` flag read from
+        # `triage.json` (a round-3 fix that round-4 review found unsound:
+        # `triage.json` for this implementation head is overwritten by every
+        # new digest, so the one record proving a close had ever completed
+        # could vanish before a THIRD digest needed it, and this guard would
+        # then re-close a lane a person had reopened in between). A
+        # confirmed-marker comment is posted only AFTER the close PATCH
+        # itself returns success, so finding one anywhere on this thread —
+        # from ANY digest, including one no longer on disk — is read
+        # straight off the forge and needs no local history at all.
+        confirmed_marker = lane_close_confirmed_marker(plan_id, d["lane_head"])
+        matches, reason = _find_lane_comment(forge, repo, d["pr"], confirmed_marker)
+        if reason is not None:
+            log.note("lane-close-guard-unreadable", repo=repo, pr=d["pr"])
+            if "lane-close-guard" not in d["paged"]:
+                orch.notify(f"meeting triage: could not read {repo}#{d['pr']}'s thread before closing it",
+                            f"retry: fleet-triage {repo} {plan_id} --impl-sha {impl_sha} "
+                            f"({_retry_hint(failed)})")
+                d["paged"].append("lane-close-guard")
+            return
+        if matches:
+            # A close for this exact lane head really completed before (the
+            # confirmed marker is proof), and the PR is open now only
+            # because a person has reopened it since. Leave it alone.
+            d["pending"] = []
+            d["skip"] = True
+            return
+        # No confirmed close on record for this exact lane head, from any
+        # digest: either no close was ever attempted, or one was attempted
+        # and never completed (D2a's measured shape — a comment that landed
+        # while its own POST reported failure, or a close PATCH that kept
+        # failing). Either way it is safe to proceed.
+    failed_step = None
+    if "comment" in d["pending"]:
+        if d["action"] == "defect" and issue_number is None:
+            pass                     # the shared issue is not ready yet — try again next run
+        else:
+            body = _render_lane_comment(d, repo, plan_id, impl_sha, comment_url, issue_number)
+            if len(body) > COMMENT_CAP:
+                # Unlike the main triage comment (`run`'s own refusal) and
+                # the defect-issue body (`_ensure_defect_issue`'s own page),
+                # this one used to have no size check at all before being
+                # handed to the forge (round-4 review of PR #1334): an
+                # oversized body must page and retry here too, never go out
+                # truncated or crash the run.
+                log.note("lane-comment-too-large", repo=repo, pr=d["pr"], bytes=len(body))
+                failed_step = "comment"
+            else:
+                marker = lane_disposition_marker(plan_id, d.get("digest"), d["lane_head"], d["action"])
+                status, comment, reason = _post_comment_once(forge, repo, d["pr"], body, marker,
+                                                              log, "lane-comment")
+                if reason == "unreadable":
+                    failed_step = "comment"
+                else:
+                    cid = comment.get("id") if isinstance(comment, dict) else None
+                    if status in (200, 201) and isinstance(cid, int):
+                        d["comment_id"] = cid
+                        d["pending"].remove("comment")
+                    else:
+                        failed_step = "comment"
+    if d["action"] == "close" and "close" in d["pending"] and "comment" not in d["pending"]:
+        # Re-gated here, not just at the top of this run: the comment step
+        # above can retry with multi-second backoff, long enough for a push
+        # to land in between. The PATCH itself carries no expected head, so
+        # without this re-check a lane pushed in that window is closed at
+        # its NEW head rather than the one these tests were actually run
+        # against.
+        _, regate_reason = _lane_gate(forge, repo, d["pr"], d["lane_head"])
+        if regate_reason == "unreadable":
+            log.note("lane-close-regate-unreadable", repo=repo, pr=d["pr"])
+            if "lane-close-regate" not in d["paged"]:
+                orch.notify(f"meeting triage: could not re-check {repo}#{d['pr']} before closing it",
+                            f"retry: fleet-triage {repo} {plan_id} --impl-sha {impl_sha} "
+                            f"({_retry_hint(failed)})")
+                d["paged"].append("lane-close-regate")
+        elif regate_reason is not None:
+            log.note("lane-close-regate-skip", repo=repo, pr=d["pr"], reason=regate_reason)
+            d["pending"] = []
+            d["skip"] = True
+        else:
+            status, _b = _retry_write(
+                lambda: forge._request("PATCH", f"/repos/{repo}/pulls/{d['pr']}", body={"state": "closed"}),
+                log, "lane-close", repo=repo, pr=d["pr"])
+            if status in (200, 201):
+                d["closed"] = True
+                d["pending"].remove("close")
+            else:
+                failed_step = failed_step or "close"
+    if d["action"] == "close" and "close" not in d["pending"] and "confirm" in d["pending"]:
+        # Posted only now that the close PATCH above has actually returned
+        # success (this call, or an earlier one) — never before, and never
+        # folded into the closing comment's own text, which is written and
+        # sent BEFORE the close is even attempted (D2: "Comment first, then
+        # close"). This is the one fact the reopen guard above trusts, so it
+        # is retried for as long as it takes (`_check_lane_gate`'s own
+        # special case keeps this step alive even once the PR shows
+        # "closed" — exactly the state this step itself causes).
+        confirmed_marker = lane_close_confirmed_marker(plan_id, d["lane_head"])
+        body = confirmed_marker + "\n\nConfirmed: the close above completed."
+        status, comment, reason = _post_comment_once(forge, repo, d["pr"], body, confirmed_marker,
+                                                      log, "lane-close-confirm")
+        if reason == "unreadable":
+            failed_step = failed_step or "confirm"
+        else:
+            cid = comment.get("id") if isinstance(comment, dict) else None
+            if status in (200, 201) and isinstance(cid, int):
+                d["pending"].remove("confirm")
+            else:
+                failed_step = failed_step or "confirm"
+    if d["action"] == "defect" and issue_number is not None and "issue" in d["pending"]:
+        d["issue"] = issue_number
+        d["pending"].remove("issue")
+    if failed_step and "write-failed" not in d["paged"]:
+        orch.notify(f"meeting triage: {failed_step} failed for {repo}#{d['pr']}",
+                    f"retry: fleet-triage {repo} {plan_id} --impl-sha {impl_sha} ({_retry_hint(failed)})")
+        d["paged"].append("write-failed")
+
+
+def _execute_disposition(d, repo, plan_id, impl_sha, forge, orch, log, comment_url, issue_number,
+                         failed=False):
+    """Public entry point: the gate, then the write. Kept as one call for
+    the unit tests that drive a single disposition directly; `execute_dispositions`
+    below gates every disposition first so the defect-issue body and the
+    undetermined page are built only from lanes still applicable this run."""
+    if _check_lane_gate(d, repo, plan_id, impl_sha, forge, orch, log, failed):
+        return
+    _run_disposition_steps(d, repo, plan_id, impl_sha, forge, orch, log, comment_url, issue_number, failed)
+
+
+def _maybe_notify_no_defect(record, repo, plan_id, impl_sha, forge, orch, log, detail):
+    """D3: when this run keeps no lane for a defect, an open marked issue
+    gets one comment saying so. `detail` names this meeting (the triage
+    comment's url, or — when there was none to post, every test having
+    passed — the findings digest) and doubles as this post's own
+    idempotency marker (D2a): a retry never duplicates it.
+
+    The issue lookup is done HERE, not in `decide_dispositions`, and retried
+    on every call until it resolves: an unreadable listing pages once
+    (D2a — never only logged, the same guarantee a failed lane write has)
+    and leaves `pending` set for the next run to try again. A listing that
+    resolves to "no open marked issue" clears `pending`: there is genuinely
+    nothing to notify.
+
+    The issue it finds is never cached across calls: a retry (this run, or a
+    later one for the same digest) looks it up again and re-checks that it
+    is still open, rather than trusting a number a PRIOR call found open —
+    the owner can close the issue in the gap between a failed post and its
+    retry, and the doc says the notice only ever lands on an open issue
+    (review of PR #1334)."""
+    failed = bool(record.get("failure"))
+    notice = record.get("no_defect_notice")
+    if not (notice and notice.get("pending")):
+        return
+    notice.setdefault("paged", [])
+    found, reason = find_defect_issue(forge, repo, plan_id, log)
+    if reason == "unreadable":
+        log.note("no-defect-notice-lookup-unreadable", repo=repo, plan=plan_id)
+        if "lookup" not in notice["paged"]:
+            orch.notify(f"meeting triage: could not look up the defect issue for {plan_id}",
+                        f"retry: fleet-triage {repo} {plan_id} --impl-sha {impl_sha} "
+                        f"({_retry_hint(failed)})")
+            notice["paged"].append("lookup")
+        return
+    if found is None or (found.get("state") or "").lower() != "open":
+        notice["issue"] = found.get("number") if found else None
+        notice["pending"] = False
+        return
+    issue_number = found.get("number")
+    notice["issue"] = issue_number
+    body = f"No lane's failing tests were classified a defect at this meeting ({detail})."
+    status, comment, reason = _post_comment_once(forge, repo, issue_number, body, detail,
+                                                 log, "defect-issue-notice")
+    if reason == "unreadable":
+        # The one unreadable step in this program that used to neither page
+        # nor leave a trace an owner could act on — every other unreadable
+        # prerequisite (the lane gate, the close guard, this same lookup
+        # above) pages once; this one silently returned (review of
+        # PR #1334). `pending` is left set, same as the other two outcomes
+        # below, so the next run tries again.
+        log.note("no-defect-notice-post-unreadable", repo=repo, plan=plan_id, issue=issue_number)
+        if "post-check" not in notice["paged"]:
+            orch.notify(f"meeting triage: could not read {repo}#{issue_number}'s thread before "
+                        "posting the no-defect notice",
+                        f"retry: fleet-triage {repo} {plan_id} --impl-sha {impl_sha} "
+                        f"({_retry_hint(failed)})")
+            notice["paged"].append("post-check")
+        return
+    cid = comment.get("id") if isinstance(comment, dict) else None
+    if status in (200, 201) and isinstance(cid, int):
+        notice["comment_id"] = cid
+        notice["pending"] = False
+    elif "write" not in notice["paged"]:
+        orch.notify(f"meeting triage: the no-defect notice failed for {plan_id}",
+                    f"retry: fleet-triage {repo} {plan_id} --impl-sha {impl_sha} ({_retry_hint(failed)})")
+        notice["paged"].append("write")
+
+
+def execute_dispositions(record, repo, plan_id, impl_sha, forge, orch, log, comment_url):
+    """D2/D3/D4: runs every pending step this record still owes, for this
+    findings digest — the retry queue D2a describes. Idempotent: a step
+    already done (absent from `pending`) is never repeated. Every
+    disposition is gated once, up front, so a lane the gate finds closed or
+    moved never reaches the defect-issue body or the undetermined page —
+    its disposition for THIS digest no longer applies, and a later digest at
+    its new (or still-open) state judges it afresh."""
+    failed = bool(record.get("failure"))
+    dispositions = record.get("dispositions") or []
+    active = [d for d in dispositions
+             if not _check_lane_gate(d, repo, plan_id, impl_sha, forge, orch, log, failed)]
+    active_ids = {id(d) for d in active}
+    defect_entries = [d for d in active if d["action"] == "defect"]
+    # The body is rebuilt from scratch on every call that touches the issue
+    # at all (D3), so it must be given EVERY defect lane this digest still
+    # has standing — not only `active` ones. A lane already fully linked in
+    # an earlier run (its `pending` is empty) is gated-out of `active` by
+    # `_check_lane_gate`'s own first check before its forge state is even
+    # read; passing only `active` here would rebuild the body from the
+    # lanes still doing something THIS run and silently drop every lane
+    # that is already finished — erasing a sibling defect lane's listing
+    # the moment any other lane in the same meeting needs a retry (round-3
+    # review of PR #1334, finding against finding 6's own first fix). A
+    # lane this run found genuinely closed or moved (`skip`) is still
+    # excluded — a stale disposition that no longer applies must not keep
+    # re-appearing — and so is one whose gate is merely UNREADABLE this run
+    # (not `skip`, still pending, not in `active`): unconfirmed, it is left
+    # out exactly as it was on the run that first found it unreadable.
+    body_entries = [d for d in dispositions if d["action"] == "defect" and not d.get("skip")
+                    and (not d["pending"] or id(d) in active_ids)]
+    # Whenever ANY defect lane here still needs linking to the shared issue
+    # — not only when NO lane's number is known yet — the body is rebuilt
+    # from every defect lane in `body_entries` above.
+    if defect_entries and any("issue" in d["pending"] for d in defect_entries):
+        issue_number = _ensure_defect_issue(forge, repo, plan_id, impl_sha, body_entries, comment_url,
+                                            orch, log, failed)
+    else:
+        issue_number = next((d["issue"] for d in body_entries if d["issue"] is not None), None)
+    for d in active:
+        _run_disposition_steps(d, repo, plan_id, impl_sha, forge, orch, log, comment_url, issue_number,
+                               failed)
+    undetermined = [d for d in active if d["action"] == "undetermined" and "undetermined" not in d["paged"]]
+    if undetermined:
+        names = ", ".join(f"{repo}#{d['pr']}" for d in undetermined)
+        orch.notify(f"meeting triage: lane(s) undetermined for {plan_id}",
+                    f"{names}\ntriage comment: {comment_url}")
+        for d in undetermined:
+            d["paged"].append("undetermined")
+    _maybe_notify_no_defect(record, repo, plan_id, impl_sha, forge, orch, log, comment_url)
+
+
+# ------------------------------------------------------------------- the comment
+def _strip_comments(text):
+    """Every `<!--` removed, to a fixed point: removing one can join its
+    neighbours into another."""
+    text = str(text)
+    while "<!--" in text:
+        text = text.replace("<!--", "")
+    return text
+
+
+def _fence(text, cap=RATIONALE_CAP):
+    """Free text from the triager or a vendor: fenced, each line prefixed `> `,
+    no `<!--`. No line of it can then start at column 0, so it cannot begin an
+    `Ack:` or `Plan:` line, close the fence, or open a marker."""
+    t = _strip_comments(text if text is not None else "")[:cap]
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    return "```\n" + "\n".join("> " + l for l in t.split("\n")) + "\n```"
+
+
+_MD = re.compile(r"([\\|\[\]`*_~])")
+
+
+def _cell(text, cap=200):
+    """One line of table text: no newline or control character, no markup, no
+    `<!--`. An identifier that reaches a table cell is still vendor-shaped."""
+    t = _strip_comments(text if text is not None else "")[:cap]
+    t = "".join(" " if (ord(ch) < 32 or ch == "\x7f") else ch for ch in t)
+    t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _MD.sub(r"\\\1", t)
+
+
+def _oneline(text, cap=300):
+    """Free text collapsed to one line, no `<!--`, bounded. A lane-comment
+    rationale, never a raw multi-line quote: a standalone `Ack:`/`Plan:` line
+    cannot survive every line break collapsing into a space."""
+    return _collapse(_strip_comments(text if text is not None else ""))[:cap]
+
+
+def _link(base_url, repo, sha_for_root, cit):
+    sha = sha_for_root[cit["root"]]
+    a, b = cit["lines"]
+    url = f"{base_url}/{repo}/src/commit/{sha}/{urllib.parse.quote(cit['path'], safe='/')}#L{a}-L{b}"
+    return f"[{_cell(cit['path'])}:{a}-{b}]({url})"
+
+
+def render_comparison(f, good=()):
+    """The `### Lanes compared` section (plan 0143 D2, D3), rendered from the
+    findings document alone: counts and text the document recorded, no model.
+    `good` is the classified items, so a disagreement can point at their rows."""
+    cmp_ = f.get("comparison")
+    if not cmp_:
+        return []
+    runners = list(cmp_["untagged"])
+    rows = {(i["lane"], i["test"]): n for n, i in enumerate(good, 1)}
+    fails = {}
+    for ln in f["lanes"]:
+        for t in ln["tests"]:
+            if t["outcome"] in ("fail", "error"):
+                for c in t.get("covers") or []:
+                    fails.setdefault(c, []).append((ln["runner"], t["id"]))
+    out = ["### Lanes compared", ""]
+    if cmp_["partial"]:
+        out += ["Partial: at least one dispatched lane is not in this meeting.", ""]
+    head = "| item | " + " | ".join(f"{_cell(r)} pass/fail/skip" for r in runners) + " | verdict |"
+    out += [head, "|---|" + "---|" * len(runners) + "---|"]
+    for it in cmp_["items"]:
+        cells = []
+        for r in runners:
+            c = it["lanes"].get(r) or {"pass": 0, "fail": 0, "skip": 0}
+            cells.append(f"{c['pass']}/{c['fail']}/{c['skip']}")
+        verdict = it["verdict"]
+        if verdict == "disagree":
+            refs = sorted({rows[k] for k in fails.get(it["id"], []) if k in rows})
+            if refs:
+                verdict += " (classified " + ", ".join(f"#{n}" for n in refs) + ")"
+        label = _cell(it["id"]) + (" " + _cell(it["text"], 80) if it["text"] else "")
+        out.append(f"| {label} | " + " | ".join(cells) + f" | {verdict} |")
+    out.append("")
+    for r in runners:
+        u = cmp_["untagged"][r]
+        k = {o: sum(1 for t in u if t["outcome"] == o) for o in ("pass", "fail", "error", "skip")}
+        out.append(f"- untagged, `{_cell(r)}`: {len(u)} test(s) — pass {k['pass']}, fail {k['fail']}, "
+                   f"error {k['error']}, skip {k['skip']}")
+    for m in cmp_["lanes_missing"]:
+        who = _cell(m["runner"]) if m["runner"] else "unknown runner"
+        pr = f" (#{m['pr']})" if m["pr"] is not None else ""
+        out.append(f"- missing lane `{who}`{pr}: {_cell(m['reason'], 300)}")
+    out.append("")
+    out += ["Gaps, as each lane wrote them (claims, not matched to items):", ""]
+    for r in runners:
+        g = cmp_["gaps"].get(r)
+        out += [f"`{_cell(r)}`:", _fence("\n".join(g) if g else "(none)" if g == [] else "(unreadable)"), ""]
+    return out
+
+
+def render_comment(ctx, verdict, failure):
+    """The one comment. `verdict` is verify_document's result, or None when the
+    triager failed; every non-pass then reads `not triaged`."""
+    f = ctx["findings"]
+    digest = ctx["digest"]
+    roots_sha = {"impl": ctx["impl_sha"]}
+    for ln in f["lanes"]:
+        roots_sha[f"lanes/{ln['runner']}"] = ln["head_sha"]
+    base = ctx["base_url"]
+    out = [marker_for(digest, failed=bool(failure)), "",
+           f"### Meeting triage — {_cell(ctx['plan_id'])}", "",
+           "This is a report. It starts no fix round and is not a status or a review; "
+           "a class below is the triager's judgment, and a verified citation proves only that "
+           "the cited text exists.", "",
+           f"- implementation: {ctx['repo']}#{f['impl']['pr']} at `{ctx['impl_sha']}`",
+           f"- findings digest: `{digest}`"]
+    for ln in f["lanes"]:
+        out.append(f"- lane `{_cell(ln['runner'])}`: {ctx['repo']}#{ln['pr']} at `{ln['head_sha']}`, "
+                   f"prompt sha256 `{ln['prompt_sha256'] or 'none'}`")
+    out.append(f"- triager: runner `{_cell(ctx['runner'])}`, model `{_cell(ctx['model'] or 'not reported')}`")
+    out.append("")
+
+    good = [i for i in verdict["items"] if i["verified"]] if verdict else []
+    out += render_comparison(f, good)
+
+    if verdict is None:
+        out += ["### Not triaged", "",
+                f"The triager did not produce valid output ({len(ctx['nonpass'])} non-pass(es) "
+                "are untriaged):", "", _fence(failure), ""]
+        for n in ctx["nonpass"]:
+            out.append(f"- `{_cell(n['lane'])}` / {_cell(n['test'])} — {n['outcome']}")
+        return "\n".join(out) + "\n"
+
+    bad = [i for i in verdict["items"] if not i["verified"]]
+    counts = {c: sum(1 for i in good if i["class"] == c) for c in CLASSES}
+    out.append("### Classified (evidence verified)")
+    out.append("")
+    out.append("Counts: " + ", ".join(f"{c} {n}" for c, n in counts.items()))
+    out.append("")
+    if good:
+        out += ["| # | lane | test | class | evidence |", "|---|---|---|---|---|"]
+        for n, i in enumerate(good, 1):
+            ev = " · ".join(_link(base, ctx["repo"], roots_sha, c) for c in i["evidence"]) or "—"
+            out.append(f"| {n} | {_cell(i['lane'])} | {_cell(i['test'])} | {i['class']} | {ev} |")
+        out += ["", "Rationale, as the triager wrote it:", ""]
+        for n, i in enumerate(good, 1):
+            out += [f"{n}.", _fence(i["rationale"]), ""]
+    else:
+        out += ["None.", ""]
+
+    out.append("### Gap contradictions (verified)")
+    out.append("")
+    ggood = [g for g in verdict["gaps"] if g["verified"]]
+    total_gaps = sum(len(g) for g in ctx["lane_gaps"].values() if g is not None)
+    out.append(f"{len(ggood)} of {total_gaps} lane gap(s); the rest are not itemised.")
+    out.append("")
+    for g in ggood:
+        ev = " · ".join(_link(base, ctx["repo"], roots_sha, c) for c in g["evidence"])
+        out += [f"- `{_cell(g['lane'])}` gap {g['index']}: {ev}",
+                "", "  The lane's gap (a claim):", _fence(g["text"]), "  The triager's rationale:",
+                _fence(g["rationale"]), ""]
+
+    out.append("### Evidence did not verify")
+    out.append("")
+    gbad = [g for g in verdict["gaps"] if not g["verified"]]
+    if not (bad or gbad):
+        out += ["None.", ""]
+    for i in bad:
+        out += [f"- `{_cell(i['lane'])}` / {_cell(i['test'])} — claimed `{i['class']}`; "
+                "failed check:", _fence(i["failure"]), "  Its rationale (unverified):",
+                _fence(i["rationale"]), ""]
+    for g in gbad:
+        out += [f"- `{_cell(g['lane'])}` gap {g['index']} — claimed `contradiction`; failed check:",
+                _fence(g["failure"]), "  Its rationale (unverified):", _fence(g["rationale"]), ""]
+
+    out.append("### Not triaged")
+    out.append("")
+    if not verdict["untriaged"]:
+        out += ["None.", ""]
+    for n in verdict["untriaged"]:
+        out += [f"- `{_cell(n['lane'])}` / {_cell(n['test'])} — {n['outcome']}; {n['why']}. "
+                "The lane's reason text (a claim):", _fence(n["reason"] or "(none)", 600), ""]
+    if verdict["notes"]:
+        out += ["### Notes", ""] + [f"- {_cell(n, 300)}" for n in verdict["notes"]] + [""]
+    return "\n".join(out) + "\n"
+
+
+def assert_body_safe(body, digest, orch, failed=False):
+    """Refuse a body that could start a fix round or be read as a marker. The
+    orchestrator's own `_ACK_RE` is imported, never restated."""
+    own = marker_for(digest, failed=failed)
+    if orch._ACK_RE.search(body):
+        raise Refuse("the comment carries an `Ack: #n` line — it would consume an owner instruction")
+    if re.search(r"^Plan:", body, re.M):
+        raise Refuse("the comment carries a `Plan:` line — it would read as a plan marker")
+    if body.split("\n", 1)[0] != own or len(re.findall(r"<!--\s*eunomia:", body)) != 1:
+        raise Refuse("the comment carries an eunomia marker other than its own")
+
+
+# --------------------------------------------------------------------- record
+def _write_json(path, obj):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _spawn_env():
+    return {k: os.environ[k] for k in TRIAGE_ENV if k in os.environ}
+
+
+def _run_triager(orch, prompt, top, log):
+    """(document or None, failure or None, model, rc). One spawn, no retry."""
+    adapter = lane.build_adapters(orch)["sub-opus"]
+    exe = shutil.which(TRIAGE_ARGV[0], path=os.environ.get("PATH", os.defpath))
+    if not exe:
+        raise Refuse(f"{TRIAGE_ARGV[0]!r} is not on PATH on this host — refusing to spawn")
+    argv = (exe,) + TRIAGE_ARGV[1:]
+    log.note("spawn", argv=" ".join(argv), cwd=str(top))
+    rc, timed_out, stdout = lane.spawn_lane(argv, top, _spawn_env(), prompt.encode("utf-8"),
+                                            timeout=TRIAGE_TIMEOUT_SECONDS)
+    clean, shapes = orch.redact_transcript(stdout)
+    log.note("spawn-exit", rc=rc, timed_out=timed_out, shapes=",".join(shapes) or "-")
+    try:
+        _usage, model = adapter["usage"](stdout)
+    except Exception:
+        model = None
+    if timed_out:
+        return None, "the triager timed out and was killed", model, rc
+    doc, _ = adapter["parse"](stdout, None)
+    if rc != 0 or (doc is None and adapter["is_error"](stdout)):
+        quota = adapter["quota"](rc, stdout, None)
+        tail = orch.redact_transcript(clean.strip()[-200:])[0]
+        return None, (f"the triager hit a usage limit: {quota}" if quota else
+                      f"the triager stopped on an error (exit {rc}): {tail}"), model, rc
+    if doc is None:
+        return None, "the triager's output did not parse into a JSON document", model, rc
+    try:
+        schema = json.loads(TRIAGE_SCHEMA_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise Refuse(f"{TRIAGE_SCHEMA_PATH} is unreadable ({e.__class__.__name__})")
+    errors = lane.validate_schema(doc, schema)
+    if errors:
+        return None, f"the triager's document failed {TRIAGE_SCHEMA_PATH.name}: {errors[:3]}", model, rc
+    return doc, None, model, rc
+
+
+def _ensure_upgraded_dispositions(record, repo, plan_id, findings, nonpass, orch, nothing_ran=False):
+    """A `triage.json` written before plan 0176 existed — or, for the
+    all-pass branch, before 0176's no-defect notice existed — has no
+    `dispositions` key at all, and no `no_defect_notice` key either. The
+    "already done" paths below reuse such a record as-is and only ever
+    REPLAY whatever is already in `dispositions`/`no_defect_notice`; a
+    missing key there, read as an empty list or `None`, would make that
+    replay a permanent no-op — a lane this plan was written to close or file
+    a defect for stays open forever, with no error and no page, because the
+    comment that would have triggered a fresh decision was already posted by
+    the pre-upgrade build (round-4 review of PR #1334).
+
+    Decided here, once, from the record's OWN already-verified classification
+    (`record["items"]`) — never by re-spawning the triager for a digest that
+    is already posted. An empty `dispositions` list is never ambiguous with
+    "not yet decided" on a 0176-era record reaching this point: every lane
+    named in a non-empty `nonpass` owns some action (`lane_disposition` never
+    returns `None` for a lane with a non-pass test), so `"dispositions" not
+    in record` is the one reliable signal of the pre-upgrade shape.
+
+    `nothing_ran` is passed straight through to `decide_dispositions`: the
+    gate-5 ("nothing to triage") caller, upgrading a pre-0176 all-pass-branch
+    record, must still suppress the no-defect notice for a meeting where no
+    lane ran (round-5 review of PR #1334, finding 2) — the other two callers,
+    upgrading a record from the ordinary non-pass branch, never pass it."""
+    if "dispositions" in record and "no_defect_notice" in record:
+        return
+    verdict = {"items": record.get("items") or []}
+    dispositions, no_defect_notice = decide_dispositions(
+        repo, plan_id, findings, nonpass, verdict, record.get("failure"), orch,
+        record.get("findings_digest"), nothing_ran=nothing_ran)
+    record.setdefault("dispositions", dispositions)
+    record.setdefault("no_defect_notice", no_defect_notice)
+
+
+def run(repo, plan_id, impl_sha, dry_run=False, no_post=False, orch_mod=None):
+    orch = orch_mod or lane._orchestrator_module()
+    log = TriageLog(plan_id, orch)
+    top = None
+    refusal = (Refuse, orch.Stop, lane.Stop, RuntimeError, ValueError, OSError,
+               subprocess.SubprocessError)
+    try:
+        log.note("gate-start", repo=repo, plan=plan_id, sha=impl_sha)
+        meet_dir = lib.work_root() / "meetings" / plan_id / impl_sha[:12]
+        findings, raw = gate_findings(repo, plan_id, impl_sha, meet_dir)
+        digest = _digest(raw)
+        log.note("gate-findings", digest=digest, sha=impl_sha)
+
+        store = lib.ensure_store(repo)
+        _ensure_commit(repo, store, impl_sha, "implementation head")
+        zone = gate_zone(repo, plan_id, orch, store)
+        log.note("gate-zone", zone=zone)
+        runner = gate_mediator(repo)
+        log.note("gate-mediator", runner=runner)
+
+        get_forge = _LazyForge(orch)
+
+        nonpass = nonpass_tests(findings)
+        triage_path = meet_dir / "triage.json"
+        if not nonpass:
+            # `nonpass_tests` is empty both when every test really passed
+            # AND when every lane refused, timed out or failed to collect
+            # (zero test entries either way) — `findings["all_passed"]` is
+            # the one field that tells them apart (it is false whenever a
+            # lane's run outcome was not `"ran"`, even with no per-test
+            # entries to be false ABOUT: bin/fleet-meet's own `all_passed`
+            # expression is false on an empty `all_tests` list). Only the
+            # genuine all-pass case is "nothing to triage"; a lane that
+            # never ran still owes D1 a disposition (`lane_disposition`
+            # below returns `"undetermined"` for it on the same empty
+            # `lane_nonpass`), and the open defect issue must never be told
+            # "every test passed" when it was not.
+            all_passed = findings["all_passed"]
+            log.note("nothing-to-triage", items=0)
+            if dry_run:
+                print("nothing to triage: every test passed" if all_passed else
+                     "nothing to triage: no test ran, and not every lane passed")
+                return 0
+            # Gate 6 ("already done") lives below, AFTER this branch, and so
+            # never applied here: every call for the SAME digest recomputed
+            # fresh dispositions from scratch, resetting each one's `paged`
+            # list — a hand rerun of an all-pass or no-test digest re-sent
+            # the undetermined page every single time, against D4's
+            # "once per (plan, digest)" rule (review of PR #1334). So this
+            # branch reads `triage_path` itself first, and a record already
+            # on disk for this exact digest is reused as-is (its `paged`
+            # lists intact) rather than rebuilt by `decide_dispositions`.
+            prior = None
+            try:
+                prior = json.loads(triage_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+            if isinstance(prior, dict) and prior.get("findings_digest") == digest:
+                record = prior
+            else:
+                # D3 applies here too: an all-pass meeting is the strongest
+                # case of "no lane kept for a defect" for this plan, and an
+                # issue an earlier meeting opened still gets told so
+                # (docs/meeting-triage.md, "A defect"). There is no triage
+                # comment to name — nothing failed, nothing was posted — so
+                # the findings digest itself is this post's unique marker
+                # instead.
+                dispositions, no_defect_notice = decide_dispositions(repo, plan_id, findings,
+                                                                     [], None, None, orch, digest,
+                                                                     nothing_ran=not all_passed)
+                record = {
+                    "schema": TRIAGE_SCHEMA_NAME, "findings_digest": digest, "repo": repo,
+                    "plan": plan_id, "impl_sha": impl_sha, "runner": runner, "model": None,
+                    "prompt_sha256": None, "raw": None, "failure": None, "items": [], "gaps": [],
+                    "untriaged": [], "notes": [], "posted_comment_id": None,
+                    "dispositions": dispositions, "no_defect_notice": no_defect_notice,
+                    "lanes_not_run": [ln["runner"] for ln in findings["lanes"]
+                                      if ln["run"]["outcome"] != "ran"] + [
+                                          f"pr {n['pr']}" for n in findings["not_run"]]}
+                _write_json(triage_path, record)
+            if not no_post:
+                detail = (f"every test passed, findings digest {digest}" if all_passed else
+                         f"no test ran for this meeting, findings digest {digest}")
+                _ensure_upgraded_dispositions(record, repo, plan_id, findings, nonpass, orch,
+                                              nothing_ran=not all_passed)
+                # `execute_dispositions` runs every lane's disposition (here,
+                # only ever `"undetermined"` ones, for a lane that never
+                # ran — see above) and itself calls `_maybe_notify_no_defect`
+                # at the end; the all-pass case has no dispositions to run,
+                # so this is the same single call either way.
+                execute_dispositions(record, repo, plan_id, impl_sha, get_forge(), orch, log, detail)
+                _write_json(triage_path, record)
+            print("nothing to triage: every test passed" if all_passed else
+                 "nothing to triage: no test ran, and not every lane passed")
+            return 0
+
+        pr = findings["impl"]["pr"]
+
+        prior = None
+        try:
+            prior = json.loads(triage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        if not (isinstance(prior, dict) and prior.get("findings_digest") == digest):
+            prior = None
+        # A success marker means done; a failure marker does not (§3: a person
+        # re-runs a failed triage by hand, for the SAME findings digest, and
+        # that re-run must actually spawn rather than exit 0 as a no-op).
+        if prior and isinstance(prior.get("posted_comment_id"), int) and not prior.get("failure"):
+            log.note("already-done", digest=digest, comment=prior["posted_comment_id"])
+            # D2a: the already-done return still runs any disposition left
+            # pending from the run that posted this comment — unless this
+            # call is itself `--dry-run` or `--no-post`, which must send
+            # nothing to the forge, the same contract the fresh-run path
+            # below honours by returning before it ever reaches a write.
+            if not (dry_run or no_post):
+                comment_url = (f"{orch._forgejo_base_url()}/{repo}/issues/{pr}"
+                              f"#issuecomment-{prior['posted_comment_id']}")
+                _ensure_upgraded_dispositions(prior, repo, plan_id, findings, nonpass, orch)
+                execute_dispositions(prior, repo, plan_id, impl_sha, get_forge(), orch, log, comment_url)
+                _write_json(triage_path, prior)
+            print(f"already posted: comment {prior['posted_comment_id']}")
+            return 0
+
+        comments = orch.read_thread(repo, pr, forge=get_forge(), mod=fleetforge)
+        if comments is None:
+            raise Refuse(f"the thread of {repo}#{pr} could not be read in full — a truncated "
+                         "read is never taken as \"no comment\"")
+        authors = lib.agent_roles()["author"].logins
+        ok_marker = marker_for(digest, failed=False)
+        for c in comments:
+            if _login(c) in authors and _has_marker_line(c.get("body"), ok_marker):
+                log.note("already-done", digest=digest, comment=c.get("id"))
+                # D2a: the triage comment exists (even though this process's
+                # OWN post attempt once reported failure) — recover its id
+                # from the thread and run any disposition still pending in
+                # the local record for this exact digest.
+                cid = c.get("id")
+                if prior is not None and isinstance(cid, int) and not (dry_run or no_post):
+                    prior["posted_comment_id"] = cid
+                    comment_url = f"{orch._forgejo_base_url()}/{repo}/issues/{pr}#issuecomment-{cid}"
+                    _ensure_upgraded_dispositions(prior, repo, plan_id, findings, nonpass, orch)
+                    execute_dispositions(prior, repo, plan_id, impl_sha, get_forge(), orch, log, comment_url)
+                    _write_json(triage_path, prior)
+                print(f"already posted: comment {c.get('id')}")
+                return 0
+
+        lane_gaps = {}
+        for ln in findings["lanes"]:
+            if not _NAME_RE.match(ln["runner"]) or ln["runner"] in lane_gaps:
+                raise Refuse(f"lane runner name {ln['runner']!r} is unusable as a directory or repeats")
+            status, pull = get_forge().get_pull(repo, ln["pr"])
+            lane_gaps[ln["runner"]] = (parse_gaps(pull.get("body"))
+                                       if status == 200 and isinstance(pull, dict) else None)
+
+        top, omitted, unavailable = build_directory(repo, findings, raw, impl_sha, nonpass,
+                                                    lane_gaps, store)
+        prompt = build_prompt(plan_id, impl_sha, nonpass, lane_gaps, omitted, unavailable)
+        prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        (meet_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+        log.note("prompt", bytes=len(prompt.encode("utf-8")), sha256=prompt_sha,
+                 items=len(nonpass), omitted=len(omitted))
+        if dry_run:
+            print(f"prompt bytes: {len(prompt.encode('utf-8'))}")
+            print(f"prompt sha256: {prompt_sha}")
+            print(f"non-pass tests: {len(nonpass)}")
+            print(f"directory: {top}")
+            print("argv: " + " ".join(TRIAGE_ARGV))
+            return 0
+
+        if prior and prior.get("raw") is not None:
+            # The triager SUCCEEDED for this digest and only the POST failed
+            # (or --no-post held it): post what it found, without re-spending.
+            # NEVER reused when the triager itself failed (prior["failure"]
+            # set, prior["raw"] None) — that must re-spawn on this call, or a
+            # transient timeout would be stuck "not triaged" forever behind a
+            # marker gate 6 no longer treats as done.
+            doc, failure = prior.get("raw"), prior.get("failure")
+            model = prior.get("model")
+            prompt_sha = prior.get("prompt_sha256") or prompt_sha
+            log.note("reuse", digest=digest)
+        else:
+            doc, failure, model, rc = _run_triager(orch, prompt, top, log)
+        roots = Roots(top, findings)
+        verdict = verify_document(doc, nonpass, lane_gaps, roots) if doc is not None else None
+        ctx = {"repo": repo, "plan_id": plan_id, "impl_sha": impl_sha, "findings": findings,
+               "digest": digest, "runner": runner, "model": model, "nonpass": nonpass,
+               "lane_gaps": lane_gaps, "base_url": orch._forgejo_base_url()}
+        dispositions, no_defect_notice = decide_dispositions(repo, plan_id, findings,
+                                                             nonpass, verdict, failure, orch, digest)
+        # `prior` is this exact digest's own last attempt, if any (loaded,
+        # and digest-matched, above) — never a scan across other digests or
+        # implementation heads: see `_carry_forward_same_digest` on why.
+        if prior is not None:
+            _carry_forward_same_digest(dispositions, prior.get("dispositions"))
+        record = {"schema": TRIAGE_SCHEMA_NAME, "findings_digest": digest, "repo": repo,
+                  "plan": plan_id, "impl_sha": impl_sha, "runner": runner, "model": model,
+                  "prompt_sha256": prompt_sha, "raw": doc, "failure": failure,
+                  "items": verdict["items"] if verdict else [],
+                  "gaps": verdict["gaps"] if verdict else [],
+                  "untriaged": verdict["untriaged"] if verdict else [],
+                  "notes": verdict["notes"] if verdict else [], "posted_comment_id": None,
+                  "dispositions": dispositions, "no_defect_notice": no_defect_notice}
+        _write_json(triage_path, record)
+        body = render_comment(ctx, verdict, failure)
+        if len(body) > COMMENT_CAP:
+            raise Refuse(f"the comment is {len(body)} characters, over the {COMMENT_CAP} cap")
+        assert_body_safe(body, digest, orch, failed=bool(failure))
+        ok = verdict and [i for i in verdict["items"] if i["verified"]]
+        log.note("verified", items=len(nonpass), classified=len(ok or []),
+                 unverified=len([i for i in verdict["items"] if not i["verified"]]) if verdict else 0,
+                 untriaged=len(verdict["untriaged"]) if verdict else len(nonpass))
+        code = 3 if failure else 0
+        if no_post:
+            print(body)
+            return code
+        status, comment = get_forge().create_issue_comment(repo, pr, body)
+        cid = comment.get("id") if isinstance(comment, dict) else None
+        if status not in (200, 201) or not isinstance(cid, int):
+            raise Refuse(f"posting the comment failed (HTTP {status}); triage.json holds the result "
+                         "and a rerun will post it without spawning the triager again")
+        record["posted_comment_id"] = cid
+        _write_json(triage_path, record)
+        comment_url = f"{orch._forgejo_base_url()}/{repo}/issues/{pr}#issuecomment-{cid}"
+        execute_dispositions(record, repo, plan_id, impl_sha, get_forge(), orch, log, comment_url)
+        _write_json(triage_path, record)
+        log.note("posted", comment=cid, exit=code)
+        print(f"comment: {repo}#{pr} {cid}")
+        return code
+    except refusal as e:
+        log.note("refused", reason=str(e))
+        orch.notify(f"meeting triage refused: {plan_id}", str(e))
+        print(f"fleet-triage: refused: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if top is not None:
+            _rmtree_force(top)
+        log.close()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-triage")
+    ap.add_argument("repo")
+    ap.add_argument("plan_id")
+    ap.add_argument("--impl-sha", required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-post", action="store_true")
+    args = ap.parse_args(argv)
+    if not _NAME_RE.match(args.plan_id):
+        print(f"fleet-triage: {args.plan_id!r} is not a plan id", file=sys.stderr)
+        return 2
+    if not _SHA_RE.match(args.impl_sha):
+        print(f"fleet-triage: --impl-sha must be a full 40-hex sha, got {args.impl_sha!r}",
+              file=sys.stderr)
+        return 2
+    try:
+        lib.repo_slug(args.repo)
+    except ValueError:
+        print(f"fleet-triage: {args.repo!r} is not owner/repo", file=sys.stderr)
+        return 2
+    return run(args.repo, args.plan_id, args.impl_sha, dry_run=args.dry_run,
+               no_post=args.no_post)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

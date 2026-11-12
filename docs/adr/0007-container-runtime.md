@@ -11,6 +11,11 @@
   with numbers beside it rather than a feature comparison. Track A (the
   `cihost-linux` CI label) is merged as **#131**; its measurements are in
   [docs/fleet-history.md](../fleet-history.md) via **#165**.
+- **Amended 2026-11-08 by the owner:** test suites no longer run on
+  `cihost-linux`. eunomia's `tests` job runs on `cihost` only, lynceus's API
+  tests move to `cihost`, and follow-up 3 is withdrawn. colima and the
+  `cihost-linux` label stay, for `probe-reach` and any job that genuinely needs
+  Linux.
 
 ## Context
 
@@ -140,6 +145,13 @@ container passes 518 and skips 4, the host passes 521 and skips 1. **That asymme
 is an argument for keeping the `cihost` label alive beside `cihost-linux`**, not for
 migrating everything — a permission-denial test is only testable where the process
 is not root.
+
+*(Amended by the owner, 2026-11-08. This paragraph argued for running the suite
+on both labels. The owner dropped the `cihost-linux` run: the fleet runs only on
+macOS, so a second full run in a root container tested a platform nothing
+deploys to, and it cost about 11 minutes of cihost CPU per push. The surviving
+half of the reasoning is why `cihost` is the label that stays: a
+permission-denial test needs a non-root process.)*
 
 **The docker-socket gate is closed by absence, and this is the rule as built.**
 `DOCKER_HOST` is set in the runner's LaunchDaemon and inherited by both lanes;
@@ -340,8 +352,10 @@ may be superseded but not silently.
    as today, or a system LaunchDaemon as the CI runner needed — and verify it with a
    real reboot. Nothing moves under Apple `container` until this holds.
 2. Reconcile plan 0024 §2's `DOCKER_HOST`-unset wording with the gate as built.
-3. Migrate the remaining Python-only workflows to `runs-on: cihost-linux` — talos,
-   requests-intake, and pr-proxy's syntax job.
+3. ~~Migrate the remaining Python-only workflows to `runs-on: cihost-linux` — talos,
+   requests-intake, and pr-proxy's syntax job.~~
+   *(Withdrawn by the owner, 2026-11-08: none of them moved in two months, and
+   test runs now stay on `cihost`. See the amendment in the header.)*
 4. `bin/fleet-candidate` depends on ambient git identity; the CI job papers over it
    with job-level `GIT_AUTHOR_*`. The hermeticity fix belongs in `bin/`.
 5. cihost disk headroom (13 GiB free) — its own investigation, not this ADR's.

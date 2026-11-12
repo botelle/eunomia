@@ -1,0 +1,13 @@
+{
+  "$comment": "bin/fleet-cli-canary's step 4 fixed lane (plan 0208 D2). plan/sha are pinned so two canary runs read byte-identical prompt input; baseline is what that exact prompt cost on the linked CLI the day it was measured. Re-measure on the linked CLI when it changes, and only overwrite a field below if the fresh measurement differs.",
+  "plan": "0202-every-catalog-model-has-a-runner",
+  "sha": "9b8abe497917bca97ccfee91e274be9316babac3",
+  "baseline": {
+    "cli_version": "0.153.4",
+    "model": "gpt-6-astra",
+    "measured_at": "2026-11-05",
+    "input_tokens": 46623,
+    "output_tokens": 898,
+    "test_files": 1
+  }
+}

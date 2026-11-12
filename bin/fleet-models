@@ -19,6 +19,12 @@ row, because a dropdown that changes nothing is worse than a missing one:
   mediator         0 or 1      default: none
   impl_supervisor  0 or 1      default: none (ADR-0009 §2)
   test_supervisor  0 or 1      default: none (ADR-0009 §2)
+  style_reviewer   1..n        default: none (ADR-0025 §4; us-hosted only)
+  lane_reviewer    1..2        default: none (plan 0163; test-lane PRs)
+  followup_triage  0 or 1      default: none (plan 0186; a seat separate from
+                                `mediator` — see bin/fleet-followups, which
+                                falls back to its own prior hardcoded default,
+                                `sub-sonnet`, when this resolves to nothing)
 
 The fleet watcher does not appear: it is fleet-scoped, and a per-repo row for
 it would imply the fleet can have more than one dispatcher.
@@ -35,13 +41,12 @@ reused — disabling #2 of 3 and adding a new one gives #4, not #2, because the
 change log (and later, review records) name ordinals, and renumbering would
 silently rewrite what an existing record meant.
 
-THE REVIEWER POSITIONS TAKE FABLE RUNNERS ONLY (plan 0065). `plan_reviewer` and
-`code_reviewer` refuse any runner whose `Runner.family` is not "fable" — the
-2026-08-26 ruling, "Fable on every PR, hard stop", previously a comment above
-`MODEL` in ~/agent/dispatch-review.py (operator/talos) and now code that refuses.
-A property of the runner, not a match on its name; enforced at write and at read
-so a row that predates this cannot stay live by surviving. Every other position
-still takes any runner in the registry (ADR-0009 §3).
+EVERY POSITION NEEDS A FULL MODEL VERSION (plan 0153, ADR-0026 §5). A runner
+whose declared `model` is None or an alias is refused everywhere; no provenance
+class or locality refuses a seat. The reviewer positions also refuse an
+`unwired` runner and one whose harness talos cannot launch (`REVIEW_HARNESSES`, plan 0157). Fable is the default by configuration, not by code. Enforced at write and at read so a row that
+predates a refusal cannot stay live by surviving. Every other position still
+takes any runner in the registry (ADR-0009 §3).
 
 A RUNNER NAME IS VALIDATED AGAINST `RUNNERS`, in `bin/orchestrator`, both at
 write time (refuse the write) and at read time (a registry entry can be
@@ -54,6 +59,8 @@ retired after the row was written). It cannot be a `CHECK` constraint because
   fleet-models set <repo> <position> [<ordinal>] <runner>
   fleet-models disable <repo> <position> [<ordinal>]    ordinal defaults to 1
   fleet-models enable  <repo> <position> [<ordinal>]
+  fleet-models reviewers <repo> <position> --json       enabled reviewers, in
+                                                         order, with each model
 
 `<ordinal>` omitted on `set`: a singleton position (exactly-1 or 0-or-1) always
 targets ordinal 1; a list position allocates the next never-before-used
@@ -83,6 +90,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -102,22 +110,33 @@ _lib_loader.exec_module(lib)
 # isolated tree, exactly the mistake `fleet_dir()` exists to prevent.
 DB = os.path.expanduser(os.environ.get("FLEET_DB", str(lib.fleet_dir() / "fleet.db")))
 
-# ADR-0009 §1's agentic rows, and nothing else — see the module docstring.
+# ADR-0009 §1's agentic rows, plus the later additions named in the module
+# docstring (`style_reviewer`, `lane_reviewer`, and now `followup_triage`,
+# plan 0186) — see the module docstring.
 POSITIONS = ("implementer", "plan_reviewer", "code_reviewer", "tester",
-             "mediator", "impl_supervisor", "test_supervisor")
+             "mediator", "impl_supervisor", "test_supervisor", "style_reviewer",
+             "lane_reviewer", "followup_triage")
 
 # Positions whose cardinality is 0-or-1 or exactly-1: `set` with no ordinal
 # always means ordinal 1, never "allocate a new one" (plan 0048 D2).
-SINGLETON = {"implementer", "mediator", "impl_supervisor", "test_supervisor"}
+SINGLETON = {"implementer", "mediator", "impl_supervisor", "test_supervisor",
+             "followup_triage"}
 
-# The positions a review runs in, and the one runner family they accept (plan
-# 0065 D2/D3). `tester`, `mediator` and the supervisors are deliberately absent:
-# the ruling names reviews, and inventing an equivalent for them is not this
-# module's call.
-REVIEWER_POSITIONS = ("plan_reviewer", "code_reviewer")
-REVIEWER_FAMILY = "fable"
-REVIEWER_POLICY = ("'Fable on every PR, hard stop' (the operator, 2026-08-26; "
-                   "~/agent/dispatch-review.py MODEL)")
+# The positions a review runs in. `tester`, `mediator` and the supervisors are
+# deliberately absent: ADR-0013 names reviews, and inventing an equivalent for
+# them is not this module's call.
+REVIEWER_POSITIONS = ("plan_reviewer", "code_reviewer", "style_reviewer",
+                      "lane_reviewer")
+
+# Seats with a ceiling: ADR-0019 names exactly two reviewer accounts, and a
+# third row would make the orchestrator's `expected_reviewers` raise Stop.
+MAX_ORDINAL = {"lane_reviewer": 2}
+# A full model version (ADR-0026 §5), from any family: a name with a digit in
+# it, so `claude-opus-5-5`, `gpt-6-astra`, `gemini-4-argon-medium` and
+# `qwen3.6:35b-a3b-q8_0` pass and an alias such as `sonnet` or `opus` does not.
+# One `/`-separated vendor namespace may precede the id (`meta/muse-spark-open-
+# 20261015`, plan 0156); a leading `~` (OpenRouter's alias form) never passes.
+FULL_MODEL = re.compile(r"(?:[a-z][a-z0-9._-]*/)?[a-z][a-z0-9._:-]*\d[a-z0-9._:-]*")
 
 # The `detail` keys of a `repo-model-changed` event, and nothing else. A runner
 # name and a position are configuration; this file's sibling, `events.jsonl`,
@@ -130,8 +149,9 @@ EVENT_DETAIL_KEYS = ("change_id", "source", "position", "ordinal",
                       "old_runner", "new_runner", "old_disabled", "new_disabled")
 EVENT_TYPE = "repo-model-changed"
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS repo_model (
+def _repo_model_ddl(name, if_not_exists):
+    return f"""
+CREATE TABLE {"IF NOT EXISTS " if if_not_exists else ""}{name} (
   repo      TEXT    NOT NULL,            -- 'operator/eunomia', or 'default'
   position  TEXT    NOT NULL,
   ordinal   INTEGER NOT NULL DEFAULT 1,  -- 1 for singletons, 1..n for lists
@@ -139,11 +159,15 @@ CREATE TABLE IF NOT EXISTS repo_model (
   disabled  INTEGER NOT NULL DEFAULT 0,  -- soft delete; rows are never removed
   PRIMARY KEY (repo, position, ordinal),
   CHECK (position IN ('implementer','plan_reviewer','code_reviewer',
-                      'tester','mediator','impl_supervisor','test_supervisor')),
+                      'tester','mediator','impl_supervisor','test_supervisor',
+                      'style_reviewer','lane_reviewer','followup_triage')),
   CHECK (ordinal >= 1),
   CHECK (disabled IN (0,1))
 );
+"""
 
+
+SCHEMA = _repo_model_ddl("repo_model", True) + """
 CREATE TABLE IF NOT EXISTS repo_model_change (
   id          TEXT    NOT NULL PRIMARY KEY,  -- ULID from the writer, not a sequence
   ts          TEXT    NOT NULL,              -- ISO-8601 UTC
@@ -158,7 +182,34 @@ CREATE TABLE IF NOT EXISTS repo_model_change (
   new_disabled INTEGER
 );
 CREATE INDEX IF NOT EXISTS repo_model_change_repo ON repo_model_change(repo, ts);
+CREATE TABLE IF NOT EXISTS seat_access (
+  repo       TEXT    NOT NULL,   -- 'operator/eunomia', or 'default'
+  position   TEXT    NOT NULL CHECK (position IN ('plan_reviewer','code_reviewer',
+                                                  'style_reviewer','lane_reviewer')),
+  ordinal    INTEGER NOT NULL CHECK (ordinal >= 1),
+  access     TEXT    NOT NULL CHECK (access IN ('repo','change','inherit')),
+  created_at REAL    NOT NULL,   -- unix seconds
+  updated_at REAL    NOT NULL,
+  PRIMARY KEY (repo, position, ordinal)
+);
+CREATE TABLE IF NOT EXISTS seat_access_change (
+  id         TEXT NOT NULL PRIMARY KEY,  -- ULID, as repo_model_change
+  ts         TEXT NOT NULL,              -- ISO-8601 UTC, as repo_model_change
+  actor      TEXT NOT NULL,
+  source     TEXT NOT NULL,
+  repo       TEXT NOT NULL,
+  position   TEXT NOT NULL,
+  ordinal    INTEGER NOT NULL,
+  old_access TEXT,                       -- NULL when the row is created
+  new_access TEXT NOT NULL               -- 'repo' | 'change' | 'inherit'
+);
 """
+
+# The `detail` keys of a `seat-access-changed` event (plan 0178 D1b), and nothing else.
+ACCESS_EVENT_DETAIL_KEYS = ("change_id", "source", "position", "ordinal",
+                            "old_access", "new_access")
+ACCESS_EVENT_TYPE = "seat-access-changed"
+ACCESS_VALUES = ("repo", "change", "inherit")
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -170,9 +221,16 @@ class UnknownRunner(ValueError):
 
 
 class ReviewerRunnerRefused(UnknownRunner):
-    """A reviewer position offered a runner outside the Fable family. An
+    """A position offered an unwired runner, one with no full model version, or (at a
+    reviewer position) one with no review spawn path. An
     `UnknownRunner` so every caller that already turns a refused runner into a
     message or a `Stop` handles this one the same way."""
+
+
+class PolicyRefused(UnknownRunner):
+    """`config/model-policy.json` denies this runner at this position for this
+    repository, or cannot be read. An `UnknownRunner` so every caller that turns
+    a refused runner into a message or a `Stop` handles it the same way."""
 
 
 class NotConfigured(LookupError):
@@ -190,12 +248,31 @@ class LedgerAppendFailed(RuntimeError):
     file this plan exists to protect is the exact gap being closed."""
 
 
+_last_ulid_ms = 0
+_last_ulid_rand = 0
+
+
 def _ulid():
     """A real ULID: 48-bit ms timestamp + 80-bit randomness, Crockford base32.
     Not a sequence — plan 0048 D1 is explicit that this is the writer's job,
-    not the DB's, so two writers can never collide on the next integer."""
+    not the DB's, so two writers can never collide on the next integer.
+
+    Monotonic within this process: two calls in the same millisecond (e.g.
+    `set_runner` then `disable` on the same seat, back to back) would
+    otherwise tie on the 48-bit timestamp and sort by the random 80 bits,
+    which has no relation to call order — `repo_model_change`'s `ORDER BY
+    ts, id` would then show the audit trail out of sequence. Reusing the
+    timestamp and incrementing the random tail when time hasn't advanced
+    keeps same-process IDs strictly increasing, matching the write order."""
+    global _last_ulid_ms, _last_ulid_rand
     ts_ms = int(time.time() * 1000)
-    data = ts_ms.to_bytes(6, "big") + os.urandom(10)
+    if ts_ms <= _last_ulid_ms:
+        ts_ms = _last_ulid_ms
+        _last_ulid_rand += 1
+    else:
+        _last_ulid_rand = int.from_bytes(os.urandom(10), "big")
+    _last_ulid_ms = ts_ms
+    data = ts_ms.to_bytes(6, "big") + (_last_ulid_rand & (2 ** 80 - 1)).to_bytes(10, "big")
     bits = int.from_bytes(data, "big") << 2  # 128 bits -> 130, base32-aligned
     return "".join(_CROCKFORD[(bits >> (130 - 5 * (i + 1))) & 0x1F] for i in range(26))
 
@@ -220,21 +297,259 @@ def known_runners():
     return sorted(_load_orchestrator().RUNNERS)
 
 
-def validate_runner(name, position=None):
-    """Refuse a name `RUNNERS` does not carry and, given a reviewer `position`,
-    any runner whose `family` is not `REVIEWER_FAMILY` (plan 0065 D2). Called
-    with the position at BOTH write and read: the write refuses, and the read
-    refuses a row that got in some other way."""
+def runner_model(runner):
+    """The model id the runner declares in its `model` field, or None. Read from
+    the declaration, never parsed out of argv or inferred from the name."""
+    return getattr(runner, "model", None)
+
+
+# The harnesses operator/talos `dispatch-review.py` can launch a review with
+# (talos plans 0032 and 0033, built in talos commit f8d4b4e / merge 07d58f3). A
+# reviewed constant, not configuration: each entry claims talos can launch that
+# harness, true only when talos's code says so. codex and antigravity run through
+# the root-owned review-as-revbot wrapper as the reviewer uid (talos 0033).
+# muse is launched the same way (talos plan 0035, talos#218): operator/talos
+# `dispatch-review.py` `SUBSCRIPTION_CLI_HARNESSES` and
+# `reviewer-uid/review-as-revbot` at 1a83fac. eunomia never spawns it.
+REVIEW_HARNESSES = ("claude", "epeius", "codex", "antigravity", "muse")
+
+
+def runner_harness(runner):
+    """"claude", "codex", "antigravity", "epeius", or None. A declared `harness`
+    field wins when the runner has one; otherwise it is derived from the
+    declared binaries (plan 0157 D1) so a runner added later needs no edit. An
+    empty argv (unwired) and anything unrecognised return None."""
+    declared = getattr(runner, "harness", None)
+    if declared:
+        return declared
+    orch = _load_orchestrator()
+    argv = runner.argv
+    if not argv:
+        return None
+    if argv[0] == orch.EPEIUS_BIN:
+        return "epeius"
+    if argv[0] == orch.ANTIGRAVITY_BIN:
+        return "antigravity"
+    if os.path.basename(argv[0]) == "claude":
+        return "claude"
+    if orch.CODEX_BIN in argv:
+        return "codex"
+    return None
+
+
+# ---------------------------------------------------------------- the policy
+#
+# ADR-0026 §2: a reviewed file denies a group of models at positions for a group
+# of repositories. Read from this checkout's `config/` only — which on the fleet
+# is the eunomia pin kept at `main` — and from nowhere else: no variable or flag
+# points at another file, because that would be a way to run with a policy
+# nobody reviewed. There are deny rules only; anything no rule matches is allowed.
+POLICY_PATH = BIN.parent / "config" / "model-policy.json"
+_POLICY_KEYS = {"v", "model_groups", "repo_groups", "deny"}
+_MODEL_GROUP_KEYS = {"runners", "families", "provenance"}
+_REPO_GROUP_KEYS = {"repos", "all_except"}
+_RULE_KEYS = {"models", "repos", "positions", "why"}
+
+
+def _str_list(value, where):
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise PolicyRefused(f"{POLICY_PATH.name}: {where} must be a list of strings")
+    return value
+
+
+def _unknown_keys(obj, allowed, where):
+    if not isinstance(obj, dict):
+        raise PolicyRefused(f"{POLICY_PATH.name}: {where} must be an object")
+    extra = sorted(set(obj) - allowed)
+    if extra:
+        raise PolicyRefused(f"{POLICY_PATH.name}: unknown key {extra[0]!r} in {where}")
+
+
+def load_policy():
+    """The parsed, fully checked policy, or `PolicyRefused` naming the defect. A
+    policy that cannot be read cannot be known to allow anything, so every set
+    and resolve refuses until it is fixed."""
+    try:
+        raw = POLICY_PATH.read_text()
+    except OSError as e:
+        raise PolicyRefused(f"model policy {POLICY_PATH} cannot be read: {e}")
+    try:
+        pol = json.loads(raw)
+    except ValueError as e:
+        raise PolicyRefused(f"model policy {POLICY_PATH} is not valid JSON: {e}")
+    _unknown_keys(pol, _POLICY_KEYS, "the policy")
+    missing = sorted(_POLICY_KEYS - set(pol))
+    if missing:
+        raise PolicyRefused(f"{POLICY_PATH.name}: missing key {missing[0]!r}")
+    if pol["v"] != 1 or isinstance(pol["v"], bool):
+        raise PolicyRefused(f"{POLICY_PATH.name}: unknown v {pol['v']!r} (this "
+                            "fleet-models reads v 1)")
+    orch = _load_orchestrator()
+    families = {r.family for r in orch.RUNNERS.values()}
+    # getattr: a test hands this module a stub registry that carries RUNNERS only.
+    classes = set(getattr(orch, "PROVENANCE_CLASSES", None)
+                  or {r.provenance for r in orch.RUNNERS.values()})
+
+    mgroups, rgroups = pol["model_groups"], pol["repo_groups"]
+    if not isinstance(mgroups, dict) or not isinstance(rgroups, dict):
+        raise PolicyRefused(f"{POLICY_PATH.name}: model_groups and repo_groups "
+                            "must be objects")
+    for g, body in mgroups.items():
+        _unknown_keys(body, _MODEL_GROUP_KEYS, f"model group {g!r}")
+        for key, known, what in (("runners", set(orch.RUNNERS), "runner"),
+                                 ("families", families, "family"),
+                                 ("provenance", classes, "provenance class")):
+            for x in _str_list(body.get(key, []), f"model group {g!r} {key}"):
+                if x not in known:
+                    raise PolicyRefused(f"{POLICY_PATH.name}: model group {g!r} "
+                                        f"names {what} {x!r}, which is not known "
+                                        f"(known: {sorted(known)})")
+    for g, body in rgroups.items():
+        _unknown_keys(body, _REPO_GROUP_KEYS, f"repo group {g!r}")
+        if len(body) != 1:
+            raise PolicyRefused(f"{POLICY_PATH.name}: repo group {g!r} needs exactly "
+                                "one of 'repos' or 'all_except'")
+        key = next(iter(body))
+        for x in _str_list(body[key], f"repo group {g!r} {key}"):
+            if key == "all_except" and x not in rgroups:
+                raise PolicyRefused(f"{POLICY_PATH.name}: repo group {g!r} excepts "
+                                    f"{x!r}, which is not a defined repo group")
+    # An all_except cycle never terminates; refuse it by name.
+    state = {}
+
+    def visit(g, path):
+        if state.get(g) == 2:
+            return
+        if state.get(g) == 1:
+            raise PolicyRefused(f"{POLICY_PATH.name}: all_except cycle: "
+                                f"{' -> '.join(path + [g])}")
+        state[g] = 1
+        for x in rgroups[g].get("all_except", []):
+            visit(x, path + [g])
+        state[g] = 2
+    for g in rgroups:
+        visit(g, [])
+
+    if not isinstance(pol["deny"], list):
+        raise PolicyRefused(f"{POLICY_PATH.name}: deny must be a list")
+    for i, rule in enumerate(pol["deny"]):
+        where = f"deny rule {i}"
+        _unknown_keys(rule, _RULE_KEYS, where)
+        missing = sorted(_RULE_KEYS - set(rule))
+        if missing:
+            raise PolicyRefused(f"{POLICY_PATH.name}: {where} lacks {missing[0]!r}")
+        if not isinstance(rule["why"], str) or not rule["why"].strip():
+            raise PolicyRefused(f"{POLICY_PATH.name}: {where} needs a non-empty 'why'")
+        if rule["models"] not in mgroups:
+            raise PolicyRefused(f"{POLICY_PATH.name}: {where} names model group "
+                                f"{rule['models']!r}, which is not defined")
+        if rule["repos"] not in rgroups:
+            raise PolicyRefused(f"{POLICY_PATH.name}: {where} names repo group "
+                                f"{rule['repos']!r}, which is not defined")
+        for pos in _str_list(rule["positions"], f"{where} positions"):
+            if pos != "*" and pos not in POSITIONS:
+                raise PolicyRefused(f"{POLICY_PATH.name}: {where} names position "
+                                    f"{pos!r}, which is not known (known: "
+                                    f"{POSITIONS} or '*')")
+    return pol
+
+
+def _runner_in_group(runner, body):
+    return (runner.name in body.get("runners", ())
+            or runner.family in body.get("families", ())
+            or runner.provenance in body.get("provenance", ()))
+
+
+def _repo_in_group(pol, group, repo):
+    """`repo` None or 'default' is no repository in particular: it is in no
+    `repos` group and in every `all_except` group, so the owner default is held
+    to the strictest rule (fail closed for a repository created tomorrow)."""
+    body = pol["repo_groups"][group]
+    if "repos" in body:
+        return repo in body["repos"]
+    return not any(_repo_in_group(pol, g, repo) for g in body["all_except"])
+
+
+def matching_rule(runner_name, position, repo, runner=None):
+    """The first deny rule matching (runner, position, repo), or None. A caller
+    that already holds the Runner (the orchestrator at spawn) passes it, so the
+    check judges the very object being spawned rather than a second registry."""
+    pol = load_policy()
+    if runner is None:
+        registry = _load_orchestrator().RUNNERS
+        if runner_name not in registry:
+            raise UnknownRunner(f"{runner_name!r} is not a runner bin/orchestrator's "
+                                f"RUNNERS carries (known: {sorted(registry)})")
+        runner = registry[runner_name]
+    for rule in pol["deny"]:
+        if ("*" in rule["positions"] or position in rule["positions"]) \
+                and _runner_in_group(runner, pol["model_groups"][rule["models"]]) \
+                and _repo_in_group(pol, rule["repos"], repo):
+            return rule
+    return None
+
+
+def _rule_text(rule):
+    return (f"models {rule['models']!r} at {rule['positions']} for repos "
+            f"{rule['repos']!r}: {rule['why']}")
+
+
+def check_policy(runner_name, position, repo, runner=None):
+    """Raise `PolicyRefused` when a deny rule matches; otherwise return."""
+    rule = matching_rule(runner_name, position, repo, runner)
+    if rule is not None:
+        raise PolicyRefused(f"{runner_name!r} is denied at {position} for "
+                            f"{repo!r} by config/model-policy.json — "
+                            f"{_rule_text(rule)}")
+
+
+def validate_runner(name, position=None, repo=None):
+    """Refuse a name `RUNNERS` does not carry and, given a `position`, a runner
+    with no full model version there, plus at reviewer positions an unwired
+    runner or one with no review spawn path. No provenance class or locality
+    refuses a seat (ADR-0026 §1). Called with the position at BOTH write and
+    read: the write refuses, and the read refuses a row that got in some other
+    way. Given a `repo` ('default' for the owner default row), the deny rules in
+    config/model-policy.json apply too."""
     registry = _load_orchestrator().RUNNERS
     if name not in registry:
         raise UnknownRunner(f"{name!r} is not a runner bin/orchestrator's RUNNERS "
                              f"carries (known: {sorted(registry)})")
-    if position in REVIEWER_POSITIONS and registry[name].family != REVIEWER_FAMILY:
-        accepted = sorted(n for n, r in registry.items() if r.family == REVIEWER_FAMILY)
+    r = registry[name]
+    if position is None:
+        return
+    reviewer = position in REVIEWER_POSITIONS
+    if reviewer and r.unwired:
         raise ReviewerRunnerRefused(
-            f"{name!r} cannot serve {position}: {REVIEWER_POLICY}. The reviewer "
-            f"positions accept only {REVIEWER_FAMILY!r}-family runners "
-            f"(accepted: {accepted})")
+            f"{name!r} cannot serve {position}: it is unwired: {r.unwired}")
+    # muse implements through its `writer_argv`; it still has no tester spawn path
+    if (not reviewer and runner_harness(r) == "muse"
+            and not (position == "implementer" and r.writer_argv)):
+        raise ReviewerRunnerRefused(
+            f"{name!r} cannot serve {position}: no implementer/tester spawn path "
+            f"for muse yet (plan 0173 D3; it implements through writer_argv)")
+    model = runner_model(r)
+    if model is None or not FULL_MODEL.fullmatch(model):
+        raise ReviewerRunnerRefused(
+            f"{name!r} cannot serve {position}: it names no full model version "
+            f"(found {model!r}); an alias moves when the catalog does (ADR-0026 §5)")
+    # A review launches only for a harness talos's dispatch-review.py can spawn
+    # (talos plan 0032). ADR-0026 §4: a missing spawn path, not a restriction.
+    if reviewer and runner_harness(r) not in REVIEW_HARNESSES:
+        raise ReviewerRunnerRefused(
+            f"{name!r} cannot serve {position}: no review spawn path yet for its "
+            f"harness {runner_harness(r)!r} (launchable: {', '.join(REVIEW_HARNESSES)}; "
+            f"ADR-0026 §4)")
+    # The `endpoint` cmd_reviewers emits for a local runner is "cihost-loopback":
+    # talos opens its own forward to cihost and to no other host. A runner on
+    # another host would review against the wrong ollama, so it is not seatable.
+    if (reviewer and runner_harness(r) == "epeius" and not r.vendor_key
+            and getattr(r, "host", "cihost") != "cihost"):
+        raise ReviewerRunnerRefused(
+            f"{name!r} cannot serve {position}: it runs on host "
+            f"{r.host!r}, and talos's review spawn path forwards to cihost only")
+    if repo is not None:
+        check_policy(name, position, repo)
 
 
 def _enable_wal(con):
@@ -258,10 +573,48 @@ def _enable_wal(con):
     return mode
 
 
+def _migrate(con):
+    """Widen `repo_model`'s position CHECK to name `followup_triage` (plan 0186;
+    `lane_reviewer` before it, plan 0163; `style_reviewer` before that, plan 0150).
+    CREATE TABLE IF NOT EXISTS leaves an older table alone, and SQLite cannot
+    alter a CHECK, so the table is rebuilt: one BEGIN IMMEDIATE transaction that
+    creates the new table, copies every row, compares counts, drops the old
+    table and renames. Any mismatch rolls back. Columns stay exactly as they
+    were; a second run finds the position named and does nothing."""
+    row = con.execute("SELECT sql FROM sqlite_master WHERE type='table' "
+                      "AND name='repo_model'").fetchone()
+    if row is None or "'followup_triage'" in (row[0] or ""):
+        return
+    con.commit()
+    prior = con.isolation_level
+    con.isolation_level = None          # explicit transaction control
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            con.execute("DROP TABLE IF EXISTS repo_model_rebuild")
+            con.execute(_repo_model_ddl("repo_model_rebuild", False).strip())
+            before = con.execute("SELECT COUNT(*) FROM repo_model").fetchone()[0]
+            con.execute(
+                "INSERT INTO repo_model_rebuild (repo, position, ordinal, runner, disabled) "
+                "SELECT repo, position, ordinal, runner, disabled FROM repo_model")
+            after = con.execute("SELECT COUNT(*) FROM repo_model_rebuild").fetchone()[0]
+            if before != after:
+                raise RuntimeError(f"repo_model rebuild copied {after} of {before} rows")
+            con.execute("DROP TABLE repo_model")
+            con.execute("ALTER TABLE repo_model_rebuild RENAME TO repo_model")
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.isolation_level = prior
+
+
 def connect(db_path=None):
     con = sqlite3.connect(db_path or DB)
     _enable_wal(con)
     con.executescript(SCHEMA)
+    _migrate(con)
     return con
 
 
@@ -290,8 +643,8 @@ def _ledger_dir(con):
     return None
 
 
-def _emit_event(con, actor, repo, detail):
-    """Append one `repo-model-changed` to the ledger beside `con`'s database.
+def _emit_event(con, actor, repo, detail, event_type=EVENT_TYPE):
+    """Append one `repo-model-changed` (or, given `event_type`, a sibling) to the ledger beside `con`'s database.
 
     bin/fleet-emit is loaded as a sibling (the idiom `_load_orchestrator` and
     bin/orchestrator use) and pointed at that directory after load, since it
@@ -309,7 +662,7 @@ def _emit_event(con, actor, repo, detail):
     emit_mod.EVENTS = fleet_dir / "events.jsonl"
     emit_mod.LOCK = fleet_dir / "locks" / "events.lock"
     try:
-        emit_mod.emit(EVENT_TYPE, actor, repo=repo, detail=detail)
+        emit_mod.emit(event_type, actor, repo=repo, detail=detail)
     except SystemExit as e:
         raise LedgerAppendFailed(f"{e.code}") from None
     except OSError as e:
@@ -351,9 +704,13 @@ def set_runner(con, repo, position, runner, ordinal=None,
     A `set` to the value already in force writes no row and no change
     (plan 0048 DoD)."""
     _check_position(position)
-    validate_runner(runner, position)
+    validate_runner(runner, position, repo)
     if ordinal is None:
         ordinal = 1 if position in SINGLETON else _next_ordinal(con, repo, position)
+    cap = MAX_ORDINAL.get(position)
+    if cap is not None and ordinal > cap:
+        raise ValueError(f"{position} holds at most {cap} ordinals; "
+                         f"ordinal {ordinal} refused (ADR-0019 names two reviewer accounts)")
     existing = _existing(con, repo, position, ordinal)
     if existing is not None and existing[0] == runner:
         return ordinal, False
@@ -419,7 +776,7 @@ def resolve(con, repo, position, ordinal=1):
     enabled row, then 'default's, then (None, None). Raises UnknownRunner if
     the row that resolved names a runner RUNNERS no longer carries (plan 0048:
     validated at write AND at read, and a reviewer position also refuses a
-    non-Fable runner — plan 0065; a row written straight into the table never
+    local, unwired or unpinned runner — plan 0081; a row written straight into the table never
     resolves)."""
     row = con.execute(
         "SELECT runner FROM repo_model WHERE repo=? AND position=? AND ordinal=? "
@@ -432,7 +789,7 @@ def resolve(con, repo, position, ordinal=1):
         layer = "default"
     if row is None:
         return None, None
-    validate_runner(row[0], position)
+    validate_runner(row[0], position, repo)
     return row[0], layer
 
 
@@ -465,6 +822,137 @@ def active_ordinals(con, repo, position):
         "SELECT DISTINCT ordinal FROM repo_model WHERE position=? AND "
         "(repo=? OR repo='default') AND disabled=0", (position, repo)).fetchall()
     return sorted(r[0] for r in rows)
+
+
+# ------------------------------------------------------------- seat access
+# Plan 0178: whether a reviewer seat reads the repository or only the change.
+
+
+def _lane_note(position):
+    if position in ("code_reviewer", "plan_reviewer"):
+        return ("lane pull requests are always reviewed without tools "
+                "(talos plan 0028)")
+    return None
+
+
+def _ceiling(position, runner):
+    """The reason a seat cannot have `repo` access, or None. Neither ceiling can
+    be lifted by a row: talos enforces both whatever it is told."""
+    harness = runner_harness(runner)
+    if harness != "claude":
+        return f"{harness} reviews without tools"
+    if position == "lane_reviewer":
+        return "lane pull requests are reviewed without tools (talos plan 0028)"
+    if position == "style_reviewer":
+        return "a style review reads only its evidence folder (talos plan 0031)"
+    return None
+
+
+def resolve_access(con, repo, position, ordinal=1):
+    """(access, layer, reason, settable) for one reviewer seat. `access` is
+    'repo' or 'change'; `reason` is set exactly when a ceiling or a missing
+    runner fixed the value, and `settable` (can `repo` be set) is then false."""
+    try:
+        name, _ = resolve(con, repo, position, ordinal)
+    except UnknownRunner as e:
+        return "change", "harness", str(e), False
+    if name is None:
+        return "change", "harness", "no runner at this seat", False
+    runner = _load_orchestrator().RUNNERS[name]
+    reason = _ceiling(position, runner)
+    row = con.execute(
+        "SELECT access FROM seat_access WHERE repo=? AND position=? AND ordinal=? "
+        "AND access!='inherit'", (repo, position, ordinal)).fetchone()
+    layer = "repo"
+    if row is None:
+        row = con.execute(
+            "SELECT access FROM seat_access WHERE repo='default' AND position=? "
+            "AND ordinal=? AND access!='inherit'", (position, ordinal)).fetchone()
+        layer = "default"
+    if row is None:
+        row, layer = ("repo" if runner_harness(runner) == "claude" else "change",), "harness"
+    if reason is not None:
+        return "change", layer, reason, False
+    return row[0], layer, None, True
+
+
+def set_access(con, repo, position, ordinal, access, actor="cli:unknown",
+               source="fleet-models"):
+    """True when something was written. The only writer of `seat_access`: both
+    tables and the ledger event go together, in one transaction. `repo` is
+    refused where a ceiling would override it, and then nothing is written."""
+    if position not in REVIEWER_POSITIONS:
+        raise ValueError(f"{position!r} is not a reviewer position "
+                         f"(known: {REVIEWER_POSITIONS})")
+    if access not in ACCESS_VALUES:
+        raise ValueError(f"{access!r} is not one of {ACCESS_VALUES}")
+    if not isinstance(ordinal, int) or ordinal < 1:
+        raise ValueError(f"ordinal must be >= 1, not {ordinal!r}")
+    if access == "repo":
+        _, _, reason, settable = resolve_access(con, repo, position, ordinal)
+        if not settable:
+            raise ValueError(f"{repo} {position}#{ordinal} cannot be set to repo "
+                             f"access: {reason}")
+    existing = con.execute(
+        "SELECT access FROM seat_access WHERE repo=? AND position=? AND ordinal=?",
+        (repo, position, ordinal)).fetchone()
+    old = existing[0] if existing else None
+    if old == access or (old is None and access == "inherit"):
+        return False
+    now = time.time()
+    con.execute(
+        "INSERT INTO seat_access (repo, position, ordinal, access, created_at, "
+        "updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(repo, position, ordinal) "
+        "DO UPDATE SET access=excluded.access, updated_at=excluded.updated_at",
+        (repo, position, ordinal, access, now, now))
+    change_id = _ulid()
+    try:
+        con.execute(
+            "INSERT INTO seat_access_change (id, ts, actor, source, repo, position, "
+            "ordinal, old_access, new_access) VALUES (?,?,?,?,?,?,?,?,?)",
+            (change_id, _now(), actor, source, repo, position, ordinal, old, access))
+        fields = {"change_id": change_id, "source": source, "position": position,
+                  "ordinal": ordinal, "old_access": old, "new_access": access}
+        _emit_event(con, actor, repo,
+                    {k: fields[k] for k in ACCESS_EVENT_DETAIL_KEYS},
+                    event_type=ACCESS_EVENT_TYPE)
+    except Exception:
+        con.rollback()
+        raise
+    con.commit()
+    return True
+
+
+def access_seats(con, repo):
+    """Every reviewer seat worth reporting for `repo`: each ordinal with an
+    enabled runner (own or default) or with a `seat_access` row of its own."""
+    seats = []
+    for position in REVIEWER_POSITIONS:
+        ords = set(active_ordinals(con, repo, position))
+        ords |= {r[0] for r in con.execute(
+            "SELECT ordinal FROM seat_access WHERE position=? AND (repo=? OR repo='default')",
+            (position, repo))}
+        seats += [(position, o) for o in sorted(ords)]
+    return seats
+
+
+def access_show(con, repo):
+    out = []
+    for position, ordinal in access_seats(con, repo):
+        access, layer, reason, settable = resolve_access(con, repo, position, ordinal)
+        out.append({"repo": repo, "position": position, "ordinal": ordinal,
+                    "access": access, "layer": layer, "reason": reason,
+                    "settable": settable, "note": _lane_note(position)})
+    return out
+
+
+def _conf_repos():
+    loader = importlib.machinery.SourceFileLoader("_fleet_models_repo", str(BIN / "fleet-repo"))
+    spec = importlib.util.spec_from_loader("_fleet_models_repo", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    repos, _errs, _kept = mod.read_conf()
+    return sorted(repos)
 
 
 # ------------------------------------------------------------- reconstruction
@@ -645,6 +1133,90 @@ def describe_reconstruction(report, limit=10):
     return lines
 
 
+def _iso_to_unix(ts):
+    from datetime import datetime, timezone
+    d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.timestamp()
+
+
+def reconstruct_seat_access(con, ledger_complete=True):
+    """Rebuild `seat_access` from the ledger's `seat-access-changed` events, in
+    order, into an ABSENT or EMPTY table only (rows are never deleted, so empty
+    means lost). Each event upserts its row to `new_access`, `inherit` included.
+    `created_at`/`updated_at` are the first and last event's `ts`. A surviving
+    table is never touched; disagreements are counted in the report.
+    Returns {"action": none|reconstructed|refused|compared, ...}."""
+    try:
+        rows = con.execute(
+            "SELECT repo, detail_json, ts FROM event WHERE type=? ORDER BY source, line",
+            (ACCESS_EVENT_TYPE,)).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    report = {"action": "none", "events": len(rows), "rows": 0, "skipped": 0,
+              "differs": 0}
+    if not rows:
+        return report
+    state, skipped = {}, 0
+    for repo, detail_json, ts in rows:
+        try:
+            d = json.loads(detail_json)
+            position, ordinal, new = d["position"], d["ordinal"], d["new_access"]
+            if (position not in REVIEWER_POSITIONS or new not in ACCESS_VALUES
+                    or not isinstance(ordinal, int) or isinstance(ordinal, bool)
+                    or ordinal < 1 or not isinstance(repo, str) or not repo):
+                raise ValueError
+            when = _iso_to_unix(ts)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            skipped += 1
+            continue
+        slot = (repo, position, ordinal)
+        first = state[slot][1] if slot in state else when
+        state[slot] = (new, first, when)
+    report["skipped"] = skipped
+    try:
+        existing = {(r[0], r[1], r[2]): r[3] for r in con.execute(
+            "SELECT repo, position, ordinal, access FROM seat_access")}
+    except sqlite3.OperationalError:
+        existing = {}
+    if not existing:
+        if not ledger_complete:
+            report["action"] = "refused"
+            return report
+        con.executescript(SCHEMA)
+        con.executemany(
+            "INSERT INTO seat_access (repo, position, ordinal, access, created_at, "
+            "updated_at) VALUES (?,?,?,?,?,?)",
+            [(r, p, o, a, c, u) for (r, p, o), (a, c, u) in sorted(state.items())])
+        con.commit()
+        report["action"] = "reconstructed"
+        report["rows"] = len(state)
+        return report
+    report["action"] = "compared"
+    report["differs"] = sum(1 for slot, (a, _c, _u) in state.items()
+                            if existing.get(slot) != a)
+    return report
+
+
+def describe_access_reconstruction(report):
+    action = report["action"]
+    lines = []
+    if action == "reconstructed":
+        lines.append(f"seat_access: was absent — reconstructed {report['rows']} row(s) "
+                     f"from {report['events']} seat-access-changed event(s)")
+    elif action == "refused":
+        lines.append("seat_access: absent but NOT reconstructed — an events file failed "
+                     "to ingest, so the ledger is incomplete")
+    elif action == "compared" and report["differs"]:
+        lines.append(f"seat_access: ledger disagrees on {report['differs']} seat(s) — "
+                     f"table left unchanged")
+    if action != "none" and report["skipped"]:
+        lines.append(f"seat_access: {report['skipped']} seat-access-changed event(s) "
+                     f"could not be read and were skipped")
+    return lines
+
+
 # --------------------------------------------------------------------- CLI
 
 
@@ -679,6 +1251,48 @@ def cmd_show(con, args):
                 continue
             tag = f"#{ordinal}" if position not in SINGLETON else ""
             print(f"{position:16} {tag:>3} {name}  [{layer}]")
+    return 0
+
+
+def cmd_reviewers(con, args):
+    """One object per enabled ordinal, in order — what `dispatch-review.py`
+    reads (plan 0081 D3). Exit 3 when ordinal 1 does not resolve."""
+    out = []
+    try:
+        for ordinal in active_ordinals(con, args.repo, args.position):
+            name, layer = resolve(con, args.repo, args.position, ordinal)
+            r = _load_orchestrator().RUNNERS[name]
+            # Consumer: operator/talos `dispatch-review.py` `resolve_reviewers`
+            # (talos plan 0032 D1). The epeius keys are present, null where they
+            # do not apply, and absent for any other harness.
+            rec = {"ordinal": ordinal, "runner": name,
+                   "model": runner_model(r), "family": r.family,
+                   "layer": layer, "harness": runner_harness(r),
+                   # talos's contracts/eunomia-calls.json lists `access` as
+                   # optional under talos plan 0038; talos ignores it until then.
+                   "access": resolve_access(con, args.repo, args.position,
+                                            ordinal)[0]}
+            if rec["harness"] == "epeius":
+                hosted = bool(r.vendor_key)
+                rec.update({
+                    "backend": f"{'openai' if hosted else 'ollama'}:{runner_model(r)}",
+                    "endpoint": r.endpoint if hosted else "cihost-loopback",
+                    "vendor_key": r.vendor_key if hosted else None,
+                    "digest": None if hosted else r.digest,
+                    "num_ctx": None if hosted else r.num_ctx,
+                    "reply_reserve": None if hosted else r.reply_reserve,
+                    "max_output_tokens": r.max_output_tokens if hosted else None,
+                    "max_input_tokens": r.max_input_tokens if hosted else None})
+            out.append(rec)
+    except UnknownRunner as e:
+        print(f"fleet-models: {e}", file=sys.stderr)
+        return 1
+    if not out or out[0]["ordinal"] != 1:
+        print(f"fleet-models: {args.repo} has no {args.position} at ordinal 1; "
+              f"set the owner default: fleet-models set default {args.position} "
+              f"<runner>", file=sys.stderr)
+        return 3
+    print(json.dumps(out, indent=2))
     return 0
 
 
@@ -722,6 +1336,55 @@ def cmd_enable(con, args):
     return 0
 
 
+def cmd_policy_check(con, args):
+    try:
+        rule = matching_rule(args.runner, args.position, args.repo)
+    except (UnknownRunner, ValueError) as e:
+        print(f"fleet-models: {e}", file=sys.stderr)
+        return 1
+    if rule is None:
+        print("allowed")
+        return 0
+    print(f"denied: {_rule_text(rule)}")
+    return 4
+
+
+def cmd_policy_show(con, args):
+    try:
+        print(json.dumps(load_policy(), indent=2))
+    except UnknownRunner as e:
+        print(f"fleet-models: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_access_show(con, args):
+    if args.all:
+        repos = _conf_repos() + ["default"]
+    elif args.repo:
+        repos = [args.repo]
+    else:
+        print("fleet-models: access show takes <repo> or --all", file=sys.stderr)
+        return 1
+    out = []
+    for repo in repos:
+        out += access_show(con, repo)
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_access_set(con, args):
+    try:
+        changed = set_access(con, args.repo, args.position, args.ordinal, args.access,
+                             actor=_actor(args), source=args.source)
+    except (ValueError, LedgerAppendFailed) as e:
+        print(f"fleet-models: {e}", file=sys.stderr)
+        return 1
+    print(f"{'set' if changed else 'unchanged'}: {args.repo} "
+          f"{args.position}#{args.ordinal} access = {args.access}")
+    return 0
+
+
 def _cmd_set_dispatch(con, args):
     if len(args.rest) == 1:
         args.ordinal, args.runner = None, args.rest[0]
@@ -749,6 +1412,12 @@ def build_parser():
     p.add_argument("repo")
     p.set_defaults(func=cmd_show)
 
+    p = sub.add_parser("reviewers")
+    p.add_argument("repo")
+    p.add_argument("position", choices=REVIEWER_POSITIONS)
+    p.add_argument("--json", action="store_true", required=True)
+    p.set_defaults(func=cmd_reviewers)
+
     p = sub.add_parser("set")
     p.add_argument("repo")
     p.add_argument("position", choices=POSITIONS)
@@ -766,11 +1435,40 @@ def build_parser():
         p.add_argument("--source", default="fleet-models")
         p.set_defaults(func=func)
 
+    p = sub.add_parser("access")
+    asub = p.add_subparsers(dest="access_cmd", required=True)
+    q = asub.add_parser("show")
+    q.add_argument("repo", nargs="?")
+    q.add_argument("--all", action="store_true")
+    q.add_argument("--json", action="store_true", required=True)
+    q.set_defaults(func=cmd_access_show)
+    q = asub.add_parser("set")
+    q.add_argument("repo")
+    q.add_argument("position", choices=REVIEWER_POSITIONS)
+    q.add_argument("ordinal", type=int)
+    q.add_argument("access", choices=ACCESS_VALUES)
+    q.add_argument("--actor")
+    q.add_argument("--source", default="fleet-models")
+    q.set_defaults(func=cmd_access_set)
+
+    p = sub.add_parser("policy")
+    psub = p.add_subparsers(dest="policy_cmd", required=True)
+    q = psub.add_parser("check")
+    q.add_argument("repo")
+    q.add_argument("position", choices=POSITIONS)
+    q.add_argument("runner")
+    q.set_defaults(func=cmd_policy_check)
+    q = psub.add_parser("show")
+    q.add_argument("--json", action="store_true", required=True)
+    q.set_defaults(func=cmd_policy_show)
+
     return ap
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.cmd == "policy":  # read-only: never opens, or creates, the db
+        return args.func(None, args)
     con = connect()
     try:
         return args.func(con, args)

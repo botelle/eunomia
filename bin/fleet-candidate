@@ -33,7 +33,7 @@ Config (env):
                         see _test_command() for why guessing is refused.
   FLEET_FORGEJO_URL     default http://forge.example:3000
   FLEET_TOKEN_CMD       command printing a Forgejo token
-  FLEET_GIT_SSH_BASE    ssh base for clones (default ssh://implbot@forge.example:2222)
+  FLEET_GIT_SSH_BASE    ssh base for clones (default ssh://git@forge.example:2222)
 
 Usage:
   fleet-candidate <owner/repo> <pr> [--post] [--verbose]

@@ -9,6 +9,15 @@
   mopsus <handle> --format json
                          the same failure as data: class, ordered action
                          shortlist, PR and links (plan 0064)
+  mopsus review-probe    D7: claim the review-retry lock, start one reset
+                         probe detached, retry on a reset — scans at most
+                         PROBE_SCAN_LIMIT held rows' own forge reads before
+                         giving up on this call (plan 0090, ADR-0016; bound
+                         added plan 0169 round 1/2)
+  mopsus review-drain --dry-run
+                         print how a reopened model gate's drain would classify
+                         and order the reviews it stopped; change nothing
+                         (plan 0169, ADR-0028)
 
 The FIRST sweep this fleet dir has ever seen (no mopsus.state.json yet) pages
 ONE summary naming how many pre-existing failures it found, instead of one
@@ -43,6 +52,16 @@ failed lease of a retryable class through `bin/fleet-release --force`, at most
 `retry_limit` times per plan, recording each as `plan-requeued` (ADR-0012). It
 never spawns: the watcher re-dispatches under the dispatch cap.
 
+A `quota` failure also closes its usage-limit gate (bin/fleet-quota, plan 0094),
+is held while the gate is closed, and is requeued once it opens; every closed
+gate is probed when a reset is due. See docs/quota-gate.md.
+
+A `round N: review dispatch failed:` stop whose repo's review-path probe fails
+(fleet-quota probe-review-path, plan 0095) is classed `review-path`, held behind
+`review-path:<repo>`, and resumed through a `resume_request` once that probe
+passes (ADR-0018). The failure text alone never classifies it. See
+docs/mopsus.md.
+
 State (idempotence: one brief per failure, not one per cycle):
   <fleet-dir>/mopsus.state.json     lease -> handle, once assigned, forever
   <fleet-dir>/mopsus/briefs/<h>.txt the brief text `mopsus <handle>` opens
@@ -62,6 +81,10 @@ Config (env):
                         sends lands in the ONE durable pages.jsonl
 """
 import argparse
+import concurrent.futures
+import contextlib
+import datetime
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -71,6 +94,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
@@ -98,6 +122,20 @@ fconfig = _load("fleet_config", BIN / "fleet-config")
 # itself reads it from — `_token()` over `TOKEN_CMD` — never the authoring
 # token orchestrator pushes with, since this is a read.
 fwatch = _load("fleet_watch", BIN / "fleet-watch")
+# The usage-limit gate (plan 0094). Its pages go through the same notify() this
+# file patches and logs, resolved at call time so a replaced one is honoured.
+fquota = _load("fleet_quota", BIN / "fleet-quota")
+fquota.NOTIFY = lambda title, body: orch.notify(title, body)
+# `pr_hold` (plan 0170): is an implementation PR held only by an unmet dependency?
+# Loaded the way fleet-deps loads fleet-watch, so "held" has one definition.
+fdeps = _load("fleet_deps_for_mopsus", BIN / "fleet-deps")
+
+# The model a `session`/`weekly` gate is probed with (plan 0094 D4): a pinned id
+# (ADR-0013 §3) whose family has no UsageBar bucket of its own, so its answer
+# reflects only the account-wide limits.
+QUOTA_PROBE_MODEL = "claude-sonnet-5"
+# A gate with a known `resets_at` is first probed this long after it.
+QUOTA_PROBE_GRACE = datetime.timedelta(minutes=2)
 
 CONF = BIN.parent / "config" / "mopsus.conf"
 
@@ -112,7 +150,7 @@ TAIL_LINES = 15
 
 FAILED_QUERY = """
 SELECT lease, repo, plan_id, session, pr, failure_reason, failure_log,
-       failure_transcript, rc, timed_out, seconds
+       failure_transcript, rc, timed_out, seconds, current_phase_ts
 FROM dispatch
 WHERE outcome = 'failed'
 ORDER BY lease
@@ -231,7 +269,7 @@ def log_tail(path_str, n=TAIL_LINES):
 # A UNIVERSAL LINK, not a custom scheme. Verified live 2026-09-19:
 #
 #   GET https://minospr.app/.well-known/apple-app-site-association -> 200
-#     appIDs     ["TM63PG5C3F.org.eunomia.minos"]
+#     appIDs     ["TEAMID0000.org.eunomia.minos"]
 #     components [{"/": "/pr/*", "comment": "Open a pull request in Minos"}]
 #   GET https://minospr.app/pr/operator/pr-proxy/70                 -> 302
 #
@@ -352,6 +390,76 @@ CLASS_ACTIONS = {
     ],
 }
 
+# plan 0116: the implementer's credential was rejected (bin/orchestrator's
+# CREDENTIAL_REJECTED). Kept OUT of CLASS_RULES and CLASS_ACTIONS for the reason
+# `review-quota` is below: `tests/test_mopsus_classify.py` pins those two to one
+# another, and is not in this plan's lane. `classify` tests it FIRST, because its
+# reason embeds the CLI's own message, which can mention an "API 401" or a
+# timeout the CLASS_RULES patterns would claim.
+# plan 0125: a venture's rejection names its principal; the operator's is unchanged.
+CREDENTIAL_RULE = re.compile(r"^implementer credential rejected(?: \(principal ([A-Za-z0-9_.-]+)\))?:")
+CREDENTIAL_ACTIONS = [
+    ("re-mint", "`claude setup-token`, store it at kv/claude/oauth, then "
+                "`fleet-quota open credential --by owner` — until then the "
+                "fleet holds, and every dispatch would fail the same way "
+                "(a venture's stop names its principal: its own gate is "
+                "`credential:<principal>`, and only its repositories hold)"),
+    ("retry", "only after the gate is open; mopsus requeues this failure "
+              "itself when it is"),
+]
+
+# plan 0090 D5: `review-quota`'s shortlist, kept OUT of CLASS_ACTIONS on
+# purpose — `tests/test_mopsus_classify.py` (unleased, DoD 6: "passes
+# unchanged") pins CLASS_ACTIONS' key set to exactly `CLASS_RULES`'s names
+# plus `unclassified`, and `review-quota` is reached by
+# _apply_review_quota_reclass, never by a CLASS_RULES match. `build_actions`
+# reads this one instead when `cls == "review-quota"`. The orchestrator's own
+# dispatch failed because its review loop hit a usage limit, and mopsus's
+# review-retry sweep (held_review_queue/review_retry_sweep) is already the
+# thing waiting on the reset, so a manual retry here would race it.
+REVIEW_QUOTA_ACTIONS = [
+    ("wait-for-reset", "free — mopsus is already retrying this review once "
+                       "the model's usage limit resets (ADR-0016)"),
+    ("retry", "redundant while mopsus is retrying the review itself — only "
+              "the ORCHESTRATOR needs a fresh dispatch, and only if the "
+              "review-retry queue no longer shows this PR"),
+]
+
+
+# plan 0095 D3: `review-path`, reached only by _apply_review_path_reclass on the
+# probe's evidence, and kept out of CLASS_ACTIONS for the same reason as above.
+REVIEW_PATH_ACTIONS = [
+    ("wait-for-fix", "free — the review dispatcher's own prerequisites fail on "
+                     "this host; the fix is a reviewed merge, and mopsus resumes "
+                     "the review once the probe passes (ADR-0018)"),
+    ("retry", "redundant — only the reviewer was stopped and the work is pushed; "
+              "a fresh dispatch rebuilds it"),
+]
+
+
+# plan 0211 D5: a STUCK plan's shortlist — a `ready` plan whose newest marked
+# PR is merged or closed, and no fresh `redispatch` cleared it. Kept OUT of
+# CLASS_ACTIONS for the same reason REVIEW_QUOTA_ACTIONS is (above):
+# tests/test_mopsus_classify.py pins CLASS_ACTIONS' keys to CLASS_RULES's, and
+# a stuck plan has no `dispatch` row, no lease and no log — `build_actions`
+# never reaches it through `classify()`. None of these three flips a plan's
+# status itself (Boundaries): `redispatch` is the owner's own comment,
+# `mark-done`/`abandon` both cost a REVIEWED plan PR (docs/plan-triage.md).
+STUCK_ACTIONS = [
+    ("redispatch", "the owner comments a line `redispatch` on the PR (Minos "
+                   "link and forge link below), and fleet-watch dispatches a "
+                   "fresh run on its next cycle (docs/redispatch.md) — a "
+                   "whole new implementation session"),
+    ("mark-done", "run `mopsus <handle>`; the session that opens MUST read "
+                  "the plan in full on main, including its Handoff section, "
+                  "and the PR, before it may propose a plan PR that sets "
+                  "`status: done` — if the plan or the PR says the plan "
+                  "stays `ready`, it proposes nothing — one reviewed plan PR"),
+    ("abandon", "the same session proposes `status: abandoned` instead — one "
+               "reviewed plan PR, and every plan that depends on this one "
+               "stays blocked until its edge is edited"),
+]
+
 
 # Classes whose evidence shows NO work began, so a fresh dispatch loses nothing
 # (ADR-0012 §1). Held as data beside the rules. Every other class means a
@@ -360,6 +468,12 @@ CLASS_ACTIONS = {
 # model backend failing before any commit existed; `quota` is NOT listed, since
 # a spend limit fails identically until it resets.
 RETRYABLE_CLASSES = frozenset({"transport", "backend-before-work"})
+# plan 0094 D5: `quota` is retryable ONLY once its gate is open — the open gate
+# is what removes the reason it was left off the list above. See try_requeue's
+# `gate_open`; it is never a member of RETRYABLE_CLASSES itself. `credential`
+# (plan 0116) is the same: its gate, opened by the owner after a re-mint, decides
+# when it retries, not `retry_limit`.
+GATED_CLASSES = frozenset({"quota", "credential"})
 
 
 def classify(failure_reason):
@@ -370,6 +484,8 @@ def classify(failure_reason):
     purpose (compose_brief), and a classifier that reached for richer evidence
     would cross that boundary to save itself a rule."""
     reason = failure_reason or ""
+    if CREDENTIAL_RULE.search(reason):
+        return "credential"
     for name, rx in CLASS_RULES:
         if rx.search(reason):
             return name
@@ -385,7 +501,10 @@ def build_actions(row, cls):
     whenever the failed lease left a PR behind (D3): work sitting in a pull
     request is reviewed or merged, and `retry` there rebuilds it. Every
     action carries what it costs, so the choice is between costs."""
-    actions = [{"action": a, "cost": c} for a, c in CLASS_ACTIONS[cls]]
+    source = (REVIEW_QUOTA_ACTIONS if cls == "review-quota"
+              else REVIEW_PATH_ACTIONS if cls == "review-path"
+              else CREDENTIAL_ACTIONS if cls == "credential" else CLASS_ACTIONS[cls])
+    actions = [{"action": a, "cost": c} for a, c in source]
     if row.get("pr") is not None:
         actions.insert(0, {
             "action": "open-pr",
@@ -434,7 +553,8 @@ def _class_section(row):
 # --- the brief -------------------------------------------------------------
 
 
-def compose_brief(row, requeued=None, release_error=None, requeue_skip=None):
+def compose_brief(row, requeued=None, release_error=None, requeue_skip=None,
+                  held=None):
     """The full brief `mopsus <handle>` opens a session holding (D2).
 
     `requeue_skip` is ADR-0012 §1's marked-PR condition or its "not recorded"
@@ -456,6 +576,10 @@ def compose_brief(row, requeued=None, release_error=None, requeue_skip=None):
     transcript_path = row["failure_transcript"] or "-"
     tail = log_tail(row["failure_log"])
     extra = ""
+    if held is not None:
+        scope, resets_at = held
+        until = "its probe passes" if fquota.is_review_path(scope) else (resets_at or "unknown")
+        extra += f"held:      {scope} closed until {until}\n"
     if requeued is not None:
         n, limit = requeued
         extra = f"requeued:   {n} of {limit} — limit reached\n"
@@ -502,6 +626,152 @@ def compose_first_run_page(n):
     return f"mopsus: first run — {n} pre-existing failure{plural} found\nmopsus list"
 
 
+# --- the stuck-plan sweep (plan 0211 D4/D5) ----------------------------------
+
+
+def build_stuck_actions(repo, plan_id, pr):
+    """[{action, cost}, ...] for a stuck plan (D5) — `STUCK_ACTIONS` plus the
+    Minos/forge links on `redispatch`, the same shape `build_actions` gives
+    `open-pr` for a dispatch failure, so lynceus's existing reader needs no
+    second code path."""
+    actions = [{"action": a, "cost": c} for a, c in STUCK_ACTIONS]
+    actions[0]["pr"] = pr
+    actions[0]["links"] = {"minos": MINOS_PR_LINK.format(repo=repo, pr=pr),
+                          "forge": _forge_pr_url(repo, pr)}
+    return actions
+
+
+def compose_stuck_brief(repo, plan_id, entry):
+    """The brief `mopsus <handle>` opens for a stuck plan (D5): header, PR,
+    form, reason and detail, the `Remainder:` text ahead of the list for a
+    `partial` reason (it usually answers the question already), then the
+    numbered shortlist with the redispatch links."""
+    pr = entry.get("pr")
+    reason = entry.get("reason")
+    detail = entry.get("detail") or "-"
+    lines = [
+        f"Stuck plan: {repo} {plan_id}",
+        f"pr:        #{pr}",
+        f"form:      {entry.get('form')}",
+        f"reason:    {reason}",
+        f"detail:    {detail}",
+    ]
+    if reason == "partial":
+        lines += ["", f"Remainder: {detail}"]
+    lines.append("")
+    for i, (action, cost) in enumerate(STUCK_ACTIONS, 1):
+        lines.append(f"{i}. {action} — {cost}")
+        if action == "redispatch":
+            lines.append(f"   minos: {MINOS_PR_LINK.format(repo=repo, pr=pr)}")
+            lines.append(f"   forge: {_forge_pr_url(repo, pr)}")
+    return "\n".join(lines) + "\n"
+
+
+def compose_first_stuck_page(n):
+    """The ONE page the first-ever stuck sweep sends, however many stuck
+    plans it found — D4's version of `compose_first_run_page`'s D5 shape."""
+    plural = "" if n == 1 else "s"
+    return f"mopsus: first stuck-plan sweep — {n} stuck plan{plural} found\nmopsus list"
+
+
+def stuck_failure_view(handle, entry):
+    """A stuck handle's `--format json` answer (D5): the same `handle`,
+    `repo`, `plan_id`, `pr`, `actions` keys `failure_view` prints, so
+    lynceus's existing reader needs no new case — `lease` is always None and
+    `class` is always `"stuck-plan"`, since neither applies here."""
+    repo, plan_id, pr = entry.get("repo"), entry.get("plan"), entry.get("pr")
+    return {"handle": handle, "repo": repo, "plan_id": plan_id, "lease": None,
+            "class": "stuck-plan", "reason": entry.get("reason"), "pr": pr,
+            "actions": build_stuck_actions(repo, plan_id, pr)}
+
+
+# `blocked.json` (fleet-watch's own, plan 0211 D2) is stale past this long —
+# cycles have measured ~1,230s under load (plan 0209), so two hours is
+# several cycles, long enough that a merely-slow cycle never reads as stale.
+STUCK_SNAPSHOT_STALE = datetime.timedelta(hours=2)
+
+
+def _blocked_snapshot():
+    """`blocked.json`'s `built`/`rejected` entries, or None when the file is
+    missing, unparseable, not `v: 1`, or older than `STUCK_SNAPSHOT_STALE`
+    (D4) — a stale file can still list a plan the owner has since
+    redispatched, and paging over that would be wrong. Read through
+    fleet-watch's own path, never a second copy of it."""
+    try:
+        data = json.loads(fwatch._blocked_snapshot_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("v") != 1:
+        return None
+    written = lib.parse_ts(data.get("written_at"))
+    if written is None:
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if now - written > STUCK_SNAPSHOT_STALE:
+        return None
+    blocked = data.get("blocked")
+    if not isinstance(blocked, list):
+        return None
+    return [e for e in blocked if isinstance(e, dict)
+           and e.get("form") in ("built", "rejected")]
+
+
+def stuck_sweep(dry_run=False):
+    """Plan 0211 D4: pages each `(repo, plan, pr)` `blocked.json` lists as
+    `built` or `rejected`, once, with a handle holding its brief (D5).
+
+    Its own idempotence, in its own `stuck_paged` namespace — a key already
+    present is never paged again, so a later cycle that still lists the same
+    stuck plan sends nothing, and a NEW marked PR on the same plan (a
+    different `pr`, so a different key) pages again. Never dispatches, never
+    writes to the forge, never changes a plan's status (Boundaries) —
+    `sweep()`'s own `n_paged`/`n_refused` are unaffected; this has none of
+    its own to report."""
+    entries = _blocked_snapshot()
+    if entries is None:
+        sys.stderr.write("mopsus: blocked.json is missing, unreadable, not "
+                         "v1, or stale — not sweeping stuck plans this cycle\n")
+        return
+    values = load_conf()
+    first_run = not dry_run and not _state_file_has_stuck_paged()
+    state = _load_state()
+    paged = state["stuck_paged"]
+    newly = []
+    would = 0
+    for e in entries:
+        repo, plan_id, pr = e.get("repo"), e.get("plan"), e.get("pr")
+        if pr is None or not repo or not plan_id:
+            continue
+        if mode_for(repo, values) == "off":
+            continue
+        key = f"{repo}|{plan_id}|{pr}"
+        if key in paged:
+            continue
+        if dry_run:
+            would += 1
+            continue
+        handle = _new_handle(state)
+        _write_brief(handle, compose_stuck_brief(repo, plan_id, e))
+        paged[key] = {"handle": handle, "repo": repo, "plan": plan_id, "pr": pr,
+                     "form": e.get("form"), "reason": e.get("reason"),
+                     "detail": e.get("detail")}
+        newly.append((e, handle))
+    if dry_run:
+        if would:
+            print(f"DRY-RUN mopsus would page {would} stuck plan(s)")
+        return
+    if newly:
+        if first_run:
+            orch.notify("mopsus: first stuck-plan sweep",
+                        compose_first_stuck_page(len(newly)))
+        else:
+            for e, handle in newly:
+                page = compose_page(e["repo"], e["plan"],
+                                    f"{e.get('reason')} #{e.get('pr')}", handle)
+                orch.notify(f"mopsus: {e['repo']} {e['plan']}", page)
+    _save_state(state)
+
+
 # --- state: one brief per failure, not one per cycle -----------------------
 
 
@@ -524,17 +794,61 @@ def _load_state():
         data["next_id"] = 1
     if not isinstance(data.get("leases"), dict):
         data["leases"] = {}
+    if not isinstance(data.get("review_paged"), dict):
+        data["review_paged"] = {}
+    if not isinstance(data.get("review_drains"), dict):
+        data["review_drains"] = {}
+    if not isinstance(data.get("stuck_paged"), dict):
+        data["stuck_paged"] = {}
     return data
 
 
-def _save_state(state):
+def _state_file_has_stuck_paged():
+    """True when the RAW state file already carries a `stuck_paged` key —
+    read before `_load_state()`'s own normalisation adds one, so the first
+    stuck sweep ever run can tell itself apart from every sweep after it
+    (plan 0211 D4, the same first-run shape as D5 of plan 0050)."""
+    try:
+        data = json.loads(_state_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and isinstance(data.get("stuck_paged"), dict)
+
+
+def _state_lock():
+    p = _state_path()
+    return lib.held_lock(p.with_suffix(p.suffix + ".lock"))
+
+
+def _write_state(state):
     p = _state_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    lock = p.with_suffix(p.suffix + ".lock")
-    with lib.held_lock(lock):
-        tmp = p.with_suffix(p.suffix + f".tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
-        os.replace(tmp, p)
+    tmp = p.with_suffix(p.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
+    os.replace(tmp, p)
+
+
+def _save_state(state):
+    _state_path().parent.mkdir(parents=True, exist_ok=True)
+    with _state_lock():
+        # `review_drains` has one writer, `_update_drain`, which runs in a detached
+        # child while a sweep holds an older copy of this file: carry the file's
+        # entries over so a sweep never writes a stale drain back.
+        state["review_drains"] = _load_state()["review_drains"]
+        _write_state(state)
+
+
+def _update_drain(tid, fn):
+    """Apply `fn(entry)` to `review_drains[<tid>]` under the state lock, reloading
+    first, and return the entry. The drain child writes each result here as it
+    happens, so a child that dies leaves the full list behind (plan 0169 D6)."""
+    _state_path().parent.mkdir(parents=True, exist_ok=True)
+    with _state_lock():
+        state = _load_state()
+        entry = state["review_drains"].setdefault(str(tid), {})
+        fn(entry)
+        _write_state(state)
+        return entry
 
 
 def _new_handle(state):
@@ -676,8 +990,9 @@ def _emit_requeued(row, attempt, limit):
     return ok, err
 
 
-def try_requeue(row, limit, db=None):
-    """(requeued, brief_kwargs). Requeue when the class is retryable, the lease
+def try_requeue(row, limit, db=None, gate_open=False):
+    """(requeued, brief_kwargs). Requeue when the class is retryable (or is
+    `quota` and the caller has verified its gate is open — plan 0094 D5), the lease
     record still shows the failed holder `active`, the plan carries no marked
     PR (ADR-0012 §1, amended), and earlier requeues are below `limit`;
     otherwise say why not, as the arguments the escalation brief needs.
@@ -698,7 +1013,8 @@ def try_requeue(row, limit, db=None):
     `retry_limit` is a bound to protect, not a count to keep exact
     (ADR-0012 §2 — the count IS the bound, and over-counting is the safe
     direction). A failed release escalates with its stderr — never retried."""
-    if row["class"] not in RETRYABLE_CLASSES:
+    if row["class"] not in RETRYABLE_CLASSES and not (
+            row["class"] in GATED_CLASSES and gate_open):
         return False, {}
     if row.get("pr") is not None:
         return False, {"requeue_skip": f"marked PR #{row['pr']} exists"}
@@ -722,6 +1038,407 @@ def try_requeue(row, limit, db=None):
     return True, {}
 
 
+# plan 0090 D5: the orchestrator's OWN dispatch failure when its review loop
+# stopped — `bin/orchestrator:review_loop`'s `f"round {n}: review dispatch
+# failed: {why}"`. No CLASS_RULES entry matches this (Measured in the plan:
+# "left unclassified"), and none should — see _apply_review_quota_reclass.
+_ROUND_REVIEW_FAILED_RE = re.compile(r"^round \d+: review dispatch failed:")
+
+
+def _apply_review_quota_reclass(rows, db=None):
+    """D5: `sweep` calls `classify()` exactly as before (via
+    `failed_dispatches`); this runs AFTER, and only ever WIDENS an
+    `unclassified` row into `review-quota` — never invents a class from the
+    text alone (Boundaries: "Don't retry on the text of a failure"). A row
+    qualifies only when D1's OWN held queue (`held_review_queue`) —
+    `review_attempt` rows, a live forge read — independently shows this
+    repo/PR as eligible for a review retry.
+
+    `review-quota` is deliberately absent from `RETRYABLE_CLASSES`: the
+    actual retry is `review_retry_sweep`'s job, keyed on `review_attempt`,
+    not this dispatch-lease's `try_requeue`. This function only makes the
+    BRIEF say what mopsus is already doing, so a human reading it does not
+    race that retry by hand."""
+    candidates = [r for r in rows if r.get("class") == "unclassified"
+                 and r.get("pr") is not None
+                 and _ROUND_REVIEW_FAILED_RE.match(r.get("failure_reason") or "")]
+    if not candidates:
+        return
+    token, _err = fwatch._token()
+    if not token:
+        return
+    queued = {(q["repo"], q["pr"])
+              for q in held_review_queue(token, db=db, outcomes=("quota",))}
+    for row in candidates:
+        if (row["repo"], row["pr"]) in queued:
+            row["class"] = "review-quota"
+
+
+# --- a broken review path (plan 0095, ADR-0018) -----------------------------
+
+
+def _apply_review_path_reclass(rows, paged, db=None, dry_run=False):
+    """D3: run after `_apply_review_quota_reclass`, so a row `review-quota`
+    claimed is never probed. Widens an `unclassified` `round N: review dispatch
+    failed:` row into `review-path` only when the repo's review-path probe
+    fails (exit 75) — the text alone never classifies it. A row already
+    recorded is not probed again: one already held keeps its class, any other
+    stays as it was. The probe writes the gate itself (fleet-quota); mopsus
+    writes no second close."""
+    probes = {}
+    for row in rows:
+        if row.get("class") != "unclassified" or not _ROUND_REVIEW_FAILED_RE.match(
+                row.get("failure_reason") or ""):
+            continue
+        entry = paged.get(row["lease"])
+        if isinstance(entry, dict) and fquota.is_review_path(entry.get("held") or ""):
+            row["class"] = "review-path"
+            continue
+        if entry is not None or dry_run:
+            continue
+        repo = row["repo"]
+        if repo not in probes:
+            probes[repo] = fquota.run_review_path_probe(repo, db=db)[0]
+        if probes[repo] == fquota.EX_CLOSED:
+            row["class"] = "review-path"
+
+
+def _pull_state(repo, pr):
+    """(status, body): the forge's answer for the PR, or (None, None) when no
+    token could be had or the forge did not answer (a transient failure)."""
+    token, _err = fwatch._token()
+    if not token or pr is None:
+        return None, None
+    st, body = fwatch._forge(token).get_pull(repo, pr)
+    return st, body if st == 200 and isinstance(body, dict) else None
+
+
+def _pull_of(repo, pr):
+    """The PR body dict, or None when it cannot be read."""
+    return _pull_state(repo, pr)[1]
+
+
+def _review_path_head(repo, pr, failed_at):
+    """(head sha, None) when the PR's head existed at the failure, else
+    (None, reason). ADR-0018 §3: a head qualifies only if its commit's
+    committer date is no later than the failure, so a push made after the
+    stop can never be the head a resume vouches for."""
+    body = _pull_of(repo, pr)
+    head = ((body or {}).get("head") or {}).get("sha")
+    if not head:
+        return None, "head could not be read before classification"
+    at = lib.parse_ts(failed_at) if failed_at else None
+    token, _err = fwatch._token()
+    st, commits = (fwatch._forge(token).list_commits(repo, sha=head, limit=1)
+                   if token else (None, None))
+    date = None
+    if st == 200 and isinstance(commits, list) and commits:
+        date = ((commits[0].get("commit") or {}).get("committer") or {}).get("date")
+    when = fquota.parse_iso(date) if date else None
+    if at is None or when is None:
+        return None, "head could not be read before classification"
+    if when > at:
+        return None, "head moved before classification"
+    return head, None
+
+
+@contextlib.contextmanager
+def _review_slot():
+    """ADR-0016 §4's one-at-a-time slot, claimed non-blocking; yields whether
+    it was free."""
+    lock_path = lib.fleet_dir() / "locks" / _REVIEW_LOCK
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _resume_review_path(row, entry, db=None):
+    """D4: ("held", None) while the gate is closed; ("resumed", None) once the
+    resume request is written; ("failed", brief_kwargs) when a check fails, and
+    nothing was written. Only the gate the probe opened lets this run. In
+    order: head unchanged and PR open (ADR-0016 §2) with the dispatch lease
+    orphaned, the single slot free, the retry limit not reached, then
+    `review-requeued` BEFORE the request."""
+    g = fquota.gate(entry["held"], db)
+    if g is None or g["state"] != "open":
+        return "held", None
+    repo, pr, head, plan_id = row["repo"], entry.get("pr"), entry.get("head"), row["plan_id"]
+    st, body = _pull_state(repo, pr)
+    if body is None:
+        if st == 404:
+            return "failed", {"requeue_skip": f"PR #{pr} not found on the forge"}
+        return "held", None       # no token, or the forge did not answer: read again next sweep
+    if body.get("state") != "open":
+        return "failed", {"requeue_skip": f"PR #{pr} is not open"}
+    cur = (body.get("head") or {}).get("sha") or None
+    if not head or cur != head:
+        return "failed", {"requeue_skip": f"head moved ({(head or 'unrecorded')[:8]} -> "
+                                          f"{(cur or 'unknown')[:8]})"}
+    rec = fwatch.dispatch_leases().get((repo, plan_id))
+    if not rec or not fwatch.lib.is_orphaned(rec):
+        return "failed", {"requeue_skip": "the dispatch lease is not orphaned"}
+    lease_id = rec.get("id")
+    limit = review_retry_limit(db)
+    n = _review_requeue_count(repo, pr, head, db)
+    with _review_slot() as free:
+        if not free:
+            return "failed", {"requeue_skip": "the review-retry slot is taken"}
+        if limit <= 0 or n >= limit:
+            return "failed", {"requeued": (n, limit)}
+        detail = {"kind": "plan", "repo": repo, "pr": pr, "head": head,
+                  "plan": plan_id, "lease": lease_id, "attempt": n + 1,
+                  "limit": limit, "cause": "review-path"}
+        ok, err = _emit_review_requeued(repo, pr, head, detail)
+        if not ok:
+            return "failed", {"requeue_skip": f"review-requeued not recorded: {err or 'no stderr'}"}
+        _write_resume_request(plan_id, lease_id, pr, head, db)
+    return "resumed", None
+
+
+# --- the usage-limit gate (plan 0094) ----------------------------------------
+
+
+def _scope_for_model(model):
+    """The gate a STOP naming `model` closes, carrying that stop's vendor and
+    account identity into recovery (plan 0184 D1): `model:<bucket>` for a
+    Claude model UsageBar meters as a bucket (`fquota.model_scope`, unchanged),
+    or the WHOLE `vendor:<account>` gate for a model a registered `local_cli`
+    runner declares under a vendor family — a vendor's meter carries no
+    per-model bucket of its own (docs/quota-gate.md D1), so the account is the
+    most that can be attributed. None for a model no runner declares, or one a
+    HOSTED runner declares (`needs` other than `local_cli`): that runner spends
+    an API key, never the vendor's subscription, however its `family` reads
+    (`hosted-muse-spark-open` is `family="muse"` and spends OpenRouter).
+
+    Looked up by the model id RUNNERS records, never by runner name — the same
+    identity `fleet-models` and `publish_worktree`'s own commit trailer use
+    (ADR-0026 §5), so a renamed runner entry cannot desync this from them."""
+    scope = fquota.model_scope(model)
+    if scope is not None:
+        return scope
+    for runner in orch.RUNNERS.values():
+        if (runner.model == model and runner.needs == "local_cli"
+                and runner.family in orch._VENDOR_ACCOUNT):
+            # a model with its own limit (orchestrator `_MODEL_ACCOUNT`) stopped
+            # on THAT limit closes its own gate, not its whole vendor's
+            own = [acct for fam, token, acct in orch._MODEL_ACCOUNT
+                   if runner.family == fam and token in (model or "").lower()]
+            return fquota.vendor_scope(own[0] if own
+                                       else orch._VENDOR_ACCOUNT[runner.family])
+    return None
+
+
+def _runner_for_lease(lease, db=None):
+    """The runner name `implementer-start` recorded for `lease`'s LAST spawn
+    (MAX seq — a fix round or a respawn may carry a different override), or
+    None when the run log names none: an old dispatch, one fleet-collect never
+    ingested, or a fixture that never wrote this phase (every lease the
+    existing suite seeds, which must keep resolving nothing here).
+
+    `implementer-start` is `_spawn_session`'s own phase (bin/orchestrator),
+    written for every implementer regardless of vendor — unlike `writer-start`,
+    which only a `writer_argv` runner's own publish path adds — so this is the
+    one place a lease's runner identity is recorded at all. Read straight off
+    `dispatch_phase`: a SEPARATE field from everything the `dispatch` view
+    projects, and widening that view is out of this plan's lane."""
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return None
+    con = sqlite3.connect(str(path))
+    try:
+        row = con.execute(
+            "SELECT detail_json FROM dispatch_phase WHERE lease=? "
+            "AND phase='implementer-start' AND seq = (SELECT MAX(seq) FROM "
+            "dispatch_phase WHERE lease=? AND phase='implementer-start')",
+            (lease, lease)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        con.close()
+    if not row:
+        return None
+    try:
+        detail = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    name = detail.get("runner") if isinstance(detail, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def _account_for_lease(lease, db=None):
+    """The meter account the lease's last recorded runner spends — `codex`,
+    `gemini`, `muse`, or `fquota.CLAUDE_ACCOUNT` — or None when the run log
+    names no runner, or one no longer in the registry. Carries that stop's
+    vendor identity forward (plan 0184 D1), by RUNNER NAME — the override env
+    var and `repo_model` both resolve a runner, and `route.model` is derived
+    from it, never the other way round."""
+    name = _runner_for_lease(lease, db)
+    if name is None:
+        return None
+    runner = orch.RUNNERS.get(name)
+    if runner is None:
+        return None
+    if runner.family in ("claude", "fable"):
+        return fquota.CLAUDE_ACCOUNT
+    if runner.needs == "local_cli":
+        return orch._VENDOR_ACCOUNT.get(runner.family)
+    return None
+
+
+def close_gate_for_failure(row, db=None):
+    """D2: close the gate an implementer's `quota` or `credential` stop names, and
+    return its scope. A `credential` stop closes the `credential` gate with
+    `resets_at` unknown (a human re-mints it; nothing resets). A `quota` stop
+    closes the WHOLE vendor account (plan 0184 D1) when the lease's own last
+    recorded runner spends one — `_account_for_lease`, carrying that stop's
+    vendor identity into recovery rather than guessing Claude; else `weekly`
+    when the reason names a weekly limit, `session` otherwise, exactly as
+    before this plan (every stop it ever recorded named no runner).
+    `resets_at` is the reason's `resets <time> (<zone>)` resolved to its first
+    occurrence after the failure's own timestamp, or unknown."""
+    reason = row.get("failure_reason")
+    at = row.get("current_phase_ts") or lib.ts(lib.now_utc())
+    if row.get("class") == "credential":
+        m = CREDENTIAL_RULE.search(reason or "")
+        scope = fquota.credential_scope(m.group(1) if m else None)
+        resets_at = None
+    else:
+        account = _account_for_lease(row["lease"], db)
+        scope = (fquota.vendor_scope(account)
+                 if account is not None and account != fquota.CLAUDE_ACCOUNT
+                 else fquota.scope_of_reason(reason))
+        resets_at = fquota.resolve_reset(reason, at)
+    fquota.close(scope, resets_at, "stop", row["lease"], at=at, db=db)
+    return scope
+
+
+def review_stop_sweep(db=None):
+    """D2: a `review_attempt` quota row closes ITS model's scope and only that
+    (never `session` or `weekly` — a review stop is what may be one model's,
+    or one vendor account's, limit — `_scope_for_model`, plan 0184 D1). A model
+    with no bucket and no registered vendor runner closes nothing. Each row
+    closes once (fleet-quota keys that on its evidence)."""
+    for row in _not_superseded_review_attempts(db, ("quota",)):
+        scope = _scope_for_model(row.get("model"))
+        if scope is None:
+            continue
+        fquota.close(scope, None, "stop", f"review_attempt:{row['rowid']}",
+                     at=row.get("stopped_at") or row.get("started_at"), db=db)
+
+
+def _gate_probe_model(g, db=None):
+    """The model a closed gate is probed with, or None when none is known. The
+    `credential` gate is never probed (plan 0116): a canary is a model call on a
+    schedule against the credential the gate says is dead, and a credential does
+    not recover on its own — a human re-mints it.
+
+    A `vendor:<account>` gate is never probed either (docs/quota-gate.md D1:
+    "mopsus probes no vendor gate") — `run_probe` reaches a vendor account only
+    through `~/agent/dispatch-review.py --probe-limit`, and that call is
+    Claude-only end to end (its own `probe_limit()` fetches a Claude OAuth token
+    through `CLAUDE_TOKEN_HELPER` and runs the `claude` CLI regardless of what
+    `--model` names). A codex/gemini/muse model string handed to it does not
+    reach that vendor's account at all — it runs under the REVIEWER's own
+    Claude credential, which is a different account's window from the
+    operator's `vendor:<account>` gate (plan 0184 Boundaries: never reopen one
+    account from another account's probe). A `vendor:<account>` gate opens by
+    the meter alone (`fleet-quota observe`), exactly as before this plan."""
+    if g["scope"] == "credential" or fquota.is_principal_credential(g["scope"]):
+        return None
+    if g["scope"] in fquota.HOLDING_SCOPES:
+        return QUOTA_PROBE_MODEL
+    if fquota.is_vendor_scope(g["scope"]):
+        return None
+    model = None
+    path = Path(db) if db else db_path()
+    if path.exists():
+        m = re.match(r"review_attempt:(\d+)$", g.get("evidence") or "")
+        con = sqlite3.connect(str(path))
+        try:
+            if m:
+                row = con.execute("SELECT model FROM review_attempt WHERE rowid=?",
+                                  (int(m.group(1)),)).fetchone()
+                if row and _scope_for_model(row[0]) == g["scope"]:
+                    model = row[0]
+            if model is None:
+                for (candidate,) in con.execute(
+                        "SELECT model FROM review_attempt WHERE outcome='quota' "
+                        "ORDER BY rowid DESC"):
+                    if _scope_for_model(candidate) == g["scope"]:
+                        model = candidate
+                        break
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            con.close()
+    return model
+
+
+def _last_probe(model, db=None):
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return None
+    con = sqlite3.connect(str(path))
+    try:
+        row = con.execute("SELECT at FROM review_probe WHERE model=? "
+                          "ORDER BY at DESC LIMIT 1", (model,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        con.close()
+    return lib.parse_ts(row[0]) if row else None
+
+
+def _gate_probe_due(g, model, minutes, db=None):
+    """D4: a gate with a known `resets_at` is due at `resets_at` + 2 minutes and
+    not before, then every `minutes`; one with none is due every `minutes`."""
+    now = lib.now_utc()
+    last = _last_probe(model, db)
+    resets = lib.parse_ts(g.get("resets_at"))
+    if resets is not None:
+        due_at = resets + QUOTA_PROBE_GRACE
+        if now < due_at:
+            return False
+        if last is None or last < due_at:
+            return True
+    return last is None or now - last >= datetime.timedelta(minutes=minutes)
+
+
+def quota_probe_sweep(db=None, dry_run=False):
+    """D4: probe a closed gate that is due, detached under the one review-retry
+    lock (a probe can take many minutes; the sweep never waits on one). An
+    answered probe opens the gate it was run for, `by probe`
+    (_cmd_review_lock_run). Dispatch-holding gates go first."""
+    if dry_run:
+        return
+    closed = fquota.closed_gates(db)
+    if not closed:
+        return
+    minutes = review_probe_minutes(db)
+    closed.sort(key=lambda g: (g["scope"] not in fquota.HOLDING_SCOPES
+                               and not fquota.is_principal_credential(g["scope"]),
+                               g["scope"]))
+    for g in closed:
+        if fquota.is_review_path(g["scope"]):
+            continue     # plan 0095 D4: a model answering is not the review path working
+        model = _gate_probe_model(g, db)
+        if model is None or not _gate_probe_due(g, model, minutes, db):
+            continue
+        if _try_start_locked(json.dumps({"model": model, "gate": g["scope"]}), db):
+            return
+
+
 # --- the sweep --------------------------------------------------------------
 
 
@@ -740,14 +1457,56 @@ def sweep(conf_path=None, db=None, dry_run=False):
     first_run = not dry_run and not _state_path().exists()
     values = load_conf(conf_path)
     rows = failed_dispatches(db)
+    _apply_review_quota_reclass(rows, db)
     state = _load_state()
     paged = state["leases"]
+    _apply_review_path_reclass(rows, paged, db, dry_run)
     n_paged = n_refused = 0
     newly_paged = []           # [(row, handle), ...] — this sweep's own briefs
     limit = None               # resolved once, and only if `mechanical` needs it
     for row in rows:
         lease, repo = row["lease"], row["repo"]
         if lease in paged:
+            entry = paged[lease]
+            if not (isinstance(entry, dict) and entry.get("held")) or dry_run:
+                continue
+            if fquota.is_review_path(entry["held"]):
+                # plan 0095 D4: resumed under ADR-0016's machinery whatever the
+                # repo's dispatch-failure mode, as a review retry is (`off` aside).
+                if mode_for(repo, values) == "off":
+                    continue
+                outcome, brief_kwargs = _resume_review_path(row, entry, db)
+                if outcome == "held":
+                    continue
+                if outcome == "resumed":
+                    paged[lease] = {"resumed": True}
+                    continue
+                handle = _new_handle(state)
+                _write_brief(handle, compose_brief(row, **brief_kwargs))
+                paged[lease] = {"handle": handle}
+                newly_paged.append((row, handle))
+                continue
+            # plan 0094 D5: a `quota` failure held behind its gate is re-read on
+            # every sweep, although it is already recorded.
+            if mode_for(repo, values) != "mechanical":
+                continue
+            g = fquota.gate(entry["held"], db)
+            if g is None or g["state"] != "open":
+                continue                 # still closed, or not judgeable: stay held
+            if limit is None:
+                limit = retry_limit(db)
+            requeued, brief_kwargs = try_requeue(row, limit, db, gate_open=True)
+            if requeued:
+                paged[lease] = {"requeued": True}
+            elif not brief_kwargs:
+                # the lease is no longer this failure's to release (someone
+                # already did): an ordinary paged entry, and no second page
+                paged[lease] = {"handle": entry.get("handle")}
+            else:
+                handle = _new_handle(state)
+                _write_brief(handle, compose_brief(row, **brief_kwargs))
+                paged[lease] = {"handle": handle}
+                newly_paged.append((row, handle))
             continue
         mode = mode_for(repo, values)
         if mode == "off":
@@ -762,13 +1521,31 @@ def sweep(conf_path=None, db=None, dry_run=False):
             continue
         # mode == "escalate" or "mechanical"
         brief_kwargs = {}
+        held_gate = None               # (scope, resets_at) while a stop's gate is closed
+        gate_open = False
+        if row["class"] in GATED_CLASSES and not dry_run:
+            # plan 0094 D2: the stop closes its gate BEFORE the brief is composed,
+            # so the brief and the hold agree.
+            scope = close_gate_for_failure(row, db)
+            g = fquota.gate(scope, db)
+            if g is not None and g["state"] == "closed":
+                held_gate = (scope, g["resets_at"])
+            else:
+                gate_open = True
+        rp_head = None
+        if row["class"] == "review-path" and not dry_run:
+            # plan 0095 D3: the probe already closed the gate; only record it,
+            # and only against a head that existed at the failure (ADR-0018 §3).
+            rp_head, rp_why = _review_path_head(repo, row["pr"], row.get("current_phase_ts"))
+            if rp_head:
+                held_gate = (fquota.review_path_scope(repo), None)
         if mode == "mechanical":
             if limit is None:
                 limit = retry_limit(db)
             if dry_run:
                 n_paged += 0 if (row["class"] in RETRYABLE_CLASSES and limit > 0) else 1
                 continue
-            requeued, brief_kwargs = try_requeue(row, limit, db)
+            requeued, brief_kwargs = try_requeue(row, limit, db, gate_open=gate_open)
             if requeued:
                 # No page and no brief: the event is the record. Marked so a
                 # second sweep does nothing.
@@ -777,10 +1554,17 @@ def sweep(conf_path=None, db=None, dry_run=False):
         if dry_run:
             n_paged += 1
             continue
-        brief = compose_brief(row, **brief_kwargs)
+        if row["class"] == "review-path" and not dry_run and not rp_head:
+            brief_kwargs = dict(brief_kwargs, requeue_skip=rp_why)
+        brief = compose_brief(row, held=held_gate, **brief_kwargs)
         handle = _new_handle(state)
         _write_brief(handle, brief)
         paged[lease] = {"handle": handle}
+        if held_gate is not None and row["class"] == "review-path":
+            paged[lease].update({"held": held_gate[0], "lease": lease,
+                                 "pr": row["pr"], "head": rp_head})
+        elif held_gate is not None and mode == "mechanical":
+            paged[lease]["held"] = held_gate[0]
         newly_paged.append((row, handle))
     if not dry_run and newly_paged:
         if first_run:
@@ -794,6 +1578,1681 @@ def sweep(conf_path=None, db=None, dry_run=False):
     if not dry_run:
         _save_state(state)
     return n_paged, n_refused
+
+
+# --- review retry (plan 0090, ADR-0016) --------------------------------------
+#
+# A review that stopped at a usage limit is a DIFFERENT failure shape than the
+# dispatch-lease failures above: there is no `dispatch` row, no lease to
+# release, and the record of what stopped lives in talos's `review_attempt`
+# table (plan 0012), not in `failure_reason`. This section never touches
+# RETRYABLE_CLASSES, try_requeue or the `leases` state namespace — it is its
+# own queue, its own idempotence (`review_paged`), and its own bound
+# (`review_retry_limit`), read fleet-wide regardless of `config/mopsus.conf`'s
+# per-repo mode (that config governs dispatch-failure triage, not this).
+
+_HELD_QUERY = """
+SELECT rowid, repo, pr, head_sha, model, outcome, session_uuid, started_at,
+       stopped_at, ordinal, position
+FROM review_attempt
+WHERE outcome IN ('quota', 'no-verdict', 'budget')
+"""
+
+# plan 0146: a credits run stopped by its own `--max-budget-usd` (talos plan 0029).
+# It is held like a quota stop but closes no gate (`review_stop_sweep` reads only
+# `quota` rows), and it is retried on credits only while `fleet-credits` says so.
+BUDGET = "budget"
+
+# ADR-0021: a stop recorded as `no-verdict` is retried once, with no probe.
+NO_VERDICT = "no-verdict"
+NO_VERDICT_LIMIT = 1
+# How long a requeued no-verdict retry may go without recording its own attempt
+# before it counts as failed (a review round is minutes; this is generous).
+NO_VERDICT_INFLIGHT_MINUTES = 90
+
+# fwatch.MARKER ("Plan: ") restated as a search-for-the-id pattern: D1's own
+# needle (marked_pr) is anchored to ONE known plan id, and here there is none
+# to anchor to yet — the id is what this pattern is for.
+_PLAN_MARKER_RE = re.compile(rf"^{re.escape(fwatch.MARKER)}(\S+)\s*$", re.M)
+
+_REVIEW_LOCK = "review-retry.lock"
+
+
+def _table_exists(con, name):
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,)).fetchone() is not None
+
+
+def _not_superseded_review_attempts(db=None, outcomes=("quota", NO_VERDICT, BUDGET)):
+    """Every `review_attempt` row of the given outcomes, at any ordinal, that
+    nothing later settles at the same (repo, pr, head_sha). "Later" is read off
+    `rowid`: this table is insert-only (plan 0012 D3 never updates or deletes a
+    row), so rowid order is insertion order, which is temporal order.
+
+    Every outcome is settled the same way (ADR-0028 §1, ADR-0021 §4): by a later
+    `review_attempt` with the SAME ordinal, or by a live `review` row from that
+    ordinal's account (ADR-0024 §4: the account is the identity; the model is a
+    record, and both ordinals may run one model). The other reviewer's row at the
+    same head is expected and proves nothing about this one."""
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return []
+    con = sqlite3.connect(str(path))
+    try:
+        con.row_factory = sqlite3.Row
+        marks = ",".join("?" for _ in outcomes)
+        rows = [dict(r) for r in con.execute(
+            _HELD_QUERY.replace("('quota', 'no-verdict', 'budget')", f"({marks})"),
+            tuple(outcomes)).fetchall()]
+        has_review = _table_exists(con, "review")
+        roles = lib.agent_roles()
+        out = []
+        for row in rows:
+            sql = ("SELECT COUNT(*) FROM review_attempt WHERE repo=? AND pr=? "
+                   "AND head_sha=? AND rowid > ? AND ordinal IS ?")
+            args = [row["repo"], row["pr"], row["head_sha"], row["rowid"],
+                    row["ordinal"]]
+            if con.execute(sql, args).fetchone()[0]:
+                continue
+            if has_review:
+                own = roles["second_reviewer" if row["ordinal"] == 2
+                            else "reviewer"].account
+                sql = ("SELECT COUNT(*) FROM review WHERE repo=? AND pr=? "
+                       "AND head_sha=? AND lower(reviewer)=lower(?) "
+                       "AND COALESCE(dismissed, 0)=0 AND COALESCE(stale, 0)=0")
+                args = [row["repo"], row["pr"], row["head_sha"], own]
+                if con.execute(sql, args).fetchone()[0]:
+                    continue
+            out.append(row)
+        return out
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        con.close()
+
+
+def held_review_queue(token, db=None, allow=None, outcomes=("quota", NO_VERDICT, BUDGET),
+                      report=None):
+    """[dict, ...] — D1's held queue. Oldest first (`started_at`), a PR
+    carrying a `Plan: ` marker ahead of a bare session PR. Each row also
+    carries `_pr_body`, the forge's own PR body text read while checking
+    eligibility — reused by `_row_kind` so nothing re-fetches it.
+
+    `allow`, when given, restricts to that set of repos (fleet-watch's own
+    configured allowlist) the same way `orphan_sweep` never reads a delisted
+    repo. A forge read that fails for a row DROPS that row from this cycle —
+    it never admits it as eligible (D1's own words).
+
+    `report`, when a list, receives `(row, reason)` for every row left out, where
+    `reason` is `closed`, `merged`, `draft`, `head moved`, `reviewed` or
+    `unreadable`, so a caller that must say why (plan 0169 D2) can; a plain call
+    drops them silently as before."""
+    def left_out(row, reason):
+        if report is not None:
+            report.append((row, reason))
+
+    roles = lib.agent_roles()
+    forge = fwatch._forge(token)
+    eligible = []
+    for row in _not_superseded_review_attempts(db, outcomes):
+        if allow is not None and row["repo"] not in allow:
+            continue
+        reason, pr_body = _pr_liveness(forge, row, roles)
+        if reason:
+            left_out(row, reason)
+            continue
+        row["_pr_body"] = pr_body.get("body") or ""
+        row["_merge_base"] = pr_body.get("merge_base") or None
+        eligible.append(row)
+    eligible.sort(key=lambda r: (fwatch.MARKER not in r["_pr_body"],
+                                 r["started_at"] or ""))
+    return eligible
+
+
+def _pr_liveness(forge, row, roles):
+    """(reason, pr_body) — `reason` is `closed`, `merged`, `draft`,
+    `head moved`, `reviewed` or `unreadable` when this row's PR is no longer a
+    live review candidate at its own recorded head, else `(None, pr_body)`.
+    The per-row check `held_review_queue` makes once per cycle, factored out
+    so a caller that must re-verify a classification made earlier — the drain,
+    immediately before it spends a dispatch slot (plan 0169 round 3 MEDIUM,
+    "classifies candidates once and dispatches ... without re-checking") —
+    can run exactly the same check again, rather than trust a read that may by
+    then be stale."""
+    st, pr_body = forge.get_pull(row["repo"], row["pr"])
+    if st == 404:                           # a deleted PR is an answer, not a failed read
+        return "closed", None
+    if st != 200 or not isinstance(pr_body, dict):
+        return "unreadable", None
+    if pr_body.get("state") != "open":
+        return ("merged" if pr_body.get("merged") else "closed"), None
+    if pr_body.get("draft"):
+        return "draft", None
+    cur_sha = ((pr_body.get("head") or {}).get("sha")) or None
+    if cur_sha != row["head_sha"]:
+        return "head moved", None
+    # Every live review at the head (`reviews_at` drops dismissed and stale
+    # ones), not the newest: with two reviewers the newest says nothing about
+    # the other. A row is settled only by its OWN reviewer (ADR-0028 §1),
+    # whatever its outcome. `mod=fwatch.fleetforge` since that module (not
+    # orchestrator's own dynamically-loaded copy) is what `forge` above was
+    # built from.
+    reviews = orch.reviews_at(row["repo"], row["pr"], row["head_sha"],
+                              forge, fwatch.fleetforge)
+    if reviews is None:
+        return "unreadable", None
+    own = roles["second_reviewer" if row["ordinal"] == 2
+                else "reviewer"].account.lower()
+    if any(((r.get("user") or {}).get("login") or "").lower() == own
+           for r in reviews):
+        return "reviewed", None
+    return None, pr_body
+
+
+def _row_kind(row):
+    """(kind, plan_id, lease) for a held-queue row. `plan` only when the PR
+    carries a `Plan: ` marker AND fleet-watch's own lease store still shows a
+    DEAD dispatch lease for that plan — a marker with no dead lease behind it
+    (already retired, or never dispatched through fleet-watch) has no lease
+    for a resume_request to name, so it is treated as `session` instead of
+    guessing one."""
+    m = _PLAN_MARKER_RE.search(row.get("_pr_body") or "")
+    if not m:
+        return "session", None, None
+    plan_id = m.group(1)
+    rec = fwatch.dispatch_leases().get((row["repo"], plan_id))
+    if not rec or not fwatch.lib.is_orphaned(rec):
+        return "session", None, None
+    return "plan", plan_id, rec.get("id")
+
+
+def review_retry_limit(db=None):
+    """`review_retry_limit` as fleet-config resolves it (row, then env, then
+    default) — the same three-tier read `retry_limit()` above uses."""
+    fallback, source = fconfig._env_fallback("review_retry_limit")
+    value, _, _ = fconfig.resolve_setting("review_retry_limit", fallback, source,
+                                          db_path=str(Path(db) if db else db_path()))
+    return value
+
+
+def review_probe_minutes(db=None):
+    fallback, source = fconfig._env_fallback("review_probe_minutes")
+    value, _, _ = fconfig.resolve_setting("review_probe_minutes", fallback, source,
+                                          db_path=str(Path(db) if db else db_path()))
+    return value
+
+
+def _review_requeue_counts_from_jsonl(repo, pr, head, reason=None):
+    n = 0
+    d = lib.fleet_dir()
+    for p in [d / "events.jsonl", *sorted(d.glob("events-*.jsonl"))]:
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if "review-requeued" not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            detail = ev.get("detail") if isinstance(ev, dict) else None
+            if (isinstance(detail, dict) and ev.get("type") == "review-requeued"
+                    and ev.get("repo") == repo and detail.get("pr") == pr
+                    and detail.get("head") == head
+                    and (reason is None or detail.get("reason") == reason)):
+                n += 1
+    return n
+
+
+def _review_requeue_count(repo, pr, head, db=None, reason=None):
+    """How many `review-requeued` events the ledger holds for this exact
+    (repo, pr, head) — mirrors `earlier_requeues`'s two-reads-larger-wins
+    reasoning: the raw event log is the authority, fleet.db's ingested copy
+    is read too, and neither a lagging collector nor a rotated-away archive
+    may LOWER the count `review_retry_limit` bounds. `reason` narrows the count
+    to events carrying that `reason` (ADR-0021 counts its own retries apart)."""
+    n_db = 0
+    path = Path(db) if db else db_path()
+    if path.exists():
+        con = sqlite3.connect(str(path))
+        try:
+            sql = ("SELECT COUNT(*) FROM event WHERE type='review-requeued' "
+                   "AND repo=? AND json_extract(detail_json,'$.pr')=? "
+                   "AND json_extract(detail_json,'$.head')=?")
+            args = [repo, pr, head]
+            if reason is not None:
+                sql += " AND json_extract(detail_json,'$.reason')=?"
+                args.append(reason)
+            n_db = con.execute(sql, args).fetchone()[0]
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            con.close()
+    return max(n_db, _review_requeue_counts_from_jsonl(repo, pr, head, reason))
+
+
+def _clean_env():
+    """EUNOMIA_SESSION=mopsus, with all three `FLEET_*_TOKEN_CMD` recipes
+    popped — the same hygiene `fleet-watch`'s `_child_env()` applies, for the
+    same reason: a child of this process must never inherit a way to mint a
+    credential mopsus itself never holds, nor a repointed recipe this process
+    did not itself resolve (this plan's own boundary).
+
+    `FLEET_TOKEN_CMD` is the read-only one, and popping it is harmless to the
+    drain child that calls `fwatch._token()`: unset, `fleet-watch` falls back
+    to its own hardcoded default (`~/bin/fetch-forgejo-token.sh`, the same
+    implbot helper), which is exactly what a child that holds no recipe of
+    its own should run (verified against `bin/fleet-watch`'s `TOKEN_CMD`
+    default and `_child_env`'s own docstring; eunomia#1401 round 2 HIGH)."""
+    env = dict(os.environ, EUNOMIA_SESSION="mopsus")
+    for k in ("FLEET_TOKEN_CMD", "FLEET_ADMIN_TOKEN_CMD", "FLEET_DIRECT_TOKEN_CMD"):
+        env.pop(k, None)
+    return env
+
+
+def _probe_due(model, minutes, db=None):
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return True
+    con = sqlite3.connect(str(path))
+    try:
+        row = con.execute(
+            "SELECT at FROM review_probe WHERE model=? ORDER BY at DESC LIMIT 1",
+            (model,)).fetchone()
+    except sqlite3.OperationalError:
+        return True
+    finally:
+        con.close()
+    if row is None:
+        return True
+    at = lib.parse_ts(row[0])
+    if at is None:
+        return True
+    return lib.now_utc() - at >= datetime.timedelta(minutes=minutes)
+
+
+def _record_probe(model, outcome, db=None):
+    path = Path(db) if db else db_path()
+    con = sqlite3.connect(str(path))
+    try:
+        con.execute("""CREATE TABLE IF NOT EXISTS review_probe (
+              model TEXT NOT NULL, at TEXT NOT NULL, outcome TEXT NOT NULL)""")
+        con.execute("INSERT INTO review_probe (model, at, outcome) VALUES (?,?,?)",
+                    (model, lib.ts(lib.now_utc()), outcome))
+        con.commit()
+    finally:
+        con.close()
+
+
+def run_probe(model, db=None):
+    """D2: one reset probe, through the SAME dispatcher the review itself
+    uses (`orch.review_command()`), never a Claude credential of mopsus's
+    own. Exit 0 -> reset, 75 -> held, anything else (including a timeout or a
+    spawn failure) -> error — an error is never read as a reset (Boundaries).
+    Always records the outcome, and returns it."""
+    env = _clean_env()
+    try:
+        r = subprocess.run(orch.review_command() + ["--probe-limit", "--model", model],
+                           capture_output=True, text=True, env=env, timeout=2700)
+        rc = r.returncode
+    except (subprocess.TimeoutExpired, OSError):
+        rc = None
+    outcome = {0: "reset", 75: "held"}.get(rc, "error")
+    _record_probe(model, outcome, db)
+    return outcome
+
+
+def _emit_review_requeued(repo, pr, head, detail):
+    """(ok, stderr). D3: emitted BEFORE any retry acts — a caller that gets
+    `ok=False` must not dispatch a session or write a resume_request, the
+    same "don't act before the record exists" rule `_emit_requeued` states
+    for the mechanical-mode requeue above."""
+    env = _clean_env()
+    r = subprocess.run([sys.executable, str(BIN / "fleet-emit"), "review-requeued",
+                        "--repo", repo, "--pr", str(pr), "--sha", head,
+                        "--detail-json", json.dumps(detail)],
+                       capture_output=True, text=True, env=env)
+    ok = r.returncode == 0
+    err = (r.stderr or "").strip()
+    if not ok:
+        sys.stderr.write(f"mopsus: review-requeued for {repo}#{pr} not recorded: "
+                         f"{err}\n")
+    return ok, err
+
+
+# What `_attempt_retry` returns when it never reached the dispatcher (plan 0169 D4):
+# an int is the dispatcher's own exit code, a str is one of these.
+RETRY_PATH_HELD = "review path held"
+RETRY_AT_LIMIT = "at the retry limit"
+RETRY_NOT_RECORDED = "review-requeued not recorded"
+RETRY_NOT_RUN = "dispatcher did not run"
+RETRY_RESUME = "resume requested"
+# talos's `dispatch-review.py` exits 75 when a round's ordinal stopped on a usage limit.
+EXIT_USAGE_LIMIT = 75
+
+
+def _dispatched_result(result):
+    """True when a drain's recorded result for a head reached the dispatcher
+    (an exit code) or wrote the resume_request a plan retry dispatches through
+    (`RETRY_RESUME`) — plan 0169 D1's "as dispatched". Every other `RETRY_*`
+    value never reached that point, so a head that only ever got one of those
+    is not excluded from a later drain (eunomia#1401 round 1/2, the `prior`
+    LOW findings)."""
+    return (isinstance(result, int) and not isinstance(result, bool)) or result == RETRY_RESUME
+
+
+def _dispatch_session_retry(repo, pr, bill=None):
+    """D3 kind=session: `dispatch-review.py <repo> <pr> --post`, detached
+    under the caller's already-held lock. No token, no secret — the
+    dispatcher fetches its own credential, exactly as it does for the
+    orchestrator (Boundaries). `bill="credits"` (plan 0146) adds `--bill credits`.
+
+    Returns the dispatcher's exit code, or `RETRY_NOT_RUN` when it could not run
+    (plan 0169 D4)."""
+    env = _clean_env()
+    extra = ["--bill", "credits"] if bill == "credits" else []
+    try:
+        # A call into operator/talos: ~/agent/dispatch-review.py `--bill credits`, talos
+        # plan 0029, carried by operator/talos#173 (approved). Only reached after
+        # _dispatcher_accepts_credits() answered yes. The exit code is read too
+        # (plan 0169): operator/talos `dispatch-review.py` documents a `--post`
+        # round's code as "0, 75 if any ordinal stopped on a usage limit, else 1",
+        # defined at talos commit 77494b4.
+        r = subprocess.run(orch.review_command() + [repo, str(pr), "--post"] + extra,
+                           capture_output=True, text=True, env=env, timeout=2700)
+        return getattr(r, "returncode", RETRY_NOT_RUN)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.stderr.write(f"mopsus: session retry for {repo}#{pr} did not run "
+                         f"({e.__class__.__name__})\n")
+        return RETRY_NOT_RUN
+
+
+def _write_resume_request(plan_id, lease, pr, head, db=None):
+    """D3 kind=plan: one `resume_request` row, `consumed_at` NULL.
+    `fleet-watch`'s `orphan_sweep` (D4) is the one consumer; mopsus spawns
+    nothing itself for this kind."""
+    path = Path(db) if db else db_path()
+    con = sqlite3.connect(str(path))
+    try:
+        con.execute("""CREATE TABLE IF NOT EXISTS resume_request (
+              plan TEXT NOT NULL, lease TEXT NOT NULL, pr INTEGER, head TEXT,
+              requested_at TEXT NOT NULL, consumed_at TEXT)""")
+        con.execute("INSERT INTO resume_request (plan, lease, pr, head, "
+                    "requested_at, consumed_at) VALUES (?,?,?,?,?,NULL)",
+                    (plan_id, lease, pr, head, lib.ts(lib.now_utc())))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _attempt_retry(payload, db=None):
+    """D3: re-checks the bound against the ledger one more time (the payload
+    was decided moments earlier, by a different process, under the lock) and,
+    only if still under `limit`, emits `review-requeued` and then acts. A
+    failed emit (D3/Boundaries) stops here — nothing is dispatched and no
+    resume_request is written.
+
+    Returns the dispatcher's exit code for a session retry, `RETRY_RESUME` for a
+    plan retry, and a distinct `RETRY_*` string for each path that never reached
+    the dispatcher (plan 0169 D4)."""
+    repo, pr, head = payload["repo"], payload["pr"], payload["head"]
+    kind, plan_id, lease = payload["kind"], payload.get("plan_id"), payload.get("lease")
+    limit = payload["limit"]
+    reason = payload.get("reason")
+    if fquota.review_path_held(repo, db):
+        return RETRY_PATH_HELD   # ADR-0018: a review sent into a broken path spends an attempt
+    n = _review_requeue_count(repo, pr, head, db, reason=reason)
+    attempt = n + 1
+    if attempt > limit:
+        return RETRY_AT_LIMIT
+    detail = {"kind": kind, "repo": repo, "pr": pr, "head": head,
+              "plan": plan_id, "lease": lease, "attempt": attempt, "limit": limit}
+    if reason:
+        detail["reason"] = reason
+    bill = payload.get("bill") if kind == "session" else None
+    if bill == "credits":
+        detail["billing"] = "credits"
+    ok, _err = _emit_review_requeued(repo, pr, head, detail)
+    if not ok:
+        return RETRY_NOT_RECORDED
+    if kind == "session":
+        # a plain retry keeps the two-argument call every existing seam expects
+        return (_dispatch_session_retry(repo, pr, bill=bill) if bill
+                else _dispatch_session_retry(repo, pr))
+    _write_resume_request(plan_id, lease, pr, head, db)
+    return RETRY_RESUME
+
+
+def _try_start_locked(payload_json, db=None, lock=None, command="_review-lock-run"):
+    """Non-blocking: claim the fleet-wide review-retry lock and start a
+    DETACHED mopsus child holding it — D2/D3/D7's "one at a time" and the
+    boundary against holding the sweep open for a review or a probe.
+
+    `pass_fds` carries the already-locked fd across exec: flock() locks the
+    OPEN FILE DESCRIPTION, which fork+exec duplicates rather than closes, so
+    the lock stays held by the child after this process closes its own copy
+    and returns — no window in which a second caller's own non-blocking
+    attempt could slip in between "start the child" and "the child grabs the
+    lock", because the child never has to grab it; it already holds it.
+
+    The drain (plan 0169) uses the same pattern with its own lock file and
+    command, so a drain lasting hours holds no probe back.
+
+    Returns True if a child was started (the retry may still, itself, find
+    nothing to do), False if the lock is already held by something else."""
+    lock_path = lib.fleet_dir() / "locks" / (lock or _REVIEW_LOCK)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    argv = [sys.executable, str(BIN / "mopsus"), command, str(fd),
+           payload_json, str(db) if db else ""]
+    try:
+        subprocess.Popen(argv, env=_clean_env(), pass_fds=(fd,),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    finally:
+        os.close(fd)
+    return True
+
+
+def _cmd_review_lock_run(argv):
+    """`mopsus _review-lock-run <fd> <payload-json> <db-or-empty>` — never run
+    by a person; `_try_start_locked` is the only spawner. Holds the inherited
+    lock for exactly one probe, and — only on a reset — one retry, then
+    releases it."""
+    fd = int(argv[0])
+    payload = json.loads(argv[1])
+    db = argv[2] if len(argv) > 2 and argv[2] else None
+    try:
+        if payload.get("reason") == NO_VERDICT:
+            # ADR-0021 §3: nothing ran out, so there is nothing to probe for.
+            _attempt_retry(payload, db=db)
+            return 0
+        if payload.get("bill") == "credits":
+            # plan 0146: the sweep's `decide --peek` already said credits; the
+            # model is known to be answerable by the window, so nothing to probe.
+            _attempt_retry(payload, db=db)
+            return 0
+        outcome = run_probe(payload["model"], db=db)
+        if outcome == "reset":
+            # plan 0094 D4: the answer opens the gate the probe was run for, and
+            # a review probe likewise opens its own model's gate.
+            scope = payload.get("gate") or fquota.model_scope(payload["model"])
+            if scope and (fquota.gate(scope, db) or {}).get("state") == "closed":
+                fquota.open_gate(scope, "probe", db=db)
+            if payload.get("repo"):
+                _attempt_retry(payload, db=db)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+    return 0
+
+
+def _review_attempt_rows(repo, pr, head, db=None):
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return []
+    con = sqlite3.connect(str(path))
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM review_attempt WHERE repo=? AND pr=? AND head_sha=? "
+            "ORDER BY started_at", (repo, pr, head)).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        con.close()
+
+
+def _review_requeued_events(repo, pr, head, db=None):
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return []
+    con = sqlite3.connect(str(path))
+    try:
+        rows = con.execute(
+            "SELECT ts, detail_json FROM event WHERE type='review-requeued' "
+            "AND repo=? AND json_extract(detail_json,'$.pr')=? "
+            "AND json_extract(detail_json,'$.head')=? ORDER BY ts",
+            (repo, pr, head)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        con.close()
+    out = []
+    for ts, detail_json in rows:
+        try:
+            detail = json.loads(detail_json)
+        except (TypeError, json.JSONDecodeError):
+            detail = {}
+        out.append({"ts": ts, "detail": detail})
+    return out
+
+
+def no_verdict_sessions(row, db=None):
+    """Session ids of this reviewer's `no-verdict` attempts at the head, oldest
+    first (ADR-0021 §2: the page names both)."""
+    return [a["session_uuid"] for a in _review_attempt_rows(
+                row["repo"], row["pr"], row["head_sha"], db)
+            if a.get("outcome") == NO_VERDICT and a.get("ordinal") == row.get("ordinal")
+            and a.get("session_uuid")]
+
+
+def compose_review_limit_brief(row, kind, plan_id, lease, limit, db=None):
+    """D6's "at the limit" brief: no `dispatch` row exists for a review-only
+    failure (a session PR has no lease at all), so this is composed from
+    `review_attempt` and `review-requeued` directly, and names the PR rather
+    than a branch."""
+    repo, pr, head = row["repo"], row["pr"], row["head_sha"]
+    lines = [
+        f"Review retry limit reached: {repo} #{pr}",
+        f"head:       {head}",
+        f"kind:       {kind}",
+        f"plan:       {plan_id or '-'}",
+        f"lease:      {lease or '-'}",
+        f"limit:      {limit}",
+        f"pr:         {_forge_pr_url(repo, pr)}",
+        "",
+        "--- review_attempt rows at this head ---",
+    ]
+    for a in _review_attempt_rows(repo, pr, head, db):
+        lines.append(f"{a.get('started_at')}  model={a.get('model')} "
+                     f"outcome={a.get('outcome')} ordinal={a.get('ordinal')}")
+    if row.get("outcome") == NO_VERDICT:
+        lines.insert(7, f"reviewer:   {row.get('model')}")
+        lines.insert(8, f"sessions:   {', '.join(no_verdict_sessions(row, db)) or '-'}")
+    lines.append("")
+    lines.append("--- review-requeued events ---")
+    for e in _review_requeued_events(repo, pr, head, db):
+        d = e["detail"]
+        lines.append(f"{e['ts']}  attempt={d.get('attempt')} kind={d.get('kind')}")
+    return "\n".join(lines) + "\n"
+
+
+def _last_review_requeue_at(repo, pr, head, db=None, reason=None):
+    """Newest `review-requeued` timestamp for (repo, pr, head), read from both
+    the ingested copy and the raw log like `_review_requeue_count`; None when
+    neither holds one."""
+    stamps = [e["ts"] for e in _review_requeued_events(repo, pr, head, db)
+              if reason is None or e["detail"].get("reason") == reason]
+    d = lib.fleet_dir()
+    for p in [d / "events.jsonl", *sorted(d.glob("events-*.jsonl"))]:
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if "review-requeued" not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            detail = ev.get("detail") if isinstance(ev, dict) else None
+            if (isinstance(detail, dict) and ev.get("type") == "review-requeued"
+                    and ev.get("repo") == repo and detail.get("pr") == pr
+                    and detail.get("head") == head
+                    and (reason is None or detail.get("reason") == reason)):
+                stamps.append(ev.get("ts"))
+    parsed = [t for t in (lib.parse_ts(s) for s in stamps if s) if t is not None]
+    return max(parsed) if parsed else None
+
+
+def _no_verdict_retry_in_flight(row, db=None):
+    """True while the retry requeued for this row is young enough to still be
+    running. An unreadable or missing timestamp is not in flight: the page is
+    the safe answer to a retry nothing can show was ever running."""
+    at = _last_review_requeue_at(row["repo"], row["pr"], row["head_sha"], db,
+                                 reason=NO_VERDICT)
+    if at is None:
+        return False
+    return lib.now_utc() - at < datetime.timedelta(minutes=NO_VERDICT_INFLIGHT_MINUTES)
+
+
+def _page_review_limit(row, db=None, dry_run=False):
+    key = f"{row['repo']}#{row['pr']}@{row['head_sha']}"
+    state = _load_state()
+    if key in state["review_paged"]:
+        return
+    if dry_run:
+        return
+    kind, plan_id, lease = _row_kind(row)
+    limit = review_retry_limit(db)
+    brief = compose_review_limit_brief(row, kind, plan_id, lease, limit, db)
+    handle = _new_handle(state)
+    _write_brief(handle, brief)
+    state["review_paged"][key] = {"handle": handle}
+    _save_state(state)
+    why = "review retry limit reached"
+    if row.get("outcome") == NO_VERDICT:
+        why = (f"review ended without a verdict twice at {row['head_sha'][:8]} "
+               f"(reviewer {row.get('model')}, sessions "
+               f"{', '.join(no_verdict_sessions(row, db)) or '-'})")
+    page = compose_page(row["repo"], f"#{row['pr']}", why, handle)
+    orch.notify(f"mopsus: review retry limit {row['repo']} #{row['pr']}", page)
+
+
+def _page_resume_stuck(row, db=None, dry_run=False):
+    """One page, once, for a plan-kind row whose `resume_request` has gone
+    `stuck` (plan 0169 round 3 MEDIUM): a prefixed key, distinct from
+    `_page_review_limit`'s, since the same head could in principle earn both."""
+    key = f"stuck-resume:{row['repo']}#{row['pr']}@{row['head_sha']}"
+    state = _load_state()
+    if key in state["review_paged"]:
+        return
+    if dry_run:
+        return
+    state["review_paged"][key] = {"handle": None}
+    _save_state(state)
+    _kind, plan_id, lease = _row_kind(row)
+    orch.notify(
+        f"mopsus: resume_request stuck {row['repo']} #{row['pr']}",
+        f"{row['repo']} #{row['pr']} @ {row['head_sha'][:8]}: plan {plan_id} "
+        f"(lease {lease}) has an unconsumed resume_request older than "
+        f"{RESUME_PENDING_STUCK_MINUTES} minutes — orphan_sweep has not picked "
+        "it up. Check whether that lease is actually dead.")
+
+
+def _review_path_open(queue, db=None):
+    """ADR-0016's queue without the rows whose repo's `review-path` gate is
+    closed (plan 0095 D3): a retry sent into a broken review path would fail
+    again and burn `review_retry_limit` on a known fault. They wait for the
+    probe to open the gate."""
+    return [r for r in queue if not fquota.review_path_held(r["repo"], db)]
+
+
+def _row_limit(row, limit):
+    """(limit, reason) for a held row. A `no-verdict` row has its own limit of
+    one, never more than `review_retry_limit` allows, counted over its own
+    retries (`reason`); a `quota` row keeps `review_retry_limit` (ADR-0021 §2)."""
+    if row["outcome"] == NO_VERDICT:
+        return min(limit, NO_VERDICT_LIMIT), NO_VERDICT
+    return limit, None
+
+
+def _retry_payload(row, limit, reason, bill=None):
+    kind, plan_id, lease = _row_kind(row)
+    payload = {
+        "model": row["model"], "repo": row["repo"], "pr": row["pr"],
+        "head": row["head_sha"], "kind": kind, "plan_id": plan_id,
+        "lease": lease, "limit": limit, "reason": reason,
+    }
+    if bill:
+        payload["bill"] = bill
+    return json.dumps(payload)
+
+
+def _credits_decision(row, db=None):
+    """`fleet-credits decide --peek` for a held row: the `bill` it answers, or
+    `hold` when it cannot answer (exit 1, unreadable output). `--peek` reserves
+    nothing and emits nothing; the dispatcher reserves for itself (plan 0146)."""
+    env = _clean_env()
+    if db:
+        env["FLEET_DB"] = str(db)
+    try:
+        r = subprocess.run([sys.executable, str(BIN / "fleet-credits"), "decide", "--peek",
+                            "--repo", row["repo"], "--pr", str(row["pr"]),
+                            "--model", row["model"] or "", "--json"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        if r.returncode != 0:
+            return "hold"
+        bill = json.loads(r.stdout).get("bill")
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return "hold"
+    return bill if bill in ("subscription", "credits") else "hold"
+
+
+def _dispatcher_accepts_credits():
+    """True when the deployed dispatcher takes `--bill credits`. Without this every
+    credits retry would fail on argparse and spend `review_retry_limit`."""
+    # A call into operator/talos: ~/agent/dispatch-review.py `--bill credits`, talos
+    # plan 0029, carried by operator/talos#173 (approved). The probe passes a choice
+    # no parser accepts, BEFORE `--help`: argparse validates a choice when it reaches
+    # the option, so a parser with `--bill subscription|credits` exits 2 with
+    # "invalid choice", while one without `--bill` only collects it as unrecognised,
+    # reaches `--help` and exits 0 (eunomia#968). `--bill credits --help` exits 0 on both.
+    try:
+        r = subprocess.run(orch.review_command() + ["--bill", "__probe__", "--help"],
+                           capture_output=True, text=True, env=_clean_env(), timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 2 and "invalid choice" in r.stderr
+
+
+def _refuse_credits(row, db=None):
+    env = _clean_env()
+    if db:
+        env["FLEET_DB"] = str(db)
+    subprocess.run([sys.executable, str(BIN / "fleet-credits"), "refused", "--repo",
+                    row["repo"], "--pr", str(row["pr"]), "--reason", "dispatcher"],
+                   capture_output=True, text=True, env=env)
+
+
+def _credits_retry_bill(row, reason, db=None):
+    """`credits` when this held row should be retried now, on credits, with no probe;
+    else None and the row follows today's path. Only a usage-limit or budget stop
+    on a session review qualifies: a no-verdict retry is never billed to credits,
+    and a plan-kind retry is a resume request the watcher consumes, which carries
+    no billing."""
+    if reason is not None or _row_kind(row)[0] != "session":
+        return None
+    if _credits_decision(row, db) != "credits":
+        return None
+    if not _dispatcher_accepts_credits():
+        _refuse_credits(row, db)
+        return None
+    return "credits"
+
+
+def review_retry_sweep(db=None, dry_run=False):
+    """The D1-D3/D6 cycle `main()` runs alongside the dispatch-failure
+    `sweep()` above, every invocation. `review_retry_limit <= 0` turns the
+    whole thing off (D6). Only the OLDEST row in the held queue is ever acted
+    on per cycle (D3) — probed at most once per `review_probe_minutes`
+    (D2/ADR-0016 §3), and retried, detached under the lock, only on that same
+    probe's reset (Boundaries: never hold the sweep open for a review or a
+    probe)."""
+    limit = review_retry_limit(db)
+    if limit <= 0:
+        return
+    token, _err = fwatch._token()
+    if not token:
+        return
+    allow = set(fwatch.repos())
+    queue = _review_path_open(held_review_queue(token, db=db, allow=allow), db)
+    if not queue:
+        return
+    draining = _drain_active_scopes()
+    forge = fwatch._forge(token)
+    files = {}
+    # A row that is spent, paged or still in flight never holds the rows behind
+    # it: the sweep acts on the oldest row that has a retry left.
+    for row in queue:
+        if _held_back_by_drain(row, draining):
+            continue                   # the drain owns this bucket's `quota` rows (plan 0169 D1)
+        row_limit, reason = _row_limit(row, limit)
+        n = _review_requeue_count(row["repo"], row["pr"], row["head_sha"], db,
+                                  reason=reason)
+        if n >= row_limit:
+            # The requeue event is recorded before the retry's own review_attempt
+            # row exists, so until a SECOND no-verdict row lands the retry may
+            # still be running: paging now would be false and would spend the
+            # page key. Only for NO_VERDICT_INFLIGHT_MINUTES, though — a retry
+            # that never recorded an attempt (timeout, broken review path,
+            # unconsumed resume_request) is a failed retry, and pages.
+            if (reason == NO_VERDICT and len(no_verdict_sessions(row, db)) < 2
+                    and _no_verdict_retry_in_flight(row, db)):
+                continue
+            _page_review_limit(row, db, dry_run)
+            continue
+        if dry_run:
+            return
+        # The drain's own skips (plan 0169 D1): a head already in its base, red,
+        # held or unreadable is not spent on, and a plan row whose resume_request
+        # is unconsumed is not asked twice.
+        verdict = _row_skip(forge, [row], db, files=files)
+        if verdict:
+            if verdict[0] == "stuck":
+                _page_resume_stuck(row, db, dry_run)
+            continue
+        bill = _credits_retry_bill(row, reason, db)
+        if reason is None and bill is None:   # a no-verdict stop is retried without a probe (ADR-0021 §3)
+            minutes = review_probe_minutes(db)
+            if not _probe_due(row["model"], minutes, db):
+                return
+        _try_start_locked(_retry_payload(row, row_limit, reason, bill), db)
+        return
+
+
+# --- the drain (plan 0169, ADR-0028) -----------------------------------------
+#
+# When fleet-quota reopens a `model:<bucket>` gate and neither `session` nor
+# `weekly` is closed, the reviews that gate stopped are retried together, a few at
+# a time, under their OWN lock so no probe waits on them. One page per reopening.
+
+_DRAIN_LOCK = "review-drain.lock"
+# Longer than the dispatcher's 2700 s timeout: a requeue younger than this with no
+# attempt since may still be running, e.g. orphaned by a killed drain child.
+DRAIN_INFLIGHT_MINUTES = 60
+# A `started` entry whose own forge reads keep failing (role unknown, a
+# persistently unreachable PR) never reaches `complete`, and until it does it
+# is never paged, which bars the one-row sweep and `review-probe` from its
+# whole bucket (eunomia#1401 round 1/2 MEDIUM, "stuck at started ... blocks
+# the one-row sweep indefinitely"). After this long, stop waiting for a clean
+# read and page from whatever was recorded.
+DRAIN_STUCK_MINUTES = 180
+# A plan-kind row's `resume_request` is normally consumed within one cycle of
+# orphan_sweep finding its dispatching lease dead. Unconsumed this long means
+# that lease never died, or orphan_sweep itself is broken — either way a bug
+# elsewhere this one row cannot fix, and `_resume_pending` on its own has no
+# bound at all: forever "in flight" is forever invisible, since neither the
+# one-row sweep nor a drain with nothing else to report ever pages for a
+# plain "in flight" skip (eunomia#1401 round 3 MEDIUM, "_resume_pending has no
+# time bound ... skipped by the sweep and every drain with no page"). Past
+# this long it is reclassified `stuck` — still never dispatched (a second
+# resume_request while the first is unconsumed would itself be the duplicate,
+# ADR-0028's "one retry per head") — but now visible.
+RESUME_PENDING_STUCK_MINUTES = 240
+_PLAN_DIR = "plans/"
+_DEPS_CONTEXT = "eunomia/deps"
+# D2's report-only reasons: the row is simply no longer live (closed, merged,
+# a moved head, already reviewed) — nothing a drain can act on, and nothing
+# that will ever stop recurring on its own. A reopening whose only skips are
+# these starts no drain and pages nobody (eunomia#1401 round 1/2 MEDIUM,
+# "every reopening pages a list of old quota stops ... and the list only
+# grows"); report-only skips are still recorded once an entry is already
+# started for some other, actionable reason.
+_DRAIN_REPORT_ONLY = frozenset({"closed", "merged", "draft", "head moved", "reviewed"})
+_DRAIN_SKIP_ORDER = ("closed", "merged", "draft", "head moved", "reviewed", "in base",
+                     "in flight", "stuck", "red", "held", "spent", "unreadable")
+
+
+def review_drain_concurrency(db=None):
+    fallback, source = fconfig._env_fallback("review_drain_concurrency")
+    value, _, _ = fconfig.resolve_setting("review_drain_concurrency", fallback, source,
+                                          db_path=str(Path(db) if db else db_path()))
+    return value
+
+
+def _head_key(row):
+    return f"{row['repo']}#{row['pr']}@{row['head_sha']}"
+
+
+def _fmt_pr(row_or_entry):
+    return f"{row_or_entry['repo']}#{row_or_entry['pr']}"
+
+
+def _gate_closed(scope, db=None):
+    return (fquota.gate(scope, db) or {}).get("state") == "closed"
+
+
+def _account_gate_closed(db=None):
+    """'session' or 'weekly' when that gate is closed, else None. A scope with no
+    row has never closed (ADR-0028 §2)."""
+    for scope in ("session", "weekly"):
+        if _gate_closed(scope, db):
+            return scope
+    return None
+
+
+def _open_transitions(db=None):
+    """{scope: (id, at)} — the newest `to_state='open'` transition of every
+    `model:<bucket>` gate that is open now."""
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return {}
+    con = sqlite3.connect(str(path))
+    try:
+        rows = con.execute(
+            "SELECT scope, id, at FROM quota_transition WHERE to_state='open' "
+            "AND scope LIKE 'model:%' ORDER BY id").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        con.close()
+    out = {}
+    for scope, tid, at in rows:
+        if (fquota.gate(scope, db) or {}).get("state") == "open":
+            out[scope] = (tid, at)
+    return out
+
+
+def _transition(tid, db=None):
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return None
+    con = sqlite3.connect(str(path))
+    try:
+        row = con.execute("SELECT scope, id, at FROM quota_transition WHERE id=?",
+                          (tid,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        con.close()
+    return {"scope": row[0], "id": row[1], "at": row[2]} if row else None
+
+
+def _max_attempt_rowid(db=None):
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return 0
+    con = sqlite3.connect(str(path))
+    try:
+        return con.execute("SELECT COALESCE(MAX(rowid), 0) FROM review_attempt").fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        con.close()
+
+
+def _new_quota_stop(scope, mark, db=None):
+    """True when a `quota` review_attempt for this bucket was inserted after `mark`."""
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return False
+    con = sqlite3.connect(str(path))
+    try:
+        models = [m for (m,) in con.execute(
+            "SELECT model FROM review_attempt WHERE outcome='quota' AND rowid > ?",
+            (mark,))]
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        con.close()
+    return any(fquota.model_scope(m) == scope for m in models)
+
+
+def _drains(state=None):
+    return (state or _load_state())["review_drains"]
+
+
+def _drain_active_scopes():
+    """The buckets whose drain entry is at `started`: the one-row sweep and
+    `review-probe` leave their `quota` rows alone (D1)."""
+    return {e.get("scope") for e in _drains().values()
+            if isinstance(e, dict) and e.get("state") == "started"}
+
+
+def _held_back_by_drain(row, active):
+    return bool(active) and row.get("outcome") == "quota" \
+        and fquota.model_scope(row.get("model")) in active
+
+
+def _resume_pending_row(row, db=None):
+    """The oldest unconsumed `resume_request` for a plan-kind row's plan, as a
+    dict (with `requested_at`), or None — also None for a session-kind row,
+    which never writes one."""
+    kind, plan_id, _lease = _row_kind(row)
+    if kind != "plan":
+        return None
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return None
+    con = sqlite3.connect(str(path))
+    try:
+        con.row_factory = sqlite3.Row
+        got = con.execute(
+            "SELECT * FROM resume_request WHERE plan=? AND consumed_at IS NULL "
+            "ORDER BY requested_at LIMIT 1", (plan_id,)).fetchone()
+        return dict(got) if got else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        con.close()
+
+
+def _resume_pending(row, db=None):
+    """True when a plan-kind row's `resume_request` is still unconsumed."""
+    return _resume_pending_row(row, db) is not None
+
+
+def _landed_since(rows, at, db=None):
+    """True when a `review_attempt`, or a live review by one of these rows'
+    own reviewers, was recorded at the head after `at`."""
+    first = rows[0]
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return False
+    roles = lib.agent_roles()
+    own = {roles["second_reviewer" if r["ordinal"] == 2 else "reviewer"].account.lower()
+           for r in rows}
+    con = sqlite3.connect(str(path))
+    try:
+        for stamp, stopped in con.execute(
+                "SELECT started_at, stopped_at FROM review_attempt "
+                "WHERE repo=? AND pr=? AND head_sha=?",
+                (first["repo"], first["pr"], first["head_sha"])):
+            t = lib.parse_ts(stopped or stamp or "")
+            if t is not None and t > at:
+                return True
+        if _table_exists(con, "review"):
+            for reviewer, stamp in con.execute(
+                    "SELECT reviewer, submitted_at FROM review WHERE repo=? AND pr=? "
+                    "AND head_sha=? AND COALESCE(dismissed,0)=0 AND COALESCE(stale,0)=0",
+                    (first["repo"], first["pr"], first["head_sha"])):
+                t = lib.parse_ts(stamp or "")
+                if (reviewer or "").lower() in own and t is not None and t > at:
+                    return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        con.close()
+    return False
+
+
+def _drain_in_flight(rows, db=None):
+    if _resume_pending(rows[0], db):
+        return True
+    at = _last_review_requeue_at(rows[0]["repo"], rows[0]["pr"], rows[0]["head_sha"], db)
+    if at is None:
+        return False
+    if lib.now_utc() - at >= datetime.timedelta(minutes=DRAIN_INFLIGHT_MINUTES):
+        return False
+    return not _landed_since(rows, at, db)
+
+
+def _plan_only(forge, repo, pr, cache):
+    """True when every file the PR changes is under `plans/`; None if unreadable."""
+    key = (repo, pr)
+    if key not in cache:
+        st, files = forge.list_pull_files(repo, pr)
+        if st != 200 or not isinstance(files, list):
+            cache[key] = None
+        else:
+            names = [f.get("filename") for f in files if isinstance(f, dict)]
+            cache[key] = bool(names) and all(
+                isinstance(n, str) and n.startswith(_PLAN_DIR) for n in names)
+    return cache[key]
+
+
+def _row_skip(forge, rows, db=None, limit=None, files=None):
+    """(outcome, detail) for the first of D2's rules that applies to this head,
+    or None to go ahead. `rows` are the stops at one head. The in-flight check
+    (an unconsumed resume_request, or a review-requeued at this head younger
+    than DRAIN_INFLIGHT_MINUTES with nothing landed since) always runs, drain or
+    not: a requeue the drain just wrote is exactly what the one-row sweep and
+    `review-probe` must not act on at the same head (plan 0169 Boundaries,
+    "one retry per head"). With `limit` the rest of the drain table also runs;
+    without it only the checks the one-row sweep shares with the drain: in
+    base, in flight, red, held, unreadable."""
+    row = rows[0]
+    repo, pr, head = row["repo"], row["pr"], row["head_sha"]
+    files = {} if files is None else files
+    if row.get("_merge_base") and row["_merge_base"] == head:
+        return "in base", ""
+    pending = _resume_pending_row(row, db)
+    if pending is not None:
+        requested = lib.parse_ts(pending.get("requested_at") or "")
+        if requested is None or lib.now_utc() - requested < datetime.timedelta(
+                minutes=RESUME_PENDING_STUCK_MINUTES):
+            return "in flight", "resume_request unconsumed"
+        return "stuck", (f"resume_request unconsumed for over "
+                         f"{RESUME_PENDING_STUCK_MINUTES} minutes")
+    if _drain_in_flight(rows, db):
+        return "in flight", ""
+    unreadable = None
+    st, body = forge.get_commit_status(repo, head)
+    if st != 200 or not isinstance(body, dict):
+        unreadable = f"statuses at {head[:8]} unreadable"
+        statuses = []
+    else:
+        statuses = [(s.get("context") or "", (s.get("status") or s.get("state") or "").lower())
+                    for s in (body.get("statuses") or []) if isinstance(s, dict)]
+    red = sorted({c for c, v in statuses
+                  if c != _DEPS_CONTEXT and v in ("failure", "error")})
+    if red:
+        return "red", ", ".join(red)
+    # Only the merger's OWN latest `eunomia/deps` status counts here, read
+    # directly through `list_statuses` (what `fdeps.pr_hold` itself reads),
+    # never the combined endpoint: the combined endpoint shows ONE entry per
+    # context — its overall latest, from whichever account posted most
+    # recently — so it can hide a different write-access account's unrelated
+    # failure behind a clean merger status (ADR-0019 §5, rev2bot, eunomia#1401
+    # round 2 MEDIUM-3) exactly as easily as it can hide the merger's OWN
+    # failure behind a different account's later, unrelated success (rev2bot,
+    # eunomia#1401 round 3, "a non-merger eunomia/deps success ... shadows
+    # the merger's own later failure"). Either way the combined entry's
+    # creator, not just its value, has to be checked, and only a read scoped
+    # to the merger's own postings can do that — but only when the combined
+    # endpoint shows SOME entry for this context: with none at all, nobody
+    # (the merger included) has ever posted one, so there is nothing to
+    # shadow and no reason to spend the extra read on every row.
+    deps_posted = any(c == _DEPS_CONTEXT for c, _v in statuses)
+    merger_login = None
+    if deps_posted:
+        try:
+            merger_login = lib.agent_roles()["agent_merger"].account
+        except Exception as e:                             # noqa: BLE001
+            if unreadable is None:
+                unreadable = f"agent merger account unknown ({e.__class__.__name__})"
+    if unreadable is None and merger_login is not None:
+        own, ok = fdeps._own_latest_read(forge, repo, head, merger_login)
+        if not ok:
+            unreadable = f"{_DEPS_CONTEXT} statuses at {head[:8]} unreadable"
+        elif own and (own.get("status") or "").lower() in ("failure", "error"):
+            hold = fdeps.pr_hold(forge, repo, head)
+            if hold and hold[0] == "unreadable":
+                unreadable = hold[1]
+            elif hold and hold[0] == "held":
+                only_plans = _plan_only(forge, repo, pr, files)
+                if only_plans is None:
+                    unreadable = f"files of #{pr} unreadable"
+                elif not only_plans:  # a plan PR is never held: its edges gate dispatch (plan 0159)
+                    return "held", hold[1]
+            else:
+                return "red", _DEPS_CONTEXT
+    if limit is not None:
+        row_limit, reason = _row_limit(row, limit)
+        n = _review_requeue_count(repo, pr, head, db, reason=reason)
+        if n >= row_limit:
+            return "spent", f"{n} of {row_limit}"
+    if unreadable:
+        return "unreadable", unreadable
+    return None
+
+
+def _group_by_head(rows):
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["repo"], r["pr"], r["head_sha"]), []).append(r)
+    return list(groups.values())
+
+
+def _drain_plan(token, tid, db=None):
+    """D2/D3: what a drain of transition `tid` would do now.
+
+    {"skips": {key: {repo, pr, reason, detail}}, "dispatch": [rows], "complete": bool}.
+    `dispatch` is ordered (plan-document PRs first, then today's order), one row
+    per (repo, PR, head). `complete` is False when any forge read failed."""
+    t = _transition(tid, db)
+    out = {"skips": {}, "dispatch": [], "complete": True}
+    if t is None:
+        return out
+    at = lib.parse_ts(t["at"])
+    # Every drain's own recorded results count, including THIS transition's: a
+    # head this same tid already dispatched must not be dispatched again by a
+    # later replan of it (an entry left `started` after a failed notify or a
+    # child that died mid-run, eunomia#1401 round 1 MEDIUM "a re-run of the
+    # same drain ... dispatches a head a second time"). Only "as dispatched"
+    # results exclude a head (D1).
+    prior = {key for e in _drains().values() if isinstance(e, dict)
+             for key, r in (e.get("results") or {}).items()
+             if _dispatched_result(r.get("result"))}
+    forge = fwatch._forge(token)
+    report = []
+    queue = held_review_queue(token, db=db, allow=set(fwatch.repos()),
+                              outcomes=("quota",), report=report)
+    queue = _review_path_open(queue, db)
+
+    def mine(row):
+        stopped = lib.parse_ts(row.get("stopped_at") or row.get("started_at") or "")
+        return (fquota.model_scope(row.get("model")) == t["scope"] and at is not None
+                and stopped is not None and stopped < at and _head_key(row) not in prior)
+
+    def skip(row, reason, detail=""):
+        key = _head_key(row)
+        out["skips"].setdefault(key, {"repo": row["repo"], "pr": row["pr"],
+                                      "reason": reason, "detail": detail})
+        if reason == "unreadable":
+            out["complete"] = False
+
+    for row, reason in report:
+        if mine(row) and not _review_path_held(row, db):
+            skip(row, reason)
+    limit = review_retry_limit(db)
+    files = {}
+    ready = []
+    for rows in _group_by_head([r for r in queue if mine(r)]):
+        verdict = _row_skip(forge, rows, db, limit=limit, files=files)
+        if verdict:
+            skip(rows[0], *verdict)
+        else:
+            ready.append(rows[0])
+    # Plan-document PRs first; the queue's own order (a `Plan: ` marker, then the
+    # oldest stop) holds within each half. A files read that fails only costs the
+    # PR its place at the front.
+    ready.sort(key=lambda r: _plan_only(forge, r["repo"], r["pr"], files) is not True)
+    out["dispatch"] = ready
+    return out
+
+
+def _review_path_held(row, db=None):
+    return fquota.review_path_held(row["repo"], db)
+
+
+def _drain_label(scope, db=None, mark=None, results=None):
+    """The reason a drain starts nothing more, or None (D5)."""
+    if _gate_closed(scope, db):
+        return f"gate closed ({scope})"
+    closed = _account_gate_closed(db)
+    if closed:
+        return f"gate closed ({closed})"
+    if any(r == EXIT_USAGE_LIMIT for r in (results or {}).values()):
+        return "retry hit the limit"
+    if mark is not None and _new_quota_stop(scope, mark, db):
+        return "new quota stop"
+    return None
+
+
+def _result_text(result):
+    if isinstance(result, int) and not isinstance(result, bool):
+        return f"exit {result}"
+    if result == RETRY_RESUME:
+        return RETRY_RESUME
+    return f"not dispatched: {result}"
+
+
+def _compose_drain_page(entry):
+    results = entry.get("results") or {}
+    dispatched = {k: r for k, r in results.items() if _dispatched_result(r["result"])}
+    not_dispatched = {k: r for k, r in results.items() if k not in dispatched}
+    # The title counts only results that actually reached the dispatcher or
+    # wrote a resume_request — a `RETRY_*` not-dispatched result is listed
+    # below, but it is not a review retried (round 1/2 LOW, "page title
+    # counts retries that never reached the dispatcher").
+    title = (f"mopsus: {len(dispatched)} reviews retried after "
+             f"{entry.get('scope')} reopened")
+    lines = ["Dispatched:"] if dispatched else ["Dispatched: none"]
+    for r in dispatched.values():
+        lines.append(f"  {_fmt_pr(r)}  {_result_text(r['result'])}")
+    if not_dispatched:
+        lines.append("Attempted, not dispatched:")
+        for r in not_dispatched.values():
+            lines.append(f"  {_fmt_pr(r)}  {_result_text(r['result'])}")
+    skips = entry.get("skips") or {}
+    for reason in _DRAIN_SKIP_ORDER:
+        group = [s for s in skips.values() if s["reason"] == reason]
+        if group:
+            lines.append(f"Skipped, {reason}:")
+            for s in group:
+                lines.append(f"  {_fmt_pr(s)}" + (f"  {s['detail']}" if s.get("detail") else ""))
+    not_started = entry.get("not_started") or {}
+    if not_started:
+        lines.append("Not started:")
+        for s in not_started.values():
+            lines.append(f"  {_fmt_pr(s)}  {s['reason']}")
+    return title, "\n".join(lines)
+
+
+def _page_drain(tid):
+    """D6: one `orch.notify` for the drain; `paged` only when it was delivered, so
+    a failed notify leaves `started` for the next cycle to page again."""
+    entry = _drains().get(str(tid))
+    if not isinstance(entry, dict) or entry.get("state") == "paged":
+        return False
+    title, body = _compose_drain_page(entry)
+    if not orch.notify(title, body):
+        return False
+    _update_drain(tid, lambda e: e.update({"state": "paged"}))
+    return True
+
+
+def _drain_lock_free():
+    lock_path = lib.fleet_dir() / "locks" / _DRAIN_LOCK
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)           # closing releases a lock we just took
+    return True
+
+
+def _record_skips(tid, plan):
+    def apply(e):
+        e.setdefault("skips", {}).update(plan["skips"])
+    _update_drain(tid, apply)
+
+
+def _recheck_dispatch(forge, row, db, limit, roles):
+    """Immediately before a dispatch slot opens: re-verify this row is STILL a
+    `dispatch` verdict. `plan["dispatch"]` was decided once, at the top of
+    `_run_drain`; with concurrency bounded (D4) a row near the back of that
+    list can wait hours for a slot, and in that time the one-row sweep may
+    have already retried this exact head (its OTHER ordinal's row, say, now
+    settled via a no-verdict retry) or its PR may have moved on — either way
+    dispatching the stale verdict now reviews the head a second time (plan
+    0169 round 3 MEDIUM, "classifies candidates once and dispatches ... so
+    ... the drain then retries the same head again"). Returns (reason, detail)
+    to skip instead, or None to go ahead."""
+    reason, _pr_body = _pr_liveness(forge, row, roles)
+    if reason:
+        return reason, ""
+    return _row_skip(forge, [row], db, limit=limit)
+
+
+def _run_drain(tid, db=None):
+    """The drain child's work, under `review-drain.lock`: classify, record, retry
+    up to `review_drain_concurrency` at once, stop cleanly, page (D1-D6)."""
+    token, _err = fwatch._token()
+    entry = _drains().get(str(tid))
+    t = _transition(tid, db)
+    if not token or not isinstance(entry, dict) or t is None:
+        return
+    limit = review_retry_limit(db)
+    conc = review_drain_concurrency(db)
+    scope, mark = t["scope"], entry.get("mark")
+    plan = _drain_plan(token, tid, db)
+    _record_skips(tid, plan)
+    pending = list(plan["dispatch"])
+    results = {k: v["result"] for k, v in (entry.get("results") or {}).items()}
+    forge = fwatch._forge(token)
+    roles = lib.agent_roles()
+    lock = threading.Lock()
+
+    def one(row):
+        key = _head_key(row)
+        verdict = _recheck_dispatch(forge, row, db, limit, roles)
+        if verdict:
+            reason, detail = verdict
+            def skip(e):
+                e.setdefault("skips", {})[key] = {"repo": row["repo"], "pr": row["pr"],
+                                                  "reason": reason, "detail": detail}
+            _update_drain(tid, skip)
+            return
+        payload = json.loads(_retry_payload(row, *_row_limit(row, limit)))
+        result = _attempt_retry(payload, db=db)
+        with lock:
+            results[key] = result if isinstance(result, int) else str(result)
+        def apply(e):
+            e.setdefault("results", {})[key] = {"repo": row["repo"], "pr": row["pr"],
+                                                "head": row["head_sha"],
+                                                "result": results[key]}
+            e.setdefault("not_started", {}).pop(key, None)
+            # A restart can dispatch a head an earlier cycle already recorded
+            # as skipped (e.g. "in flight"); drop the stale skip so the page
+            # never lists one PR under both Skipped and Dispatched.
+            e.setdefault("skips", {}).pop(key, None)
+        _update_drain(tid, apply)
+
+    running = set()
+    stopped = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=conc) as pool:
+        while pending:
+            if len(running) >= conc:
+                done, running = concurrent.futures.wait(
+                    running, return_when=concurrent.futures.FIRST_COMPLETED)
+                for f in done:
+                    f.result()
+                continue
+            with lock:
+                snapshot = dict(results)
+            stopped = _drain_label(scope, db, mark, snapshot)
+            if stopped:
+                break
+            row = pending.pop(0)
+            if _row_kind(row)[0] == "plan":
+                one(row)               # a resume_request takes no slot
+            else:
+                running.add(pool.submit(one, row))
+        for f in concurrent.futures.wait(running)[0]:
+            f.result()
+    if pending:
+        def apply(e):
+            for row in pending:
+                e.setdefault("not_started", {})[_head_key(row)] = {
+                    "repo": row["repo"], "pr": row["pr"], "reason": stopped}
+        _update_drain(tid, apply)
+    _page_drain(tid)
+
+
+def _cmd_review_drain_run(argv):
+    """`mopsus _review-drain-run <fd> <transition-id> <db-or-empty>` — never run by
+    a person; `review_drain_sweep` starts it through `_try_start_locked`, which
+    passes the already-held lock's fd."""
+    fd = int(argv[0])
+    tid = int(argv[1])
+    db = argv[2] if len(argv) > 2 and argv[2] else None
+    try:
+        _run_drain(tid, db)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+    return 0
+
+
+def review_drain_sweep(db=None):
+    """D1: run from `main()` every cycle. Starts a drain for a reopened `model:`
+    gate when it has something actionable to do, and finishes (pages) one
+    whose child died, whose gate closed again, whose transition row is gone,
+    or whose reads have failed for DRAIN_STUCK_MINUTES straight."""
+    if review_retry_limit(db) <= 0:
+        return
+    token, _err = fwatch._token()
+    if not token:
+        return
+    transitions = _open_transitions(db)
+    newest = {tid: scope for scope, (tid, _at) in transitions.items()}
+    account_closed = _account_gate_closed(db)
+    todo = [int(i) for i, e in _drains().items()
+            if isinstance(e, dict) and e.get("state") == "started"]
+    for scope, (tid, at) in transitions.items():
+        if str(tid) not in _drains() and not account_closed and tid not in todo:
+            todo.append(tid)
+    for tid in sorted(todo):
+        entry = _drains().get(str(tid))
+        fresh = entry is None
+        if not fresh and not _drain_lock_free():
+            continue                   # a child is running; it pages itself
+        t = _transition(tid, db)
+        if t is None:
+            if not fresh:
+                # The transition row itself is gone (e.g. fleet.db rebuilt
+                # while this drain ran). There is nothing left to read, so
+                # waiting for a clean read would wait forever: page from
+                # whatever this entry already recorded and release the
+                # bucket (round 2 MEDIUM, "a started entry whose transition
+                # row is gone blocks its bucket forever").
+                _page_drain(tid)
+            continue
+        if fresh:
+            # Reserve the bucket BEFORE `_drain_plan`'s scan, not after:
+            # `_held_back_by_drain` only excludes a scope once its entry is
+            # `started`, and that scan can cost real wall-clock time (one
+            # forge read per held row). A one-row sweep running concurrently
+            # (a different mopsus invocation, if a cycle ever overlaps the
+            # next) would not yet see this bucket as draining during that
+            # window and could dispatch the very head the drain is about to
+            # (round 3 MEDIUM, "a start-up window where the one-row sweep and
+            # a just-started drain can both dispatch the same head"). Downgraded
+            # to `not-actionable` below if the scan finds nothing to do.
+            _update_drain(tid, lambda e: e.update({
+                "state": "started", "scope": t["scope"], "at": t["at"],
+                "since": lib.ts(lib.now_utc()),
+                "mark": _max_attempt_rowid(db), "results": {}, "skips": {},
+                "not_started": {}}))
+            entry = _drains().get(str(tid))
+        plan = _drain_plan(token, tid, db)
+        if not plan["complete"]:
+            # DRAIN_STUCK_MINUTES counts from the FIRST failing read, not from
+            # when the entry was created (`since`): an entry already hours old
+            # when its reads start failing must not page as "stuck" on the very
+            # next cycle (round 2 MEDIUM, "measured from entry creation ...
+            # paged with no 180-minute read failure").
+            if entry is not None and entry.get("incomplete_since") is None:
+                _update_drain(tid, lambda e: e.setdefault(
+                    "incomplete_since", lib.ts(lib.now_utc())))
+                entry = _drains().get(str(tid))
+            incomplete_since = lib.parse_ts((entry or {}).get("incomplete_since") or "")
+            stuck = (incomplete_since is not None and lib.now_utc() - incomplete_since
+                     >= datetime.timedelta(minutes=DRAIN_STUCK_MINUTES))
+            if stuck:
+                _record_skips(tid, plan)
+                _page_drain(tid)       # a forge read has failed for hours: stop waiting
+            continue                   # an incomplete read otherwise changes nothing
+        if entry is not None and entry.get("incomplete_since") is not None:
+            _update_drain(tid, lambda e: e.pop("incomplete_since", None))
+        drainable = (tid in newest and newest[tid] == t["scope"] and not account_closed
+                     and not _gate_closed(t["scope"], db))
+        if (not fresh and plan["dispatch"] and drainable
+                and not (entry or {}).get("results")):
+            # Every cycle so far has respawned a child that died before
+            # recording even ONE result — e.g. the hardcoded fallback
+            # `_clean_env` leaves as the drain child's only token source
+            # (`fwatch._token()`'s default, `~/bin/fetch-forgejo-token.sh`)
+            # failing persistently, never verified from inside this child's
+            # own stripped env. `plan["complete"]` is True here (THIS process
+            # can read the forge fine), so DRAIN_STUCK_MINUTES's read-failure
+            # check above never sees this — a genuinely complete read with
+            # candidates that nothing ever acts on (round 3 MEDIUM, "a
+            # persistent child-side failure would hold the bucket silently
+            # with no stuck timeout"). Past the same bound, stop respawning
+            # and release it.
+            since = lib.parse_ts((entry or {}).get("since") or "")
+            if since is not None and lib.now_utc() - since >= datetime.timedelta(
+                    minutes=DRAIN_STUCK_MINUTES):
+                _record_skips(tid, plan)
+                _page_drain(tid)
+                continue
+        if fresh:
+            actionable = bool(plan["dispatch"]) or any(
+                s["reason"] not in _DRAIN_REPORT_ONLY for s in plan["skips"].values())
+            if not actionable:
+                # `mine()`'s filter (this scope, stopped before `t["at"]`) is
+                # fixed once the transition exists, so a non-actionable verdict
+                # for this tid cannot later turn actionable. Record it, so a
+                # transition that never gets an entry doesn't repeat this cycle's
+                # full held-queue forge scan on every cycle for as long as the
+                # gate stays open (round 2 MEDIUM, "re-runs _drain_plan's full
+                # held-queue forge scan every cycle, permanently doubling
+                # mopsus's per-cycle forge reads").
+                _update_drain(tid, lambda e: e.update({
+                    "state": "not-actionable", "scope": t["scope"], "at": t["at"]}))
+                continue
+        if plan["dispatch"] and drainable:
+            _try_start_locked(str(tid), db, lock=_DRAIN_LOCK, command="_review-drain-run")
+            continue
+        # Nothing left to start, or the gate cannot drain now: finish from what
+        # the entry recorded plus what this read shows.
+        label = None
+        if plan["dispatch"]:
+            label = _drain_label(t["scope"], db) if tid in newest else None
+        def apply(e):
+            e.setdefault("skips", {}).update(plan["skips"])
+            if label:
+                for row in plan["dispatch"]:
+                    e.setdefault("not_started", {})[_head_key(row)] = {
+                        "repo": row["repo"], "pr": row["pr"], "reason": label}
+        _update_drain(tid, apply)
+        _page_drain(tid)
+
+
+def cmd_review_drain(db=None, dry_run=False):
+    """D7: `mopsus review-drain --dry-run` prints D2's classification and D3's
+    order for the newest open transition. It dispatches nothing, writes no state
+    and pages nobody."""
+    if not dry_run:
+        sys.stderr.write("mopsus: review-drain only reads (--dry-run); the sweep "
+                         "starts drains\n")
+        return 2
+    token, _err = fwatch._token()
+    path = Path(db) if db else db_path()
+    newest = None
+    if path.exists():
+        con = sqlite3.connect(str(path))
+        try:
+            newest = con.execute(
+                "SELECT id, scope, at FROM quota_transition WHERE to_state='open' "
+                "AND scope LIKE 'model:%' ORDER BY id DESC LIMIT 1").fetchone()
+        except sqlite3.OperationalError:
+            newest = None
+        finally:
+            con.close()
+    if newest is None or not token:
+        print("review-drain: no open transition to drain" if newest is None
+              else "review-drain: no forge token")
+        return 0
+    tid, scope, at = newest
+    print(f"transition {tid}: {scope} opened {at}")
+    closed = _account_gate_closed(db)
+    if closed:
+        print(f"a drain would not start: the {closed} gate is closed")
+    elif _gate_closed(scope, db):
+        print(f"a drain would not start: {scope} is closed again")
+    plan = _drain_plan(token, tid, db)
+    for i, row in enumerate(plan["dispatch"], 1):
+        print(f"{i}. dispatch  {_fmt_pr(row)}@{row['head_sha'][:8]}")
+    for s in plan["skips"].values():
+        print(f"   skip: {s['reason']}  {_fmt_pr(s)}" + (f"  {s['detail']}" if s["detail"] else ""))
+    if not plan["dispatch"] and not plan["skips"]:
+        print("no held quota stops to drain")
+    if not plan["complete"]:
+        print("some reads failed; a sweep would wait")
+    return 0
+
+
+def credits_window_tick(db=None):
+    """plan 0146: while a credits window is open, run `fleet-credits status` once per
+    cycle, so an ended window is closed, evented and paged within one cycle even
+    when no review is held. Reads the window row itself; opens nothing."""
+    path = Path(db) if db else db_path()
+    if not path.exists():
+        return
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+        try:
+            row = con.execute("SELECT 1 FROM credit_window WHERE closed_at IS NULL").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return
+    if row is None:
+        return
+    env = _clean_env()
+    if db:
+        env["FLEET_DB"] = str(db)
+    try:
+        subprocess.run([sys.executable, str(BIN / "fleet-credits"), "status", "--json"],
+                       capture_output=True, text=True, env=env, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+PROBE_SCAN_LIMIT = 20
+
+
+def cmd_review_probe(db=None):
+    """D7: `mopsus review-probe` — never waits on the probe or the retry it
+    may trigger, and scans at most PROBE_SCAN_LIMIT candidates of the held
+    queue's own per-row forge reads before giving up on this call, so a long
+    run of spent, red or held rows at the front of the queue cannot turn the
+    one status/deps/files read per candidate (plan 0169 D2) into an unbounded
+    one (round 1/2 LOW, "returns within two seconds" eroding further).
+    Ignores `review_probe_minutes` (the caller, lynceus plan 0023, is asking
+    for one right now)."""
+    token, _err = fwatch._token()
+    if not token:
+        print("nothing-held")
+        return 0
+    limit = review_retry_limit(db)
+    if limit <= 0:
+        print("nothing-held")
+        return 0
+    allow = set(fwatch.repos())
+    queue = _review_path_open(held_review_queue(token, db=db, allow=allow), db)
+    if not queue:
+        print("nothing-held")
+        return 0
+    draining = _drain_active_scopes()
+    forge = fwatch._forge(token)
+    row = row_limit = reason = None
+    for cand in queue[:PROBE_SCAN_LIMIT]:
+        if _held_back_by_drain(cand, draining):
+            continue
+        cand_limit, cand_reason = _row_limit(cand, limit)
+        n = _review_requeue_count(cand["repo"], cand["pr"], cand["head_sha"], db,
+                                  reason=cand_reason)
+        if n >= cand_limit:
+            continue
+        verdict = _row_skip(forge, [cand], db)
+        if verdict:
+            if verdict[0] == "stuck":
+                _page_resume_stuck(cand, db)
+            continue
+        row, row_limit, reason = cand, cand_limit, cand_reason
+        break
+    if row is None:
+        print("nothing-held")
+        return 0
+    started = _try_start_locked(_retry_payload(row, row_limit, reason), db)
+    print("started" if started else "busy")
+    return 0
 
 
 # --- opening a handle --------------------------------------------------------
@@ -821,13 +3280,22 @@ def handle_view(handle, db=None):
     handle is unknown or its fleet.db row has rotated away. Looked up through
     the state file's handle -> lease map and re-read from fleet.db, so it also
     answers for handles issued before the class existed, and reads nothing
-    from disk but the database."""
-    lease = next((l for l, info in _load_state()["leases"].items()
+    from disk but the database. A STUCK handle (plan 0211 D5) has no lease at
+    all — checked second, against `stuck_paged`, and answered entirely from
+    its own state entry."""
+    state = _load_state()
+    lease = next((l for l, info in state["leases"].items()
                   if isinstance(info, dict) and info.get("handle") == handle), None)
-    row = next((r for r in failed_dispatches(db) if r["lease"] == lease), None)
-    if row is None:
+    if lease is not None:
+        row = next((r for r in failed_dispatches(db) if r["lease"] == lease), None)
+        if row is None:
+            return None
+        return {"handle": handle, **failure_view(row)}
+    entry = next((v for v in state["stuck_paged"].values()
+                 if isinstance(v, dict) and v.get("handle") == handle), None)
+    if entry is None:
         return None
-    return {"handle": handle, **failure_view(row)}
+    return stuck_failure_view(handle, entry)
 
 
 # --- D5b: `mopsus list` -------------------------------------------------------
@@ -859,9 +3327,24 @@ def list_handles():
     return out
 
 
+def list_stuck_handles():
+    """[(handle, repo, plan_id, pr)] over every `stuck_paged` entry recorded
+    (plan 0211 D5b) — read from the state entry itself, never from a brief
+    that a later `blocked.json` may have outrun."""
+    state = _load_state()
+    out = []
+    for _key, info in sorted(state["stuck_paged"].items()):
+        if not isinstance(info, dict):
+            continue
+        out.append((info.get("handle"), info.get("repo"), info.get("plan"),
+                    info.get("pr")))
+    return out
+
+
 def cmd_list():
     entries = list_handles()
-    if not entries:
+    stuck = list_stuck_handles()
+    if not entries and not stuck:
         print("mopsus: no handles recorded")
         return 0
     for lease, handle, repo, plan_id in entries:
@@ -869,6 +3352,8 @@ def cmd_list():
             print(f"{handle or '-'}\t{lease}\tMISSING BRIEF")
         else:
             print(f"{handle}\t{repo}\t{plan_id}\t{lease}")
+    for handle, repo, plan_id, pr in stuck:
+        print(f"{handle}\t{repo}\t{plan_id}\tstuck:#{pr}")
     return 0
 
 
@@ -879,6 +3364,19 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "list":
         return cmd_list()
+    if argv and argv[0] == "review-probe":
+        return cmd_review_probe()
+    if argv and argv[0] == "review-drain":
+        ap = argparse.ArgumentParser(prog="mopsus review-drain")
+        ap.add_argument("--dry-run", action="store_true")
+        ap.add_argument("--db", help="fleet.db path (test seam)")
+        a = ap.parse_args(argv[1:])
+        return cmd_review_drain(a.db, a.dry_run)
+    if argv and argv[0] == "_review-drain-run":
+        return _cmd_review_drain_run(argv[1:])
+    if argv and argv[0] == "_review-lock-run":
+        # Never run by a person — see _try_start_locked's docstring.
+        return _cmd_review_lock_run(argv[1:])
 
     ap = argparse.ArgumentParser(prog="mopsus", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -912,6 +3410,15 @@ def main(argv=None):
     except ConfigError as e:
         sys.stderr.write(f"mopsus: {e}\n")
         return 2
+    if not args.dry_run:
+        review_stop_sweep(args.db)
+    quota_probe_sweep(args.db, args.dry_run)
+    if not args.dry_run:
+        review_drain_sweep(args.db)
+    review_retry_sweep(args.db, args.dry_run)
+    stuck_sweep(args.dry_run)
+    if not args.dry_run:
+        credits_window_tick(args.db)
     print(f"mopsus: {n_paged} paged, {n_refused} refused (mode not built)")
     return 2 if n_refused else 0
 

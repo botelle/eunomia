@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+"""fleet-attest — test every change record against checks A1-A8 (plan 0120).
+
+  fleet-attest check [--from REPO=SHA]...        walk each repository from its
+                                                 last attested tip, report and
+                                                 page exceptions
+  fleet-attest report --month YYYY-MM|previous   write the month's attestation
+                       [--from REPO=SHA]... [--rerun]   to the spool
+
+Read-only. It never holds the recorder's key or token and pushes to no remote:
+outputs go to FLEET_ATTEST_SPOOL, which `fleet-record publish` commits. It judges
+a merge by its record and the ledger's autonomy history, never by forge state
+read now, and calls no model. See docs/fleet-attest.md.
+"""
+import argparse
+import datetime as dt
+import fnmatch
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+ROOT = BIN.parent
+
+
+def _load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+fleetlib = _load("fleetlib", BIN / "fleetlib.py")
+
+LABEL = "fleet-attest"
+EVIDENCE_REPO = "operator/recordstore"
+EVIDENCE_BRANCH = "main"
+ADR_PREFIX = "docs/adr/"
+LANE_PREFIX = "tests/lane/"
+PLANS_PREFIX = "plans/"
+DEPLOY_PREFIXES = ("launchd/", ".forgejo/")
+
+# Our own copy, deliberately not imported from bin/fleet-merge: this is the
+# detective control for mergebot's preventive one, and shared code would make a bug
+# in one a bug in both. tests/test_fleet_attest.py asserts the two are equal.
+ENFORCING = frozenset({
+    "bin/fleet-merge",
+    "bin/fleet-deps",
+    "bin/fleet-watch",
+    "bin/fleet-depsd",
+    "bin/fleetlib.py",
+    "bin/fleetforge.py",
+    "bin/fleet-config",
+    "bin/fleet-install-hooks",
+    "bin/fleet-secret-guard",
+    "config/secret-patterns.conf",
+    "launchd/org.eunomia.fleet-merge.plist",
+    "launchd/org.eunomia.fleet-deps.plist",
+    "launchd/org.eunomia.fleet-depsd.plist",
+})
+
+# The check table. `control` and `fields` must match the control table of
+# docs/change-management.md section 3, and every name in `fields` must exist in
+# config/change-record.schema.json; `other` names the evidence that is not a
+# record field. tests/test_fleet_attest.py holds the document to this table.
+# A6's `autonomy` is named because the document names it; the check itself reads
+# autonomy at merged_at from the ledger, since the record's value is read at
+# record time.
+CHECKS = {
+    "A1": {"control": "C1", "fields": ("merge_sha", "pr"), "other": ()},
+    "A2": {"control": "C2", "other": (),
+           "fields": ("plan.id", "plan.status_at_merge", "plan.commit",
+                      "plan.commit_merged_by")},
+    "A3": {"control": "C3", "fields": ("reviews[]",), "other": ()},
+    "A4": {"control": "C4", "fields": ("author", "merged_by", "reviews[].account"),
+           "other": ()},
+    "A5": {"control": "C5", "fields": ("statuses[]", "required_contexts"), "other": ()},
+    "A6": {"control": "C6", "fields": ("merged_by", "autonomy", "files"), "other": ()},
+    "A7": {"control": "C7", "fields": (),
+           "other": ("autonomy change events", "protection snapshots")},
+    "A8": {"control": "C8", "fields": ("source", "supersedes"),
+           "other": ("the evidence repository's history",)},
+}
+CLASSES = ("unrecorded", "history-rewritten", "red-ci", "control-change",
+           "record-edited", "rule")
+
+
+class ReadError(Exception):
+    """A read that could not tell. Reported as an exception, never as a pass."""
+
+
+class Refuse(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- environment
+def _env(key, default=""):
+    return os.environ.get(key, default)
+
+
+def _now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _parse_ts(s):
+    t = dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc)
+
+
+# Plan 0136: the repository list is the eunomia pin's, wherever this runs from.
+# Path and format checked against the eunomia pin at 324d3e9 (main): the file is
+# config/repos.conf, `repo: <owner/name> [flags]` lines, last changed in 6c2a52d.
+# It is parsed by this checkout's fleet-watch.repos(); a moved file or a changed
+# format reads as no repositories, which run() refuses by name.
+PINNED_CONF = Path("~/.local/share/pins/eunomia/config/repos.conf")
+
+
+def pinned_conf_path():
+    return Path(os.path.expanduser(str(PINNED_CONF)))
+
+
+def repos():
+    watch = _load("fleet_watch_for_attest_repos", BIN / "fleet-watch")
+    watch.REPOS_CONF = pinned_conf_path()
+    return watch.repos()
+
+
+def _dir(key, default):
+    return Path(os.path.expanduser(_env(key, default)))
+
+
+def spool_dir():
+    return _dir("FLEET_ATTEST_SPOOL", "~/dev/.fleet/recordstore-spool")
+
+
+def clones_dir():
+    return _dir("FLEET_ATTEST_CLONES", "~/dev/.fleet/change-attest-clones")
+
+
+def evidence_dir():
+    return _dir("FLEET_ATTEST_EVIDENCE", "~/dev/.fleet/change-attest-evidence")
+
+
+def state_path():
+    return _dir("FLEET_ATTEST_STATE", str(fleetlib.fleet_dir() / "fleet-attest-seen.json"))
+
+
+def remote_for(repo):
+    return _env("FLEET_ATTEST_REMOTE_TEMPLATE",
+                "ssh://git@forge.example:2222/{repo}.git").format(repo=repo)
+
+
+def log(msg):
+    print(f"fleet-attest: {msg}")
+
+
+def page(title, body):
+    """Page through fleet-watch's notify. True when delivered; never raises."""
+    try:
+        watch = _load("fleet_watch_for_attest", BIN / "fleet-watch")
+        return watch.notify(title, body, LABEL) is not False
+    except Exception as e:
+        print(f"fleet-attest: NOTIFY(failed) {title} — {body} ({e.__class__.__name__})",
+              file=sys.stderr)
+        return False
+
+
+def make_forge():
+    """A forge handle that this tool only ever reads with.
+
+    Cross-repo host tool: operator/hosttools, bin/fetch-forgejo-token.sh,
+    installed at ~/bin/, at e6227b5 (its last change), as bin/fleet-style-evidence
+    cites it. Contract relied on: takes NO arguments, prints the implbot PAT as
+    the last non-empty line of stdout, exits non-zero when it cannot. ADR-0022 §2.
+    That PAT is the author account's read-write token, not a read-scoped one:
+    no read-only credential exists on this fleet. Nothing here writes with it.
+    FLEET_ATTEST_TOKEN_CMD overrides it."""
+    cmd = _env("FLEET_ATTEST_TOKEN_CMD", os.path.expanduser("~/bin/fetch-forgejo-token.sh"))
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    lines = r.stdout.strip().splitlines()
+    if r.returncode != 0 or not lines:
+        raise Refuse("the token command failed")
+    return fleetforge.Forge(_env("FLEET_FORGEJO_URL", "http://forge.example:3000"),
+                            lines[-1].strip())
+
+
+def accounts():
+    roles = fleetlib.agent_roles()
+    return {"merger": roles["merger"].account,
+            "agent_merger": roles["agent_merger"].account,
+            "reviewer": roles["reviewer"].account,
+            "second_reviewer": roles["second_reviewer"].account,
+            "recorder": _env("FLEET_RECORDER_ACCOUNT", "recordbot")}
+
+
+# ------------------------------------------------------------------------ git
+def git(d, *args):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    return subprocess.run(["git", "-C", str(d), "-c", "core.quotepath=off", *args],
+                          capture_output=True, text=True, env=env)
+
+
+def git_out(d, *args):
+    r = git(d, *args)
+    if r.returncode != 0:
+        raise ReadError(f"git {args[0]} failed: {r.stderr.strip()[:200]}")
+    return r.stdout
+
+
+def sync(d, url, branch):
+    """A fetch-only clone at `d`; returns the SHA of origin/<branch>. The fetch
+    is forced so a rewritten branch shows as rewritten."""
+    d = Path(d)
+    if not (d / ".git").exists():
+        d.mkdir(parents=True, exist_ok=True)
+        git_out(d, "init", "-q")
+    if git(d, "remote", "get-url", "origin").returncode == 0:
+        git_out(d, "remote", "set-url", "origin", url)
+    else:
+        git_out(d, "remote", "add", "origin", url)
+    git_out(d, "fetch", "-q", "--no-tags", "origin",
+            f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    return git_out(d, "rev-parse", f"refs/remotes/origin/{branch}").strip()
+
+
+def pin(d, sha):
+    """Keep an attested SHA alive so a later rewrite can still be recognised."""
+    git(d, "update-ref", f"refs/attest/{sha[:12]}", sha)
+
+
+def sha12(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+# --------------------------------------------------------------- exceptions
+def exc_id(check, repo, key):
+    owner, _, name = repo.partition("/")
+    safe = lambda s: re.sub(r"[^A-Za-z0-9._-]", "_", s)  # noqa: E731
+    return f"{check}-{safe(owner)}--{safe(name)}-{key}"
+
+
+def exc(check, klass, repo, key, detail, merge_sha=None):
+    return {"id": exc_id(check, repo, key), "check": check, "class": klass,
+            "repo": repo, "detail": detail, "merge_sha": merge_sha}
+
+
+# ------------------------------------------------------------------- ledger
+def ledger_events():
+    """Every `fleet-setting-changed` event for autonomy, in ledger order
+    (archives first), as (ts, raw_line, repo, new) plus the newest event ts."""
+    d = fleetlib.fleet_dir()
+    files = sorted(d.glob("events-*.jsonl")) + [d / "events.jsonl"]
+    out, newest = [], None
+    for f in files:
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            try:
+                ev = json.loads(raw)
+                ts = _parse_ts(ev["ts"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if newest is None or ts > newest:
+                newest = ts
+            detail = ev.get("detail")
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except ValueError:
+                    continue
+            if (ev.get("type") != "fleet-setting-changed" or not isinstance(detail, dict)
+                    or detail.get("key") != "autonomy"):
+                continue
+            out.append((ts, raw, detail.get("repo") or "default", detail.get("new")))
+    return out, newest
+
+
+def autonomy_at(events, repo, t):
+    """The repo's autonomy at time `t`: its own layer, else the default layer,
+    else the built-in `critical`. Only the ledger is read."""
+    state = {}
+    for ts, _raw, scope, new in events:
+        if ts > t:
+            continue
+        if new is None:
+            state.pop(scope, None)
+        else:
+            state[scope] = new
+    return state.get(repo) or state.get("default") or "critical"
+
+
+# ----------------------------------------------------------------- A2 - A6
+def valid_approval(rv, head):
+    return (str(rv.get("state", "")).upper() == "APPROVED" and not rv.get("dismissed")
+            and not rv.get("stale") and rv.get("commit_id") == head)
+
+
+def src_violation(files, plan_id):
+    """The first reason an agent-merged `src` PR is out of limits (ADR-0019 §4),
+    judged by path alone; None when it is within them."""
+    own = f"{PLANS_PREFIX}{plan_id}.md" if plan_id else None
+    for n in files:
+        if n.startswith(ADR_PREFIX) or n.startswith(LANE_PREFIX):
+            return f"touches {n}"
+        if n in ENFORCING:
+            return f"touches enforcing file {n}"
+        if n.startswith(PLANS_PREFIX) and n != own:
+            return f"touches {n}, not the PR's own plan"
+        if n.startswith(DEPLOY_PREFIXES):
+            return f"touches deploy path {n}"
+    return None
+
+
+_STATUS_LINE = re.compile(r"^status:[ \t]*[\"']?(\w+)[\"']?[ \t]*$")
+
+
+def status_only_change(base, head):
+    base_l, head_l = base.splitlines(), head.splitlines()
+    if len(base_l) != len(head_l):
+        return False
+    diff = [(a, b) for a, b in zip(base_l, head_l) if a != b]
+    if len(diff) != 1:
+        return False
+    a, b = _STATUS_LINE.match(diff[0][0]), _STATUS_LINE.match(diff[0][1])
+    return bool(a and b and a.group(1) == "ready" and b.group(1) == "done")
+
+
+def plan_edit_problem(clone, rec, plan_file):
+    """None when the plan file differs between the merge's first parent and the
+    merge only in `status: ready` -> `done`. Read from git, not the forge."""
+    sha = rec["merge_sha"]
+    base = git(clone, "show", f"{sha}^1:{plan_file}")
+    head = git(clone, "show", f"{sha}:{plan_file}")
+    if base.returncode != 0 or head.returncode != 0:
+        return f"cannot read {plan_file} at {sha[:8]}"
+    if not status_only_change(base.stdout, head.stdout):
+        return f"{plan_file} changes more than `status: ready` -> `done`"
+    return None
+
+
+def judge(rec, acct, events, clone):
+    """A2-A6 for one record. Returns (problems, facts): problems are
+    (check, class, detail); facts carries the counts the report keeps."""
+    out, facts = [], {}
+    merger, agent = rec["merged_by"], acct["agent_merger"]
+    by_agent = merger == agent
+    head = rec["head_sha"]
+    reviews = rec.get("reviews") or []
+    approvers = {rv.get("account") for rv in reviews
+                 if str(rv.get("state", "")).upper() == "APPROVED"}
+    reviewer_accts = (acct["reviewer"], acct["second_reviewer"])
+    plan = rec.get("plan")
+
+    if by_agent:                                                       # A2
+        if not plan:
+            out.append(("A2", "rule", "agent merge carries no plan"))
+        else:
+            if plan.get("status_at_merge") != "ready":
+                out.append(("A2", "rule",
+                            f"plan status at merge is {plan.get('status_at_merge')!r}, not 'ready'"))
+            if plan.get("commit_merged_by") != acct["merger"]:
+                out.append(("A2", "rule",
+                            f"plan commit merged by {plan.get('commit_merged_by')!r}, "
+                            f"not {acct['merger']!r}"))
+        for who in reviewer_accts:                                     # A3
+            mine = [rv for rv in reviews if rv.get("account") == who and valid_approval(rv, head)]
+            if not mine:
+                out.append(("A3", "rule", f"no approval by {who} at the head"))
+            elif not any(rv.get("model") for rv in mine):
+                out.append(("A3", "rule", f"approval by {who} has no model (unprovable)"))
+    else:
+        facts["owner_reviewed"] = any(valid_approval(rv, head) and rv.get("account") in reviewer_accts
+                                      for rv in reviews)
+
+    author = rec["author"]                                             # A4
+    if by_agent and (author == agent or author in reviewer_accts):
+        out.append(("A4", "rule", f"agent merge of a change authored by {author}"))
+    if author in approvers:
+        out.append(("A4", "rule", f"{author} approved a change it authored"))
+    roles_in = {author, merger} | {rv.get("account") for rv in reviews}
+    if acct["recorder"] in roles_in:
+        out.append(("A4", "rule", f"recorder account {acct['recorder']} holds a role"))
+    facts["owner_self"] = (author == merger == acct["merger"])
+
+    have = {s.get("context"): s.get("state") for s in rec.get("statuses") or []}   # A5
+    for ctx in rec.get("required_contexts") or []:
+        if have.get(ctx) != "success":
+            out.append(("A5", "red-ci", f"required context {ctx!r} is {have.get(ctx)!r}"))
+
+    if merger == acct["merger"]:                                       # A6
+        pass
+    elif not by_agent:
+        out.append(("A6", "rule", f"merged by {merger!r}, neither the human nor the agent merger"))
+    else:
+        auto = autonomy_at(events, rec["repo"], _parse_ts(rec["merged_at"]))
+        files = rec.get("files") or []
+        if auto != "autonomous":
+            out.append(("A6", "rule", f"agent merge while the repository was {auto} at merged_at"))
+        elif files and all(f.startswith(LANE_PREFIX) for f in files):
+            pass                                                       # a `tests` PR
+        else:
+            why = src_violation(files, (plan or {}).get("id"))
+            own = f"{PLANS_PREFIX}{plan['id']}.md" if plan else None
+            if why is None and own in files:
+                why = plan_edit_problem(clone, rec, own)
+            if why:
+                out.append(("A6", "rule", f"agent `src` PR out of limits: {why}"))
+    return out, facts
+
+
+# ------------------------------------------------------------ evidence reads
+def load_records(ev, repo):
+    """{merge_sha: record} for one repository, read from the evidence checkout.
+    A record that corrects another wins over it."""
+    base = Path(ev) / "records" / repo
+    out, bad = {}, []
+    for f in sorted(base.rglob("*.json")) if base.is_dir() else []:
+        try:
+            rec = json.loads(f.read_text())
+            sha = rec["merge_sha"]
+        except (ValueError, KeyError, TypeError):
+            bad.append(f.relative_to(ev).as_posix())
+            continue
+        if sha not in out or rec.get("supersedes"):
+            out[sha] = rec
+    return out, bad
+
+
+def report_files(ev, spool):
+    """{name: path} of every report .json in the evidence repository and the spool."""
+    out = {}
+    for base in (Path(ev), Path(spool)):
+        d = base / "reports"
+        for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+            if re.fullmatch(r"\d{4}-\d{2}(\.r\d+)?\.json", f.name):
+                out[f.name] = f
+    return out
+
+
+def _report_key(name):
+    m = re.fullmatch(r"(\d{4}-\d{2})(?:\.r(\d+))?\.json", name)
+    return (m.group(1), int(m.group(2) or 1))
+
+
+def latest_report(files):
+    if not files:
+        return None, None
+    name = max(files, key=_report_key)
+    return name, json.loads(files[name].read_text())
+
+
+# -------------------------------------------------------------------- checks
+def walk_repo(forge, repo, start, acct, events, ev):
+    """Everything check learns about one repository: (exceptions, summary)."""
+    excs, clone = [], clones_dir() / repo.replace("/", "--")
+    summary = {"from": start, "through": start, "merges": 0, "evidenced": 0,
+               "by_merger": {}, "by_source": {}, "owner_merges": 0,
+               "owner_reviewed": 0, "owner_self": 0}
+    status, body = forge.get_repo(repo)
+    default = (body or {}).get("default_branch") if status == 200 else None
+    if not isinstance(default, str) or not default:
+        raise ReadError(f"{repo} default branch -> {status}")
+    tip = sync(clone, remote_for(repo), default)
+    summary["default_branch"], summary["tip"] = default, tip
+    if start is None:
+        excs.append(exc("A1", "rule", repo, tip[:12], "no start SHA; supply --from "
+                        f"{repo}=<sha>"))
+        return excs, summary
+    if git(clone, "cat-file", "-e", f"{start}^{{commit}}").returncode != 0 \
+            or git(clone, "merge-base", "--is-ancestor", start, tip).returncode != 0:
+        excs.append(exc("A1", "history-rewritten", repo, tip[:12],
+                        f"{start[:12]} is no longer an ancestor of {default} ({tip[:12]})"))
+        return excs, summary
+    pin(clone, tip)
+    commits = git_out(clone, "rev-list", "--first-parent", "--reverse",
+                      f"{start}..{tip}").split()
+    records, bad = load_records(ev, repo)
+    for path in bad:
+        excs.append(exc("A1", "rule", repo, sha12(path), f"unreadable record {path}"))
+    for sha in commits:
+        rec = records.get(sha)
+        if rec is None:
+            excs.append(exc("A1", "unrecorded", repo, sha[:12],
+                            f"{sha[:12]} on {default} has no record", sha))
+            continue
+        summary["merges"] += 1
+        summary["by_source"][rec.get("source")] = summary["by_source"].get(rec.get("source"), 0) + 1
+        try:
+            problems, facts = judge(rec, acct, events, clone)
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            problems, facts = [("A1", "rule", f"record malformed ({e.__class__.__name__}: {e})")], {}
+        who = rec.get("merged_by")
+        summary["by_merger"][who] = summary["by_merger"].get(who, 0) + 1
+        if who == acct["merger"]:
+            summary["owner_merges"] += 1
+            summary["owner_reviewed"] += bool(facts.get("owner_reviewed"))
+            summary["owner_self"] += bool(facts.get("owner_self"))
+        if not problems:
+            summary["evidenced"] += 1
+        for check, klass, detail in problems:
+            excs.append(exc(check, klass, repo, sha[:12], detail, sha))
+    summary["through"] = tip
+    return excs, summary
+
+
+def protection_snapshot(forge, repo, default):
+    status, rules = forge.get_branch_protections(repo)
+    if status != 200 or not isinstance(rules, list):
+        raise ReadError(f"{repo} branch protections -> {status}")
+    chosen = None
+    for r in rules:
+        name = r.get("branch_name") or r.get("rule_name") or ""
+        if name == default or fnmatch.fnmatch(default, name):
+            chosen = r
+            if name == default:
+                break
+    if chosen is not None:
+        chosen = {k: v for k, v in sorted(chosen.items())
+                  if not (k.endswith("_unix") or k in ("created_at", "updated_at", "id"))}
+    return {"repo": repo, "branch": default, "rule": chosen}
+
+
+def check_protection(forge, repo, default, ev, spool):
+    """A7's snapshot half. Writes the snapshot to the spool when it is the first
+    or has changed since the last one; a change is a `control-change`."""
+    snap = protection_snapshot(forge, repo, default)
+    text = json.dumps(snap, indent=2, sort_keys=True) + "\n"
+    rel = Path("protection") / f"{repo}.json"
+    last = next((p for p in (Path(ev) / rel, Path(spool) / rel) if p.is_file()), None)
+    if last is not None and last.read_text() == text:
+        return []
+    dest = Path(spool) / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text)
+    if last is None:
+        return []
+    return [exc("A7", "control-change", repo, sha12(text),
+                f"the {default} protection rule changed since the last snapshot")]
+
+
+def check_ledger(events, since):
+    out = []
+    for ts, raw, scope, new in events:
+        if since is not None and ts <= since:
+            continue
+        repo = scope if "/" in scope else f"fleet/{scope}"
+        out.append(exc("A7", "control-change", repo, sha12(raw),
+                       f"autonomy set to {new!r} at {ts:%Y-%m-%dT%H:%M:%SZ}"))
+    return out
+
+
+def check_evidence(ev, since):
+    """A8: any commit since `since` that modifies or deletes a file in records/."""
+    d, out = Path(ev), []
+    head = git_out(d, "rev-parse", "HEAD").strip()
+    rng = head
+    if since:
+        if git(d, "cat-file", "-e", f"{since}^{{commit}}").returncode != 0 \
+                or git(d, "merge-base", "--is-ancestor", since, head).returncode != 0:
+            return [exc("A8", "history-rewritten", EVIDENCE_REPO, head[:12],
+                        f"{since[:12]} is no longer an ancestor of the evidence history")]
+        rng = f"{since}..{head}"
+    log_out = git_out(d, "log", "-m", "--no-renames", "--name-status",
+                      "--format=commit %H", rng, "--", "records/")
+    seen, cur = set(), None
+    for line in log_out.splitlines():
+        if line.startswith("commit "):
+            cur = line.split()[1]
+        elif line and cur and line[0] in "MDT" and "\t" in line:
+            path = line.split("\t", 1)[1]
+            if cur not in seen:
+                seen.add(cur)
+                out.append(exc("A8", "record-edited", EVIDENCE_REPO, cur[:12],
+                               f"{cur[:12]} changed {path}"))
+    return out
+
+
+def disposed(ev, e):
+    return (Path(ev) / "dispositions" / f"{e['id']}.md").is_file()
+
+
+def parse_from(items):
+    out = {}
+    for it in items or []:
+        repo, sep, sha = it.partition("=")
+        if not sep or "/" not in repo or not re.fullmatch(r"[0-9a-f]{7,64}", sha):
+            raise Refuse(f"--from wants <owner/repo>=<sha>, got {it!r}")
+        out[repo] = sha
+    return out
+
+
+def refresh_evidence():
+    """Fetch the evidence repository and check out its tip; returns the SHA."""
+    ev = evidence_dir()
+    ev_sha = sync(ev, _env("FLEET_ATTEST_EVIDENCE_REMOTE", remote_for(EVIDENCE_REPO)),
+                  EVIDENCE_BRANCH)
+    git_out(ev, "checkout", "-q", "-f", "--detach", ev_sha)
+    pin(ev, ev_sha)
+    return ev_sha
+
+
+def run_period(forge, froms, base_report, ev_sha):
+    """Walk every repository. `base_report` supplies start points and the
+    evidence/ledger cursors. Returns the whole result."""
+    acct = accounts()
+    ev = evidence_dir()
+    events, newest = ledger_events()
+    prior = (base_report or {}).get("period", {})
+    starts = {**prior.get("through", {}), **froms}
+    excs, summaries = [], {}
+    repo_list = repos()
+    if not repo_list:
+        raise Refuse(f"no repositories read from {pinned_conf_path()}: the pinned "
+                     "repos.conf is missing or its format changed")
+    for repo in repo_list:
+        start = starts.get(repo)
+        try:
+            e, s = walk_repo(forge, repo, start, acct, events, ev)
+            excs += e
+            if s.get("default_branch") and s.get("tip"):
+                try:
+                    excs += check_protection(forge, repo, s["default_branch"], ev, spool_dir())
+                except ReadError as err:
+                    excs.append(exc("A7", "rule", repo, sha12("protection"), f"cannot read: {err}"))
+        except ReadError as err:
+            excs.append(exc("A1", "rule", repo, sha12("unreadable"), f"cannot read: {err}"))
+            s = {"from": start, "through": start, "merges": 0, "evidenced": 0,
+                 "by_merger": {}, "by_source": {}, "owner_merges": 0,
+                 "owner_reviewed": 0, "owner_self": 0}
+        summaries[repo] = s
+    if not any(s["from"] for s in summaries.values()):
+        raise Refuse("no repository has a start SHA: there is no prior report and no "
+                     "--from <repo>=<sha> was given")
+    excs += check_ledger(events, _parse_ts(prior["ledger_through"])
+                         if prior.get("ledger_through") else None)
+    excs += check_evidence(ev, prior.get("evidence_through"))
+    merged = {}
+    for e in excs:                       # one id, one exception: details join
+        if e["id"] in merged:
+            merged[e["id"]]["detail"] += "; " + e["detail"]
+        else:
+            merged[e["id"]] = e
+    excs = list(merged.values())
+    for e in excs:
+        e["status"] = "disposed" if disposed(ev, e) else "open"
+    late = {}
+    for repo in summaries:
+        recs, _ = load_records(ev, repo)
+        late[repo] = sum(1 for r in recs.values() if r.get("source") in ("late", "backfill"))
+    return {"repos": summaries, "exceptions": excs, "ev_sha": ev_sha,
+            "ledger_from": prior.get("ledger_through"),
+            "ledger_through": newest.strftime("%Y-%m-%dT%H:%M:%SZ") if newest else
+            prior.get("ledger_through"), "late": late}
+
+
+def counts_by_class(excs):
+    out = {c: {"open": 0, "disposed": 0} for c in CLASSES}
+    for e in excs:
+        out[e["class"]][e["status"]] += 1
+    return out
+
+
+def load_state():
+    try:
+        return set(json.loads(state_path().read_text()))
+    except (OSError, ValueError):
+        return set()
+
+
+def cmd_check(args):
+    forge = make_forge()
+    froms = parse_from(args.frm)
+    ev_sha = refresh_evidence()
+    _, base = latest_report(report_files(evidence_dir(), spool_dir()))
+    res = run_period(forge, froms, base, ev_sha)
+    excs = res["exceptions"]
+    open_ = [e for e in excs if e["status"] == "open"]
+    for repo, s in sorted(res["repos"].items()):
+        log(f"{repo}: {s['merges']} merge(s), {s['evidenced']} fully evidenced, "
+            f"owner merges {s['owner_merges']} ({s['owner_reviewed']} with a reviewer "
+            f"approval at the head, {s['owner_self']} self-authored)")
+    for e in excs:
+        log(f"{e['status'].upper()} {e['class']} {e['check']} {e['id']}: {e['detail']}")
+    seen = load_state()
+    new = [e for e in open_ if e["id"] not in seen]
+    if new and not args.no_page:
+        by = {}
+        for e in new:
+            by[e["class"]] = by.get(e["class"], 0) + 1
+        body = ", ".join(f"{n} {c}" for c, n in sorted(by.items()))
+        if page(f"fleet-attest: {len(new)} new exception(s)", body):
+            state_path().parent.mkdir(parents=True, exist_ok=True)
+            state_path().write_text(json.dumps(sorted(seen | {e["id"] for e in new})))
+    if args.json:
+        print(json.dumps({"exceptions": excs, "repos": res["repos"]}, indent=2, sort_keys=True))
+    return 0
+
+
+# -------------------------------------------------------------------- report
+def eunomia_commit():
+    r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise ReadError("cannot read the eunomia commit")
+    return r.stdout.strip()
+
+
+def render_md(rep):
+    p = rep["period"]
+    lines = [f"# Change attestation {rep['month']}" + (f" (rerun {rep['name']})" if rep["follows"] else ""),
+             "", f"- eunomia commit: `{rep['eunomia_commit']}`",
+             f"- evidence repository SHA: `{p['evidence_through']}`"]
+    if rep["follows"]:
+        lines.append(f"- follows: `{rep['follows']}`")
+    lines += ["", "## Repositories", "",
+              "| repo | from | through | merges | fully evidenced | by merger | by source |",
+              "|---|---|---|---|---|---|---|"]
+    for repo, s in sorted(rep["repos"].items()):
+        lines.append(f"| {repo} | `{(s['from'] or '-')[:12]}` | `{(s['through'] or '-')[:12]}` | "
+                     f"{s['merges']} | {s['evidenced']} | {json.dumps(s['by_merger'], sort_keys=True)} | "
+                     f"{json.dumps(s['by_source'], sort_keys=True)} |")
+    lines += ["", "## Exceptions by class", "", "| class | open | disposed |", "|---|---|---|"]
+    for c, n in rep["exceptions_by_class"].items():
+        lines.append(f"| {c} | {n['open']} | {n['disposed']} |")
+    lines += ["", "## Exceptions", ""]
+    lines += [f"- `{e['id']}` ({e['class']}, {e['check']}, {e['status']}): {e['detail']}"
+              for e in rep["exceptions"]] or ["None."]
+    return "\n".join(lines) + "\n"
+
+
+def cmd_report(args):
+    month = args.month
+    if month == "previous":
+        t = _now()
+        y, m = (t.year - 1, 12) if t.month == 1 else (t.year, t.month - 1)
+        month = f"{y:04d}-{m:02d}"
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+        raise Refuse(f"--month wants YYYY-MM or previous, got {args.month!r}")
+    forge = make_forge()
+    froms = parse_from(args.frm)
+    ev, spool = evidence_dir(), spool_dir()
+    ev_sha = refresh_evidence()
+    files = report_files(ev, spool)
+    mine = sorted((n for n in files if _report_key(n)[0] == month), key=_report_key)
+    if mine and not args.rerun:
+        raise Refuse(f"{month} already has a report ({mine[-1]}); use --rerun")
+    if args.rerun and not mine:
+        raise Refuse(f"--rerun: {month} has no report to follow")
+    follows, base = None, None
+    if mine:
+        follows = f"reports/{mine[-1]}"
+        first = json.loads(files[mine[0]].read_text())
+        fp = first["period"]
+        base = {"period": {"through": {r: v for r, v in fp["from"].items() if v},
+                           "evidence_through": fp.get("evidence_from"),
+                           "ledger_through": fp.get("ledger_from")}}
+        n = _report_key(mine[-1])[1] + 1
+        name = f"{month}.r{n}"
+    else:
+        _, base = latest_report(files)
+        name = month
+    res = run_period(forge, froms, base, ev_sha)
+    bp = (base or {}).get("period", {})
+    rep = {
+        "schema": 1, "month": month, "name": name, "follows": follows,
+        "eunomia_commit": eunomia_commit(),
+        "period": {
+            "from": {r: s["from"] for r, s in res["repos"].items()},
+            "through": {r: s["through"] for r, s in res["repos"].items()},
+            "evidence_from": bp.get("evidence_through"),
+            "evidence_through": res["ev_sha"],
+            "ledger_from": res["ledger_from"],
+            "ledger_through": res["ledger_through"]},
+        "repos": res["repos"],
+        "records_late_or_backfill": res["late"],
+        "exceptions": res["exceptions"],
+        "exceptions_by_class": counts_by_class(res["exceptions"]),
+    }
+    out = spool / "reports"
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / f"{name}.json", "x") as f:
+        f.write(json.dumps(rep, indent=2, sort_keys=True) + "\n")
+    with open(out / f"{name}.md", "x") as f:
+        f.write(render_md(rep))
+    log(f"wrote reports/{name}.json and .md to {spool}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-attest", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check")
+    c.add_argument("--from", dest="frm", action="append", metavar="REPO=SHA")
+    c.add_argument("--no-page", action="store_true")
+    c.add_argument("--json", action="store_true")
+    r = sub.add_parser("report")
+    r.add_argument("--month", required=True)
+    r.add_argument("--from", dest="frm", action="append", metavar="REPO=SHA")
+    r.add_argument("--rerun", action="store_true")
+    args = ap.parse_args(argv)
+    try:
+        return cmd_check(args) if args.cmd == "check" else cmd_report(args)
+    except (Refuse, ReadError) as e:
+        print(f"fleet-attest: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

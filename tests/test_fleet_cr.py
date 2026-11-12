@@ -581,17 +581,20 @@ def test_next_never_claims_a_role_bearing_row(tmp_path):
     assert rec["holder"] is None, "the role row is untouched"
 
 
-def test_hyphenated_prose_is_not_an_openai_key(tmp_path):
-    """1522 #11 r4 L1: 'sk-learn-based-classifier' prose files fine; a
-    real-shaped key still refuses."""
+def test_hyphenated_long_run_after_sk_is_now_an_openai_key(tmp_path):
+    """Plan 0071 reverses 1522 #11 r4 L1 on purpose. The conf's dashless
+    openai-key let 'sk-learn-based-classifier' prose file, and let every
+    `sk-ant-` Anthropic key and hyphenated `sk-svcacct-` key through with it.
+    The conf now carries the watcher's wider shape (the union), so a 20+ char
+    hyphenated run after `sk-` refuses; short prose like 'sk-learn' still files."""
     r = _run(tmp_path, ["file", "--repo", "operator/x", "--lane", "w1",
                         "--target", "clf.py",
-                        "--intent", "swap in the sk-learn-based-classifier here"])
+                        "--intent", "swap in the sk-learn classifier here"])
     assert r.returncode == 0, r.stderr
-    r2 = _run(tmp_path, ["file", "--repo", "operator/x", "--lane", "w1",
-                         "--target", "clf.py",
-                         "--intent", "key is sk-" + "a1" * 15])
-    assert r2.returncode != 0 and "openai-key" in r2.stderr
+    for text in ("the sk-learn-based-classifier here", "key is sk-" + "a1" * 15):
+        r2 = _run(tmp_path, ["file", "--repo", "operator/x", "--lane", "w1",
+                             "--target", "clf.py", "--intent", text])
+        assert r2.returncode != 0 and "openai-key" in r2.stderr, text
 
 
 def test_cr_ids_never_recycle_after_rm(tmp_path):

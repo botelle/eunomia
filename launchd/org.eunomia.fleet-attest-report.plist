@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-attest report — monthly attestation (plans 0120, 0121). 07:30 on day 1,
+  for the previous month; the program's "previous" month value does the date arithmetic in the
+  program (plan 0120 D3), not here.
+
+  Install (opshost):
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-attest-report.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-attest-report.plist
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia (ADR-0005). The pin is a
+  detached worktree of this repo at ~/.local/share/pins/eunomia.
+
+  No ProcessType, deliberately: Background throttles a job about 4x on these
+  hosts, which is no way to treat a job with a deadline. No token is set here.
+
+  PIN PROVENANCE: ~/.local/share/pins/eunomia/bin/fleet-attest below is
+  provided by operator/eunomia (plan 0120, added in 9e1195c, merged in PR
+  #1043). The unit must not be bootstrapped until the pin contains that file:
+    test -x ~/.local/share/pins/eunomia/bin/fleet-attest   # must succeed
+  fleet-pin-advance moves the pin; confirm it before install.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-attest-report</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-attest</string>
+    <string>report</string>
+    <string>--month</string>
+    <string>previous</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>FLEET_ATTEST_SPOOL</key><string>/Users/operator/dev/.fleet/recordstore-spool</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key><integer>1</integer>
+    <key>Hour</key><integer>7</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/fleet-attest-report.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/fleet-attest-report.log</string>
+</dict>
+</plist>

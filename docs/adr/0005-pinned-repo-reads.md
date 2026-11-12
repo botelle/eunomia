@@ -140,7 +140,8 @@ and picking one is a plan.
   and most of rule 5; what it lacked on 2026-09-08 was the hooks-only
   `--settings` document, and that is a talos change this ADR obliges first.
   `fleetlib.add_worktree` needs rules 2 and 4; the orchestrator's implementer
-  spawn needs rule 3's writer half made explicit.
+  spawn needs rule 3's writer half made explicit. The writer half is
+  applied in [`docs/implementer-sandbox.md`](../implementer-sandbox.md).
 - A refusal replaces a silent wrong answer in three places: SHA absent,
   worktree not at the SHA, changed-file list unavailable. Each will sometimes
   stop a run that would have produced *something*. That is the trade.

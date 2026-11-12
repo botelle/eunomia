@@ -139,6 +139,49 @@ def test_get_pull_hits_the_pull_path():
     assert seen == {"method": "GET", "path": "/api/v1/repos/owner/repo/pulls/42"}
 
 
+def test_get_pull_by_branch_hits_the_base_head_path():
+    seen = {}
+
+    def route(method, path, body):
+        seen.update(method=method, path=path)
+        return 200, {"number": 42}
+
+    with _stub_server(route) as (_, base):
+        status, resp = _forge(base).get_pull_by_branch("owner/repo", "main", "feat/x")
+    assert (status, resp) == (200, {"number": 42})
+    # `_quote`'s own contract (safe="") percent-encodes the `/` inside `head`
+    # too — see test_get_pull_by_branch_percent_encodes_a_slash_in_the_branch_name
+    # for why that is correct against the real forge, not a bug to fix here.
+    assert seen == {"method": "GET",
+                    "path": "/api/v1/repos/owner/repo/pulls/main/feat%2Fx"}
+
+
+def test_get_pull_by_branch_percent_encodes_a_slash_in_the_branch_name():
+    """`agent/tests/<plan>/<runner>` branches (plan 0215 D3) have a `/` inside
+    the HEAD segment, not just between path components. `_quote`'s own
+    contract (`safe=""`) encodes it rather than letting it split into extra
+    segments — measured live against operator/eunomia on 2026-11-07 that
+    Forgejo's router still resolves the %2F-encoded form to the right PR."""
+    seen = {}
+
+    def route(method, path, body):
+        seen["path"] = path
+        return 200, {"number": 7}
+
+    with _stub_server(route) as (_, base):
+        status, resp = _forge(base).get_pull_by_branch(
+            "owner/repo", "main", "agent/tests/0215-x/sub-codex")
+    assert (status, resp) == (200, {"number": 7})
+    assert seen["path"] == (
+        "/api/v1/repos/owner/repo/pulls/main/"
+        "agent%2Ftests%2F0215-x%2Fsub-codex")
+
+
+def test_get_pull_by_branch_404_means_no_pr_not_unreadable():
+    with _stub_server(lambda m, p, b: (404, {"message": "not found"})) as (_, base):
+        assert _forge(base).get_pull_by_branch("o/r", "main", "feat/x") == (404, None)
+
+
 def test_list_pulls_hits_the_pulls_list_with_state_page_limit():
     seen = {}
 
@@ -334,6 +377,7 @@ def test_a_malformed_repo_never_reaches_the_network():
         forge = _forge(base)
         assert forge.get_pull("not-a-repo", 1) == (0, None)
         assert forge.get_pull("too/many/slashes", 1) == (0, None)
+        assert forge.get_pull_by_branch("not-a-repo", "main", "feat/x") == (0, None)
         assert forge.list_pulls("") == (0, None)
         assert forge.post_status("", "sha", "success", "d", "c") == (0, None)
         assert forge.create_pull("", "t", "h", "main", "b") == (0, None)
@@ -669,6 +713,8 @@ _ENUMERATED_CALL_SITES = [
     # docs/forge.md). What is left below is the ntfy notification — not a
     # forge call, same exception as the three tools above.
     ("fleet-orphans", "urllib.request.urlopen(req, timeout=5).read()"),
+    # fleet-drift (plan 0098): a service's own health URL, not a forge call.
+    ("fleet-drift", "with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:"),
 ]
 
 
@@ -779,3 +825,42 @@ def test_the_contents_verbs_refuse_a_traversal_without_calling_out():
     # and the legitimate read still goes out
     assert f.get_contents("owner/repo", "plans", ref="main")[0] == 200
     assert calls == ["/repos/owner/repo/contents/plans"]
+
+
+def test_list_tree_walks_branch_root_and_dir_trees():
+    seen = []
+
+    def route(method, path, body):
+        p, _, q = path.partition("?")
+        seen.append(p)
+        if p.endswith("/branches/main"):
+            return 200, {"name": "main", "commit": {"id": "c0"}}
+        if p.endswith("/git/trees/c0"):
+            return 200, {"tree": [{"path": "plans", "type": "tree", "sha": "t1"},
+                                  {"path": "README.md", "type": "blob", "sha": "b0"}]}
+        if p.endswith("/git/trees/t1"):
+            return 200, {"tree": [{"path": "0001-a.md", "type": "blob", "sha": "b1"}]}
+        return 404, None
+
+    with _stub_server(route) as (_, base):
+        st, body = _forge(base).list_tree("owner/repo", "plans", ref="main")
+    assert st == 200
+    assert body == [{"name": "0001-a.md", "sha": "b1", "type": "file"}]
+    assert seen == ["/api/v1/repos/owner/repo/branches/main",
+                    "/api/v1/repos/owner/repo/git/trees/c0",
+                    "/api/v1/repos/owner/repo/git/trees/t1"]
+
+
+def test_list_tree_refuses_a_truncated_tree_and_a_missing_dir():
+    def route(method, path, body):
+        p, _, _ = path.partition("?")
+        if p.endswith("/branches/main"):
+            return 200, {"commit": {"id": "c0"}}
+        return 200, {"tree": [{"path": "plans", "type": "tree", "sha": "t1"}],
+                     "truncated": p.endswith("/t1")}
+
+    with _stub_server(route) as (_, base):
+        f = _forge(base)
+        assert f.list_tree("owner/repo", "plans") == (0, None)
+        assert f.list_tree("owner/repo", "nope")[1] is None
+        assert f.list_tree("owner/repo", "../x") == (0, None)

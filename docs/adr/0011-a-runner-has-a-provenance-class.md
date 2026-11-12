@@ -8,6 +8,14 @@
   replaced by a per-repo reviewer defaulting to Fable.
 - **Amended by:** [ADR-0014](0014-a-pull-request-changes-one-kind-of-thing.md), 2026-09-25 — §2: `adr_reviewer`,
   `docs_reviewer` and `deploy_reviewer` are `us-hosted` only.
+- **Amended by:** [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22 — §2 withdrawn: any runner may hold any
+  position; a restriction by class is configuration for a named repository. §4 and the
+  first Consequence fall with it; §3's box applies only where a repository's
+  configuration sets it. §1 and §5 stand.
+- **Amended by:** [ADR-0024](0024-no-review-requires-a-named-model.md), 2026-10-21 — no
+  reviewer defaults to or requires Fable; the reviewer is configuration (the default was
+  withdrawn from ADR-0013 §3 on 2026-09-28).
+- **Amended by:** [ADR-0025](0025-a-style-only-change-may-take-a-style-review-inside-declared-paths-with-screenshots.md), 2026-10-22 — §2: `style_reviewer` is `us-hosted` only.
 - **Relates:** [ADR-0009](0009-a-lane-may-have-a-supervisor.md) §3 (a position
   names a runner, not a vendor; this adds the second runner property a position
   may be tested by), [ADR-0006](0006-blackbox-test-lanes.md) §7 (the zone
@@ -68,12 +76,20 @@ The registry carries the names. This record carries the classes.
 classes, and nothing in this record obliges a repo to use them: it says which
 seats the class may be offered, not which it is put in.
 
+*(Withdrawn by [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22. Every runner may hold every position, on every
+repository. A restriction by provenance class, if one is ever set, is configuration
+for the repositories it names. The classes in §1 stand as a record.)*
+
 **3. Both open classes run in the same box**, and it is the box
 `operator/epeius` already implements: credential kind `None`, no environment
 beyond the one variable naming its own model endpoint, no network reach but that
 endpoint, uncommitted edits handed out rather than pushed, and no pull request
 of its own. The harness opens the pull request, as agent-bus does for qwen
 today, and the gate stays with the caller.
+
+*(Amended by [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22. The box is configuration for a named
+repository: it applies where that repository sets it, and no repository sets it
+today. What the box is stands as written.)*
 
 **4. Output from an open-weights runner reaches a merge button only through a
 Fable review.** Plan 0065 already makes the reviewer positions Fable-only, so
@@ -87,6 +103,10 @@ open-weights runner out of the reviewer seats, so output from one reaches a
 merge button only through a `us-hosted` review, and that reviewer is
 necessarily from a different family than the open-weights runner.)*
 
+*(Withdrawn by [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22, with §2: an open-weights runner may review. Where
+a repository wants its output reviewed by another class, it says so in its own
+configuration.)*
+
 **5. The line between `us-open` and `cn-open` is a provenance judgment about
 the labs, and is cited as one.** Open weights cannot phone home; they are
 numbers, and §3 gives both classes an identical box. The residual risk is a
@@ -98,10 +118,11 @@ trust, and this line is revisited when the evidence about conduct changes.
 
 ## Consequences
 
-- `bin/fleet-models` refuses a class at a position §2 forbids and names this
+- *(Withdrawn by [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22.)* `bin/fleet-models` refuses a class at a position §2 forbids and names this
   record in the refusal. Tested the way plan 0065 established: on the declared
   attribute, never on a substring of the runner name.
-- `bin/orchestrator` refuses at spawn time to run an open-weights runner that
+- *(Amended by [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22: only on a repository that sets the box.)*
+  `bin/orchestrator` refuses at spawn time to run an open-weights runner that
   declares a credential, or any environment variable beyond its endpoint. A hard
   stop, not a fallback to a smaller box.
 - The box is one box, so hardening it is one change and cannot drift between the

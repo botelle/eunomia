@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-merge — mergebot merges a planned implementation PR, or its lane tests,
+  on an autonomous repository once two reviews, CI, the dependency status and
+  the plan's integration tests allow it (plan 0108, ADR-0019 §4). Once a
+  minute it reads each autonomous repository's open PRs and merges those that
+  pass every check. It touches nothing on a critical repository. See
+  docs/fleet-merge.md.
+
+  Install (opshost): set FLEET_NTFY_URL to the Fleet-ops push URL, then
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-merge.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-merge.plist
+  Verify (PROVENANCE §8.3 — see it work before trusting it): with every
+  repository still critical, `fleet-merge once` must print nothing and write
+  nothing. Only then make one repository autonomous (docs/fleet-merge.md).
+
+  The token is mergebot's, from FLEET_MERGE_TOKEN_CMD (default
+  ~/bin/fetch-forgejo-mergebot-token.sh). There is deliberately no fallback to
+  the implbot token.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia (see fleet-deps' plist for
+  why).
+
+  PIN PROVENANCE: ~/.local/share/pins/eunomia/bin/fleet-merge below is provided
+  by the operator/eunomia merge of plan 0108's PR. The unit must not be
+  bootstrapped until the pin contains that file:
+    test -x ~/.local/share/pins/eunomia/bin/fleet-merge   # must succeed
+  fleet-pin-advance moves the pin; confirm it before install.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-merge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-merge</string>
+    <string>once</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- replace with the real Fleet-ops push URL at install; empty = print-only -->
+    <key>FLEET_NTFY_URL</key><string></string>
+    <key>FLEET_FORGEJO_URL</key><string>http://forge.example:3000</string>
+  </dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/merge.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/merge.log</string>
+</dict>
+</plist>

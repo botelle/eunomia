@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""fleet-drift — a deployed service that stays behind main is named once (plan 0098).
+
+  fleet-drift [--dry-run]
+
+Reads `config/deployed.conf` and polls each service's own health URL, which
+reports whether the running code is `main`'s. It never deploys, restarts or
+rolls back: the page is the action. It never computes a verdict of its own
+either — `up_to_date` is the service's word for what it covers.
+
+Each sample is one of:
+
+  current  `up_to_date` is true
+  behind   `up_to_date` is false
+  unknown  anything else: field missing, non-200, timeout, unparseable JSON
+
+A SPELL is one continuous run of non-current samples. Only `current` ends it;
+switching between behind and unknown does not restart the clock, or one
+transient unknown in a long behind would suppress the page indefinitely.
+When a spell has lasted longer than the service's `allow` hours, ONE page is
+sent, worded by the latest state. A `current` sample that ends a paged spell
+sends one "current again" page; a spell never paged ends silently.
+
+Page reasons are a fixed vocabulary (REASONS), never a response body or an
+exception message: a health endpoint's body is the service's text, and a page
+carries it to a phone.
+
+Config (env):
+  FLEET_DEPLOYED_CONF   default config/deployed.conf
+  FLEET_SERVICES_CONF   default config/services.conf (as fleet-svc reads it)
+  FLEET_NTFY_URL / FLEET_ANGELIA_*   page channels, as bin/orchestrator's notify()
+
+State: `<fleet dir>/drift/<name>.json`.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import socket
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+# notify()/record_page() are bin/orchestrator's, as mopsus reuses them.
+orch = _load("orchestrator", BIN / "orchestrator")
+
+UNIT = "org.eunomia.fleet-drift"
+
+TIMEOUT = 5
+MAX_BODY = 65536
+DEFAULT_ALLOW = 24.0
+
+# The fixed vocabulary a page may carry as its reason (fleet-orphans's rule).
+REASONS = ("field-missing", "http-<status>", "timeout", "unreachable", "bad-json")
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}\Z")
+_SHA_RE = re.compile(r"^[0-9a-f]{1,64}\Z")
+
+_orig_record_page = orch.record_page
+
+
+def _record_page_with_unit(title, body, delivered, detail="", extra=None):
+    """notify() records its own row; this stamps the unit onto that one row
+    (plan 0058) instead of adding a second."""
+    _orig_record_page(title, body, delivered, detail,
+                      extra={**(extra or {}), "unit": UNIT})
+
+
+orch.record_page = _record_page_with_unit
+
+
+class ConfigError(Exception):
+    pass
+
+
+def _deployed_conf():
+    env = os.environ.get("FLEET_DEPLOYED_CONF")
+    return Path(env) if env else BIN.parent / "config" / "deployed.conf"
+
+
+def _services_conf():
+    env = os.environ.get("FLEET_SERVICES_CONF")
+    return Path(env) if env else BIN.parent / "config" / "services.conf"
+
+
+def _service_names():
+    try:
+        text = _services_conf().read_text()
+    except OSError as e:
+        raise ConfigError(f"cannot read services.conf ({e.__class__.__name__})")
+    names = set()
+    for raw in text.splitlines():
+        m = re.match(r"^service:\s*(\S+)", raw.strip())
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def load_conf(path=None):
+    """[{name, url, allow}] in file order; any bad line refuses the whole file."""
+    path = Path(path) if path else _deployed_conf()
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise ConfigError(f"cannot read {path.name} ({e.__class__.__name__})")
+    known = _service_names()
+    rows, seen = [], set()
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        where = f"{path.name}:{lineno}"
+        parts = line.split()
+        if len(parts) not in (2, 3):
+            raise ConfigError(f"{where}: want '<name> <url> [allow=<hours>]'")
+        name, url = parts[0], parts[1]
+        if not _NAME_RE.match(name):
+            raise ConfigError(f"{where}: malformed service name")
+        if name not in known:
+            raise ConfigError(f"{where}: {name} is not a service in services.conf")
+        if name in seen:
+            raise ConfigError(f"{where}: duplicate entry for {name}")
+        if not re.match(r"^https?://[^\s/]+", url):
+            raise ConfigError(f"{where}: {name} url must be http(s)://")
+        allow = DEFAULT_ALLOW
+        if len(parts) == 3:
+            m = re.match(r"^allow=(\S+)$", parts[2])
+            if not m:
+                raise ConfigError(f"{where}: unknown field {parts[2]!r}")
+            try:
+                allow = float(m.group(1))
+            except ValueError:
+                raise ConfigError(f"{where}: allow must be a number of hours")
+            if not (allow >= 0) or allow == float("inf"):
+                raise ConfigError(f"{where}: allow must be a finite number >= 0")
+        seen.add(name)
+        rows.append({"name": name, "url": url, "allow": allow})
+    return rows
+
+
+def sample(url):
+    """(state, reason, running_sha, main_sha). Reason is from REASONS only."""
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
+            status = resp.status
+            raw = resp.read(MAX_BODY)
+    except urllib.error.HTTPError as e:
+        return "unknown", f"http-{e.code}", None, None
+    except (socket.timeout, TimeoutError):
+        return "unknown", "timeout", None, None
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (socket.timeout, TimeoutError)):
+            return "unknown", "timeout", None, None
+        return "unknown", "unreachable", None, None
+    except Exception:
+        return "unknown", "unreachable", None, None
+    if status != 200:
+        return "unknown", f"http-{status}", None, None
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "unknown", "bad-json", None, None
+    if not isinstance(doc, dict):
+        return "unknown", "bad-json", None, None
+    up = doc.get("up_to_date")
+    if up is True:
+        return "current", "", None, None
+    running, main = (_sha(doc.get("running_sha")), _sha(doc.get("main_sha")))
+    if up is False:
+        return "behind", "", running, main
+    return "unknown", "field-missing", None, None
+
+
+def _sha(v):
+    """A hex digest or '?': the service's text is never carried into a page."""
+    return v if isinstance(v, str) and _SHA_RE.match(v) else "?"
+
+
+def _state_path(name):
+    return lib.fleet_dir() / "drift" / f"{name}.json"
+
+
+def load_state(name):
+    try:
+        d = json.loads(_state_path(name).read_text())
+        if isinstance(d, dict):
+            return d
+    except (OSError, ValueError):
+        pass
+    return {"spell_since": None, "state": "current", "reason": "", "paged": False}
+
+
+def save_state(name, st):
+    p = _state_path(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=1, sort_keys=True) + "\n")
+    os.replace(tmp, p)
+
+
+def step(entry, st, obs, now):
+    """Advance one service's state by one sample.
+
+    Returns (new_state, page) where page is (title, body) or None."""
+    state, reason, running, main = obs
+    st = dict(st)
+    page = None
+    if state == "current":
+        if st.get("paged"):
+            page = ("drift", f"{entry['name']} current again")
+        st.update(spell_since=None, paged=False)
+    else:
+        since = lib.parse_ts(st.get("spell_since"))
+        if since is None:
+            since = now
+            st["spell_since"] = lib.ts(now)
+            st["paged"] = False
+        hours = (now - since).total_seconds() / 3600
+        if not st.get("paged") and hours > entry["allow"]:
+            if state == "behind":
+                text = (f"{entry['name']} behind main for {hours:.0f}h "
+                        f"(running {running}, main {main})")
+            else:
+                text = f"{entry['name']} cannot tell for {hours:.0f}h — {reason}"
+            page = ("drift", text)
+            st["paged"] = True
+    st["state"], st["reason"] = state, reason
+    return st, page
+
+
+def run(rows, now, dry_run=False, fetch=sample):
+    counts = {"current": 0, "behind": 0, "unknown": 0}
+    paged = 0
+    for entry in rows:
+        obs = fetch(entry["url"])
+        state, reason = obs[0], obs[1]
+        counts[state] += 1
+        if dry_run:
+            print(f"fleet-drift: {entry['name']} {state}"
+                  + (f" ({reason})" if reason else ""))
+            continue
+        st, page = step(entry, load_state(entry["name"]), obs, now)
+        if page:
+            orch.notify(*page)
+            paged += 1
+        save_state(entry["name"], st)
+    print(f"fleet-drift: {len(rows)} service(s): {counts['current']} current, "
+          f"{counts['behind']} behind, {counts['unknown']} unknown, "
+          f"{paged} page(s)" + (" [dry-run]" if dry_run else ""))
+    return counts, paged
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-drift")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print each classification; page nothing, write nothing")
+    args = ap.parse_args(argv)
+    try:
+        rows = load_conf()
+    except ConfigError as e:
+        print(f"fleet-drift: {e}", file=sys.stderr)
+        return 2
+    run(rows, datetime.now(timezone.utc), dry_run=args.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

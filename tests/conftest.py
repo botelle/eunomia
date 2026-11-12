@@ -65,11 +65,45 @@ culprit, so the cost of finding it again is what this file removes.
 
 The guard REPAIRS before it fails. Leaving the leak in place would let one bad
 test cascade into every later one, and the cascade is what buries the cause.
+
+A RUN THAT NEVER ENDS (2026-09-27, eunomia#605). Two review runs of this suite
+on opshost were still going after 2 days 21 hours, looping in
+tests/test_watch_self_restart.py. Three things here made that possible, and
+opshost ended at load average 368:
+
+  - No test had a time limit. `_test_timeout` below fails any test that runs
+    longer than EUNOMIA_TEST_TIMEOUT seconds (default 300).
+  - Every `git commit` in a temp repo could start `git maintenance run --auto
+    --detach`, which reparents to launchd and outlives the test and pytest.
+    One commit every few seconds stacked up ~360 of them. The environment set
+    at import below turns auto-maintenance off for every git this suite runs.
+  - `fleet-watch resident()` installs a SIGTERM handler that only sets a flag,
+    and nothing put the old one back. From then on `kill` did nothing to the
+    pytest process; only `kill -9` stopped it. `_no_signal_leaks` restores the
+    handlers after every test. Like the environment guard, it repairs and does
+    not fail: installing that handler is resident()'s job.
 """
+import importlib.machinery
 import os
+import signal
+import sys
 import urllib.request
 
 import pytest
+
+
+def _disable_git_auto_maintenance():
+    """Append to GIT_CONFIG_COUNT rather than overwrite it, so a runner that
+    already passes config through the environment keeps it."""
+    n = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)
+    for key, value in (("maintenance.auto", "false"), ("gc.auto", "0")):
+        os.environ[f"GIT_CONFIG_KEY_{n}"] = key
+        os.environ[f"GIT_CONFIG_VALUE_{n}"] = value
+        n += 1
+    os.environ["GIT_CONFIG_COUNT"] = str(n)
+
+
+_disable_git_auto_maintenance()
 
 # Add a (module, attribute) pair here when a test is caught leaking one.
 _GLOBALS = (
@@ -117,3 +151,104 @@ def _no_env_leaks():
     for key, value in before.items():
         if os.environ.get(key) != value:
             os.environ[key] = value               # changed or deleted by it
+
+
+@pytest.fixture(autouse=True)
+def _no_reviewer_roots(tmp_path_factory, monkeypatch):
+    """Point plan 0092's reviewer-published paths at nothing, so no test reads (or
+    pages on) the real /Users/Shared/dispatch-review of the host running the suite.
+    A test that wants a root sets the variable itself."""
+    nowhere = tmp_path_factory.mktemp("no-reviewer")
+    monkeypatch.setenv("FLEET_REVIEWER_TRANSCRIPTS", str(nowhere / "transcripts"))
+    monkeypatch.setenv("FLEET_REVIEWER_GUARD_LOG", str(nowhere / "secret-guard.log"))
+
+
+@pytest.fixture(autouse=True)
+def _no_host_review_path():
+    """Keep fleet-watch's review-path probe (plan 0095) off the host's real
+    talos contract and eunomia pin. On opshost both exist, and a test that spawns
+    would be held by whatever state the live pin is in. A test of the probe sets
+    these itself."""
+    os.environ["FLEET_REVIEW_CONTRACT"] = "/nonexistent/eunomia-calls.json"
+    os.environ["FLEET_REVIEW_PINS"] = "/nonexistent/pins/bin"
+
+
+@pytest.fixture(autouse=True)
+def _config_stand_ins(_no_process_global_leaks, tmp_path_factory, monkeypatch):
+    """Plan 0132: the orchestrator reads the configured reviewers and the review
+    bar from `fleet-models` / `fleet-config`, and a test fleet database lists none
+    (`fleet-models reviewers` exits 3). Point it at one reviewer and bar `high`;
+    a test of the config reads sets its own.
+
+    It names `_no_process_global_leaks` first so that fixture is set up before
+    `monkeypatch` and torn down after it; otherwise an autouse fixture sorting
+    ahead of the guard pulls `monkeypatch` in first, the guard checks before
+    monkeypatch undoes, and every test that patches urlopen reads as a leak."""
+    d = tmp_path_factory.mktemp("cfgbin")
+    (d / "fleet-models").write_text(
+        '#!/bin/sh\necho \'[{"ordinal": 1, "runner": "r", "model": "m"}]\'\n')
+    (d / "fleet-config").write_text(
+        '#!/bin/sh\necho \'{"key": "review_bar", "value": "high"}\'\n')
+    for f in d.iterdir():
+        f.chmod(0o755)
+    monkeypatch.setenv("FLEET_CONFIG_BIN", str(d))
+
+
+@pytest.fixture(autouse=True)
+def _watch_repos_conf_stand_in(tmp_path_factory):
+    """Plan 0134: keep fleet-watch off the real config/repos.conf; see
+    tests/fakes/repos_conf_shim.py. FLEET_WATCH_REPOS is read by the harness,
+    not by fleet-watch."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "fakes"))
+    try:
+        import repos_conf_shim
+    except ImportError:         # a copy of this file in a scratch dir (test_env_isolation)
+        yield
+        return
+    finally:
+        sys.path.pop(0)
+    original = repos_conf_shim.install(tmp_path_factory.mktemp("repos-conf"))
+    try:
+        yield
+    finally:
+        importlib.machinery.SourceFileLoader.exec_module = original
+
+
+_SIGNALS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGINT", "SIGHUP")
+                 if hasattr(signal, name))
+
+
+@pytest.fixture(autouse=True)
+def _no_signal_leaks():
+    """Put back any signal handler a test replaced. See A RUN THAT NEVER ENDS
+    above: a leaked handler is how `kill` stopped working on a runaway run."""
+    before = {sig: signal.getsignal(sig) for sig in _SIGNALS}
+    yield
+    for sig, handler in before.items():
+        if signal.getsignal(sig) is not handler:
+            signal.signal(sig, handler)
+
+
+@pytest.fixture(autouse=True)
+def _test_timeout(request):
+    """Fail a test that runs longer than EUNOMIA_TEST_TIMEOUT seconds (default
+    300; 0 turns it off). SIGALRM, not pytest-timeout: the suite runs under
+    whatever python the host has (CI's venv, a review's Xcode 3.9), and this
+    needs nothing installed. `pytest.fail` raises a BaseException, so it gets
+    past `except Exception` handlers inside the code under test."""
+    seconds = int(os.environ.get("EUNOMIA_TEST_TIMEOUT", "300") or 0)
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _expired(_signum, _frame):
+        pytest.fail(f"{request.node.nodeid} ran longer than {seconds}s "
+                    "(EUNOMIA_TEST_TIMEOUT)", pytrace=True)
+
+    previous = signal.signal(signal.SIGALRM, _expired)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)

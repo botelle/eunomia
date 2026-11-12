@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-git-master: keep one ssh ControlMaster to the Forgejo git host up on opshost.
+
+  fleet-deploy fetches only over a master that is ALREADY up (its _fetch runs
+  `ssh -O check forge.example` and never dials a fresh connection), so with no
+  master every cycle ends "unfetchable" and nothing deploys. This job is the
+  thing that keeps one up.
+
+  Every 60 s: if `ssh -O check` finds the master, exit (a mux check opens no TCP
+  connection, so this is not the 90k-TIME_WAIT polling shape). Otherwise dial
+  once with no command: Forgejo prints its "no shell access" banner and closes
+  the session, and ControlPersist leaves the master running in the background.
+
+  REQUIRES this block in ~/.ssh/config, above `Host *`:
+    Host forge.example
+        Port 3022
+        User operator
+        ControlMaster auto
+        ControlPath ~/.ssh/cm/%C
+        ControlPersist yes
+        ServerAliveInterval 30
+        ServerAliveCountMax 4
+  Port has to be pinned there: fleet-deploy's check passes no port, and the
+  ControlPath hash covers the port, so without it the check and the fetch look
+  for two different sockets. (`mkdir -m 700 ~/.ssh/cm` once.)
+
+  Not `ssh -M -N`: an -N master refuses mux session requests ("Master refused
+  session request: Permission denied", measured with OpenSSH 10.3 on opshost), and
+  git then silently dials its own connection.
+
+  AbandonProcessGroup: the persisted master is a background child of the dial.
+  Without this key launchd kills the job's process group when the shell exits,
+  and the master dies with it.
+
+  Install (opshost):
+    cp launchd/org.eunomia.fleet-git-master.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-git-master.plist
+  Verify: `ssh -O check forge.example` says "Master running".
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-git-master</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>/usr/bin/ssh -o BatchMode=yes -O check forge.example 2>/dev/null &amp;&amp; exit 0; /usr/bin/ssh -o BatchMode=yes -T forge.example &lt;/dev/null &gt;/dev/null 2>&amp;1; /usr/bin/ssh -o BatchMode=yes -O check forge.example</string>
+  </array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/git-master.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/git-master.log</string>
+</dict>
+</plist>

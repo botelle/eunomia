@@ -1,0 +1,898 @@
+#!/usr/bin/env python3
+"""fleet-quota — the gates on the subscriptions' usage limits (plan 0094).
+
+  fleet-quota observe            read UsageBar's latest.json; close/open gates
+  fleet-quota close SCOPE --resets-at ISO|- --by stop --evidence ID [--at ISO]
+  fleet-quota open SCOPE --by owner|probe [--for HOURS]  (probe: not for review-path:*;
+                 --for: review-path owner override window, default 24, 1-168)
+  fleet-quota probe-review-path REPO   exit 0 fine, 75 broken, 1 cannot judge
+  fleet-quota check [--scope S]  exit 0 open, 75 closed, 1 unknown
+  fleet-quota status --json
+
+One row per scope in `quota_gate` (fleet.db): `session`, `weekly` (the CLAUDE
+account's meter only), `vendor:<account>` (`vendor:codex`, `vendor:gemini`,
+`vendor:muse`: closed when any of that account's quotas reads 100), and
+`model:<bucket>` (today `model:fable`), and `credential` (plan 0116: closed by
+mopsus when an implementer's credential is rejected, opened only by the owner),
+and `credential:<principal>` (plan 0125: the same, for a venture's own credential,
+holding only that principal's repositories). This file is the gate's ONLY writer;
+every transition also lands in `quota_transition` and is emitted as
+`quota-closed` / `quota-opened`. `session` and `weekly` transitions page once. `review-path:<repo>` (plan 0095)
+is closed and opened only by `probe-review-path`, or by the owner.
+
+What may move a gate (docs/quota-gate.md):
+  close  a fresh meter at >= 100, or a recorded stop (an implementer's 429, a
+         review_attempt quota row). Text and `resetsAt` may close: that is the
+         safe direction, it holds work.
+  open   a fresh meter below 100 taken AFTER the close, a probe the model
+         answers, or the owner. Never text, never the clock: `resetsAt` was
+         wrong by two days on 2026-09-27.
+
+A stale, missing or unparseable meter changes nothing. Freshness is the
+snapshot's own `dataAsOf`, never `generatedAt` and never the file's mtime.
+
+Exit 75 from `check` is EX_TEMPFAIL: a one-off script should stop there and
+not start another run.
+
+Config (env):
+  FLEET_REVIEW_CONTRACT the deployed dispatcher's call contract (default
+                        ~/agent/contracts/eunomia-calls.json)
+  FLEET_REVIEW_PINS     the pinned eunomia bin/ (default
+                        ~/.local/share/pins/eunomia/bin)
+  EUNOMIA_FLEET_DIR     fleet tree root (fleet.db, events.jsonl)
+  FLEET_QUOTA_LATEST    UsageBar's latest.json (default
+                        ~/Library/Application Support/UsageBar/latest.json)
+  FLEET_QUOTA_ACCOUNT   the `accounts.<label>` that feeds session/weekly/model
+                        gates (default: `claude`); the vendor accounts feed
+                        their own `vendor:<account>` gate either way
+"""
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+
+EX_CLOSED = 75
+EX_UNKNOWN = 1
+
+# The scopes that hold dispatch. A `model:*` gate never does (plan 0094 §3).
+#
+# `credential` (plan 0116) is not a meter reading: mopsus closes it when an
+# implementer's credential is rejected, and only the owner opens it, after a
+# re-mint. The meter's scopes are the first two; nothing the meter says can
+# touch `credential`.
+HOLDING_SCOPES = ("session", "weekly", "credential")
+METER_SCOPES = ("session", "weekly")
+# The other vendors' subscriptions, each metered by its own UsageBar account and
+# gated by its own `vendor:<account>` scope. Like `credential:<principal>`, these
+# are NOT in HOLDING_SCOPES: nothing holds the whole fleet any more. A repo is
+# held behind the gates of the accounts its seats spend (`closed_vendor_gates`).
+CLAUDE_ACCOUNT = "claude"
+VENDOR_ACCOUNTS = ("codex", "gemini", "muse")
+VENDOR_PREFIX = "vendor:"
+# A vendor quota that is ONE model's own limit, by account and the key's first
+# hyphen token -> the gate account it closes instead of the vendor's. gemini's
+# `argon-weekly` limits gemini-4-argon-high alone; folded into `vendor:gemini`
+# it held every gemini seat, gemini-3.8-flash-high included, while flash's own
+# quota read 0% (2026-11-06). Only seats on that model spend it
+# (bin/orchestrator `_MODEL_ACCOUNT`).
+MODEL_LIMITS = {"gemini": {"argon": "gemini-argon"}}
+MODEL_LIMIT_ACCOUNTS = tuple(a for m in MODEL_LIMITS.values() for a in m.values())
+# plan 0125: one venture's rejected credential. Deliberately NOT in HOLDING_SCOPES,
+# which hold the whole fleet: `held()` reads these only for the principal asked
+# about, so a venture's dead token never stops the operator's repositories.
+CREDENTIAL_PREFIX = "credential:"
+# plan 0095: a repo whose review dispatcher cannot run its pinned prerequisites.
+REVIEW_PATH_PREFIX = "review-path:"
+EX_CANNOT_JUDGE = 1
+PROBE_CALL_TIMEOUT = 60
+# UsageBar quota keys that are a model's own limit. A model whose family has no
+# key here maps to no model scope.
+MODEL_BUCKETS = ("fable",)
+FRESH = datetime.timedelta(minutes=30)
+# A snapshot dated in the future is a clock fault, not a fresh reading.
+FUTURE_SLACK = datetime.timedelta(minutes=5)
+
+# Overridable page sender: callers that already hold bin/orchestrator's
+# notify() (mopsus, fleet-watch) set this so every page goes through the one
+# they already patch and log; otherwise it is loaded on first use.
+NOTIFY = None
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS quota_gate (
+  scope TEXT PRIMARY KEY, state TEXT NOT NULL, closed_at TEXT, resets_at TEXT,
+  closed_by TEXT, evidence TEXT, opened_at TEXT, opened_by TEXT);
+CREATE TABLE IF NOT EXISTS quota_transition (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL,
+  to_state TEXT NOT NULL, at TEXT NOT NULL, by TEXT NOT NULL, evidence TEXT,
+  evidence_at TEXT, resets_at TEXT, percent REAL);
+"""
+
+
+def db_path():
+    return lib.fleet_dir() / "fleet.db"
+
+
+def _connect(create=True, db=None):
+    path = Path(db) if db else db_path()
+    if not create and not path.exists():
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(path), timeout=30, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    con.executescript(SCHEMA)
+    return con
+
+
+def credential_scope(principal):
+    """`credential` for the operator, `credential:<principal>` for anyone else."""
+    return "credential" if principal in (None, "", "operator") else CREDENTIAL_PREFIX + principal
+
+
+def is_principal_credential(scope):
+    return (isinstance(scope, str) and scope.startswith(CREDENTIAL_PREFIX)
+            and len(scope) > len(CREDENTIAL_PREFIX))
+
+
+def vendor_scope(account):
+    return VENDOR_PREFIX + account
+
+
+def is_vendor_scope(scope):
+    return isinstance(scope, str) and scope in map(
+        vendor_scope, VENDOR_ACCOUNTS + MODEL_LIMIT_ACCOUNTS)
+
+
+def valid_scope(scope):
+    return scope in HOLDING_SCOPES or is_principal_credential(scope) or (
+        is_vendor_scope(scope)) or (
+        isinstance(scope, str) and (
+            (scope.startswith("model:") and len(scope) > 6)
+            or (scope.startswith(REVIEW_PATH_PREFIX) and len(scope) > len(REVIEW_PATH_PREFIX))))
+
+
+def review_path_scope(repo):
+    return REVIEW_PATH_PREFIX + repo
+
+
+def is_review_path(scope):
+    return isinstance(scope, str) and scope.startswith(REVIEW_PATH_PREFIX)
+
+
+def model_scope(model):
+    """`model:<bucket>` for a model id, or None. The family token is the second
+    hyphen-separated segment of `claude-<family>-...`."""
+    parts = (model or "").split("-")
+    if len(parts) >= 2 and parts[0] == "claude" and parts[1] in MODEL_BUCKETS:
+        return f"model:{parts[1]}"
+    return None
+
+
+# --- time ---------------------------------------------------------------------
+
+
+def parse_iso(value):
+    """A tz-aware UTC datetime from an ISO-8601 string, or None. Python 3.9's
+    fromisoformat takes neither `Z` nor a fractional part of any length."""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    s = re.sub(r"(\.\d{1,6})\d*", r"\1", s)
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+_RESETS_RE = re.compile(
+    r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([A-Za-z0-9_+\-/]+)\)", re.I)
+
+
+def scope_of_reason(reason):
+    """`weekly` when the failure reason names a weekly limit, else `session`."""
+    return "weekly" if re.search(r"\bweekly\b", reason or "", re.I) else "session"
+
+
+def resolve_reset(reason, after):
+    """The first occurrence of the reason's `resets <time> (<zone>)` strictly
+    after `after` (a datetime, or ts string), as a ts string; None when the
+    reason names no parseable time. The CLI states a time of day, not a date:
+    reading it against today instead of the failure's own instant puts a
+    23:30Z failure's `3:10am` (America/New_York) a day in the past."""
+    m = _RESETS_RE.search(reason or "")
+    after = parse_iso(after) if isinstance(after, str) else after
+    if not m or after is None:
+        return None
+    hour, minute, ampm, zone = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower(), m.group(4)
+    if not 1 <= hour <= 12 or minute > 59:
+        return None
+    hour = hour % 12 + (12 if ampm == "pm" else 0)
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(zone)
+    except Exception:
+        return None
+    local = after.astimezone(tz)
+    for days in (0, 1, 2):
+        day = local.date() + datetime.timedelta(days=days)
+        cand = datetime.datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz)
+        cand_utc = cand.astimezone(datetime.timezone.utc)
+        if cand_utc > after:
+            return lib.ts(cand_utc)
+    return None
+
+
+# --- events and pages ---------------------------------------------------------
+
+
+def _notify(title, body):
+    global NOTIFY
+    if NOTIFY is None:
+        NOTIFY = _load("orchestrator", BIN / "orchestrator").notify
+    try:
+        NOTIFY(title, body)
+    except Exception as e:                       # a page must never undo a gate
+        sys.stderr.write(f"fleet-quota: page failed ({e.__class__.__name__})\n")
+
+
+def _emit(kind, scope, by, evidence, resets_at, percent):
+    detail = {"scope": scope, "by": by, "evidence": evidence, "resets_at": resets_at}
+    if percent is not None:
+        detail["percent"] = percent
+    env = dict(os.environ)
+    env.setdefault("EUNOMIA_SESSION", "fleet-quota")
+    r = subprocess.run([sys.executable, str(BIN / "fleet-emit"), kind,
+                        "--detail-json", json.dumps(detail)],
+                       capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        sys.stderr.write(f"fleet-quota: {kind} not recorded: {(r.stderr or '').strip()}\n")
+
+
+def _announce(kind, scope, by, evidence, resets_at, percent):
+    _emit(kind, scope, by, evidence, resets_at, percent)
+    if is_principal_credential(scope):
+        who = scope[len(CREDENTIAL_PREFIX):]
+        if kind == "quota-closed":
+            _notify("fleet credential", f"{who} held: its implementer credential was "
+                    f"rejected — re-mint it, then `fleet-quota open {scope} --by owner`")
+        else:
+            _notify("fleet credential", f"{who} released: credential reopened ({by})")
+        return
+    if is_vendor_scope(scope):
+        who = scope[len(VENDOR_PREFIX):]
+        if kind == "quota-closed":
+            _notify("fleet quota", f"{who} seats held: {scope} limit, until "
+                    f"{resets_at or 'unknown'}")
+        else:
+            _notify("fleet quota", f"{who} seats released: {scope} reset ({by})")
+        return
+    if scope not in HOLDING_SCOPES:
+        return
+    if scope == "credential":
+        if kind == "quota-closed":
+            _notify("fleet credential", "fleet held: the implementer credential was "
+                    "rejected — re-mint it, then `fleet-quota open credential --by owner`")
+        else:
+            _notify("fleet credential", f"fleet released: credential reopened ({by})")
+        return
+    if kind == "quota-closed":
+        _notify("fleet quota", f"fleet held: {scope} limit, until {resets_at or 'unknown'}")
+    else:
+        _notify("fleet quota", f"fleet released: {scope} reset ({by})")
+
+
+# --- the two writes -----------------------------------------------------------
+
+
+def _row(con, scope):
+    return con.execute("SELECT * FROM quota_gate WHERE scope=?", (scope,)).fetchone()
+
+
+def close(scope, resets_at, by, evidence, at=None, percent=None, db=None):
+    """Close `scope`. True when the state changed, else False (and nothing is
+    emitted or paged). One stop closes once: a scope already closed, evidence
+    that already closed it, or evidence dated at or before the scope's last
+    open all change nothing — a stop that happened before a reset cannot undo
+    it."""
+    if not valid_scope(scope):
+        raise ValueError(f"unknown scope {scope!r}")
+    if by not in ("meter", "stop", "probe"):
+        raise ValueError(f"unknown closer {by!r}")
+    if by == "probe" and not is_review_path(scope):
+        raise ValueError("only a review-path scope is closed by a probe")
+    if is_review_path(scope) and by != "probe":
+        raise ValueError("a review-path scope is closed only by probe-review-path")
+    at_dt = parse_iso(at) if isinstance(at, str) else (at or lib.now_utc())
+    if at_dt is None:
+        at_dt = lib.now_utc()
+    resets_at = lib.ts(parse_iso(resets_at)) if parse_iso(resets_at) else None
+    con = _connect(db=db)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = _row(con, scope)
+        if row is not None and row["state"] == "closed":
+            con.execute("ROLLBACK")
+            return False
+        if row is not None and row["opened_at"]:
+            opened = lib.parse_ts(row["opened_at"])
+            if opened is not None and at_dt <= opened:
+                con.execute("ROLLBACK")
+                return False
+        if evidence and evidence != "meter" and con.execute(
+                "SELECT 1 FROM quota_transition WHERE scope=? AND to_state='closed' "
+                "AND evidence=?", (scope, evidence)).fetchone():
+            con.execute("ROLLBACK")
+            return False
+        now = lib.ts(lib.now_utc())
+        closed_at = lib.ts(at_dt)
+        con.execute(
+            "INSERT INTO quota_gate (scope, state, closed_at, resets_at, closed_by, "
+            "evidence, opened_at, opened_by) VALUES (?,?,?,?,?,?,NULL,NULL) "
+            "ON CONFLICT(scope) DO UPDATE SET state='closed', closed_at=excluded.closed_at, "
+            "resets_at=excluded.resets_at, closed_by=excluded.closed_by, "
+            "evidence=excluded.evidence",
+            (scope, "closed", closed_at, resets_at, by, evidence))
+        con.execute(
+            "INSERT INTO quota_transition (scope, to_state, at, by, evidence, "
+            "evidence_at, resets_at, percent) VALUES (?,?,?,?,?,?,?,?)",
+            (scope, "closed", now, by, evidence, closed_at, resets_at, percent))
+        con.execute("COMMIT")
+    finally:
+        con.close()
+    _announce("quota-closed", scope, by, evidence, resets_at, percent)
+    return True
+
+
+def open_gate(scope, by, observed_at=None, percent=None, db=None,
+              review_path_probe=False):
+    """Open `scope`. True when the state changed. `observed_at` (a meter's
+    `dataAsOf`) must be later than the close: a reading taken before a stop
+    says nothing about that stop. A `review-path:*` scope opens `by probe` only
+    for `run_review_path_probe` (`review_path_probe=True`): a usage-limit probe
+    answers whether a model responds, not whether the review path works."""
+    if not valid_scope(scope):
+        raise ValueError(f"unknown scope {scope!r}")
+    if by not in ("meter", "probe", "owner"):
+        raise ValueError(f"unknown opener {by!r}")
+    if is_review_path(scope) and by == "meter":
+        raise ValueError("a meter cannot open a review-path scope")
+    if is_review_path(scope) and by == "probe" and not review_path_probe:
+        raise ValueError("a review-path scope opens by probe only from probe-review-path")
+    con = _connect(db=db)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = _row(con, scope)
+        if row is None or row["state"] != "closed":
+            con.execute("ROLLBACK")
+            return False
+        if observed_at is not None:
+            closed = lib.parse_ts(row["closed_at"])
+            if closed is not None and observed_at <= closed:
+                con.execute("ROLLBACK")
+                return False
+        now = lib.ts(lib.now_utc())
+        con.execute("UPDATE quota_gate SET state='open', opened_at=?, opened_by=? "
+                    "WHERE scope=?", (now, by, scope))
+        con.execute(
+            "INSERT INTO quota_transition (scope, to_state, at, by, evidence, "
+            "evidence_at, resets_at, percent) VALUES (?,?,?,?,?,?,?,?)",
+            (scope, "open", now, by, row["evidence"], now, row["resets_at"], percent))
+        con.execute("COMMIT")
+        evidence, resets_at = row["evidence"], row["resets_at"]
+    finally:
+        con.close()
+    _announce("quota-opened", scope, by, evidence, resets_at, percent)
+    return True
+
+
+# --- reads --------------------------------------------------------------------
+
+
+def gates(db=None):
+    """[dict, ...] — every recorded gate. A missing database reads as none."""
+    con = _connect(create=False, db=db)
+    if con is None:
+        return []
+    try:
+        return [dict(r) for r in con.execute("SELECT * FROM quota_gate ORDER BY scope")]
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def gate(scope, db=None):
+    return next((g for g in gates(db) if g["scope"] == scope), None)
+
+
+def closed_gates(db=None):
+    return [g for g in gates(db) if g["state"] == "closed"]
+
+
+def held(db=None, principal=None):
+    """(scope, resets_at) of the first closed dispatch-holding gate, or None.
+
+    With `principal` (plan 0125) a closed `credential:<principal>` gate holds too,
+    for that principal's repositories only. Without it, or for the operator, the
+    answer is the fleet-wide one: a venture's gate never appears there."""
+    own = credential_scope(principal)
+    for g in gates(db):
+        if g["state"] != "closed":
+            continue
+        if g["scope"] in HOLDING_SCOPES or (own != "credential" and g["scope"] == own):
+            return g["scope"], g["resets_at"]
+    return None
+
+
+def closed_vendor_gates(db=None):
+    """{account: (scope, resets_at)} for every subscription account with a closed
+    gate. `claude` is present when `session`, `weekly` or `credential` is closed
+    (the answer `held()` gives); the others when their `vendor:*` gate is. A repo
+    is held behind the accounts its seats spend, no others."""
+    out = {}
+    h = held(db)
+    if h:
+        out[CLAUDE_ACCOUNT] = h
+    for g in closed_gates(db):
+        if is_vendor_scope(g["scope"]):
+            out[g["scope"][len(VENDOR_PREFIX):]] = (g["scope"], g["resets_at"])
+    return out
+
+
+def held_note(h):
+    """`h` is (scope, resets_at) or, from fleet-watch, (scope, resets_at, seat):
+    the seat that spends the closed gate, so the owner knows which one to move."""
+    seat = f" (seat {h[2]})" if len(h) > 2 and h[2] else ""
+    return f"held: {h[0]} closed until {h[1] or 'unknown'}{seat}"
+
+
+def check(scope=None, db=None):
+    """(exit code, line). Without a scope, the dispatch-holding pair."""
+    scopes = [scope] if scope else list(HOLDING_SCOPES)
+    known = {g["scope"]: g for g in gates(db)}
+    for s in scopes:
+        g = known.get(s)
+        if g and g["state"] == "closed":
+            return EX_CLOSED, f"closed {s} until {g['resets_at'] or 'unknown'}"
+    if any(s in known for s in scopes):
+        return 0, "open " + ",".join(s for s in scopes if s in known)
+    return EX_UNKNOWN, "unknown " + ",".join(scopes)
+
+
+# --- observe ------------------------------------------------------------------
+
+
+def latest_path():
+    env = os.environ.get("FLEET_QUOTA_LATEST")
+    if env:
+        return Path(env)
+    return Path.home() / "Library" / "Application Support" / "UsageBar" / "latest.json"
+
+
+def _vendor_reading(quotas):
+    """(percent, resets_at ts|None) for one vendor account: its highest quota's
+    percent and, at 100, the latest `resetsAt` among the quotas at 100 (the gate
+    can open only when all of them have cleared). None with no usable quota.
+
+    A `3p-*` quota (gemini's allowance for third-party models inside
+    antigravity) is skipped: no runner spends it, so its limit must not hold
+    the seats that run gemini-4-argon-high."""
+    rows = []
+    for key, q in quotas.items():
+        if key.startswith("3p-"):
+            continue
+        pct = q.get("percent") if isinstance(q, dict) else None
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        rows.append((float(pct), parse_iso(q.get("resetsAt"))))
+    if not rows:
+        return None
+    top = max(p for p, _ in rows)
+    pool = [r for p, r in rows if r is not None and (p >= 100 if top >= 100 else p == top)]
+    reset = max(pool) if pool else None
+    return top, (lib.ts(reset) if reset else None)
+
+
+def read_snapshot(now=None, path=None):
+    """{scope: (percent, resets_at ts|None, observed_at datetime)} from a FRESH
+    snapshot, or {} when nothing in it is fresh and well-formed.
+
+    `session`, `weekly` and `model:*` read the Claude account alone; each other
+    vendor's account is one `vendor:<account>` scope. Four subscriptions, four
+    meters: codex at 100% must not close a Claude gate.
+
+    Each scope carries ITS OWN account's `dataAsOf`, never a snapshot-wide
+    minimum (plan 0184 D3): `observe` applies a transition at the reading that
+    made it, so a vendor account's older or newer snapshot can never block —
+    or wrongly allow — another account's. Four subscriptions, four windows."""
+    now = now or lib.now_utc()
+    try:
+        data = json.loads(Path(path or latest_path()).read_text())
+    except (OSError, ValueError):
+        return {}
+    accounts = data.get("accounts") if isinstance(data, dict) else None
+    if not isinstance(accounts, dict):
+        return {}
+    only = os.environ.get("FLEET_QUOTA_ACCOUNT", "").strip() or CLAUDE_ACCOUNT
+    scopes = {}
+    for label, acct in accounts.items():
+        if label != only and label not in VENDOR_ACCOUNTS:
+            continue
+        if not isinstance(acct, dict) or not isinstance(acct.get("quotas"), dict):
+            continue
+        seen = parse_iso(acct.get("dataAsOf") or data.get("dataAsOf"))
+        if seen is None or now - seen >= FRESH or seen - now > FUTURE_SLACK:
+            continue
+        if label != only:
+            # a vendor account is one gate: closed when ANY of its quotas
+            # (session, weekly, a model's own weekly...) reads 100
+            # ...except a model's own limit (MODEL_LIMITS), which is its own gate
+            own = MODEL_LIMITS.get(label, {})
+            split = {}
+            for key, q in acct["quotas"].items():
+                split.setdefault(own.get(key.split("-", 1)[0], label), {})[key] = q
+            for gate_acct, quotas in split.items():
+                read = _vendor_reading(quotas)
+                if read is not None:
+                    pct, resets_at = read
+                    scopes[vendor_scope(gate_acct)] = (pct, resets_at, seen)
+            continue
+        for key, q in acct["quotas"].items():
+            scope = key if key in METER_SCOPES else (
+                f"model:{key}" if key in MODEL_BUCKETS else None)
+            pct = q.get("percent") if isinstance(q, dict) else None
+            if scope is None or isinstance(pct, bool) or not isinstance(pct, (int, float)):
+                continue
+            reset = parse_iso(q.get("resetsAt"))
+            cur = scopes.get(scope)
+            if cur is None or pct > cur[0]:
+                scopes[scope] = (float(pct), lib.ts(reset) if reset else None, seen)
+    return scopes
+
+
+def observe(now=None, path=None, db=None):
+    """Apply one snapshot. Returns [(scope, 'closed'|'open'), ...] for the
+    transitions it made — empty for a stale, missing or unparseable meter.
+
+    Each scope is applied at the account's OWN reading time (`read_snapshot`),
+    never a fleet-wide one: an account's quota window is independent of every
+    other's, and a transition dated from a different account's snapshot is
+    evidence about a stop or a reset that account never had (plan 0184 D3)."""
+    scopes = read_snapshot(now, path)
+    if not scopes:
+        return []
+    made = []
+    known = {g["scope"]: g for g in gates(db)}
+    for scope, (pct, resets_at, seen) in sorted(scopes.items()):
+        if pct >= 100:
+            if close(scope, resets_at, "meter", "meter", at=seen, percent=pct, db=db):
+                made.append((scope, "closed"))
+        else:
+            g = known.get(scope)
+            if g and g["state"] == "closed" and open_gate(
+                    scope, "meter", observed_at=seen, percent=pct, db=db):
+                made.append((scope, "open"))
+    return made
+
+
+# --- the review-path probe (plan 0095) ------------------------------------------
+
+_RULES = ("json-list-first-ordinal-1", "json-object-value-in")
+
+# The contract read below is operator/talos's `contracts/eunomia-calls.json`
+# (v1, talos plan 0016, commit d045409; v2 adds fleet-credits calls, talos plan
+# 0029, commit 2ddb17e), deployed on opshost as
+# ~/agent/contracts/eunomia-calls.json. It is the review dispatcher's own list
+# of the pinned eunomia programs it execs, with each call's argv template,
+# positions and accept rule. Do not restate those calls here; evidence for the
+# shape is in docs/quota-gate.md and tests/test_review_path_gate.py.
+
+
+def contract_path():
+    env = os.environ.get("FLEET_REVIEW_CONTRACT")
+    return Path(env) if env else Path.home() / "agent" / "contracts" / "eunomia-calls.json"
+
+
+def pin_bin():
+    env = os.environ.get("FLEET_REVIEW_PINS")
+    return Path(env) if env else Path.home() / ".local" / "share" / "pins" / "eunomia" / "bin"
+
+
+def review_path_deployed():
+    """True when this host carries any of what the probe reads. A host with
+    neither the contract nor the pin (a CI runner, the broker host) runs no
+    dispatcher, so a probe there has nothing to judge and nothing to page."""
+    return contract_path().exists() or pin_bin().is_dir()
+
+
+def _load_contract(path):
+    """(calls, None), or (None, reason) when the probe cannot judge."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        return None, f"contract {path} unreadable ({e.__class__.__name__})"
+    v = data.get("v") if isinstance(data, dict) else None
+    if not (isinstance(v, int) and not isinstance(v, bool) and v >= 1):
+        return None, f"contract v is {v!r}, not an integer >= 1"
+    calls = data.get("calls")
+    if not isinstance(calls, list) or not calls:
+        return None, "contract has no calls"
+    for c in calls:
+        if not (isinstance(c, dict) and isinstance(c.get("id"), str)
+                and isinstance(c.get("program"), str) and c["program"]
+                and "/" not in c["program"]
+                and isinstance(c.get("argv"), list)
+                and all(isinstance(a, str) for a in c["argv"])):
+            return None, f"contract entry malformed: {str(c)[:80]}"
+        if _rule(c) not in _RULES:
+            # A call this probe has no rule for (talos v2, commit 2ddb17e, plan
+            # 0029: fleet-credits decide and record). It is checked for shape
+            # and later for an executable program, and never run: `record`
+            # books spend, and the probe never changes the host.
+            continue
+        pos = c.get("positions")
+        if pos is not None and not (isinstance(pos, list) and pos
+                                    and all(isinstance(p, str) for p in pos)):
+            return None, f"contract entry {c['id']} has bad positions"
+        if pos is None and any("{position}" in a for a in c["argv"]):
+            return None, f"contract entry {c['id']} uses {{position}} with no positions"
+        if pos is not None and not any("{position}" in a for a in c["argv"]):
+            return None, f"contract entry {c['id']} has positions but no {{position}} in argv"
+        if _rule(c) == "json-object-value-in" and not isinstance(c["accept"].get("values"), list):
+            return None, f"contract entry {c['id']} has no values"
+    if not any(_rule(c) in _RULES for c in calls):
+        return None, "contract has no call this probe has a rule for"
+    return calls, None
+
+
+def _rule(call):
+    """The call's accept rule, or None when `accept` is absent or not a dict."""
+    accept = call.get("accept")
+    return accept.get("rule") if isinstance(accept, dict) else None
+
+
+def _accepts(call, stdout):
+    accept = call["accept"]
+    try:
+        data = json.loads(stdout)
+    except ValueError:
+        return False
+    if accept["rule"] == "json-list-first-ordinal-1":
+        return (isinstance(data, list) and bool(data) and isinstance(data[0], dict)
+                and data[0].get("ordinal") == 1)
+    return isinstance(data, dict) and data.get("value") in accept["values"]
+
+
+def _probe_env():
+    """The environment a pinned program is exec'd with: the caller's, without
+    the token-helper recipes fleet-watch's `_child_env` withholds from every
+    child (r12) — the probe runs under fleet-watch, and a pinned program has no
+    use for them."""
+    env = dict(os.environ)
+    for k in ("FLEET_TOKEN_CMD", "FLEET_ADMIN_TOKEN_CMD", "FLEET_DIRECT_TOKEN_CMD"):
+        env.pop(k, None)
+    return env
+
+
+def probe_review_path(repo, contract=None, pins=None):
+    """(exit code, line, entry id|None). Runs every call in the deployed
+    dispatcher's contract, for each of its positions, as a program under the
+    pin — exec'd, never imported, so a lost exec bit fails here as it does for
+    talos. Never changes the host and never writes the gate."""
+    calls, reason = _load_contract(contract or contract_path())
+    if calls is None:
+        return EX_CANNOT_JUDGE, f"review-path probe cannot judge: {reason}", None
+    bindir = Path(pins) if pins else pin_bin()
+    skipped = [c for c in calls if _rule(c) not in _RULES]
+    calls = [c for c in calls if _rule(c) in _RULES]
+    # Render every call first: a template the probe cannot render is a probe
+    # defect (exit 1), and must not be reported as a broken review path by a
+    # call that happens to fail earlier.
+    plan = []
+    for call in calls:
+        for position in call.get("positions") or [None]:
+            argv = [a.replace("{repo}", repo).replace("{position}", position or "")
+                    for a in call["argv"]]
+            if any("{" in a or "}" in a for a in argv):
+                return (EX_CANNOT_JUDGE, "review-path probe cannot judge: contract entry "
+                        f"{call['id']} argv does not render", None)
+            plan.append((call, position, argv))
+    env = _probe_env()
+    # Each call below is one the dispatcher makes per operator/talos's
+    # ~/agent/contracts/eunomia-calls.json (v1 commit d045409, plan 0016; v2
+    # commit 2ddb17e, plan 0029): the program is exec'd from the pin with the
+    # contract's argv, as talos does. A skipped call's program is not run, but a
+    # lost exec bit on it still closes the gate.
+    for call in skipped:
+        prog = bindir / call["program"]
+        if not (prog.is_file() and os.access(prog, os.X_OK)):
+            return (EX_CLOSED, f"{repo} {call['id']}: {call['program']} missing or not "
+                    "executable (not run: no rule)", call["id"])
+    for call, position, argv in plan:
+        try:
+            r = subprocess.run([str(bindir / call["program"]), *argv],
+                               capture_output=True, text=True, env=env,
+                               timeout=PROBE_CALL_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as e:
+            return EX_CLOSED, f"{repo} {call['id']}: {e.__class__.__name__}", call["id"]
+        if r.returncode != 0:
+            err = " ".join((r.stderr or "").split())[:200]
+            return EX_CLOSED, f"{repo} {call['id']}: exit {r.returncode} {err}".rstrip(), call["id"]
+        if not _accepts(call, r.stdout):
+            what = f" ({position})" if position else ""
+            return (EX_CLOSED, f"{repo} {call['id']}: exit 0 but {call['accept']['rule']} "
+                    f"not met{what} {' '.join((r.stderr or '').split())[:200]}".rstrip(),
+                    call["id"])
+    tail = f" (not run, no rule: {', '.join(c['id'] for c in skipped)})" if skipped else ""
+    return 0, f"review path ok: {repo}{tail}", None
+
+
+def run_review_path_probe(repo, contract=None, pins=None, db=None):
+    """(exit code, line, transition). The probe, then the gate: 75 closes
+    `review-path:<repo>` by probe with evidence unique to this run (so a
+    repeat of the same fault can close it again after an open), 0 opens it by
+    probe, 1 changes nothing. A 75 inside the owner's `open --for` window closes
+    nothing (transition 'overridden'). transition is 'closed', 'open', 'overridden'
+    or None."""
+    code, line, entry = probe_review_path(repo, contract, pins)
+    scope = review_path_scope(repo)
+    if code == EX_CLOSED:
+        if override_until(scope, db=db):
+            return code, line, "overridden"      # the owner's window: print, never close
+        stamp = lib.now_utc().strftime("%Y-%m-%dT%H:%M:%S.%fZ")   # unique per run
+        evidence = f"probe:{stamp}:{entry}"
+        if close(scope, None, "probe", evidence, db=db):
+            return code, line, "closed"
+    elif code == 0:
+        if open_gate(scope, "probe", db=db, review_path_probe=True):
+            return code, line, "open"
+    return code, line, None
+
+
+def override_until(scope, now=None, db=None):
+    """The end of the owner's override window on `scope` (a datetime), or None
+    when none is running. Recorded by `open --by owner --for` as a
+    `quota_transition` row with evidence `override`."""
+    con = _connect(create=False, db=db)
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            "SELECT resets_at FROM quota_transition WHERE scope=? AND by='owner' "
+            "AND to_state='open' AND evidence='override' ORDER BY id DESC LIMIT 1",
+            (scope,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    until = lib.parse_ts(row["resets_at"]) if row and row["resets_at"] else None
+    return until if until and until > (now or lib.now_utc()) else None
+
+
+def owner_open(scope, hours=None, db=None):
+    """Open `scope` by the owner. For a review-path scope, `hours` (default 24,
+    1-168) also starts the window in which a failing probe does not re-close it."""
+    if is_review_path(scope):
+        hours = 24 if hours is None else hours
+        if not 1 <= hours <= 168:
+            raise ValueError("--for is 1 to 168 hours")
+    elif hours is not None:
+        raise ValueError("--for applies to a review-path scope only")
+    changed = open_gate(scope, "owner", db=db)
+    if is_review_path(scope):
+        now = lib.now_utc()
+        until = lib.ts(now + datetime.timedelta(hours=hours))
+        con = _connect(db=db)
+        try:
+            con.execute(
+                "INSERT INTO quota_transition (scope, to_state, at, by, evidence, "
+                "evidence_at, resets_at, percent) VALUES (?,?,?,?,?,?,?,NULL)",
+                (scope, "open", lib.ts(now), "owner", "override", lib.ts(now), until))
+        finally:
+            con.close()
+    return changed
+
+
+def review_path_held(repo, db=None):
+    g = gate(review_path_scope(repo), db)
+    return bool(g and g["state"] == "closed")
+
+
+# --- CLI ----------------------------------------------------------------------
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-quota", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("observe")
+    c = sub.add_parser("close")
+    c.add_argument("scope")
+    c.add_argument("--resets-at", required=True, help="ISO time, or - when unknown")
+    c.add_argument("--by", required=True, choices=["stop"])
+    c.add_argument("--evidence", required=True)
+    c.add_argument("--at", help="when the stop happened (default now)")
+    o = sub.add_parser("open")
+    o.add_argument("scope")
+    o.add_argument("--by", required=True, choices=["owner", "probe"])
+    o.add_argument("--for", dest="hours", type=int, metavar="HOURS",
+                   help="review-path scope, --by owner: hold it open against failing "
+                        "probes for this long (default 24, 1-168)")
+    pr = sub.add_parser("probe-review-path")
+    pr.add_argument("repo")
+    k = sub.add_parser("check")
+    k.add_argument("--scope")
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.cmd == "observe":
+        for scope, to in observe():
+            print(f"{to} {scope}")
+        return 0
+    if args.cmd == "close":
+        if not valid_scope(args.scope):
+            ap.error(f"unknown scope {args.scope!r}")
+        if is_review_path(args.scope):
+            ap.error("a review-path scope is closed only by probe-review-path")
+        resets = None if args.resets_at == "-" else args.resets_at
+        if resets is not None and parse_iso(resets) is None:
+            ap.error("--resets-at is not an ISO time")
+        changed = close(args.scope, resets, args.by, args.evidence, at=args.at)
+        print("closed" if changed else "unchanged")
+        return 0
+    if args.cmd == "open":
+        if not valid_scope(args.scope):
+            ap.error(f"unknown scope {args.scope!r}")
+        if is_review_path(args.scope) and args.by == "probe":
+            ap.error("a review-path scope opens by probe only from probe-review-path")
+        if args.hours is not None and (args.by != "owner" or not is_review_path(args.scope)):
+            ap.error("--for applies to `open review-path:<repo> --by owner` only")
+        if args.hours is not None and not 1 <= args.hours <= 168:
+            ap.error("--for is 1 to 168 hours")
+        changed = (owner_open(args.scope, args.hours)
+                   if args.by == "owner" and is_review_path(args.scope)
+                   else open_gate(args.scope, args.by))
+        print("opened" if changed else "unchanged")
+        return 0
+    if args.cmd == "probe-review-path":
+        code, line, _t = run_review_path_probe(args.repo)
+        print(line)
+        return code
+    if args.cmd == "check":
+        if args.scope and not valid_scope(args.scope):
+            ap.error(f"unknown scope {args.scope!r}")
+        code, line = check(args.scope)
+        print(line)
+        return code
+    print(json.dumps({"gates": gates()}, indent=1, sort_keys=True) if args.json
+          else "\n".join(f"{g['scope']}\t{g['state']}\t{g['resets_at'] or '-'}"
+                         for g in gates()))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

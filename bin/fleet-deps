@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""fleet-deps — keep the `eunomia/deps` status on every open PR (plan 0107).
+
+  fleet-deps once
+
+One pass over the repositories the watcher scans (`conf_repos()`'s dispatch
+list), for every open PR targeting `main`. Each head gets one state under the
+context `eunomia/deps`, as ADR-0019 §5 defines it:
+
+  failure  the PR carries `Plan: <id>` and `plans/<id>.md` is not on main at
+           `ready` or `done`, or that plan's `depends_on` is unmet
+  pending  this program cannot decide (an unreadable PR list, plan file or
+           dependency check). It pages once per episode and never guesses.
+  success  everything else, including a PR that names no plan (plans, ADRs,
+           docs, reverts): ADR-0019 §2 leaves those to the owner's merge.
+
+"Unmet" is `fleet-watch`'s `_plan_dependency_block`, loaded read-only from
+that file with SourceFileLoader — one definition of "satisfied", not a second
+one here. This program does not look at approvals or authorship.
+
+The token comes from FLEET_DEPS_TOKEN_CMD (default
+~/bin/fetch-forgejo-mergebot-token.sh). There is no fallback to FLEET_TOKEN_CMD:
+plan 0108 trusts only a status that mergebot created, and implementer tooling
+reaches the implbot token. Before anything is posted, `GET /user` must return
+the `agent_merger` login; any other login refuses the whole run and pages.
+
+A status is posted only when the state or description differs from the latest
+`eunomia/deps` status mergebot itself created on that head. Another account's
+status in the same context is ignored.
+
+Plan 0145 adds a second context, `eunomia/meeting`, on the same heads, under the
+same identity and the same post-only-on-change rule:
+
+  a lane PR      success/failure once its meeting against the MERGED
+                 implementation has a result at the lane's current head; no
+                 status while there is none (or the lane was `not_run`) --
+                 absent blocks the merge without blocking the review
+  no tests marker  success, "not a lane pull request"
+  a refused tests marker  no status
+
+Plan 0177 adds a third context, `eunomia/plan-lint`, under the same identity
+and the same post-only-on-change rule, on every open PR that adds or modifies
+a file under `plans/` (in ANY repository the watcher scans, not only
+eunomia):
+
+  failure  `bin/fleet-plan`'s own `lint()`, run read-only against that
+           repository's `plans/` directory and `governance.yaml` at the PR
+           head, finds a problem in a plan file the PR adds or modifies —
+           including the new spec_watch check, but also every other rule
+           `lint()` already enforces. Only eunomia's own CI ran this before;
+           every other repository's plan PRs were unchecked.
+  pending  the files could not be read. Pages once per episode.
+  success  0 problems.
+  (no status)  the PR changes no file under `plans/`.
+
+Plan 0216: `plans/` and `governance.yaml` are read through the git trees and
+blobs API (`fleetforge.Forge.get_git_tree`/`get_git_blob`), not the contents
+API — `GET /contents/plans?ref=<sha>` took 110 s against eunomia's own
+194-entry `plans/` (263 KB), past this program's timeout, and the status sat
+at `pending` on every eunomia PR that touched `plans/` as a result. A tree
+read answers in about a second regardless of directory size; each plan
+file's text is cached on disk under `plan-lint-blobs/`, keyed by its blob
+sha — never by path or ref, since a path's content differs between heads but
+a blob sha always names the one content it was computed from.
+
+Config (env):
+  FLEET_FORGEJO_URL     default http://forge.example:3000
+  FLEET_DEPS_TOKEN_CMD  command printing mergebot's token
+  FLEET_NTFY_URL        page channel (as fleet-watch notify)
+"""
+import importlib.machinery
+import importlib.util
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+# Read-only: `_plan_dependency_block`, `plan_files`, `front_matter`, `notify`,
+# `MARKER`. Nothing in fleet-watch is called that writes.
+watch = _load("fleet_watch_for_deps", BIN / "fleet-watch")
+# Read-only: `lane_problem`, `header_fields`, `lane_branch`, `findings_path`'s
+# layout, the schema and its validator.
+meet = _load("fleet_meet_for_deps", BIN / "fleet-meet")
+# Read-only: `lint()`. One definition of "valid" for a plan file, not a
+# second one for other repositories' plans (plan 0177 Boundaries).
+plan_lib = _load("fleet_plan_for_deps", BIN / "fleet-plan")
+
+UNIT = "org.eunomia.fleet-deps"
+CONTEXT = "eunomia/deps"
+MEETING_CONTEXT = "eunomia/meeting"
+LINT_CONTEXT = "eunomia/plan-lint"
+NOT_LANE = "not a lane pull request"
+LANE_DIR = "tests/lane/"
+FORGEJO_URL = os.environ.get("FLEET_FORGEJO_URL", "http://forge.example:3000")
+# Host tool, not part of this repo: ~/bin/fetch-forgejo-mergebot-token.sh is
+# provided by operator/hosttools at bin/fetch-forgejo-mergebot-token.sh, added
+# by commit f625a94 (PR #35, merge 181d5b5, plan 0003-mergebot-and-rev2bot-have-
+# helpers-and-the-rules-admit-them) and installed to ~/bin. The
+# contract relied on, same as ~/bin/fetch-forgejo-token.sh: exit 0 and print
+# the token as the LAST non-empty stdout line (earlier lines may be noise).
+# Anything else is treated as "no token" and refuses the run (_token below).
+# The identity is verified separately by GET /user, never assumed from this.
+TOKEN_CMD = os.environ.get("FLEET_DEPS_TOKEN_CMD",
+                           str(Path.home() / "bin" / "fetch-forgejo-mergebot-token.sh"))
+PAGE_SIZE = 50
+STATUS_PAGE_CAP = 5
+DESC_MAX = 140
+
+NO_PLAN = "no plan named"
+# The one place the unmet-dependency description is built and recognised:
+# `_decide_plan` writes it, `pr_hold` matches it, so the two cannot drift.
+_WAITS_ON = re.compile(r"^plan \S+ waits on ")
+_PLAN_LINE = re.compile(rf"^{re.escape(watch.MARKER)}(.*?)\s*$", re.M)
+_ID_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def _log(msg):
+    print(f"fleet-deps: {msg}", file=sys.stderr)
+
+
+# ------------------------------------------------------------------ paging
+def _markers_dir():
+    return lib.fleet_dir() / "deps-notified"
+
+
+def _marker(key):
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", key).strip("-")[:120] or "deps"
+    return _markers_dir() / f"{safe}.pending"
+
+
+def _page_once(key, title, body):
+    """One page per episode: an O_EXCL marker, consumed by delivery (a failed
+    delivery removes it so the next pass tries again)."""
+    marker = _marker(key)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.close(fd)
+    except FileExistsError:
+        return False
+    except OSError:
+        pass
+    if watch.notify(title, body, label=UNIT) is False:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _clear(key):
+    try:
+        _marker(key).unlink()
+    except OSError:
+        pass
+
+
+def _clear_stale(slug, keep):
+    """Drop the markers of this repo's episodes that are over."""
+    try:
+        for m in _markers_dir().glob(f"{slug}--*.pending"):
+            if m.name not in keep:
+                m.unlink()
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ token
+def _token():
+    # Execs the hosttools host tool named at TOKEN_CMD above (hosttools
+    # bin/fetch-forgejo-mergebot-token.sh, PR #35 / f625a94);
+    # contract: token is the last non-empty stdout line, exit 0.
+    try:
+        r = subprocess.run(["sh", "-c", TOKEN_CMD], capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"token helper failed ({e.__class__.__name__})"
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not lines:
+        return None, "token helper produced no token"
+    return lines[-1].strip(), ""
+
+
+def _forge(token):
+    return fleetforge.Forge(FORGEJO_URL, token, timeout=watch.forge_timeout())
+
+
+# ------------------------------------------------------------------ decide
+def _plan_text(forge, repo, plan_id):
+    """(text, None) | (None, "absent") | (None, "unreadable")."""
+    st, f = forge.get_contents(repo, f"plans/{plan_id}.md", ref="main")
+    if st == 404:
+        return None, "absent"
+    if st != 200 or not isinstance(f, dict):
+        return None, "unreadable"
+    try:
+        return base64.b64decode(f.get("content") or "").decode("utf-8"), None
+    except Exception:                                    # noqa: BLE001
+        return None, "unreadable"
+
+
+def _waits_on_desc(plan_id, dep, why):
+    desc = f"plan {plan_id} waits on {dep}: {why}"
+    assert _WAITS_ON.match(desc)
+    return desc
+
+
+def _decide_plan(forge, token, repo, plan_id, index):
+    """(state, description) for one named plan. `index` is a one-element list
+    holding the repo's id->front-matter map, read lazily at most once."""
+    if not _ID_OK.match(plan_id):
+        return "failure", f"plan id {plan_id[:60]!r} is not a plan id"
+    text, why = _plan_text(forge, repo, plan_id)
+    if why == "absent":
+        return "failure", f"plan {plan_id} is not on main"
+    if why:
+        return "pending", f"cannot read plan {plan_id}"
+    fm = watch.front_matter(text)
+    status = fm.get("status")
+    if status not in ("ready", "done"):
+        return "failure", f"plan {plan_id} is {status or 'status-less'} on main, not ready or done"
+    deps = fm.get("depends_on") or []
+    if not deps:
+        return "success", f"plan {plan_id} is {status} on main"
+    if not index:
+        plans = watch.plan_files(repo, token)
+        if plans is None:
+            return "pending", "cannot read plans on main"
+        index.append({p[1].get("id"): p[1] for p in plans})
+    try:
+        block = watch._plan_dependency_block(repo, deps, index[0], token)
+    except Exception:                                    # noqa: BLE001
+        return "pending", "dependency check failed"
+    if block:
+        return "failure", _waits_on_desc(plan_id, block[0], block[3])
+    return "success", f"plan {plan_id} is {status}, its dependencies are met"
+
+
+def decide(forge, token, repo, body, index):
+    """(state, description) for a PR body. First failing/pending plan line
+    wins; failure outranks pending outranks success."""
+    ids = _PLAN_LINE.findall(body or "")
+    if not ids:
+        return "success", NO_PLAN
+    results = [_decide_plan(forge, token, repo, i.strip(), index) for i in ids]
+    for want in ("failure", "pending"):
+        for state, desc in results:
+            if state == want:
+                return state, desc
+    return results[0]
+
+
+# ------------------------------------------------------------------- forge
+def _open_prs(forge, repo):
+    """(prs, complete). Open PRs read page by page to a confirmed empty page."""
+    out = []
+    for page in range(1, watch.PAGE_CAP + 1):
+        st, body = forge.list_pulls(repo, state="open", page=page, limit=PAGE_SIZE)
+        if st != 200 or not isinstance(body, list):
+            return out, False
+        if not body:
+            return out, True
+        out.extend(body)
+    return out, False
+
+
+def _own_latest_read(forge, repo, sha, login, context=CONTEXT):
+    """(status | None, read_ok). `read_ok` False means the list could not be
+    read, which is not the same as there being no status."""
+    best = None
+    for page in range(1, STATUS_PAGE_CAP + 1):
+        st, body = forge.list_statuses(repo, sha, page=page, limit=PAGE_SIZE)
+        if st != 200 or not isinstance(body, list):
+            return None, False
+        if not body:
+            break
+        for s in body:
+            if s.get("context") != context:
+                continue
+            if ((s.get("creator") or {}).get("login")) != login:
+                continue
+            key = (s.get("id") if isinstance(s.get("id"), int) else -1,
+                   s.get("created_at") or "")
+            if best is None or key > best[0]:
+                best = (key, s)
+    return (best[1] if best else None), True
+
+
+def _own_latest(forge, repo, sha, login, context=CONTEXT):
+    """The latest `context` status created by `login` on `sha`, or None."""
+    return _own_latest_read(forge, repo, sha, login, context)[0]
+
+
+def pr_hold(forge, repo, sha):
+    """Is the implementation PR at head `sha` held only by an unmet dependency?
+
+    ("held", description) | ("unreadable", detail) | None. Read only: posts
+    nothing and never touches the owner-met cache. Only the unmet-dependency
+    failure is a hold; every other failure is a fault the owner must fix."""
+    try:
+        login = lib.agent_roles()["agent_merger"].account
+    except Exception as e:                               # noqa: BLE001
+        return "unreadable", f"agent merger account unknown ({e.__class__.__name__})"
+    best, ok = _own_latest_read(forge, repo, sha, login)
+    if not ok:
+        return "unreadable", f"{CONTEXT} statuses at {str(sha)[:8]} unreadable"
+    if best and best.get("status") == "failure":
+        desc = best.get("description") or ""
+        if _WAITS_ON.match(desc):
+            return "held", desc
+    return None
+
+
+def _post(forge, repo, sha, state, desc, login, context=CONTEXT):
+    desc = desc[:DESC_MAX]
+    prev = _own_latest(forge, repo, sha, login, context)
+    if prev and prev.get("status") == state and prev.get("description") == desc:
+        return False
+    st, _ = forge.post_status(repo, sha, state, desc, context)
+    if st not in (200, 201):
+        _log(f"{repo}@{sha[:8]}: posting {context} {state} failed (HTTP {st})")
+        return False
+    _log(f"{repo}@{sha[:8]}: {state} — {desc}")
+    return True
+
+
+# ----------------------------------------------------------------- meeting
+_TESTS_FOR = re.compile(r"^Tests-for:", re.M)
+_LANE_REF = re.compile(r"agent/tests/([A-Za-z0-9][A-Za-z0-9._-]*)/")
+
+
+def _tests_markers(forge, repo, pull):
+    """(has_marker, plan_id_or_None). The markers plan 0108 D1b reads: a branch
+    under `agent/tests/`, a `Tests-for:` line, a changed file under
+    `tests/lane/`. `(None, None)` when the files cannot be listed."""
+    ref = meet.lane_branch(pull)
+    body = pull.get("body") or ""
+    named = meet.header_fields(body).get("Tests-for") or []
+    m = _LANE_REF.match(ref)
+    plan = named[0] if len(named) == 1 else (m.group(1) if m else None)
+    if ref.startswith("agent/tests/") or _TESTS_FOR.search(body):
+        return True, plan
+    st, files = forge.list_pull_files(repo, pull.get("number"))
+    if st != 200 or not isinstance(files, list):
+        return None, None
+    for f in files:
+        names = (f.get("filename"), f.get("previous_filename"))
+        if any(isinstance(n, str) and n.startswith(LANE_DIR) for n in names):
+            return True, plan
+    return False, None
+
+
+def _documents(plan_id):
+    """(docs, bad_path): every findings document of the plan, newest first by
+    `generated_at`. `bad_path` is the first one that cannot be read or fails
+    its schema; the plan then posts nothing."""
+    base = meet.lib.work_root() / "meetings" / plan_id
+    try:
+        paths = sorted(base.glob("*/findings.json"))
+    except OSError:
+        return [], str(base)
+    try:
+        schema = json.loads(meet.SCHEMA_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, str(meet.SCHEMA_PATH)
+    docs = []
+    for p in paths:
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None, str(p)
+        if meet.lane.validate_schema(doc, schema) or doc.get("plan") != plan_id:
+            return None, str(p)
+        docs.append(doc)
+    docs.sort(key=lambda d: d["generated_at"], reverse=True)
+    return docs, None
+
+
+def _impl_merged_at(forge, repo, doc, cache):
+    """True when the document's implementation PR is merged at the head the
+    document names. One read per implementation PR per pass."""
+    n = doc["impl"]["pr"]
+    if n not in cache:
+        st, pull = forge.get_pull(repo, n)
+        cache[n] = pull if st == 200 and isinstance(pull, dict) else None
+    pull = cache[n]
+    return bool(pull and pull.get("merged")
+                and ((pull.get("head") or {}).get("sha")) == doc["impl"]["head_sha"])
+
+
+def _lane_result(docs, forge, repo, num, sha, cache):
+    """(state, description) or None (no status) for one lane PR."""
+    for doc in docs:
+        entry = next((l for l in doc["lanes"] if l["pr"] == num and l["head_sha"] == sha), None)
+        unread = next((x for x in doc["not_run"] if x["pr"] == num and x["head_sha"] == sha), None)
+        if entry is None and unread is None:
+            continue
+        if not _impl_merged_at(forge, repo, doc, cache):
+            continue
+        if entry is None:
+            return None
+        run = entry["run"]
+        if run["outcome"] != "ran":
+            return "failure", f"meeting: lane {run['outcome']}"
+        c = {}
+        for t in entry["tests"]:
+            c[t["outcome"]] = c.get(t["outcome"], 0) + 1
+        if not entry["tests"]:
+            return "failure", "meeting: no tests recorded"
+        if set(c) == {"pass"}:
+            return "success", f"met: {c['pass']} passed"
+        return "failure", ("meeting: " + ", ".join(
+            f"{c[k]} {w}" for k, w in (("pass", "passed"), ("fail", "failed"),
+                                       ("error", "errored"), ("skip", "skipped"))
+            if k in c))
+    return None
+
+
+def decide_meeting(forge, repo, pull, roles, plans, impl_cache):
+    """(state, description) or None. `plans` memoises each plan's documents."""
+    has, plan = _tests_markers(forge, repo, pull)
+    if has is None:
+        return None
+    if not has:
+        return "success", NOT_LANE
+    if not plan or not _ID_OK.match(plan) or meet.lane_problem(pull, plan, roles):
+        return None
+    if plan not in plans:
+        docs, bad = _documents(plan)
+        if docs is None:
+            _log(f"{repo}: findings document unreadable or invalid: {bad}")
+        plans[plan] = docs
+    if plans[plan] is None:
+        return None
+    return _lane_result(plans[plan], forge, repo, pull["number"],
+                        (pull.get("head") or {}).get("sha"), impl_cache)
+
+
+# ----------------------------------------------------------------- plan-lint
+#
+# Plan 0177: `eunomia/plan-lint` runs `plan_lib.lint()` — the SAME function
+# eunomia's own CI runs on itself — against every OTHER fleet repository's
+# plan PRs too. Nothing is executed from the PR's checkout: only
+# `plans/*.md` and `governance.yaml`, read through the forge and written
+# into a fresh temporary directory, are ever passed to `lint()`.
+#
+# Plan 0216: that read goes through the git trees and blobs API, not
+# `list_contents`/`get_contents` — see the module docstring for the 110 s vs
+# 0.27 s measurement. A blob's text is cached on disk by its OWN sha, never
+# by path: a path's content differs between two heads, a blob sha never does.
+
+def _changed_plan_files(forge, repo, num):
+    """The `plans/` filenames this PR's diff adds or modifies, or `None` if
+    the file list could not be read. A pure deletion is never in this set —
+    see `decide_plan_lint`, which only reports a problem for a name it can
+    also find in the directory listing at the PR head."""
+    st, files = forge.list_pull_files(repo, num)
+    if st != 200 or not isinstance(files, list):
+        return None
+    return {f.get("filename") for f in files
+            if isinstance(f, dict) and (f.get("filename") or "").startswith(watch.PLAN_DIR)}
+
+
+def _blob_cache_dir():
+    return lib.fleet_dir() / "plan-lint-blobs"
+
+
+def _blob_cache_path(sha):
+    safe = re.sub(r"[^A-Za-z0-9]+", "", sha or "")[:64] or "blob"
+    return _blob_cache_dir() / safe
+
+
+def _blob_cache_read(sha):
+    """The cached text for `sha`, or `None` on a miss — including an
+    unreadable cache file, which is treated as a miss and re-read from the
+    forge (plan 0216 D3), not an error. A hit's mtime is bumped to now, so
+    `_prune_blob_cache` prunes by last READ, not last written."""
+    path = _blob_cache_path(sha)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        path.touch()
+    except OSError:
+        pass
+    return text
+
+
+def _blob_cache_write(sha, text):
+    path = _blob_cache_path(sha)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass                              # a cache: the next read refetches
+
+
+BLOB_CACHE_MAX_AGE = 30 * 24 * 3600
+
+
+def _prune_blob_cache(now=None):
+    """Drop cached blobs not read in 30 days (plan 0216 D3). Called once at
+    the top of `once()` — at most once per pass, never per repo or per PR.
+    A missing cache directory is created; any entry this cannot stat is left
+    alone rather than guessed about."""
+    now = time.time() if now is None else now
+    d = _blob_cache_dir()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        entries = list(d.iterdir())
+    except OSError:
+        return
+    for p in entries:
+        try:
+            if p.is_file() and now - p.stat().st_mtime > BLOB_CACHE_MAX_AGE:
+                p.unlink()
+        except OSError:
+            continue
+
+
+def _tree_lookup(forge, repo, sha, what):
+    """(entries, None) | (None, "why") for one non-recursive git tree read —
+    `[{"path", "sha", "type"}, ...]` of the tree named by `sha`. A truncated
+    tree is unreadable, never a partial listing (the same rule
+    `fleetforge.Forge.list_tree` holds)."""
+    st, t = forge.get_git_tree(repo, sha)
+    if st != 200 or not isinstance(t, dict) or t.get("truncated"):
+        return None, f"{what} unreadable (HTTP {st if st != 200 else 0})"
+    return t.get("tree") or [], None
+
+
+def _blob_text(forge, repo, sha, what):
+    """(text, None) | (None, "why"). Cached under `plan-lint-blobs/` keyed
+    by the blob's OWN sha (never by `what`, a path, and never by ref) — see
+    the Boundaries this plan carries on staleness. A cache miss costs one
+    `get_git_blob` read, stored for next time."""
+    key = sha
+    cached = _blob_cache_read(key) if key else None
+    if cached is not None:
+        return cached, None
+    st, b = forge.get_git_blob(repo, sha)
+    if st != 200 or not isinstance(b, dict):
+        return None, f"{what} unreadable (HTTP {st})"
+    try:
+        text = base64.b64decode(b.get("content") or "").decode("utf-8")
+    except Exception:                                    # noqa: BLE001
+        return None, f"{what} undecodable"
+    if key:
+        _blob_cache_write(key, text)
+    return text, None
+
+
+def _read_plan_dir(forge, repo, sha):
+    """(tmp_plans_dir, None) | (None, "why"). Writes every `plans/*.md` blob
+    at `sha` — the whole directory, not only the changed ones, so `lint()`'s
+    own index (duplicate ids, `depends_on`) sees every sibling plan the
+    checkout has — plus `governance.yaml` if the repository has one, into a
+    fresh temporary directory. The caller removes it.
+
+    Reads the head commit's root tree, finds `plans` there and reads THAT
+    tree (one entry, one read — no recursion into `plans/`'s own
+    subdirectories, which `lint()` does not expect), then reads
+    `governance.yaml` from the root tree the same way: a second, independent
+    read of the root, not threaded through from the first — the same
+    `_tree_lookup` either entry goes through, so there is exactly one place
+    that knows how to read an entry out of a tree. A repository with no
+    `plans` entry in its root tree is today's no-plans case: an empty
+    directory, not an error."""
+    root, err = _tree_lookup(forge, repo, sha, "root tree")
+    if err:
+        return None, err
+    tmp = Path(tempfile.mkdtemp(prefix="fleet-deps-plan-lint-"))
+    plans_dir = tmp / "plans"
+    plans_dir.mkdir()
+    plans_entry = next((e for e in root if isinstance(e, dict)
+                        and e.get("path") == "plans" and e.get("type") == "tree"), None)
+    if plans_entry is not None:
+        entries, err = _tree_lookup(forge, repo, plans_entry.get("sha"), "plans/ tree")
+        if err:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return None, err
+        for e in entries:
+            name = e.get("path") if isinstance(e, dict) else None
+            if not name or e.get("type") != "blob" or not name.endswith(".md"):
+                continue
+            text, err = _blob_text(forge, repo, e.get("sha"), f"plans/{name}")
+            if err:
+                shutil.rmtree(tmp, ignore_errors=True)
+                return None, err
+            (plans_dir / name).write_text(text)
+    root2, err = _tree_lookup(forge, repo, sha, "root tree")
+    if err:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, err
+    gov_entry = next((e for e in root2 if isinstance(e, dict)
+                      and e.get("path") == "governance.yaml" and e.get("type") == "blob"), None)
+    if gov_entry is not None:
+        text, err = _blob_text(forge, repo, gov_entry.get("sha"), "governance.yaml")
+        if err:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return None, err
+        (tmp / "governance.yaml").write_text(text)
+    return plans_dir, None
+
+
+def decide_plan_lint(forge, repo, pull):
+    """(state, description) or `None` — no status — when the PR changes no
+    file under `plans/`."""
+    num, sha = pull.get("number"), (pull.get("head") or {}).get("sha")
+    changed = _changed_plan_files(forge, repo, num)
+    if changed is None:
+        return "pending", "plans/ changed-file list unreadable"
+    changed = {c for c in changed if c}
+    if not changed:
+        return None
+    plans_dir, err = _read_plan_dir(forge, repo, sha)
+    if err:
+        return "pending", err
+    try:
+        problems = []
+        for f in sorted(plans_dir.glob("*.md")):
+            if f"{watch.PLAN_DIR}{f.name}" not in changed:
+                continue                     # read for the index, not reported
+            problems.extend(plan_lib.lint(f))
+    finally:
+        shutil.rmtree(plans_dir.parent, ignore_errors=True)
+    if problems:
+        return "failure", problems[0]
+    return "success", "0 problems"
+
+
+def once():
+    token, err = _token()
+    if token is None:
+        _page_once("identity", "fleet-deps refused", f"no mergebot token: {err}")
+        _log(f"refused: {err}")
+        return 2
+    forge = _forge(token)
+    want = lib.agent_roles()["agent_merger"].account
+    st, me = forge.get_user()
+    login = me.get("login") if st == 200 and isinstance(me, dict) else None
+    if login != want:
+        who = "unreadable" if login is None else "not the agent merger"
+        _page_once("identity", "fleet-deps refused",
+                   f"GET /user is {who} (expected {want}); nothing posted")
+        _log(f"refused: GET /user is {who}")
+        return 2
+    _clear("identity")
+    _prune_blob_cache()
+
+    got = watch.conf_repos()
+    if got is None:
+        _page_once("conf", "fleet-deps cannot read repos.conf",
+                   "no repository was checked")
+        return 0
+    _clear("conf")
+    for repo in got[0]:
+        slug = repo.replace("/", "-")
+        keep = set()
+        prs, complete = _open_prs(forge, repo)
+        index = []
+        roles = lib.agent_roles()
+        plans, impl_cache = {}, {}
+        for pr in prs:
+            if (pr.get("base") or {}).get("ref") != "main":
+                continue
+            sha = (pr.get("head") or {}).get("sha")
+            num = pr.get("number")
+            if not sha or num is None:
+                continue
+            state, desc = decide(forge, token, repo, pr.get("body"), index)
+            key = f"{slug}--{num}"
+            if state == "pending":
+                keep.add(_marker(key).name)
+                _page_once(key, "eunomia/deps pending",
+                           f"{repo}#{num}: {desc}")
+            _post(forge, repo, sha, state, desc, login)
+            got_m = decide_meeting(forge, repo, pr, roles, plans, impl_cache)
+            if got_m:
+                _post(forge, repo, sha, got_m[0], got_m[1], login, MEETING_CONTEXT)
+            got_l = decide_plan_lint(forge, repo, pr)
+            if got_l:
+                lstate, ldesc = got_l
+                if lstate == "pending":
+                    lkey = f"{slug}--{num}--lint"
+                    keep.add(_marker(lkey).name)
+                    _page_once(lkey, "eunomia/plan-lint pending",
+                               f"{repo}#{num}: {ldesc}")
+                _post(forge, repo, sha, lstate, ldesc, login, LINT_CONTEXT)
+        if not complete:
+            key = f"{slug}--list"
+            keep.add(_marker(key).name)
+            _page_once(key, "eunomia/deps pending",
+                       f"{repo}: cannot list every open PR")
+        _clear_stale(slug, keep)
+    return 0
+
+
+def main(argv):
+    if argv != ["once"]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return once()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

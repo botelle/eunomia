@@ -146,6 +146,7 @@ def test_an_unfetchable_pin_is_refused(tmp_path):
     subprocess.run(["git", "-C", str(pin), "remote", "set-url", "origin",
                     str(tmp_path / "gone.git")], check=True)
     mod = _load(tmp_path / "fleet", FLEET_PINS=str(pin))
+    mod.watch.PIN_FETCH_RETRY_SECS = 0   # both attempts fail; don't wait
     _vouch(mod)
     advanced, refused = mod.run()
     assert advanced == []
@@ -255,6 +256,67 @@ def test_a_stale_vouched_for_pin_advances(tmp_path):
     assert refused == []
     assert [p for p, _ in advanced] == [str(pin)]
     assert _head(pin) == target
+
+
+def test_a_fetch_that_fails_once_then_succeeds_still_advances_with_retry_noted(
+        tmp_path, capsys):
+    """Evidence: opshost 2026-09-29, ~/dev/.fleet/pin-advance.log, 78/854 runs
+    refused a pin `unfetchable` with the stderr discarded. `pin_status`
+    (bin/fleet-watch) now retries a failed fetch once before giving up; this
+    exercises that path through `fleet-pin-advance.run()` end to end, with a
+    fake `_fetch_origin` standing in for the transient failure so the test
+    does not depend on a real flaky network."""
+    work, pin = _pin_repo(tmp_path)
+    _advance_origin(work)
+    target = subprocess.run(["git", "-C", str(work), "rev-parse", "origin/main"],
+                            capture_output=True, text=True).stdout.strip()
+    mod = _load(tmp_path / "fleet", FLEET_PINS=str(pin))
+    mod.watch.PIN_FETCH_RETRY_SECS = 0
+    _vouch(mod)
+    real_fetch_origin = mod.watch._fetch_origin
+    calls = []
+
+    def fake_fetch_origin(path):
+        calls.append(path)
+        if len(calls) == 1:
+            return False, 128, "fatal: unable to access: Could not resolve host"
+        return real_fetch_origin(path)
+
+    mod.watch._fetch_origin = fake_fetch_origin
+    advanced, refused = mod.run()
+    assert len(calls) == 2, "one retry, not more"
+    assert refused == []
+    assert [p for p, _ in advanced] == [str(pin)]
+    assert _head(pin) == target
+    out = capsys.readouterr().out
+    assert "retried once, succeeded" in out, out
+
+
+def test_a_fetch_that_fails_twice_refuses_with_rc_and_stderr(tmp_path):
+    """The other half of the same evidence: a fetch that does NOT recover
+    within the one retry must be refused as `unfetchable`, and the refusal
+    must carry the return code and the (redacted) stderr — not a bare state
+    name — so the next occurrence of this log is diagnosable."""
+    _, pin = _pin_repo(tmp_path)
+    mod = _load(tmp_path / "fleet", FLEET_PINS=str(pin))
+    mod.watch.PIN_FETCH_RETRY_SECS = 0
+    _vouch(mod)
+    calls = []
+
+    def fake_fetch_origin(path):
+        calls.append(path)
+        return False, 128, "fatal: could not read from remote repository."
+
+    mod.watch._fetch_origin = fake_fetch_origin
+    advanced, refused = mod.run()
+    assert len(calls) == 2
+    assert advanced == []
+    assert len(refused) == 1
+    detail = refused[0][1]
+    assert "unfetchable" in detail
+    assert "rc=128" in detail
+    assert "could not read from remote repository" in detail
+    assert "retried once, still failed" in detail
 
 
 def test_dry_run_writes_nothing(tmp_path):

@@ -282,3 +282,146 @@ def test_docs_describe_two_tiers_and_name_the_drop_list():
     assert "repo_model" in doc
     assert "session" in doc and "dispatch_phase" in doc
     assert "derived" in doc.lower() and "durable" in doc.lower()
+
+
+# ------------------------------------------------- style_reviewer (plan 0150 D3)
+
+OLD_REPO_MODEL = """
+CREATE TABLE repo_model (
+  repo      TEXT    NOT NULL,
+  position  TEXT    NOT NULL,
+  ordinal   INTEGER NOT NULL DEFAULT 1,
+  runner    TEXT    NOT NULL,
+  disabled  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (repo, position, ordinal),
+  CHECK (position IN ('implementer','plan_reviewer','code_reviewer',
+                      'tester','mediator','impl_supervisor','test_supervisor')),
+  CHECK (ordinal >= 1),
+  CHECK (disabled IN (0,1))
+);
+"""
+
+
+def _old_db(path):
+    con = sqlite3.connect(path)
+    con.executescript(OLD_REPO_MODEL)
+    con.executemany("INSERT INTO repo_model VALUES (?,?,?,?,?)", [
+        ("default", "code_reviewer", 1, "sub-opus-5-5", 0),
+        ("default", "code_reviewer", 2, "sub-opus-5-5", 0),
+        ("operator/x", "implementer", 1, "sub-sonnet", 1)])
+    con.commit()
+    con.close()
+
+
+def test_style_reviewer_is_a_list_reviewer_position(tmp_path, monkeypatch):
+    mod = _fm(tmp_path, monkeypatch)
+    assert "style_reviewer" in mod.POSITIONS and "style_reviewer" in mod.REVIEWER_POSITIONS
+    assert "style_reviewer" not in mod.SINGLETON
+    assert not hasattr(mod, "PROVENANCE_POSITIONS")
+
+
+def test_an_old_table_is_rebuilt_keeping_every_row_and_a_second_run_is_a_noop(tmp_path, monkeypatch):
+    mod = _fm(tmp_path, monkeypatch)
+    _old_db(tmp_path / "fleet.db")
+    con = mod.connect()
+    assert con.execute("SELECT COUNT(*) FROM repo_model").fetchone()[0] == 3
+    assert con.execute("SELECT * FROM repo_model WHERE repo='operator/x'").fetchone() == (
+        "operator/x", "implementer", 1, "sub-sonnet", 1)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(repo_model)")]
+    assert cols == ["repo", "position", "ordinal", "runner", "disabled"]
+    ordinal, changed = mod.set_runner(con, "operator/x", "style_reviewer", "sub-opus-5-5")
+    assert (ordinal, changed) == (1, True)
+    before = con.execute("SELECT sql FROM sqlite_master WHERE name='repo_model'").fetchone()
+    con.close()
+    con = mod.connect()
+    assert con.execute("SELECT sql FROM sqlite_master WHERE name='repo_model'").fetchone() == before
+    assert con.execute("SELECT COUNT(*) FROM repo_model").fetchone()[0] == 4
+    assert not con.execute("SELECT 1 FROM sqlite_master WHERE name='repo_model_rebuild'").fetchone()
+    con.close()
+
+
+def test_a_failed_copy_rolls_the_rebuild_back(tmp_path, monkeypatch):
+    mod = _fm(tmp_path, monkeypatch)
+    _old_db(tmp_path / "fleet.db")
+    con = sqlite3.connect(tmp_path / "fleet.db")
+    # a row the old table's CHECK would have refused: the new table refuses it too
+    con.execute("PRAGMA ignore_check_constraints=ON")
+    con.execute("INSERT INTO repo_model VALUES ('operator/x','implementer',2,'r',7)")
+    con.execute("PRAGMA ignore_check_constraints=OFF")
+    con.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        mod._migrate(con)
+    assert con.execute("SELECT COUNT(*) FROM repo_model").fetchone()[0] == 4
+    assert "'style_reviewer'" not in con.execute(
+        "SELECT sql FROM sqlite_master WHERE name='repo_model'").fetchone()[0]
+    assert not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='repo_model_rebuild'").fetchone()
+    con.close()
+
+
+def test_fleet_db_migrate_reaches_the_rebuild(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    _old_db(tmp_path / "fleet.db")
+    env = dict(os.environ, FLEET_DB=str(tmp_path / "fleet.db"),
+               EUNOMIA_FLEET_DIR=str(tmp_path))
+    r = subprocess.run([sys.executable, str(BIN / "fleet-db-migrate")], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    con = sqlite3.connect(tmp_path / "fleet.db")
+    assert "'style_reviewer'" in con.execute(
+        "SELECT sql FROM sqlite_master WHERE name='repo_model'").fetchone()[0]
+    assert con.execute("SELECT COUNT(*) FROM repo_model").fetchone()[0] == 3
+    con.close()
+
+
+# ------------------------------------------------- lane_reviewer (plan 0163)
+
+STYLE_REPO_MODEL = OLD_REPO_MODEL.replace(
+    "'test_supervisor')),", "'test_supervisor','style_reviewer')),")
+
+
+def test_lane_reviewer_is_a_two_ordinal_list_reviewer_position(tmp_path, monkeypatch):
+    mod = _fm(tmp_path, monkeypatch)
+    assert "lane_reviewer" in mod.POSITIONS and "lane_reviewer" in mod.REVIEWER_POSITIONS
+    assert "lane_reviewer" not in mod.SINGLETON
+    con = mod.connect()
+    assert mod.set_runner(con, "default", "lane_reviewer", "sub-opus-5-5", 1) == (1, True)
+    assert mod.set_runner(con, "default", "lane_reviewer", "sub-opus-5-5", 2) == (2, True)
+    with pytest.raises(ValueError, match="at most 2"):
+        mod.set_runner(con, "default", "lane_reviewer", "sub-opus-5-5", 3)
+    with pytest.raises(ValueError, match="at most 2"):
+        mod.set_runner(con, "default", "lane_reviewer", "sub-opus-5-5")   # next ordinal is 3
+    con.close()
+
+
+def test_lane_reviewer_refuses_what_code_reviewer_refuses(tmp_path, monkeypatch):
+    mod = _fm(tmp_path, monkeypatch)
+    for runner in ("no-such-runner", "sonnet"):
+        msgs = []
+        for pos in ("code_reviewer", "lane_reviewer"):
+            with pytest.raises(Exception) as e:
+                mod.validate_runner(runner, pos)
+            msgs.append(str(e.value).replace(pos, "POS"))
+        assert msgs[0] == msgs[1]
+
+
+def test_a_0150_table_is_widened_for_lane_reviewer_once(tmp_path, monkeypatch):
+    mod = _fm(tmp_path, monkeypatch)
+    con = sqlite3.connect(tmp_path / "fleet.db")
+    con.executescript(STYLE_REPO_MODEL)
+    con.execute("INSERT INTO repo_model VALUES ('default','style_reviewer',1,'sub-opus-5-5',0)")
+    con.execute("INSERT INTO repo_model VALUES ('operator/x','implementer',1,'sub-sonnet',1)")
+    con.commit()
+    con.close()
+    con = mod.connect()
+    assert con.execute("SELECT COUNT(*) FROM repo_model").fetchone()[0] == 2
+    sql = con.execute("SELECT sql FROM sqlite_master WHERE name='repo_model'").fetchone()
+    assert "'lane_reviewer'" in sql[0]
+    assert mod.set_runner(con, "default", "lane_reviewer", "sub-opus-5-5", 1) == (1, True)
+    con.close()
+    con = mod.connect()
+    assert con.execute("SELECT COUNT(*) FROM repo_model").fetchone()[0] == 3
+    assert not con.execute("SELECT 1 FROM sqlite_master WHERE name='repo_model_rebuild'").fetchone()
+    con.close()

@@ -1,0 +1,1359 @@
+#!/usr/bin/env python3
+"""fleet-meet — a test lane's tests meet the implementation (plan 0102).
+
+    fleet-meet <repo> <plan-id> --impl <pr> [--lane <pr>]... [--dry-run]
+
+Runs the pull-request files of one or more test lanes (`fleet-lane`'s
+`agent/tests/<plan>/<runner>` PRs) against the implementation pull request's
+head, in a confined runner, and writes ONE findings document:
+
+    <work root>/meetings/<plan>/<impl-sha12>/findings.json
+
+validated against config/meeting-findings.schema.json. It prints that path on
+stdout. Every test gets an outcome — pass, fail, error or skip — and a skip is
+never counted as a pass (`all_passed` is false whenever one exists).
+
+A lane runs only after it has been read at the exact commit that will run.
+On every repository the reader may be the HUMAN: the `merger` role's approval
+(ADR-0006 §5). On a repository whose `autonomy` is `autonomous` it may instead
+be the repository's two code reviewers (ADR-0019 §3-§4): both approve at the
+head, in reviews whose dispatcher trailer says `tools=none`, with different
+models. On a `critical` repository, or when `autonomy` cannot be read, only the
+human's approval counts. The sha is read once, in the same step as the
+reviews, and every later step fetches and runs that value; the branch name is
+never used again. Nothing of a lane is imported before that holds.
+
+Exit codes:
+    0   a document was written (a document full of failures is still 0:
+        findings are output, not failure — ADR-0006 §4)
+    1   a host-level failure — no `sandbox-exec`, the start-up probe failed, a
+        forge read was incomplete, the store could not fetch, or the
+        implementation PR / a named lane PR is refused. No document is written
+    2   a usage error
+    75  no lane met the read precondition (the human's approval, or on an
+        autonomous repository the two reviewers'), or a forge read failed in
+        transport (timeout, connection refused or reset, DNS): "later,
+        unchanged, this may pass". No document is written
+
+This program only READS the forge, through `fleetforge`. It posts nothing.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import posixpath
+import pwd
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+ROOT = BIN.parent
+
+
+def _load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+# The one validator (`validate_schema`) and the loaders for fleetlib and
+# fleetforge live in bin/fleet-lane; this program loads them through the same
+# SourceFileLoader shape rather than keeping a second copy (plan 0102 D6).
+lane = _load("fleet_lane_for_meet", BIN / "fleet-lane")
+lib = lane.lib
+fleetforge = lane.fleetforge
+
+SCHEMA_NAME = "meeting-findings/1"
+SCHEMA_PATH = ROOT / "config" / "meeting-findings.schema.json"
+PROFILE_PATH = ROOT / "config" / "meeting-runner.sb"
+
+EXIT_LATER = 75
+BASE_BRANCH = "main"
+LANE_ROOT = "tests/lane"
+
+# A constant in this program (plan 0102 D3), not a setting.
+MEET_TIMEOUT_SECONDS = 900
+SWEEP_SECONDS = 10
+REASON_MAX = 4000
+
+# Test-only seams, never a CLI flag: a test points SANDBOX_EXEC at a missing
+# path to prove the runner fails closed, and switches these two off to prove
+# each control does what it claims. Nothing in `main` reads them from argv.
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+USE_PROFILE = True
+SWEEP_ENABLED = True
+
+_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+_HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class HostError(Exception):
+    """A host-level failure: exit 1, no document (D1 step 7). A broken sandbox
+    recorded as a finished meeting would never be retried until a head moved."""
+
+
+class ForgeLater(HostError):
+    """A forge read that failed in transport (timeout, refused or reset
+    connection, DNS): exit 75, "later". Not an HTTP status, not a verb the
+    backend lacks, not a request that never left the process."""
+
+
+class Refused(Exception):
+    """The implementation PR or a named lane PR is not what it was named as."""
+
+
+# ------------------------------------------------------------------ forge
+def _orch():
+    return lane._orchestrator_module()
+
+
+class _Forge(fleetforge.Forge):
+    """`fleetforge.Forge` plus `transport_failed`: whether the LAST request
+    died in transport. `fleetforge` answers `(0, None)` for that and for a
+    verb the backend lacks, a malformed repo and a request the
+    standard library rejects before sending; only an `OSError` raised by `urlopen` itself
+    (an HTTP status is an `HTTPError`, which is excluded) is a transport
+    failure."""
+
+    transport_failed = False
+
+    def _request(self, *args, **kw):
+        self.transport_failed = False
+        # The spy wraps fleetforge's own opener; this file makes no forge call of
+        # its own, so it reaches the module through fleetforge, not by import.
+        opener = getattr(fleetforge.urllib, "request")
+        real = opener.urlopen
+
+        def spy(*a, **k):
+            try:
+                return real(*a, **k)
+            except urllib.error.HTTPError:
+                raise
+            except OSError:                  # URLError, timeout, refused, reset, DNS
+                self.transport_failed = True
+                raise
+        opener.urlopen = spy
+        try:
+            return super()._request(*args, **kw)
+        finally:
+            opener.urlopen = real
+
+    def _dispatch(self, spec):
+        self.transport_failed = False       # a verb never sent is not a transport failure
+        return super()._dispatch(spec)
+
+
+def _forge(orch):
+    return _Forge(orch._forgejo_base_url(), orch._implbot_token(),
+                  timeout=orch.forge_timeout())
+
+
+def _read_failure(forge, message):
+    """ForgeLater when the forge's last request died in transport, else HostError."""
+    cls = ForgeLater if getattr(forge, "transport_failed", False) else HostError
+    return cls(message)
+
+
+def _marker_needle(plan_id):
+    """`Plan: <id>` on a line of its own, built the way `bin/fleet-watch`
+    `marked_pr()` builds it. MARKER is imported; the regex is local to that
+    function, so it cannot be."""
+    watch = _load("fleet_watch_for_meet", BIN / "fleet-watch")
+    return re.compile(rf"^{re.escape(watch.MARKER)}{re.escape(plan_id)}\s*$", re.M)
+
+
+def _login(obj):
+    return ((obj or {}).get("login") or "").lower()
+
+
+def _get_pull(forge, repo, n):
+    status, pull = forge.get_pull(repo, n)
+    if status != 200 or not isinstance(pull, dict):
+        raise _read_failure(forge, f"could not read {repo}#{n} (HTTP {status})")
+    head = ((pull.get("head") or {}).get("sha")) or ""
+    if not _SHA_RE.match(head):
+        raise HostError(f"{repo}#{n} reports no 40-hex head sha")
+    return pull, head
+
+
+def _drain(forge_verb, *args, **kw):
+    """(items, None) when the listing finished, else (None, why). Never raises."""
+    try:
+        pages = fleetforge.paged(forge_verb, *args, **kw)
+        items = []
+        for page in pages:
+            items.extend(page)
+        if pages.outcome != fleetforge.EXHAUSTED:
+            return None, f"listing ended {pages.outcome} (status {pages.failed_status})"
+        return items, None
+    except Exception as e:                       # noqa: BLE001 — fail closed
+        return None, f"listing raised {e.__class__.__name__}"
+
+
+# ---------------------------------------------------------- the PR body header
+HEADER_FIELDS = ("Tests-for", "runner", "sha", "prompt sha256", "usage")
+_HEADER_LINE = re.compile(r"^(Tests-for|runner|sha|prompt sha256|usage): ?(.*?)\s*$")
+
+
+def header_fields(body):
+    """{field: [values]} from the HEADER BLOCK only: the lines up to the next
+    blank line, which `fleet-lane` writes before any vendor text. A field is
+    read from nowhere else, and a repeat is kept so the caller can refuse it.
+
+    Two real layouts exist (plan 0102 D4, amended by #677). Today's
+    `build_pr_body` writes `Tests-for:` then the four field lines with no
+    blank line between them. #653 — the first real lane, dispatched before
+    that amendment — writes `Tests-for:`, ONE blank line, then the four field
+    lines, then the blank line that ends the block. Both are read as the same
+    header block: when the first line is `Tests-for:`, exactly one blank line
+    directly after it is skipped before scanning for the block's fields."""
+    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = {}
+    start = 0
+    first = _HEADER_LINE.match(lines[0]) if lines else None
+    if first:
+        out.setdefault(first.group(1), []).append(first.group(2))
+        start = 1
+        if first.group(1) == "Tests-for" and len(lines) > 1 and not lines[1].strip():
+            start = 2                  # #653's layout: one blank line right after Tests-for
+    for line in lines[start:]:
+        if not line.strip():
+            break
+        m = _HEADER_LINE.match(line)
+        if m:
+            out.setdefault(m.group(1), []).append(m.group(2))
+    return out
+
+
+def lane_branch(pull):
+    """The lane pull request's head branch name.
+
+    Forgejo deletes a merged pull request's branch and then reports its head
+    `ref` as `refs/pull/<n>/head`, keeping the branch name in `head.label`
+    (measured on eunomia#912, merged 2026-10-16: label
+    `agent/tests/0130-…/sub-codex`, ref `refs/pull/912/head`). So for a MERGED
+    pull request whose ref has that shape, the label is the branch. Never for
+    an open one: its ref is the branch, and the label is not consulted."""
+    head = pull.get("head") or {}
+    ref = head.get("ref") or ""
+    if pull.get("merged") and re.fullmatch(r"refs/pull/\d+/head", ref):
+        label = head.get("label") or ""
+        if label and ":" not in label:
+            return label
+    return ref
+
+
+def lane_problem(pull, plan_id, roles):
+    """Why `pull` is not a lane for `plan_id`, or None (D1 step 2)."""
+    if _login(pull.get("user")) not in roles["author"].logins:
+        return "not authored by the author role"
+    ref = lane_branch(pull)
+    if not re.fullmatch(rf"agent/tests/{re.escape(plan_id)}/[A-Za-z0-9._-]+", ref):
+        return f"head branch {ref!r} is not agent/tests/{plan_id}/<runner>"
+    if header_fields(pull.get("body")).get("Tests-for") != [plan_id]:
+        return f"no `Tests-for: {plan_id}` line in the body's header block"
+    return None
+
+
+# ---------------------------------------------- the reviewers' read (plan 0138)
+# Copied from talos `post-review.py` PROVENANCE_RE (talos commit 7a314b69, the
+# file's last change when this was copied, 2026-10-16). It is the shape of the
+# line the dispatcher writes; keep it in step with that file.
+PROVENANCE_RE = (r"^Review-provenance: model=[^;\n]+; "
+                 r"(?:session=[0-9a-fA-F-]+; )?"
+                 r"(?P<extra>(?:[a-z][a-z-]*=[^;\s]+; )*)"
+                 r"same-session-as-author=(yes|no|spawned-subagent)\s*$")
+_PROVENANCE = re.compile(PROVENANCE_RE)
+_MODEL = re.compile(r"^Review-provenance: model=([^;\n]+); ")
+
+
+def read_autonomy(repo):
+    """The repository's `autonomy`, read the way `bin/fleet-record` reads it
+    (`fleet-config get autonomy --repo <repo> --json`). Anything but a clean
+    answer is `critical`: unreadable never widens who may read a lane."""
+    try:
+        r = subprocess.run([str(BIN / "fleet-config"), "get", "autonomy", "--repo", repo, "--json"],
+                           capture_output=True, text=True, timeout=60)
+        val = json.loads(r.stdout).get("value")
+    except (ValueError, AttributeError, OSError, subprocess.SubprocessError):
+        return "critical"
+    if r.returncode != 0 or val != "autonomous":
+        return "critical"
+    return val
+
+
+def expected_reviewers(repo):
+    return _orch().lane_expected_reviewers(repo)
+
+
+def provenance_trailer(body):
+    """(fields, None) or (None, why): the dispatcher's trailer, which is the
+    body's last non-blank lines when they are a contiguous block of
+    `Review-provenance…` lines. Only that block is read; a provenance line
+    anywhere above it is model-authored text and is ignored."""
+    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    block = []
+    while lines and lines[-1].startswith("Review-provenance"):
+        block.insert(0, lines.pop())
+    if not block:
+        return None, "no provenance trailer"
+    hits = [ln for ln in block if _PROVENANCE.match(ln)]
+    if len(hits) != 1:
+        return None, f"{len(hits)} provenance lines in the trailer, not exactly one"
+    m = _PROVENANCE.match(hits[0])
+    fields = {}
+    for part in m.group("extra").split("; "):
+        if part:
+            k, v = part.split("=", 1)
+            fields.setdefault(k, []).append(v)
+    fields["_model"] = _MODEL.match(hits[0]).group(1)
+    return fields, None
+
+
+def _reviewer_verdict(reviews, account, head_sha):
+    """(review, None) or (None, reason): `account`'s latest verdict, checked."""
+    mine = [r for r in reviews if isinstance(r, dict) and _login(r.get("user")) == account
+            and r.get("state") in ("APPROVED", "REQUEST_CHANGES")]
+    if not mine:
+        return None, f"{account}: no approval"
+    r = max(mine, key=lambda x: ((x.get("submitted_at") or ""), x.get("id") or 0))
+    if r.get("state") != "APPROVED":
+        return None, f"{account}: latest verdict is {r.get('state')}"
+    if r.get("dismissed"):
+        return None, f"{account}: the approval was dismissed"
+    if r.get("stale"):
+        return None, f"{account}: the approval is stale"
+    if r.get("commit_id") != head_sha:
+        return None, f"{account}: approved at {r.get('commit_id')}, not at the head {head_sha}"
+    fields, why = provenance_trailer(r.get("body"))
+    if fields is None:
+        return None, f"{account}: {why}"
+    if fields.get("head") != [head_sha]:
+        return None, f"{account}: provenance head is {fields.get('head')}, not exactly [{head_sha}]"
+    if fields.get("tools") != ["none"]:
+        return None, f"{account}: provenance tools is {fields.get('tools')}, not exactly ['none']"
+    return (r, fields["_model"]), None
+
+
+def approval_by_the_reviewers(repo, reviews, head_sha):
+    """(reader, None) or (None, reason) — plan 0138 D1. Autonomous repositories
+    only; the caller checks that. `reader` is the finding's reader fields."""
+    try:
+        accounts = expected_reviewers(repo)
+    except Exception as e:                       # noqa: BLE001 — a Stop, whichever copy of the
+        # orchestrator module raised it; whatever it was, the reviewers' path fails closed
+        return None, f"the reviewers cannot be named ({e.__class__.__name__}): {e}"
+    if len(set(accounts)) < 2:
+        return None, f"fewer than two reviewers configured ({len(set(accounts))})"
+    found, models = [], []
+    for account in accounts:
+        got, why = _reviewer_verdict(reviews, account, head_sha)
+        if got is None:
+            return None, why
+        found.append(got[0])
+        models.append(got[1])
+    # The accounts are the two readers; the models are not compared (ADR-0024):
+    # two instances of one model are two reviews. `models` is kept for the
+    # finding's `read_models`, which config/meeting-findings.schema.json (outside
+    # plan 0149's lane) must admit first.
+    return {"reader": "reviewers", "read_by": ",".join(accounts),
+            "review_id": found[0].get("id"), "review_ids": [r["id"] for r in found if isinstance(r.get("id"), int)],
+            "read_at": max((r.get("submitted_at") or "") for r in found)}, None
+
+
+# ------------------------------------------------------- the human-read check
+def approval_by_the_human(reviews, head_sha, roles):
+    """(review, None) or (None, reason) — D2. Deliberately NOT
+    `orchestrator.approval_stands`: that returns True when the reviews cannot
+    be read (right for freezing a branch, backwards here) and accepts any
+    reviewer. Here an unreadable list never reaches this function as a pass."""
+    merger = roles["merger"].logins
+    agents = {a.lower() for a in lib.agent_accounts(roles)}
+    found = None
+    why = "no review"
+    for r in reviews:
+        if not isinstance(r, dict):
+            continue
+        who = _login(r.get("user"))
+        if r.get("state") != "APPROVED":
+            why = f"no approval (latest state {r.get('state')!r} by {who})"
+            continue
+        if r.get("dismissed"):
+            why = "the approval was dismissed"
+            continue
+        if r.get("stale"):
+            why = "the approval is stale"
+            continue
+        if who not in merger or who in agents:
+            why = f"approved by {who!r}, not by the human position"
+            continue
+        if r.get("commit_id") != head_sha:
+            why = (f"approved at {r.get('commit_id')}, not at the head {head_sha} "
+                   "(a push after the read is unread code)")
+            continue
+        if found is None or (r.get("submitted_at") or "") >= (found.get("submitted_at") or ""):
+            found = r
+    if found is not None:
+        return found, None
+    return None, why
+
+
+def read_lane(forge, repo, n, roles):
+    """The lane PR's head sha and its reviews, in one step. This value is what
+    the precondition compares and what every later step fetches and runs; the
+    branch is never re-read. Returns (pull, head, reader, why): `reader` is the
+    finding's reader fields, from the human's approval or, on an autonomous
+    repository, the two reviewers'."""
+    pull, head = _get_pull(forge, repo, n)
+    reviews, err = _drain(forge.list_reviews, repo, n)
+    if reviews is None:
+        return pull, head, None, f"the review list is unreadable ({err}) — fails closed"
+    review, why = approval_by_the_human(reviews, head, roles)
+    if review is not None:
+        return pull, head, {"reader": "human", "read_by": _login(review.get("user")),
+                            "review_id": review.get("id"), "review_ids": [review["id"]] if isinstance(review.get("id"), int) else [],
+                            "read_at": review.get("submitted_at") or ""}, None
+    if read_autonomy(repo) != "autonomous":
+        return pull, head, None, why
+    reader, rwhy = approval_by_the_reviewers(repo, reviews, head)
+    if reader is None:
+        return pull, head, None, f"{why}; the reviewers' read: {rwhy}"
+    return pull, head, reader, None
+
+
+# ------------------------------------------------------------------ the store
+def _git(store, args, timeout=300, text=True, check=False):
+    r = subprocess.run(["git", *args], cwd=str(store), capture_output=True,
+                       text=text, timeout=timeout)
+    if check and r.returncode != 0:
+        raise HostError(f"git {' '.join(args[:2])} failed: {(r.stderr or '')[:200]}")
+    return r
+
+
+def fetch_shas(repo, shas):
+    """Fetch exactly these commits, by sha. The store cannot fetch: host-level."""
+    try:
+        store = lib.ensure_store(repo)
+        with lib.store_lock(repo):
+            r = _git(store, ["fetch", "--quiet", "origin", *sorted(set(shas))], timeout=900)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        raise HostError(f"the store cannot fetch: {e.__class__.__name__}: {str(e)[:200]}")
+    if r.returncode != 0:
+        raise HostError(f"the store cannot fetch: {(r.stderr or '').strip()[:200]}")
+    return store
+
+
+def lane_paths(store, lane_sha, impl_sha, base=None):
+    """(files, problems): what the lane at `lane_sha` adds relative to its
+    merge-base with main, and every reason it must be refused (D1 step 4). Every
+    changed path must be an ADDED, regular (100644) file under tests/lane/, and
+    must not already exist at the implementation head.
+
+    `base` is a merged lane pull request's own `merge_base`, from the forge.
+    Once the lane is merged its commit is on main, so its merge-base with main
+    is itself and the diff is empty: eunomia#912's meeting refused it as "adds
+    no files" on 2026-10-16. The recorded base is what the pull request was
+    reviewed against."""
+    if base:
+        if not _SHA_RE.match(base):
+            return [], [f"the recorded merge base {base!r} is not a sha"]
+        merge_base = base
+    else:
+        mb = _git(store, ["merge-base", f"origin/{BASE_BRANCH}", lane_sha])
+        if mb.returncode != 0 or not _SHA_RE.match(mb.stdout.strip()):
+            return [], [f"no merge-base with {BASE_BRANCH}"]
+        merge_base = mb.stdout.strip()
+    d = _git(store, ["diff", "--raw", "-z", "--no-renames", "--no-abbrev",
+                     merge_base, lane_sha])
+    if d.returncode != 0:
+        return [], ["the lane's diff could not be read"]
+    tokens = d.stdout.split("\0")
+    files, problems = [], []
+    i = 0
+    while i < len(tokens) and tokens[i].startswith(":"):
+        meta = tokens[i][1:].split()
+        path = tokens[i + 1] if i + 1 < len(tokens) else ""
+        i += 2
+        old_mode, new_mode, _old, new_blob, status = (meta + [""] * 5)[:5]
+        if status != "A":
+            problems.append(f"{path}: status {status!r}, only added files are allowed")
+            continue
+        parts = path.split("/")
+        if (posixpath.normpath(path) != path or any(p in ("", ".", "..", ".git") for p in parts)
+                or parts[:2] != LANE_ROOT.split("/") or len(parts) < 3):
+            problems.append(f"{path}: not under {LANE_ROOT}/")
+            continue
+        if new_mode != "100644":
+            problems.append(f"{path}: mode {new_mode}, only 100644 is allowed")
+            continue
+        if _git(store, ["cat-file", "-e", f"{impl_sha}:{path}"]).returncode == 0:
+            problems.append(f"{path}: already exists at the implementation head")
+            continue
+        files.append((path, new_blob))
+    if not files and not problems:
+        problems.append("the lane adds no files")
+    return files, problems
+
+
+def test_files(files):
+    out = []
+    for path, _ in files:
+        base = posixpath.basename(path)
+        if base.endswith(".py") and (base.startswith("test_") or base.endswith("_test.py")):
+            out.append(path)
+    return out
+
+
+# --------------------------------------------------------------- prompt hash
+def _lane_run_hash(repo, plan_id, runner, pr):
+    """0100's `lane_run` row for this lane, or None. Read-only; an unreadable
+    database is 'no row', which can only make a hash LESS verified."""
+    try:
+        db = lane._config_module().DB
+        if not os.path.exists(db):
+            return None
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute(
+                "SELECT prompt_sha256 FROM lane_run WHERE repo=? AND plan=? AND runner=? "
+                "AND pr=? ORDER BY started_at DESC LIMIT 1",
+                (repo, plan_id, runner, pr)).fetchone()
+        finally:
+            con.close()
+        return row[0] if row and row[0] else None
+    except (sqlite3.Error, OSError, Exception):          # noqa: BLE001
+        return None
+
+
+def prompt_hash(repo, plan_id, runner, pr, body):
+    """D4. The hash is read from the body's header block AND 0100's lane_run row;
+    the two are recorded. Returns (fields, dispatch_sha)."""
+    hdr = header_fields(body)
+    reasons = []
+    values = {}
+    for name in ("sha", "prompt sha256"):
+        vals = hdr.get(name, [])
+        if len(vals) > 1:
+            reasons.append(f"repeated header field {name!r}")
+        elif not vals:
+            reasons.append(f"missing header field {name!r}")
+        else:
+            values[name] = vals[0]
+    for name in ("Tests-for", "runner", "usage"):
+        if len(hdr.get(name, [])) > 1:
+            reasons.append(f"repeated header field {name!r}")
+    body_hash = values.get("prompt sha256")
+    if body_hash is not None and not _HASH_RE.match(body_hash):
+        reasons.append("the header's prompt sha256 is not 64 hex")
+        body_hash = None
+    dispatch = values.get("sha")
+    if dispatch is not None and not _SHA_RE.match(dispatch):
+        dispatch = None
+    row_hash = _lane_run_hash(repo, plan_id, runner, pr)
+    if row_hash is not None and not _HASH_RE.match(row_hash):
+        row_hash = None
+    if body_hash is not None:
+        source, chosen = "pr-body", body_hash
+    elif row_hash is not None:
+        source, chosen = "lane_run", row_hash
+    else:
+        source, chosen = None, None
+    if row_hash is None:
+        reasons.append("no lane_run row: the hash comes from the PR body alone")
+    elif body_hash is not None and row_hash != body_hash:
+        reasons.append("the PR body and the lane_run row disagree")
+    verified = not reasons and body_hash is not None and body_hash == row_hash
+    return ({"prompt_sha256": chosen, "prompt_sha256_source": source,
+             "prompt_sha256_verified": verified,
+             "prompt_sha256_reason": "; ".join(reasons) or None,
+             "prompt_sha256_lane_run": row_hash}, dispatch)
+
+
+def compare(lanes):
+    """(comparable, comparability). Lanes are comparable only when their VERIFIED
+    prompt hashes are equal: the same sha can make different prompts, so neither
+    the sha, the runner nor the branch counts."""
+    if len(lanes) < 2:
+        return None, "one lane: nothing to compare"
+    hashes = [l["prompt_sha256"] for l in lanes]
+    if all(l["prompt_sha256_verified"] for l in lanes) and len(set(hashes)) == 1:
+        return True, None
+    named = "; ".join(
+        f"lane {l['pr']} ({l['runner']}) prompt sha256 {l['prompt_sha256']} "
+        f"({'verified' if l['prompt_sha256_verified'] else 'unverified'})" for l in lanes)
+    return False, (f"{named}. The lanes did not see byte-identical, verified input, so a "
+                   "disagreement between them is not evidence of an ambiguous "
+                   "specification (ADR-0006 §3).")
+
+
+# ------------------------------------------------------------- the comparison
+def parse_gaps(body):
+    """The lane's gaps from its PR body's `gaps:` block (the one `fleet-lane`
+    renders: a fence, each vendor line prefixed `> `, a fence), or None when the
+    block is missing or does not parse. None is never "no gaps"."""
+    lines = (body or "").replace("\r\n", "\n").split("\n")
+    try:
+        i = lines.index("gaps:")
+    except ValueError:
+        return None
+    if i + 1 >= len(lines) or lines[i + 1] != "```":
+        return None
+    out = []
+    for line in lines[i + 2:]:
+        if line == "```":
+            return [] if out == ["(none)"] else out
+        if line.startswith("> "):
+            out.append(line[2:])
+        elif line == ">":
+            out.append("")
+        else:
+            return None
+    return None
+
+
+def dispatched_runners(repo, plan_id):
+    """The runners the watcher dispatched a lane to for this plan, from its
+    `lane-dispatched` events, in first-seen order. [] when the log is unreadable."""
+    out = []
+    try:
+        with open(lib.fleet_dir() / "events.jsonl", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                d = ev.get("detail") if isinstance(ev, dict) else None
+                if (isinstance(d, dict) and ev.get("type") == "lane-dispatched"
+                        and d.get("plan") == plan_id and ev.get("repo", repo) == repo
+                        and isinstance(d.get("runner"), str) and d["runner"] not in out):
+                    out.append(d["runner"])
+    except OSError:
+        pass
+    return out
+
+
+def _tally(tests):
+    c = {"tests": len(tests), "pass": 0, "fail": 0, "skip": 0}
+    for t in tests:
+        c["pass" if t["outcome"] == "pass" else "skip" if t["outcome"] == "skip" else "fail"] += 1
+    return c
+
+
+def _verdict(per_lane):
+    cover = [c["tests"] > 0 for c in per_lane]
+    if not any(cover):
+        return "uncovered"
+    if not all(cover):
+        return "one-lane"
+    clean = [c["pass"] == c["tests"] for c in per_lane]
+    failed = [c["fail"] > 0 for c in per_lane]
+    if all(clean):
+        return "agree-pass"
+    if all(failed):
+        return "agree-fail"
+    if any(clean):
+        return "disagree"
+    return "inconclusive"
+
+
+def build_comparison(lanes, items, not_run, dispatched, gaps):
+    """The per-item comparison of comparable lanes (plan 0143 D1, D3). `items`
+    is [(id, first line)] or None when the plan could not be read, in which case
+    the ids are the ones the tests named. `gaps` maps runner to a list or None."""
+    if items is None:
+        named = sorted({c for l in lanes for t in l["tests"] for c in t.get("covers") or []})
+        items = [(c, "") for c in named]
+    out_items = []
+    for item_id, text in items:
+        per = {}
+        for l in lanes:
+            per[l["runner"]] = _tally([t for t in l["tests"] if item_id in (t.get("covers") or [])])
+        out_items.append({"id": item_id, "text": text, "lanes": per,
+                          "verdict": _verdict(list(per.values()))})
+    untagged = {l["runner"]: [{"id": t["id"], "outcome": t["outcome"]}
+                              for t in l["tests"] if not t.get("covers")] for l in lanes}
+    present = {l["runner"] for l in lanes}
+    missing, seen = [], set()
+    for x in not_run:
+        runner = x.get("runner")
+        if runner:
+            seen.add(runner)
+        missing.append({"runner": runner, "pr": x["pr"], "reason": x["reason"]})
+    for r in dispatched:
+        if r not in present and r not in seen:
+            missing.append({"runner": r, "pr": None,
+                            "reason": "dispatched, but no lane pull request is in this meeting"})
+    return {"items": out_items, "untagged": untagged, "lanes_missing": missing,
+            "partial": bool(missing), "gaps": {l["runner"]: gaps.get(l["runner"]) for l in lanes}}
+
+
+# ---------------------------------------------------------------- the runner
+PLUGIN = '''\
+import json
+_F = open(%(report)s, "a", buffering=1)
+
+
+def _text(rep):
+    lr = rep.longrepr
+    if isinstance(lr, tuple) and len(lr) == 3:      # a skip: (file, line, "Skipped: why")
+        return str(lr[2])
+    try:
+        return rep.longreprtext
+    except Exception:
+        return str(lr)
+
+
+def _emit(kind, rep):
+    _F.write(json.dumps({
+        "kind": kind, "nodeid": rep.nodeid,
+        "location": list(rep.location) if getattr(rep, "location", None) else None,
+        "when": getattr(rep, "when", "collect"), "outcome": rep.outcome,
+        "wasxfail": str(rep.wasxfail) if hasattr(rep, "wasxfail") else None,
+        "longreprtext": _text(rep), "duration": getattr(rep, "duration", 0.0)}) + "\\n")
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "covers(*ids): the plan item ids this test checks (plan 0142)")
+
+
+def pytest_collection_modifyitems(items):
+    for item in items:
+        ids = [a for m in item.iter_markers("covers") for a in m.args if isinstance(a, str)]
+        _F.write(json.dumps({"kind": "covers", "nodeid": item.nodeid, "covers": ids}) + "\\n")
+
+
+def pytest_runtest_logreport(report):
+    _emit("test", report)
+
+
+def pytest_collectreport(report):
+    _emit("collect", report)
+'''
+
+
+def _pytest_site():
+    spec = importlib.util.find_spec("pytest")
+    if spec is None or not spec.origin:
+        raise HostError("pytest is not importable by this interpreter")
+    return os.path.realpath(os.path.dirname(os.path.dirname(spec.origin)))
+
+
+def _real_home():
+    return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def profile_sha256():
+    return hashlib.sha256(PROFILE_PATH.read_bytes()).hexdigest()
+
+
+META_SLOTS = 12   # literal metadata rules in config/meeting-runner.sb (META0..META11)
+
+
+def _meta_chain(home, *paths):
+    """Every directory strictly between `home` and each of `paths`, deduplicated
+    and ordered. A path that is not under `home` contributes nothing."""
+    seen = []
+    for p in paths:
+        p = Path(os.path.realpath(str(p)))
+        try:
+            p.relative_to(home)
+        except ValueError:
+            continue
+        for d in p.parents:
+            if d == Path(home) or d == d.parent:
+                break
+            if str(d) not in seen:
+                seen.append(str(d))
+    return sorted(seen)
+
+
+def _sb_params(worktree, store, scratch, pysite):
+    home = _real_home()
+    real = {k: os.path.realpath(str(v)) for k, v in
+            (("WORKTREE", worktree), ("STORE", store), ("SCRATCH", scratch), ("PYSITE", pysite))}
+    chain = _meta_chain(home, real["WORKTREE"], real["STORE"], real["SCRATCH"])
+    if len(chain) > META_SLOTS:
+        raise HostError(f"{len(chain)} directories above the worktree, store and scratch "
+                        f"need a metadata rule; the profile has {META_SLOTS} slots")
+    # An unused slot repeats a path the profile already admits, never an unset one.
+    chain += [real["WORKTREE"]] * (META_SLOTS - len(chain))
+    out = []
+    for k, v in ([("REAL_HOME", home)] + list(real.items())
+                 + [(f"META{i}", d) for i, d in enumerate(chain)]):
+        out += ["-D", f"{k}={v}"]
+    return out
+
+
+def _argv(prefix_args, worktree, store, scratch, pysite, cmd):
+    """The confined command. With USE_PROFILE off (a test-only seam, the
+    control for every confinement probe) `cmd` runs bare."""
+    if not USE_PROFILE:
+        return list(cmd)
+    return ([SANDBOX_EXEC, "-f", str(PROFILE_PATH)]
+            + _sb_params(worktree, store, scratch, pysite) + list(cmd))
+
+
+def make_env(scratch, pysite, nonce):
+    """Built with nothing inherited (D3): no FLEET_*, no EUNOMIA_*, no
+    SSH_AUTH_SOCK, no token variable."""
+    return {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": str(scratch / "home"),
+        "TMPDIR": str(scratch / "tmp"),
+        "PYTHONPATH": os.pathsep.join([str(scratch / "plugins"), pysite]),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        "MEET_RUN_NONCE": nonce,
+    }
+
+
+def _new_scratch():
+    """One scratch directory per lane run, under THIS process's per-user
+    temporary directory (not /private/tmp, which every user shares, and not the
+    fleet tree: under the real home, git's walk of the parents needs a metadata
+    rule for each directory above it, and crashed runs piled up there, 23 on
+    2026-10-14). A run that dies before its `finally` leaves its directory for
+    the operating system to clean."""
+    base = os.path.realpath(tempfile.gettempdir())
+    scratch = Path(os.path.realpath(tempfile.mkdtemp(prefix="meet-run-", dir=base)))
+    for d in ("home", "tmp", "plugins"):
+        (scratch / d).mkdir()
+    (scratch / "report.jsonl").write_text("")
+    (scratch / "plugins" / "meet_report.py").write_text(
+        PLUGIN % {"report": json.dumps(str(scratch / "report.jsonl"))})
+    return scratch
+
+
+def _kill_group(pgid):
+    """SIGTERM then SIGKILL the process group `pgid`, which the caller records
+    AT SPAWN time (`proc.pid` right after `Popen(..., start_new_session=True)`,
+    which makes the new leader its own process group). Querying it here with
+    `os.getpgid(proc.pid)` after `proc.wait()` has already reaped the leader
+    raises ESRCH and turns the whole call into a silent no-op — exactly the
+    case where a child left running in that group (one that never called
+    `os.setsid()`) most needs the signal, because the run otherwise exited
+    cleanly. So both signals are always sent, unconditionally: a straggler
+    that ignores SIGTERM must not survive just because the leader exited
+    first. (A grandchild that itself called `os.setsid()` has left this group
+    entirely; nothing here reaches it — that is the nonce sweep's job.)"""
+    if pgid == os.getpgrp():
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            return
+        time.sleep(0.2)
+
+
+def _nonce_pids(nonce):
+    # macOS: `-E` appends the environment. procps (Linux) has no such flag; its
+    # BSD-style `e` modifier does the same.
+    argv = (["ps", "ewwx", "-o", "pid=,args="] if sys.platform.startswith("linux")
+            else ["ps", "-E", "-ww", "-x", "-o", "pid=,command="])
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    needle = re.compile(rf"MEET_RUN_NONCE={re.escape(nonce)}(?:\s|$)")
+    pids = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        pid, _, rest = line.partition(" ")
+        if pid.isdigit() and int(pid) != os.getpid() and needle.search(rest):
+            pids.append(int(pid))
+    return pids
+
+
+def sweep(nonce):
+    """Kill every process of this user whose environment carries this run's
+    nonce. A child that called `os.setsid()` has left the process group but
+    still carries the variable. Repeats until none remain, or refuses the
+    meeting after SWEEP_SECONDS."""
+    if not SWEEP_ENABLED:
+        return
+    deadline = time.monotonic() + SWEEP_SECONDS
+    while True:
+        pids = _nonce_pids(nonce)
+        if not pids:
+            return
+        if time.monotonic() > deadline:
+            raise HostError(f"{len(pids)} process(es) carrying this run's nonce survive SIGKILL")
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.1)
+
+
+def check_sandbox(store):
+    """Fail closed: no `sandbox-exec`, or a one-line probe under the profile
+    that will not start, is a host-level failure. There is no unconfined
+    fallback and no flag to skip the profile. (USE_PROFILE is a test-only
+    seam, the control every confinement probe is run against.)"""
+    if not USE_PROFILE:
+        return
+    if not os.access(SANDBOX_EXEC, os.X_OK):
+        raise HostError(f"{SANDBOX_EXEC} is missing — refusing to run vendor tests unconfined")
+    scratch = _new_scratch()
+    nonce = os.urandom(16).hex()
+    try:
+        pysite = _pytest_site()
+        cmd = _argv(None, scratch / "tmp", store, scratch, pysite,
+                    [sys.executable, "-c", "import pytest"])
+        r = subprocess.run(cmd, cwd=str(scratch / "tmp"), env=make_env(scratch, pysite, nonce),
+                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        if r.returncode != 0:
+            raise HostError("the confinement profile's start-up probe failed: "
+                            f"{(r.stderr or r.stdout).strip()[-200:]}")
+    except subprocess.TimeoutExpired:
+        raise HostError("the confinement profile's start-up probe timed out")
+    except OSError as e:
+        raise HostError(f"the confinement profile's start-up probe could not start: {e}")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _read_report(path):
+    out = []
+    try:
+        for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("nodeid") is not None:
+                out.append(rec)
+    except OSError:
+        pass
+    return out
+
+
+def clean_reason(text, tail):
+    """Free text, vendor-authored: redacted (whole, BEFORE it is cut, so a token
+    is never split across the cut) and bounded. Returns (text, shape names)."""
+    clean, shapes = _orch().redact_transcript(text or "")
+    clean = clean.strip()
+    if len(clean) > REASON_MAX:
+        clean = ("…" + clean[-(REASON_MAX - 1):]) if tail else (clean[:REASON_MAX - 1] + "…")
+    return clean, shapes
+
+
+def _classify(r):
+    """(outcome, pytest_outcome, reason text) for one pytest report, or None."""
+    when, oc, xf = r.get("when"), r.get("outcome"), r.get("wasxfail")
+    text = r.get("longreprtext") or ""
+    if oc == "passed" and (r.get("kind") == "collect" or when in ("setup", "teardown")):
+        return None
+    if xf is not None:
+        if oc == "skipped":
+            return "skip", "xfailed", f"xfail: {xf}"
+        if oc == "passed":
+            return "pass", "xpassed", None       # non-strict; strict arrives as a failure
+    if oc == "failed":
+        if r.get("kind") == "collect" or when in ("setup", "teardown"):
+            return "error", "error", text
+        return "fail", "failed", text
+    if oc == "skipped":
+        return "skip", "skipped", re.sub(r"^Skipped: ?", "", text)
+    if oc == "passed":
+        return "pass", "passed", None
+    return None
+
+
+def map_reports(records, files_run, ran, plan_ids=None):
+    """One entry per test from pytest's own report fields (never JUnit, never
+    `-rA` text). The first non-pass phase decides a test; a pass needs its call
+    to have passed. Then the two collection cases: a file that failed to import
+    is one `error` entry (its id is the file path), and a lane file that
+    yielded no tests at all is one `error` entry, `no tests collected`."""
+    per, order = {}, []
+    covers = {r["nodeid"]: [c for c in r.get("covers") or [] if isinstance(c, str)]
+              for r in records if r.get("kind") == "covers"}
+    for r in records:
+        if r.get("kind") == "covers":
+            continue
+        got = _classify(r)
+        if got is None:
+            continue
+        outcome, pyoc, reason = got
+        key = r["nodeid"]
+        loc = r.get("location") or []
+        src = loc[0] if loc and isinstance(loc[0], str) else key.split("::")[0]
+        if src.startswith("/") or src.startswith(".."):
+            src = key.split("::")[0]
+        dur = float(r.get("duration") or 0.0)
+        if key not in per:
+            per[key] = {"id": key, "outcome": outcome, "pytest_outcome": pyoc,
+                        "reason": reason, "source_path": src, "duration_s": dur,
+                        "_call": r.get("when") == "call"}
+            order.append(key)
+            continue
+        e = per[key]
+        e["duration_s"] += dur
+        if e["outcome"] == "pass" and outcome != "pass":
+            e.update(outcome=outcome, pytest_outcome=pyoc, reason=reason)
+    tests = []
+    for key in order:
+        e = per[key]
+        text, shapes = clean_reason(e["reason"], tail=e["outcome"] in ("fail", "error")) \
+            if e["reason"] is not None else (None, [])
+        entry = {"id": e["id"], "outcome": e["outcome"], "pytest_outcome": e["pytest_outcome"],
+                 "reason": text, "reason_redacted": shapes,
+                 "source_path": e["source_path"], "duration_s": round(e["duration_s"], 4),
+                 "covers": covers.get(e["id"], [])}
+        if plan_ids is not None:
+            entry["covers_unknown"] = [c for c in entry["covers"] if c not in plan_ids]
+        tests.append(entry)
+    if ran:
+        seen = {t["id"].split("::")[0] for t in tests}
+        for f in files_run:
+            if f not in seen:
+                tests.append({"id": f, "outcome": "error", "pytest_outcome": "error",
+                              "reason": "no tests collected", "reason_redacted": [],
+                              "source_path": f, "duration_s": 0.0})
+    return tests
+
+
+def counts_of(tests):
+    c = {"pass": 0, "fail": 0, "error": 0, "skip": 0}
+    for t in tests:
+        c[t["outcome"]] += 1
+    return c
+
+
+def _refused_run(reason):
+    return {"outcome": "refused", "pytest_exit": None, "duration_s": 0.0, "reason": reason}
+
+
+def plan_ids_at(store, plan_id, impl_sha):
+    """The plan's item ids from the plan file at the implementation head (plan
+    0142 D3), or None when that file cannot be read there: then no id can be
+    called unknown."""
+    r = _git(store, ["show", f"{impl_sha}:plans/{plan_id}.md"])
+    return lane.plan_item_ids(r.stdout) if r.returncode == 0 else None
+
+
+def plan_items_at(store, plan_id, impl_sha):
+    """[(id, first line)] of the plan at the implementation head, or None."""
+    r = _git(store, ["show", f"{impl_sha}:plans/{plan_id}.md"])
+    return lane.plan_items(r.stdout) if r.returncode == 0 else None
+
+
+def _runner_of(pull):
+    try:
+        return lane_branch(pull).rsplit("/", 1)[1]
+    except (IndexError, AttributeError, TypeError):
+        return None
+
+
+def run_lane(repo, plan_id, impl_sha, ln, store, pysite):
+    """Run one lane, separately: a fresh detached worktree at the implementation
+    head, this lane's files written in from the blobs at the approved sha."""
+    key = f"meet-{re.sub(r'[^A-Za-z0-9._-]+', '-', plan_id)[:60]}-{impl_sha[:12]}-{ln['pr']}"
+    worktree = None
+    scratch = _new_scratch()
+    nonce = os.urandom(16).hex()
+    try:
+        worktree = lib.add_worktree(repo, key, impl_sha)
+        wt_real = Path(os.path.realpath(worktree))
+        for part in ("tests", "tests/lane"):
+            p = wt_real / part
+            if p.is_symlink() or (p.exists() and not p.is_dir()):
+                return _refused_run(f"{part} is a symlink or not a directory at the implementation head"), []
+        for path, blob in ln["_files"]:
+            data = _git(store, ["cat-file", "blob", blob], text=False, check=True).stdout
+            dest = wt_real / path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if os.path.realpath(dest.parent) != str(dest.parent) and not str(
+                    os.path.realpath(dest.parent)).startswith(str(wt_real) + os.sep):
+                return _refused_run(f"{path} resolves outside the worktree"), []
+            dest.write_bytes(data)
+            os.chmod(dest, 0o644)
+        files_run = ln["_test_files"]
+        env = make_env(scratch, pysite, nonce)
+        cmd = _argv(None, wt_real, store, scratch, pysite,
+                    [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:randomly",
+                     "-p", "meet_report", "-q", "--continue-on-collection-errors",
+                     # A root that does not depend on the repository's ini
+                     # files. What pytest may read above it is the profile's.
+                     "--rootdir", str(wt_real), *files_run])
+        started = time.monotonic()
+        timed_out = False
+        with open(scratch / "stdout.txt", "wb") as out:
+            proc = subprocess.Popen(cmd, cwd=str(wt_real), env=env, stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+            # Recorded HERE, at spawn: `start_new_session=True` makes this
+            # child its own process group leader, so its pgid equals its pid.
+            # Read again later, via `getpgid(proc.pid)` after `proc.wait()`
+            # has reaped it, that lookup raises ESRCH and silently skips the
+            # kill on the very path (a normal exit) most likely to leave a
+            # stray group member behind.
+            pgid = proc.pid
+            try:
+                rc = proc.wait(timeout=MEET_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                rc = None
+            _kill_group(pgid)
+        # No process outlives the run: sweep by nonce, on success and on timeout.
+        sweep(nonce)
+        duration = round(time.monotonic() - started, 3)
+        records = _read_report(scratch / "report.jsonl")
+        collect_failed = any(r.get("kind") == "collect" and r.get("outcome") == "failed"
+                             for r in records)
+        if timed_out:
+            outcome, reason = "timeout", f"no exit within {MEET_TIMEOUT_SECONDS}s; killed"
+        elif not records and rc not in (0, 1, 5):
+            outcome, reason = "collection-error", f"pytest exited {rc} before it reported anything"
+        elif collect_failed:
+            outcome, reason = "collection-error", "at least one file failed to import or collect"
+        else:
+            outcome, reason = "ran", None
+        tests = map_reports(records, files_run, ran=outcome in ("ran", "collection-error")
+                            and not (not records and rc not in (0, 1, 5)),
+                            plan_ids=plan_ids_at(store, plan_id, impl_sha))
+        return {"outcome": outcome, "pytest_exit": rc, "duration_s": duration,
+                "reason": reason}, tests
+    finally:
+        if worktree is not None:
+            lib.remove_worktree(repo, key)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ document
+def _utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def findings_path(plan_id, impl_sha):
+    return lib.work_root() / "meetings" / plan_id / impl_sha[:12] / "findings.json"
+
+
+def write_document(doc, path):
+    """Validated against the schema BEFORE the rename; a document that fails is
+    never written. The old `findings.json` for the same head is kept beside it
+    as `findings.<its generated_at>.json` (a hard link first, so a reader never
+    sees no `findings.json`)."""
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    errors = lane.validate_schema(doc, schema)
+    if errors:
+        raise HostError(f"the findings document failed its own schema: {errors[:5]}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".findings.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if path.exists():
+        try:
+            stamp = json.loads(path.read_text(encoding="utf-8")).get("generated_at")
+        except (OSError, ValueError):
+            stamp = None
+        stamp = re.sub(r"[^0-9A-Za-z._:-]", "_", str(stamp or "unknown"))
+        archive, n = path.with_name(f"findings.{stamp}.json"), 0
+        while archive.exists():
+            n += 1
+            archive = path.with_name(f"findings.{stamp}.{n}.json")
+        try:
+            os.link(path, archive)
+        except OSError:
+            shutil.copy2(path, archive)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------- run
+def _say(text=""):
+    print(text)
+
+
+def discover(forge, repo, plan_id, roles, impl_pr):
+    items, err = _drain(forge.list_pulls, repo, state="all")
+    if items is None:
+        raise _read_failure(forge, f"the pull-request listing did not finish ({err}); "
+                                   "refusing to choose lanes from a partial list")
+    return sorted(int(p["number"]) for p in items
+                  if isinstance(p, dict) and str(p.get("number", "")).isdigit()
+                  and int(p["number"]) != impl_pr and lane_problem(p, plan_id, roles) is None)
+
+
+def run(repo, plan_id, impl_pr, lane_prs, dry_run=False):
+    orch = _orch()
+    forge = _forge(orch)
+    roles = lib.agent_roles()
+
+    # 1. the implementation PR — its head is read once, here.
+    impl, impl_sha = _get_pull(forge, repo, impl_pr)
+    if impl.get("state") != "open" and not impl.get("merged"):
+        raise Refused(f"{repo}#{impl_pr} is neither open nor merged")
+    if _login(impl.get("user")) not in roles["author"].logins:
+        raise Refused(f"{repo}#{impl_pr} is not authored by the author role")
+    if not _marker_needle(plan_id).search(impl.get("body") or ""):
+        raise Refused(f"{repo}#{impl_pr} carries no `Plan: {plan_id}` line of its own")
+
+    # 2. the lanes.
+    if lane_prs:
+        candidates = []
+        for n in lane_prs:
+            pull, _ = _get_pull(forge, repo, n)
+            why = lane_problem(pull, plan_id, roles)
+            if why:
+                raise Refused(f"{repo}#{n} is not a lane for {plan_id}: {why}")
+            candidates.append(n)
+    else:
+        candidates = discover(forge, repo, plan_id, roles, impl_pr)
+
+    # 3. the human-read precondition, per lane. The sha is read once, here.
+    lanes, not_run, not_run_runner = [], [], {}
+    for n in candidates:
+        pull, head, reader, why = read_lane(forge, repo, n, roles)
+        problem = lane_problem(pull, plan_id, roles)
+        if problem:
+            not_run.append({"pr": n, "head_sha": head, "reason": problem})
+            not_run_runner[n] = _runner_of(pull)
+        elif reader is None:
+            not_run.append({"pr": n, "head_sha": head, "reason": why})
+            not_run_runner[n] = _runner_of(pull)
+        else:
+            runner = lane_branch(pull).rsplit("/", 1)[1]
+            fields, dispatch = prompt_hash(repo, plan_id, runner, n, pull.get("body"))
+            lanes.append({
+                "pr": n, "head_sha": head, "branch": lane_branch(pull), "runner": runner,
+                "_base": pull.get("merge_base") if pull.get("merged") else None,
+                "dispatch_sha": dispatch, **fields,
+                **reader,
+                # Neither reader is independent: the human also approves the
+                # implementation, and on an autonomous repository so do the
+                # reviewers (ADR-0006 §5).
+                "independent_reader": False,
+                "_gaps": parse_gaps(pull.get("body"))})
+
+    _say(f"implementation: {repo}#{impl_pr} at {impl_sha}")
+    for x in not_run:
+        _say(f"lane {x['pr']} at {x['head_sha']}: NOT RUN — {x['reason']}")
+    for l in lanes:
+        _say(f"lane {l['pr']} at {l['head_sha']}: read by {l['read_by']} "
+             f"(review {l['review_id']})")
+
+    if not lanes and not dry_run:
+        print(f"fleet-meet: no lane of {plan_id} has an approval its repository accepts at its head "
+              "(the human's; on an autonomous repository, both reviewers') — later, "
+              "unchanged, this may pass", file=sys.stderr)
+        return EXIT_LATER
+
+    # 4. the paths. Only names are read: nothing is imported or executed here.
+    shas = [impl_sha] + [l["head_sha"] for l in lanes] + [
+        l["_base"] for l in lanes if l.get("_base")]
+    if dry_run:
+        shas += [x["head_sha"] for x in not_run]
+    store = fetch_shas(repo, shas)
+    for l in lanes:
+        files, problems = lane_paths(store, l["head_sha"], impl_sha, base=l.get("_base"))
+        l["_files"], l["files"] = files, [p for p, _ in files]
+        l["_test_files"] = test_files(files)
+        l["_refusal"] = ("; ".join(problems) if problems
+                         else None if l["_test_files"] else "the lane adds no test file")
+    if dry_run:
+        for x in not_run:
+            files, problems = lane_paths(store, x["head_sha"], impl_sha)
+            _say(f"lane {x['pr']} would add: {[p for p, _ in files]}"
+                 + (f" (would be refused: {'; '.join(problems)})" if problems else ""))
+        for l in lanes:
+            _say(f"lane {l['pr']} files: {l['files']}"
+                 + (f"; would be refused: {l['_refusal']}" if l["_refusal"] else ""))
+        comparable, why = compare(lanes)
+        _say(f"comparable: {json.dumps(comparable)}" + (f" — {why}" if why else ""))
+        _say("dry run: nothing was run")
+        return 0
+
+    # 5. the runner. Host-level failures raise HostError before any file runs.
+    if any(l["_refusal"] is None for l in lanes):
+        check_sandbox(store)
+    pysite = _pytest_site()
+    for l in lanes:
+        if l["_refusal"]:
+            l["run"], tests = _refused_run(l["_refusal"]), []
+        else:
+            l["run"], tests = run_lane(repo, plan_id, impl_sha, l, store, pysite)
+        l["tests"], l["counts"] = tests, counts_of(tests)
+
+    # 6-7. the comparison and the document.
+    comparable, why = compare(lanes)
+    all_tests = [t for l in lanes for t in l["tests"]]
+    comparison = None
+    if comparable:
+        comparison = build_comparison(
+            lanes, plan_items_at(store, plan_id, impl_sha),
+            [dict(x, runner=not_run_runner.get(x["pr"])) for x in not_run],
+            dispatched_runners(repo, plan_id), {l["runner"]: l["_gaps"] for l in lanes})
+    doc = {
+        "schema": SCHEMA_NAME, "repo": repo, "plan": plan_id, "generated_at": _utc_now(),
+        "impl": {"pr": impl_pr, "head_sha": impl_sha},
+        "lanes": [{k: v for k, v in l.items() if not k.startswith("_")} for l in lanes],
+        "not_run": not_run,
+        "comparable": comparable, "comparability": why,
+        "all_passed": bool(all_tests and not not_run
+                           and all(l["run"]["outcome"] == "ran" for l in lanes)
+                           and all(t["outcome"] == "pass" for t in all_tests)),
+        "confinement": {"profile_sha256": profile_sha256(),
+                        # #677 measured that SBPL cannot express a loopback-only
+                        # bind on this host (`localhost` matches every local
+                        # interface): this is the record of what the profile
+                        # actually does, not a confinement it does not provide.
+                        "network": {"outbound": "this-host-only", "bind": "any-local-address",
+                                    "denied_ports": [8200]},
+                        "env_keys": sorted(make_env(Path("."), "", "")),
+                        "timeout_seconds": MEET_TIMEOUT_SECONDS},
+    }
+    if comparison is not None:
+        doc["comparison"] = comparison
+    path = findings_path(plan_id, impl_sha)
+    write_document(doc, path)
+    print(path)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-meet")
+    ap.add_argument("repo")
+    ap.add_argument("plan_id")
+    ap.add_argument("--impl", required=True, type=int, help="the implementation pull request")
+    ap.add_argument("--lane", action="append", type=int, default=[],
+                    help="a lane pull request (repeatable); default: every lane of the plan")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args(argv)
+    if "/" in args.plan_id or args.plan_id in (".", "..") or not args.plan_id:
+        print(f"fleet-meet: {args.plan_id!r} is not a plan id", file=sys.stderr)
+        return 2
+    try:
+        lib.repo_slug(args.repo)
+    except ValueError:
+        print(f"fleet-meet: {args.repo!r} is not owner/repo", file=sys.stderr)
+        return 2
+    try:
+        return run(args.repo, args.plan_id, args.impl, args.lane, dry_run=args.dry_run)
+    except Refused as e:
+        print(f"fleet-meet: refused: {e}", file=sys.stderr)
+        return 1
+    except ForgeLater as e:
+        print(f"fleet-meet: {e}", file=sys.stderr)
+        return EXIT_LATER
+    except HostError as e:
+        print(f"fleet-meet: {e}", file=sys.stderr)
+        return 1
+    except (lane.Stop, _orch().Stop) as e:
+        print(f"fleet-meet: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -185,11 +185,23 @@ RECORDED = {
         "forgejo": [{"sha": "abc123", "commit": {"message": "x"}}],
         "github": [{"sha": "abc123", "commit": {"message": "x"}}],
     },
+    "get_git_tree": {
+        "forgejo": {"sha": "t1", "truncated": False,
+                    "tree": [{"path": "plans", "type": "tree", "sha": "t2"}]},
+        "github": {"sha": "t1", "truncated": False,
+                   "tree": [{"path": "plans", "type": "tree", "sha": "t2"}]},
+    },
+    "get_git_blob": {
+        "forgejo": {"sha": "b1", "size": 5, "encoding": "base64", "content": "aGVsbG8="},
+        "github": {"sha": "b1", "size": 5, "encoding": "base64", "content": "aGVsbG8="},
+    },
 }
 
 # (verb name, args to call it with) — one row per verb EXCEPT
-# get_branch_protections, whose whole point is that it does NOT share this
-# contract (see test_get_branch_protections_diverges_by_design below), and
+# get_branch_protections and list_action_runs, whose whole point is that they
+# do NOT share this contract (see test_get_branch_protections_diverges_by_design
+# and test_list_action_runs_diverges_by_design below), get_pull_by_branch, for
+# the same reason (see test_get_pull_by_branch_diverges_by_design below), and
 # search_repos, whose path does not share the `/repos/` prefix every other
 # verb does (see test_search_repos_diverges_by_wrapping_key_and_path below).
 VERB_CALLS = [
@@ -207,6 +219,8 @@ VERB_CALLS = [
     ("get_repo", ("owner/repo",)),
     ("list_branches", ("owner/repo",)),
     ("list_commits", ("owner/repo",)),
+    ("get_git_tree", ("owner/repo", "t1")),
+    ("get_git_blob", ("owner/repo", "b1")),
 ]
 
 assert set(RECORDED) == {name for name, _ in VERB_CALLS}, (
@@ -380,6 +394,74 @@ def test_get_branch_protections_diverges_by_design():
         assert httpd.requests == []
 
     assert forgejo_request_count == 1
+
+
+# ----------------------------------------------- list_action_runs diverges
+def test_list_action_runs_diverges_by_design():
+    """Forgejo serves `/actions/runs` and the body comes back unchanged;
+    GitHub's run object has no `stopped`, so that backend answers `(0, None)`
+    without a request (see `_GithubBackend.list_action_runs`)."""
+    seen = {}
+    body_in = {"total_count": 1, "workflow_runs": [{"commit_sha": "ab"}]}
+
+    def route(method, path, body):
+        seen["path"] = path
+        return 200, body_in
+
+    with _stub_server(route) as (httpd, base):
+        status, body = _forge(base, "forgejo").list_action_runs(
+            "owner/repo", page=2, limit=50)
+    assert status == 200 and body == body_in
+    assert seen["path"].startswith("/api/v1/repos/owner/repo/actions/runs?")
+    assert "page=2" in seen["path"] and "limit=50" in seen["path"]
+
+    def route_never(method, path, body):
+        raise AssertionError("github's list_action_runs must never hit the wire")
+
+    with _stub_server(route_never) as (httpd, base):
+        assert _forge(base, "github").list_action_runs("owner/repo") == (0, None)
+        assert httpd.requests == []
+
+    assert _forge("http://example.invalid", "forgejo").list_action_runs(
+        "not-a-repo") == (0, None)
+
+
+# ----------------------------------------------- get_pull_by_branch diverges
+def test_get_pull_by_branch_diverges_by_design():
+    """Forgejo answers `/pulls/{base}/{head}` with the one matching pull
+    request; GitHub has no equivalent (its nearest is a LIST endpoint), so
+    that backend answers `(0, None)` without a request (see
+    `_GithubBackend.get_pull_by_branch`)."""
+    seen = {}
+    body_in = {"number": 42, "head": {"ref": "feat/x"}, "base": {"ref": "main"}}
+
+    def route(method, path, body):
+        seen["path"] = path
+        return 200, body_in
+
+    with _stub_server(route) as (httpd, base):
+        status, body = _forge(base, "forgejo").get_pull_by_branch(
+            "owner/repo", "main", "feat/x")
+    assert status == 200 and body == body_in
+    assert seen["path"] == "/api/v1/repos/owner/repo/pulls/main/feat%2Fx"
+
+    def route_never(method, path, body):
+        raise AssertionError("github's get_pull_by_branch must never hit the wire")
+
+    with _stub_server(route_never) as (httpd, base):
+        assert _forge(base, "github").get_pull_by_branch(
+            "owner/repo", "main", "feat/x") == (0, None)
+        assert httpd.requests == []
+
+    def route_404(method, path, body):
+        return 404, {"message": "not found"}
+
+    with _stub_server(route_404) as (_, base):
+        assert _forge(base, "forgejo").get_pull_by_branch(
+            "owner/repo", "main", "feat/x") == (404, None)
+
+    assert _forge("http://example.invalid", "forgejo").get_pull_by_branch(
+        "not-a-repo", "main", "feat/x") == (0, None)
 
 
 # --------------------------------------------------- never raises, either way

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-drift — polls each deployed service's own up_to_date verdict and pages
+  once when one has stayed behind main (or unknown) past its allowance
+  (plan 0098). Report only: it never deploys or restarts anything.
+
+  Install (opshost): set FLEET_NTFY_URL to the Fleet-ops push URL, then
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-drift.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-drift.plist
+  Verify: run fleet-drift with the dry-run flag by hand and confirm each
+  service prints a classification.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia (see fleet-orphans's plist).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-drift</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-drift</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- replace with the real Fleet-ops push URL at install; empty = print-only -->
+    <key>FLEET_NTFY_URL</key><string></string>
+  </dict>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/drift.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/drift.log</string>
+</dict>
+</plist>

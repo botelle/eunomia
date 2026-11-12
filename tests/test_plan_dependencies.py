@@ -1,4 +1,3 @@
-import pytest
 """Tests for `depends_on` (plan 0039): the three forms, `fleet-watch`'s
 dispatch-time check, and `fleet-plan lint`'s graph checks.
 
@@ -8,7 +7,11 @@ IMPORTING those modules (pytest's default "prepend" import mode already puts
 broker stub machinery here — this file adds one new fixture of its own
 (`_api_factory_multi`, below), which those two files have no need for.
 """
+import pytest
+import importlib.machinery
+import importlib.util
 import re
+import sqlite3
 import urllib.parse
 from pathlib import Path
 
@@ -16,6 +19,18 @@ import test_fleet_plan as tp
 import test_fleet_watch as tw
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
+
+
+def _depsd_schema():
+    """`bin/fleet-depsd`'s `SCHEMA`, loaded by path — the same idiom
+    `_load_watch()` uses — so a test fixture's `fleet.db` carries the real
+    `dependency_attestation` table shape, not a restatement of it."""
+    loader = importlib.machinery.SourceFileLoader(
+        "fleet_depsd_for_deps_test", str(BIN / "fleet-depsd"))
+    spec = importlib.util.spec_from_loader("fleet_depsd_for_deps_test", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod.SCHEMA
 
 
 # --------------------------------------------------------------- fleet-watch
@@ -38,6 +53,11 @@ def _api_factory_multi(protected=True, plan_texts=None, pulls=None,
             return (200, [tw._bp()]) if protected else (200, [])
         if path.endswith("/contents/plans?ref=main"):
             return 200, tw._contents_list(plan_texts.keys())
+        # plan 0106 D6: every plan was merged by the human.
+        if "/commits?" in path:
+            return 200, [{"sha": "a" * 40}]
+        if path.endswith("/pull") and "/commits/" in path:
+            return 200, {"number": 1, "merged_by": {"login": "operator"}}
         if "/contents/plans/" in path:
             name = urllib.parse.unquote(
                 path.split("/contents/plans/", 1)[1].split("?", 1)[0])
@@ -52,6 +72,12 @@ def _api_factory_multi(protected=True, plan_texts=None, pulls=None,
             return (200, {}) if p in path_hits else (404, None)
         if "/pulls?" in path:
             return 200, ((pulls or []) if "page=1" in path else [])
+        if "/issues?" in path and "type=pulls" in path:
+            # The dedupe scan's own listing since plan 0218 (test_fleet_watch's
+            # `_api_factory` carries the same pair of handlers for the same
+            # reason: `_pull_pages` reads this endpoint now, not `/pulls?`).
+            rows = [tw._issue_shape(p) for p in (pulls or [])]
+            return 200, (rows if "page=1" in path else [])
         if "/issues/" in path and "/comments" in path:
             rows = list(comments or [])
             m = re.search(r"[?&]since=([^&]+)", path)
@@ -161,16 +187,23 @@ def test_an_unmet_path_dependency_blocks(tmp_path):
     assert tw._spawns(log) == []
 
 
-def test_external_dependency_never_auto_satisfies(tmp_path, capsys):
+def test_external_dependency_unattested_is_unmet(tmp_path, capsys):
+    """Plan 0180 D1: an `external:<slug>` entry is unmet until an owner
+    attestation exists for that slug — a temporary, migrated `fleet.db` with
+    no row for it, never the host's."""
     orch, log = tw._stub_orchestrator(tmp_path)
-    mod = tw._load(tmp_path / "fleet", FLEET_WATCH_REPOS="operator/sniff")
+    fleet_dir = tmp_path / "fleet"
+    db = fleet_dir / "fleet.db"
+    db.parent.mkdir(parents=True)
+    sqlite3.connect(db).executescript(_depsd_schema())
+    mod = tw._load(fleet_dir, FLEET_WATCH_REPOS="operator/sniff", FLEET_DB=str(db))
     dependent = DEPENDENT.replace("depends_on: [0008-dep]",
                                   "depends_on: [external:cihost-caddy]")
     api = _api_factory_multi(plan_texts={"0009-thing.md": dependent})
     tw._wire(mod, api, orch)
     assert mod.cycle() == 0
     assert tw._spawns(log) == []
-    assert "external" in capsys.readouterr().err
+    assert "unattested" in capsys.readouterr().err
 
 
 def test_dry_run_reports_a_blocked_plan_and_mutates_nothing(tmp_path):
@@ -334,13 +367,14 @@ def test_a_met_dependency_lints_clean_and_warns_nothing(tmp_path):
 
 
 @pytest.mark.skip(reason="asserts on the private fleet's plan history, which the public cut omits")
-def test_the_repos_own_depends_on_edges_are_four_warnings_zero_errors():
+def test_the_repos_own_depends_on_edges_are_six_warnings_zero_errors():
     """The regression this plan's own DoD names: the abandoned-dependency
-    edges among the real plans in this repo warn, and only the (now-fixed)
+    edges among the real plans in this repo (six, now that 0013 is
+    abandoned) warn, and only the (now-fixed)
     dispatchable ones would ever error."""
     mod = tp._load()
     plans = sorted((Path(__file__).resolve().parent.parent / "plans").glob("*.md"))
     errs = [e for f in plans for e in mod.lint(f)]
     warns = [w for f in plans for w in mod.dependency_warnings(f)]
     assert errs == [], errs
-    assert len(warns) == 4, warns
+    assert len(warns) == 6, warns

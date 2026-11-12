@@ -1,7 +1,7 @@
 # Plan dispatch — the processes that run, and the data each one writes
 
 *Companion to [`docs/diagrams/dispatch-dataflow.svg`](diagrams/dispatch-dataflow.svg)
-(v1.0, 2026-09-22). `docs/plan-dispatch.md` is the design and says who decides;
+(v1.1, 2026-09-27). `docs/plan-dispatch.md` is the design and says who decides;
 this page says what runs and what it leaves behind, so a reader can go from any
 step to the file, table or forge object it wrote — and from any file back to
 the step that wrote it. Measured on opshost against `main` @ `245fd0b`; where a
@@ -12,20 +12,20 @@ plan will change a row it is named.*
 | # | step | process | trigger | reads | writes |
 |---|---|---|---|---|---|
 | ① | plan PR opened | `file-a-plan` skill → `~/bin/forgejo-open-pr.sh`, as implbot | a person | the target repo's `main` (id sweep, paths, broker verdict) | forge: PR on `plans/NNNN-slug` |
-| ② | plan review | `~/agent/dispatch-review.py` → a Fable session | the author session, after CI | the PR diff by SHA in a private worktree (ADR-0005) | forge: review, `review-ledger` comment, follow-ups issue (`file-followups.py`) |
+| ② | plan review | `~/agent/dispatch-review.py` → the repo's reviewer (default Fable, ADR-0013) | the author session, after CI | the PR diff by SHA in a private worktree (ADR-0005) | forge: review, `review-ledger` comment, follow-ups issue (`file-followups.py`) |
 | ③ | merge the plan PR | the operator, in Minos | two approvals | — | `main`: `plans/NNNN-slug.md` at `status: ready` |
 | ④ | verdict per repo | `bin/fleet-watch --resident` | every 120 s | `FLEET_WATCH_REPOS`; keyvault's forgejo-broker over `FLEET_BROKER_SOCKET` | `pages.jsonl` once on refusal; `leases/<key>.watch-notified` |
 | ⑤ | scan, dedupe, gate | `fleet-watch` | same cycle | `plans/` on `main` via the contents API; the repo's PR list (any PR with `Plan: <id>`); `depends_on`; `leases/` (live count vs `FLEET_WATCH_CAP`) | `events.jsonl: plan-blocked` on transition; `watch.log` (`deferred — at cap N`) |
 | ⑥ | spawn | `fleet-watch` → `bin/fleet-claim --assign`, `bin/fleetjob.py` | a `ready`, undispatched, unblocked plan and a free slot | — | `leases/<lease>.json` (assigned), `locks/`; `events.jsonl: lease-assigned, plan-dispatched`; launchd job `org.eunomia.fleet-orch.<lease>` with `EUNOMIA_SESSION/PLAN_ID/ZONE/TIER` |
 | ⑦ | start | `bin/orchestrator` | the launchd job | the lease; `fleet-models` (runner per position); the private `.git-store` clone | lease → active, heartbeats; `events.jsonl: lease-activated`; `work/<repo>/<lease>/` worktree, `feat/<slug>` branch; `work/logs/<lease>.log` (every phase from here on); `sessions/<sid>/` |
 | ⑧ | implementer session | `claude -p` as the resolved runner (default `sub-sonnet`) | ⑦ | preamble + plan + bounds on stdin; the worktree | commits, `git push`; the work PR **with `Plan: <id>`** (the session opens it); `~/dev/.orchestrator-transcripts/<lease>.log` (redacted at write); run log `implementer-start/exit` |
-| ⑨ | verify, wait for CI | `bin/orchestrator` | ⑧ exits | the PR by marker (`fleetforge`); the plan file on the branch; combined commit status | forge: PR body (marker stamped); run log `verified` / `unverified`, `ci-waiting`, `ci-resolved` |
-| ⑩ | review round | `dispatch-review.py` → Fable; or a CI-fix session | CI resolved | the PR at head SHA; today the failing check names only (plan 0069 adds the stored log) | forge: review, ledger comment, follow-ups issue; `fleet.db review` later via `fleet-reviews` |
+| ⑨ | verify, wait for CI | `bin/orchestrator` | ⑧ exits | the PR by marker (`fleetforge`); the plan file on the branch; combined commit status; the repo's workflow runs (`/actions/runs`, up to 4 pages, for the CI wait bound) | forge: PR body (marker stamped); run log `verified` / `unverified`, `ci-bound`, `ci-waiting`, `ci-resolved` |
+| ⑩ | review round | `dispatch-review.py` → the repo's reviewer (default Fable), additional reviewers annotate; or a CI-fix session | CI resolved | the PR at head SHA; today the failing check names only (plan 0069 adds the stored log) | forge: review, ledger comment, follow-ups issue; `fleet.db review` later via `fleet-reviews` |
 | ⑪ | fix round, or stop | a fix session; `bin/orchestrator` | a HIGH, or CI red | the review findings | commits; run log `review-round`, `review-stopped`; `events.jsonl: plan-failed` on stop |
 | ⑫ | freeze and steward | `bin/orchestrator` | APPROVE | the PR's top-level comments every 60 s (`unfreeze`, `instruction`, `followup`) | pushes refused; run log `review-approved`, `steward-start`, `steward-*`; forge: ack comments |
 | ⑬ | merge the work PR | the operator, in Minos | two approvals | — | `main` |
-| ⑭ | release | `bin/orchestrator` | the steward sees merged | — | lease → released; `events.jsonl: lease-released`; run log `steward-end`; the job exits and ⑤ reaps its label |
-| ⑮ | orphan sweep | `fleet-watch` | a lease whose heartbeat lapsed or whose process is gone | `leases/`, the process table | `pages.jsonl` + angelia push (`Orchestrator dead`), once; `leases/<lease>.watch-notified`; `events.jsonl: lease-orphaned` |
+| ⑭ | release | `bin/orchestrator` | the steward sees merged, **or (plan 0179 D1) any other exit once the plan reads `done`/`abandoned` on `main`** | the plan file on `main` (every exit but the steward's) | lease → released; `events.jsonl: lease-released` (`reason: plan-done`/`plan-abandoned` outside the steward's end); run log `steward-end` or `lease-settled`; the job exits and ⑤ reaps its label |
+| ⑮ | orphan sweep | `fleet-watch` | a lease whose heartbeat lapsed or whose process is gone | `leases/`, the process table, the plan file on `main` | `pages.jsonl` + angelia push (`Orchestrator dead`), once; `leases/<lease>.watch-notified`; `events.jsonl: lease-orphaned`; **once the plan reads `done`/`abandoned` (plan 0179 D2): lease → released via `fleet-release --force --expect-orphaned`, `events.jsonl: lease-released` (`reason: plan-done`/`plan-abandoned`), no forge read, instead of the page** |
 | ⑯ | brief | `bin/mopsus` | every cycle | `leases/`, `fleet.db` (`dispatch_phase`), the run log; `CLASS_RULES` | `pages.jsonl` + push with the shortlist and a Minos link; `mopsus.state.json` |
 | ⑰ | a person answers | the operator | the page | — | forge: a top-level `respawn` comment (bound to `FLEET_OPERATOR_UID`, must be newer than the lease) → back to ⑥ at the cap |
 

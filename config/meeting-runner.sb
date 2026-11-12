@@ -1,0 +1,107 @@
+;; config/meeting-runner.sb — the confinement for `bin/fleet-meet` (plan 0102 D3).
+;;
+;; A template: `bin/fleet-meet` fills the parameters with `sandbox-exec -D`,
+;; never by string formatting. SBPL applies the LAST matching rule, so each
+;; allow below is followed by its narrower deny.
+;;
+;;   REAL_HOME  the operator's home directory (from the account, not $HOME)
+;;   WORKTREE   the lane's own worktree, at the implementation head
+;;   STORE      the repo's `.git-store` that worktree points at
+;;   SCRATCH    the per-run scratch directory: HOME, TMPDIR, the plugin
+;;              directory and the report file
+;;   PYSITE     the directory holding the interpreter's `pytest` package
+;;   META0..META11  the directories strictly between REAL_HOME and WORKTREE,
+;;              STORE and SCRATCH, for metadata only (below); unused slots
+;;              repeat WORKTREE. More directories than slots fails the run.
+;;
+;; This is NOT config/codex-tester.sb and must not be merged with it: that one
+;; confines a model that has to reach its vendor over the network and read
+;; ~/.codex; this one confines TESTS that reach nothing but loopback.
+(version 1)
+(allow default)
+
+;; Writes are denied by default. A deny-list fails open on the directory it
+;; forgot (/opt/homebrew/bin/claude, /Users/Shared); an allowlist fails closed.
+(deny file-write*)
+(allow file-write*
+  (subpath (param "WORKTREE"))
+  (subpath (param "SCRATCH"))
+  (literal "/dev/null")
+  (literal "/dev/tty")
+  (literal "/dev/dtracehelper"))
+
+;; Reads under the real HOME are denied, then only what a lane run needs.
+(deny file-read* (subpath (param "REAL_HOME")))
+(allow file-read*
+  (literal (param "REAL_HOME"))
+  (subpath (param "WORKTREE"))
+  (subpath (param "STORE"))
+  (subpath (param "PYSITE"))
+  (subpath (param "SCRATCH")))
+;; Metadata, and nothing else, of each directory above the worktree, the store
+;; and the scratch directory, as `literal` paths. Measured 2026-10-14 (macOS
+;; 27.2): pytest stats the directory above its root, and git checks or resolves
+;; every parent from the top before it mkdirs or opens a worktree: `git init
+;; --bare` exited 128 `cannot mkdir … Operation not permitted` and `git -C
+;; <worktree> rev-parse HEAD` exited 128 `Invalid path '<~/dev>'`, with the
+;; sandbox log `deny(1) file-read-metadata <~/dev>`. Metadata says that one
+;; directory exists and when it changed: not its listing, not a sibling, not
+;; its contents. Never `subpath` (it would admit every checkout and the fleet
+;; db) and never metadata on all of REAL_HOME (existence of a key is
+;; information). The scratch directory is outside the home, so needs none.
+(allow file-read-metadata
+  (literal (param "META0"))
+  (literal (param "META1"))
+  (literal (param "META2"))
+  (literal (param "META3"))
+  (literal (param "META4"))
+  (literal (param "META5"))
+  (literal (param "META6"))
+  (literal (param "META7"))
+  (literal (param "META8"))
+  (literal (param "META9"))
+  (literal (param "META10"))
+  (literal (param "META11")))
+
+;; Loopback is what a stub forge needs. Denying network-outbound also shuts out
+;; DNS and unix sockets (measured). 8200 is keyvault's loopback port on a host
+;; that runs the token helper's vault login (plan 0073): denied by name. The deny
+;; is `remote tcp`, not `remote ip`: measured against a real listener on 8200,
+;; `(remote ip "localhost:8200")` did NOT stop the connect (the plan's first
+;; measurement could not show it, because nothing listened there).
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:*"))
+(deny network-outbound (remote tcp "localhost:8200"))
+
+;; Binding and listening are otherwise open, on every address (measured: SBPL
+;; cannot name loopback on this host — see `confinement.network` in the
+;; findings document and #677 §2). 8200 is the one port denied on every axis:
+;; a confined test may not connect to it (above), bind it or accept on it,
+;; because a listener there would receive whatever an unconfined helper sends
+;; at keyvault's login (plan 0073). The `tcp` filter is load-bearing, same as
+;; the outbound deny above: the `ip` form was measured to deny nothing.
+(deny network-bind (local tcp "localhost:8200"))
+(deny network-inbound (local tcp "localhost:8200"))
+
+;; No process escapes the sandbox: each of these hands work to a process that
+;; launchd, an app or LaunchServices starts OUTSIDE it, with the real HOME.
+(deny job-creation)
+(deny appleevent-send)
+(deny lsopen)
+
+;; No signal reaches a process outside this sandbox. Without this, confined
+;; code can `os.kill()` any process of this uid — fleet-watch, the
+;; orchestrator, fleet-meet itself — because SBPL's default is `(allow
+;; default)` and nothing here named `signal` before. Measured on this host:
+;; a confined `os.kill(pid, 0)` on a process started outside the sandbox
+;; raises PermissionError; the same call unconfined succeeds.
+(deny signal)
+(allow signal (target same-sandbox))
+
+;; No Mach service is reachable. Measured (docs/test-lane.md): with every Keychain
+;; service name denied by name a throwaway keychain item was STILL readable
+;; (`security find-generic-password` printed it, confined and not), so the names
+;; are not the control. `(deny mach-lookup)` is: the same item is then not
+;; found, while pytest, subprocess, git, sqlite3, curl and a loopback HTTP
+;; round-trip all still run under it. No exception was needed.
+(deny mach-lookup)

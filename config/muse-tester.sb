@@ -1,0 +1,190 @@
+;; config/muse-tester.sb — the confinement for the `sub-muse` test lane (plan
+;; 0183), built from `config/codex-tester.sb` (plan 0101) as the measured
+;; starting point and cross-checked against operator/talos's own
+;; `reviewer-uid/muse-review.sb` (plan 0035), the only other profile that has
+;; ever confined this binary.
+;;
+;; The registry argv (`MUSE_TESTER_ARGV` in bin/fleet-lane) passes the
+;; parameters with `/usr/bin/sandbox-exec -D`, and `bin/fleet-lane` fills the
+;; placeholders. Never fill it by string formatting.
+;;
+;;   LANE          the lane's own scratch directory: the cwd, the prompt file
+;;                 and codex's... no — muse's result rides stdout, so LANE
+;;                 holds only the prompt file muse reads with `--prompt-file`
+;;   MUSE_HOME     the operator's real ~/.config/muse (the login lives there)
+;;   MUSE_BIN_DIR  the operator's real ~/.local/bin (muse is a self-updating
+;;                 launcher script there, not a single binary — see below)
+;;
+;; muse is not one binary: `~/.local/bin/muse` is a bash launcher that resolves
+;; itself, checks for an update over HTTPS, and `exec`s the versioned payload
+;; it finds beside itself (`muse-bin-<version>`). The launcher is denied
+;; nothing by this profile that stops it running the EXISTING payload; the
+;; self-update path (`MUSE_NO_AUTO_UPDATE=1`, set in the run's environment by
+;; `bin/fleet-lane`, not by this profile) is what keeps that side quiet. A
+;; later muse upgrade on this host changes the versioned filename; the profile
+;; grants the whole `MUSE_BIN_DIR` directory for exactly that reason, the same
+;; choice `codex-tester.sb` makes for Caskroom/codex.
+;;
+;; Like codex (ADR-0006 §6), muse's OWN sandbox is not the control. Unlike
+;; codex's, muse's is ON by default ("approval and sandbox are ON by
+;; default") and governs its shell tool's reads and writes, not the process
+;; itself — and `--preset empty` means no tool, shell or otherwise, is ever
+;; registered, so there is nothing for that inner sandbox to govern in this
+;; posture. Measured 2026-11-07 (muse-cli 1.4.14 / 1.4.14-R7309.1, macOS
+;; 27.2, host opshost): muse's own in-process "approval reviewer" still tries to
+;; start A SECOND, NESTED seatbelt sandbox for itself on every run regardless
+;; of whether any tool exists to approve, and that nested sandbox-exec cannot
+;; start inside this outer one (`failed to create sandbox temp root:
+;; Operation not permitted`) — the same "codex's own sandbox cannot start
+;; inside an outer one" fact plan 0101 §3 measured, reached here by a
+;; different route. `--disable-approval` stops muse from starting that
+;; reviewer at all; `--disable-shell`, `--disable-write`, `--disable-web-tools`
+;; and `--disable-request-user-input` are additional surface reduction, named
+;; and pinned, and are NOT the control — the outer profile is.
+;;
+;; ADR-0006 §6's `~/.claude/CLAUDE.md` hazard (the operator's own settings
+;; reaching a tester) has a muse-shaped twin, measured the same day: with no
+;; override, a confined run's LAST fatal denial before this profile reached a
+;; working state was `failed to read rules file at
+;; /Users/operator/.claude/CLAUDE.md` (muse reads a "foreign" coding
+;; assistant's own rules file as personal context), and after passing
+;; `--no-foreign-personal-context` the next one was `failed to read skill
+;; file at /Users/operator/.agents/skills` — a personal, USER-SCOPE skills
+;; directory (`muse skills list --source all`) that is not excluded by that
+;; flag at all; it carries this host's own fleet-operational skills
+;; (bakeoff-pr, build-an-ios-app, the git skill's rules, …), exactly the kind
+;; of operator context ADR-0006 says a tester must never see. Neither flag
+;; stops muse from trying to open the real path. The fix is not a flag:
+;; `bin/fleet-lane` spawns this runner with `HOME` overridden to an empty
+;; scratch directory that holds neither `.claude/` nor `.agents/`, so the
+;; tilde-expansion muse itself performs resolves to a path that does not
+;; exist — which muse treats as "nothing to load", not as a denial — and
+;; `MUSE_AUTH_PATH` is set to the real login path explicitly so the login
+;; still resolves under the faked `HOME`. This is the one place this plan
+;; relies on an isolated HOME, and plan 0101 §3's Boundary ("do not satisfy
+;; ADR-0006 §6 with an isolated HOME alone") still holds: HOME changes what
+;; `~` expands to inside muse's own path construction, not what an absolute
+;; path can reach — the profile's `(deny default)` is what stops an absolute
+;; read of `/Users/operator/.claude/CLAUDE.md` or `/Users/operator/.agents/skills`
+;; if the HOME override is ever absent or wrong, and neither is granted
+;; below.
+;;
+;; It starts from `(deny default)`: every allow below is an entry a real
+;; confined run was measured to need, and the comment after it is the denial
+;; that proved it (`log stream --predicate 'sender == "Sandbox"' --info`,
+;; filtered to the `muse-bin-*` process), dated 2026-11-07 against the
+;; `--provider echo` deterministic probe — a real `muse exec`, not a model
+;; call, same discipline as `codex-tester.sb`'s `codex sandbox` probes.
+(version 1)
+(deny default)
+
+;; ---------------------------------------------------------------- processes
+(allow process-exec*)
+(allow process-fork)
+(allow sysctl-read)                 ;; denied: sysctl-read kern.* at start-up, as codex
+(allow file-read-metadata)          ;; denied: file-read-metadata on every path walk (stat)
+
+;; ------------------------------------------------------------------ reads
+;; Denied under (deny default), 2026-11-07, running the launcher through to
+;; a completed `run.terminal.completed` event:
+(allow file-read*
+  (literal "/")                                  ;; file-read-data /
+  (subpath "/usr/lib")                           ;; dyld, libSystem
+  (subpath "/usr/share/icu")                     ;; file-read-data /usr/share/icu/icudt78l.dat
+  (subpath "/System")                            ;; frameworks, dyld shared cache
+  (subpath "/private/var/db/dyld")               ;; file-read-data under /private/var/db/dyld
+  (subpath "/private/var/db/timezone")           ;; file-read-data /private/var/db/timezone/tz/*/zoneinfo/GMT
+  (subpath "/Library/Preferences")               ;; file-read-data under /Library/Preferences
+  ;; muse lists these two directories at start (names only, not contents),
+  ;; and without them stops with "Agent Definition filesystem source failed:
+  ;; IoError" — the same two `reviewer-uid/muse-review.sb` (plan 0035,
+  ;; 2026-10-29) already measured and named, for this same binary.
+  (literal "/Library")
+  (literal "/Library/Application Support")
+  (literal "/dev/urandom")                       ;; file-read-data /dev/urandom
+  (literal "/dev/random")
+  (literal "/dev/null")                          ;; file-read-data /dev/null
+  (literal "/dev/dtracehelper")                  ;; file-ioctl /dev/dtracehelper
+  (literal "/private/etc/passwd")                ;; opendirectoryd's own fallback read (see mach-lookup below)
+  (subpath (param "LANE"))                       ;; the prompt file
+  (subpath (param "MUSE_HOME"))                  ;; the login, its settings and its lock files
+  (subpath (param "MUSE_BIN_DIR")))              ;; the launcher and its versioned payload
+
+;; What a run needs to read is above; nothing under the operator's real HOME
+;; is granted beyond MUSE_HOME and MUSE_BIN_DIR. `~/.claude`, `~/.agents`,
+;; `~/.local/share/muse` (session index, skills cache, local tracing) and
+;; every other real-HOME path stay denied — the HOME override above is what
+;; keeps muse from ever asking for the first two; the sandbox is what would
+;; still refuse them if it ever did. `~/.local/share/muse/sessions` and the
+;; skill/plugin cache under it are read ONLY if `--no-session-log` and
+;; `--preset empty` are ever dropped from the argv (see bin/fleet-lane) — do
+;; not add a blanket allow for `~/.local/share/muse` to chase a future flag
+;; change; measure the new denial and name it here instead.
+
+;; ----------------------------------------------------------------- writes
+;; The scratch directory and the login. The login directory is writable on
+;; purpose: a Meta login refreshes itself (`~/.config/muse/auth.json`'s mtime
+;; moved during this plan's own measurement runs, on a run that made no model
+;; call), the same hazard plan 0101 §3 names for codex, and
+;; `~/.config/muse/.auth.json.lock` is written on every run regardless —
+;; denied under this profile before this line was added. Writes elsewhere
+;; (`~/.local/share/muse/...`, every `/private/var/folders/.../T/muse-*`
+;; scratch path the launcher or the binary tries under TMPDIR) are denied;
+;; muse tolerates all of them, degrading ("Built-in skills were disabled for
+;; this startup", "memory-bearing Agent Definitions are unavailable this
+;; session") rather than failing the run.
+(allow file-write*
+  (subpath (param "LANE"))
+  (subpath (param "MUSE_HOME"))
+  (literal "/dev/null")
+  (literal "/dev/dtracehelper"))
+
+;; --------------------------------------------------------------- network
+;; The launcher's own version check and the CLI's request to the Meta backend
+;; both leave from this process, so outbound TCP stays open to every address
+;; (residual reach) exactly as codex's. `bin/fleet-lane` sets
+;; `MUSE_NO_AUTO_UPDATE=1` in the run's environment so the launcher does not
+;; also attempt a self-update on every lane spawn; that is a quietness
+;; control, not a confinement one — this profile would still contain a
+;; self-update that ran anyway, because TCP stays open and the only writes a
+;; download could land are still confined to LANE and MUSE_HOME.
+(allow system-socket)                                  ;; denied: system-socket at the first socket()
+(allow network-outbound (remote tcp))
+(allow network-outbound (remote udp))                  ;; DNS
+;; AF_UNIX connects: only inside the scratch directory, and the resolver.
+(allow network-outbound (remote unix-socket (subpath (param "LANE"))))
+(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+;; A client has no reason to listen. Measured with both denied (D5, same
+;; probes as codex-tester.sb's).
+(deny network-bind)
+(deny network-inbound)
+
+;; ------------------------------------------------------ process escapes
+;; Each of these hands work to a process launchd, an app or Launch Services
+;; starts OUTSIDE the sandbox, with the real HOME (#663). Already denied by
+;; `(deny default)`; written out so a later edit that moves to `(allow
+;; default)` does not lose them, exactly as codex-tester.sb.
+(deny job-creation)
+(deny appleevent-send)
+(deny lsopen)
+
+;; No signal reaches a process outside this sandbox (#705), but muse may
+;; still need to stop a command it started — moot under `--disable-shell`
+;; today, kept in case a future argv re-enables the shell tool.
+(deny signal)
+(allow signal (target same-sandbox))
+
+;; No Mach service is reachable except the two named below. Measured
+;; 2026-11-07: with `(deny mach-lookup)` and no exceptions, muse fails to
+;; start at all (`AccountLookupFailed`-shaped denial reading
+;; `com.apple.system.opendirectoryd.libinfo`, the uid/gid lookup libinfo
+;; proxies, with `/private/etc/passwd` as its own measured fallback read
+;; above) and fails to post its local notification
+;; (`com.apple.system.notification_center`). UNLIKE codex-tester.sb, no
+;; Keychain service (`com.apple.SecurityServer` or similar) was ever denied
+;; in this measurement — muse's login is a plain file under MUSE_HOME, not a
+;; Keychain item, so the Keychain stays UNREACHABLE from this lane, not
+;; reopened.
+(deny mach-lookup)
+(allow mach-lookup (global-name "com.apple.system.notification_center")
+                   (global-name "com.apple.system.opendirectoryd.libinfo"))

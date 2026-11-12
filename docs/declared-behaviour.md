@@ -24,6 +24,63 @@ is recorded as a finding, not silently resolved.
 
 ## Programs
 
+### bin/fleet-arena
+
+declared
+
+**Purpose.** Runs one cell of a model comparison against a single arena
+repository (`cell`), lists cells (`list`), or shows one cell's full record
+(`show`). A cell is a real dispatch of the orchestrator with the
+`implementer` position pinned to a chosen runner; `--base` is an assertion
+checked against the arena's `origin/main`, not a selector.
+
+**Exit codes.**
+- `0`: success. `cell` prints the new cell id on stdout; `list` prints one
+  line per cell (or "no arena_cell rows"); `show` prints the full record.
+- `1`: refused or failed — an unknown or unwired position or runner, a
+  `--base` that is not a full SHA or is not the arena's `origin/main`, an
+  unreadable plan at the base, a dispatch failure (lease mint or
+  orchestrator spawn), or `show` given an unknown cell id. Refusals happen
+  before any row is written.
+- argparse's own exit 2 on malformed CLI arguments.
+
+**Writes.**
+- The shared database: one `arena_cell` row and seven
+  `arena_cell_assignment` rows per cell, written in one short transaction
+  before dispatch; a dispatch failure afterward updates the row to
+  `outcome='failed'` and never deletes it.
+- One lease record per cell, naming the branch `cell/<plan-slug>/<cell_id>`,
+  through `fleet-claim`; and the orchestrator process it spawns.
+- `list` and `show` write nothing. Diagnostics go to stderr.
+- No event is emitted. It never merges a branch and never changes a plan's
+  status.
+
+**Shape.** `list` lines: cell id, timestamp, repo, round, outcome, PR
+number, branch. `show` prints `key: value` lines for the record followed by
+one line per assignment row (position, ordinal, runner, source, effective).
+
+### bin/fleet-attest
+
+declared
+
+**Purpose.** Tests every change record against checks A1-A8 of
+`docs/change-management.md` and reports each exception. Read-only: it holds
+neither the recorder's key nor its token, pushes to no remote, and calls no
+model. Subcommands: `check`, `report --month YYYY-MM|previous [--rerun]`.
+
+**Exit codes.**
+- `0`: the pass completed, with or without exceptions.
+- `2`: a refusal or an unreadable input: no start SHA for any run with no
+  prior report, a month that already has a report (without `--rerun`), or
+  malformed flags.
+
+**Writes.**
+- `reports/YYYY-MM[.rN].md` and `.json` and `protection/<owner>/<repo>.json`
+  under `FLEET_ATTEST_SPOOL`; `fleet-record publish` is their only reader.
+- A page through `fleet-watch notify`, once per `check` run, only for
+  exceptions not seen in an earlier run.
+- Stdout/stderr: one line per repository and per exception.
+
 ### bin/fleet-bundle
 
 declared
@@ -177,6 +234,50 @@ routine that is the actual write path, invoked only by `bin/fleet-collect`
 — a reader of the CLI surface alone would not discover that this file is a
 load-bearing writer through a non-CLI entry point.
 
+### bin/fleet-ci-stress
+
+declared
+
+**Purpose.** Runs plan 0113's concurrency measurement outside any model
+session. `round` pushes one scratch commit to three `ci-stress` branches,
+waits for their CI, and records which jobs overlapped; `rebuild` writes the
+same record for a round that already ran, from the forge's task list alone;
+`gate` reads the records and states whether the measurement's Gate passes.
+A person starts it; nothing schedules it.
+
+**Exit codes.**
+- `round`: `0` recorded, the round counted, every job green. `1` recorded,
+  but a job is not green or no two full-suite jobs on different branches
+  overlapped (the round does not count and is rerun). `2` refused or failed
+  before a record could be written: the queue is not empty (or could not be
+  read), a branch already exists, a record already exists without
+  `--replace`, the push failed, the token helper failed or names an admin
+  helper. `3` the wall-clock bound expired; no record. `130`, `143`, `129`:
+  interrupted by SIGINT, SIGTERM or SIGHUP; no record.
+- `rebuild`: `0` record written. `2` refused: a named run is absent from the
+  task list, the runs are not the three branches of that round, or they
+  disagree on the commit.
+- `gate`: `0` the Gate passes. `1` it does not. `2` a record is unreadable.
+- argparse's own exit 2 on malformed CLI arguments.
+
+**Writes.**
+- One JSON record per round, `round-<kind>-<n>.json`, under the evidence
+  directory (default `docs/ci-evidence/0113/`): kind, round, the scratch
+  commit and its tree, the commit it was built on, every task's id, run
+  number, workflow, name, branch, result and interval, the overlapping pair
+  or null, and whether the round counts. An existing record is not
+  overwritten without `--replace`. `gate` writes nothing.
+- On the forge (`round` only): three branches `ci-stress/0113-r<n>-{a,b,c}`
+  created by one atomic push to the checkout's remote, and deleted again on
+  every exit path that can be caught. A branch that cannot be deleted is
+  named on stderr. No pull request, comment, status, or setting is touched.
+- Reads the forge's branch, commit, commit-status, task and run lists with
+  the implbot token from a helper command. The token stays in memory and in
+  an Authorization header; it is never in argv, a file, or any output.
+- Stdout: the record's path (`round`, `rebuild`) or the verdict lines
+  (`gate`). Stderr: refusals and progress. No event emitted; no database
+  write.
+
 ### bin/fleet-claim
 
 declared
@@ -237,12 +338,95 @@ below). Four mutually exclusive modes: `--assign`, `--activate`, `--next`,
 - Stdout: the acted-on lease id, printed after the durable write.
 - No database table, no forge object.
 
+### bin/fleet-cli-canary
+
+declared
+
+**Purpose.** Checks a not-yet-linked codex-cli binary against everything the
+fleet asks of it before the owner relinks `/opt/homebrew/bin/codex` to it:
+its `--version` differs from the linked CLI's, every flag the fleet's codex
+runners pass is present in `<candidate> exec --help`, the candidate starts
+and answers a one-line prompt under the tester sandbox profile, the
+installed reviewer sandbox profile, and with no outer profile at all, and
+one real test lane (a fixed plan and sha) runs against it with its usage
+compared to a recorded baseline. `codex --startup-only` runs the flag and
+start-up checks alone and is allowed on the linked CLI itself, as a positive
+control. It never relinks, installs, upgrades or downloads anything, posts
+or pushes nothing, opens no pull request, and runs no review.
+
+**Exit codes.**
+- `0`: every step that ran passed.
+- `1`: a step failed — the report names which one. This covers a failure of
+  step 4's own work too (a `git archive`/extraction failure, or the pinned
+  plan file missing at the pinned sha): the fixed sha not existing or not
+  extracting is a failure of the lane this step runs, not a usage error, so
+  it is reported and paged like any other step fail — never silently
+  discarded after steps 1-3 already ran and spent their vendor turns.
+- `2`: a refusal before any step runs (the candidate is not executable, its
+  `--version` or `exec --help` could not be read, `config/cli-canary.json`
+  is missing or unreadable, or the candidate is the same file as, or reports
+  the same version as, the linked CLI), or argparse's own exit on malformed
+  arguments. `config/cli-canary.json` is read and validated up front, before
+  step 1, so a broken config is caught before any step runs rather than only
+  once step 4 is reached.
+
+**Writes.**
+- `<work root>/canary/codex/<candidate's own version>.json`: every step's
+  outcome, the lane's usage, and the elapsed time.
+- A page through the orchestrator's `notify`, once per run that reaches a
+  pass or a fail, naming the version, the first failed step on a fail, and
+  any startup probe left `skipped` even on a pass (so a clean pass is never
+  read as "every check ran" when one did not).
+- A `mkdtemp` scratch directory per start-up probe and per lane run, removed
+  before the process exits; nothing under the candidate's own path, nothing
+  under `/opt/homebrew/bin/codex`, no branch, no pull request, no lease, no
+  `fleet.db` row.
+
+**Shape.** The report's `steps` holds `version` (`pass`/`fail`/`skip`),
+`flags` (`checked`, `missing`), `startup.tester` / `startup.reviewer` /
+`startup.writer` (`pass`/`fail`/`skipped`, the last only for the reviewer
+profile when it cannot be confirmed to grant the one write it needs), and
+`lane` (`pass`/`fail`, `usage`, `baseline`). The `writer` probe runs with no
+outer sandbox profile AND the real `writer_argv`'s own flags, never the
+tester argv's — it exists to start-up-test the actual unconfined writer
+invocation, not a tester-flavoured one. `brew` names whether the codex
+cask is still installed (D3's upgrade procedure assumes it is not).
+
+### bin/fleet-cloud-review
+
+declared
+
+**Purpose.** Sends one pull request to a Claude cloud session the owner
+created by hand, so the review is billed to the cloud credit, and brings the
+review back as a file. `request` refuses unless the repository is listed in
+`config/cloud-review.conf`, the credit's expiry date (UTC) has not been
+reached, the request counts are under their limits, and an unauthenticated
+read of the mirror answers 404; it then pushes the pull request's base and
+head to the mirror and messages the session. `collect` accepts the session's
+branch only when its first line names the request and its diff adds
+`review.md` alone. `prune` deletes a request's branches from the mirror.
+
+**Exit codes.**
+- `0`: done.
+- `1`: a refusal, with the check named.
+- `2`: argparse's exit on malformed arguments.
+- `3`: `collect` found no review branch yet.
+
+**Writes.**
+- Branches `req/<req-id>/*` on the mirror, deleted by `prune`.
+- One line per request appended to `requests.jsonl`, and one review file per
+  collected request, under `cloud-review/` in the fleet directory.
+- Never the forge: no review, no comment, no status.
+- A temporary clone, removed on every path. It touches no shared checkout,
+  pin or worktree.
+
 ### bin/fleet-config
 
 declared
 
 **Purpose.** The single writer for a small, closed set of fleet-scoped
-settings (currently only the dispatch concurrency cap) held in the fleet's
+settings (the dispatch concurrency cap, and the per-runner test-lane run
+cap `lane_run_cap`, which has no default) held in the fleet's
 shared database, with every change also appended as a durable event so the
 setting can be rebuilt from the event ledger alone if the database is
 lost. Subcommands: `get`, `set`, `list`.
@@ -267,7 +451,9 @@ lost. Subcommands: `get`, `set`, `list`.
   exactly the key and its old and new value — documented as never to carry
   a credential.
 - Stdout: `get` prints the key, its value, source, and last-changed time
-  (or the same as JSON); `list` prints one line per row; `set` prints a
+  (or the same as JSON). A key with neither an environment fallback nor a
+  default (`lane_run_cap`) with no row prints `unset`, source `unset`
+  (JSON `"value": null`) and exits 0; `list` prints one line per row; `set` prints a
   confirmation or "unchanged" line.
 - No forge object; no filesystem writes beyond the database file and its
   own journal sidecars.
@@ -320,6 +506,66 @@ lease on that repository; `list` reads the queue.
 - No database table; no forge object — a change request is a fleet-local
   queue, and the actual change still lands only through a normal pull
   request.
+
+### bin/fleet-credits
+
+declared
+
+**Purpose.** The one writer of the API-credits ledger (plan 0146, ADR-0023). The
+owner opens a window of at most seven days (`on --days N`), closes it at once
+(`off`), and frees an expired reservation by hand (`release ID`); `on` and
+`release` refuse unless stdin is a terminal. `status [--json]` prints the open
+window, the month's spend against its cap, and per-pull-request spend. `decide`
+answers `subscription`, `credits` or `hold` for one review and, on `credits`,
+reserves the budget it hands out; `decide --peek` answers the same and reserves
+and emits nothing. `record` stores the spend the reviewer reported and settles
+the newest open reservation; `record --dry-run` prints the row and writes
+nothing. `refused` records a refusal, at most once per repository, pull request
+and reason per window. A reservation nothing settled within four hours is
+booked at its full amount. The program never reads or holds the API key.
+
+**Exit codes.**
+- `0`: any answer the program could make, including `off` with no window open.
+- `1`: `on` or `release` without a terminal or refused by a check; `decide`
+  could not read the database or the gate (callers treat that as `hold`).
+- `2`: argparse's exit on malformed arguments, such as `--days` outside 1 to 7
+  or a bad `--usd`.
+
+**Writes.**
+- `fleet.db`: the tables `credit_window`, `credit_reservation`, `credit_spend`,
+  `credit_notice` and `credit_release`, created on first use, every row stamped
+  with `created_at` and `updated_at`.
+- Events: `credits-window-opened`, `credits-window-closed`, `credits-spent`,
+  `credits-cap-reached`, `credits-reservation-expired`, `credits-refused`,
+  `credits-grant-given`, `credits-grant-revoked` and `credits-job-spent`,
+  each with the detail keys SPEC.md names. Pages for a window opening or
+  closing, a cap reached and an expired reservation, each once per window.
+- Stdout: `decide` prints one JSON object with `bill`, `budget_usd`, `reason`
+  and `window_ends`; `record` prints the row; `status` prints text or JSON.
+- No forge object, and no network call except the dispatcher probe `on` runs.
+
+### bin/fleet-db-migrate
+
+declared
+
+**Purpose.** Creates every table the fleet's schema owners define in the
+shared database, so a reader that refuses a missing table finds it. Applies
+each owner's own schema definition (never a copy of it) and that owner's own
+additive migration step, and nothing else.
+
+**Exit codes.**
+- `0`: every owner's schema applied (or, under `--dry-run`, listed).
+- `1`: at least one owner failed to load or apply; the others are still applied.
+- argparse's own exit 2 on malformed CLI arguments.
+
+**Writes.**
+- Database (path from `FLEET_DB`, else the fleet's data area; created if
+  absent): additive `CREATE ... IF NOT EXISTS` and the review table's
+  add-missing-column step only. Never drops, deletes or removes a column.
+  The collector's derived tables and its schema version are not touched.
+- `--dry-run` writes nothing and does not create the database file.
+- No event, no forge interaction. Stdout: one `ok <owner> (<n> tables)` or
+  `FAILED <owner>: <error>` line per owner.
 
 ### bin/fleet-db-snapshot
 
@@ -394,6 +640,186 @@ binding that ignores the already-attempted skip).
   `fleet-svc`'s gate. `--dry-run` prints each step and changes and emits
   nothing.
 - Stdout: one status line per binding.
+
+### bin/fleet-deps
+
+declared
+
+**Purpose.** Keeps up to three commit statuses on the head of every open pull
+request targeting `main` in each repository the watcher scans. `eunomia/deps`:
+`failure` when the pull request names a plan (`Plan: <id>`) that is not on
+`main` at `ready` or `done`, or whose dependencies are unmet; `success` for
+everything else, including a pull request naming no plan; `pending` when it
+cannot decide. `eunomia/plan-lint` (plan 0177): `failure` when `bin/fleet-plan`'s
+own `lint()`, run read-only against that repository's `plans/` directory and
+`governance.yaml` at the pull request's head, finds a problem in a plan file
+the pull request adds or modifies; `success` at 0 problems; `pending` when the
+files cannot be read; no status at all when the pull request changes no file
+under `plans/`. Subcommand: `once` (one pass).
+
+**Exit codes.**
+- `0`: a pass completed, including one where some pull requests were
+  undecidable (those post `pending` and page) or the repository list could
+  not be read (paged, nothing checked).
+- `2`: a refused run (no token from the configured helper, or the token's
+  account is not the agent merger; nothing is posted and it pages), or a
+  missing or unknown subcommand.
+
+**Writes.**
+- A commit status in the context `eunomia/deps`, and one in `eunomia/plan-lint`
+  when the pull request touches `plans/`, on each pull request head — each
+  posted only when its state or description differs from the latest status
+  in that context created by the agent merger account itself; another
+  account's status in the same context never suppresses a post.
+- A push notification once per episode for a refusal, an unreadable list,
+  or a `pending` pull request (either context), through the same channel as
+  the other watchers, and marker files recording which episodes have been
+  paged.
+- Never uses any other account's token and never falls back to one. Reads
+  the watcher's dependency check and `fleet-plan`'s lint without modifying
+  either. Nothing is executed from a pull request's checkout: only its
+  `plans/*.md` and `governance.yaml`, read through the forge into a
+  temporary directory removed at the end of each check, are ever passed to
+  `lint()`.
+- Stdout: nothing. Stderr: one line per status posted or refusal.
+
+### bin/fleet-depsd
+
+declared
+
+**Purpose.** The table owner for an owner attestation that satisfies an
+`external:<slug>` entry in a plan's `depends_on` (plan 0180), and (plan 0181)
+a resident service, `serve`, that re-checks every held plan when a watched
+repository's main moves or the owner attests a slug. Subcommands:
+`attestations [--json]` and `serve [--once [--dry-run]]`. There is no
+`attest` or `revoke` subcommand, and no library function writes
+`dependency_attestation` outside `serve`'s own authenticated POST/DELETE.
+
+Plan 0189 extends `serve`'s own `POST /webhook/forgejo` (the same signed
+route plan 0181's `push` handling already answers) with a `pull_request`
+branch: a lifecycle delivery (opened, reopened, a push onto the PR's own
+branch, or taking it out of draft) persists a `plan_review_job` row
+through plan 0188's existing `bin/fleet-plan-review` queue — reading the
+pull request's CURRENT head from the forge, never trusted from the
+delivery's own `head` field — before answering `202`, and never dispatches
+one itself. `serve` (resident) runs a SECOND worker loop, on its own
+thread, that reconciles a bounded slice of
+the enrolled registry (a resumable cursor in `fleet.db`, recovering a
+missed delivery) and then claims and dispatches a bounded worker pass
+through `bin/fleet-plan-review`'s own `_claim_jobs()`/`_dispatch_one()` —
+never a restated claim or dispatch path. This loop is deliberately separate
+from the one that triggers `recompute()`, so a slow or waiting review can
+never delay push processing. See docs/depsd.md and
+docs/plan-review-dispatch.md.
+
+**Exit codes.**
+- `0`: `attestations` printed its listing; `serve --once` completed one
+  `recompute()` pass; `serve` (resident) returning after a clean shutdown.
+- `1`: `attestations` on an unreadable store; `serve` (resident) refused to
+  start because its service lease is held elsewhere, or the lock file is
+  held by another instance on this host.
+- `2`: argparse's own code on a missing or unrecognised subcommand
+  (including `attest`/`revoke`, which do not exist), or a configuration
+  value outside its accepted range (a wildcard bind address; a poll interval
+  outside 60..3600 seconds).
+
+**Writes.**
+- `attestations` and `serve --once --dry-run` write nothing; `attestations`
+  opens the database read-only (`mode=ro`).
+- `serve`'s `recompute()` owns `dependency_hold` and `dependency_scan`
+  outright, replacing one repository's hold rows in one transaction per
+  pass, and never deletes a repository's rows on a read failure. It also
+  deletes both tables' rows for any repository no longer in `repos.conf`'s
+  dispatch list, so a dropped repo's holds do not go on satisfying the
+  attestation POST's "cited by a held plan" check forever.
+- `serve`'s POST/DELETE on `/api/v1/attestations[/<slug>]` are the only
+  writers of `dependency_attestation`/`_change`, gated by a same-host peer
+  check and a bearer token read from a configured helper's stdout — held in
+  memory only, never written to disk, argv, a log or a response.
+- `serve` writes a wake file per `(repo, plan)` whose last hold clears,
+  under the fleet state directory's `wake/` spool, for `bin/fleet-watch` to
+  consume.
+- `serve` (resident) takes a `service` lease on `<host>:fleet-depsd`, keyed
+  by this machine's hostname (never `FLEET_DEPSD_BIND`'s address), and
+  heartbeats it; releases it on SIGTERM.
+- Plan 0189: a signed `pull_request` delivery whose `action` is one this
+  file treats as lifecycle-worthy, for an enrolled repository, writes one
+  `plan_review_job`/`plan_review_job_change` row pair — through
+  `bin/fleet-plan-review`'s own `_enqueue()`, the one writer plan 0188
+  already established, never a second one here. `serve` (resident) also
+  owns `plan_review_reconcile_cursor` outright (one row, advanced one
+  bounded slice of the enrolled registry per pass) and, through
+  `bin/fleet-plan-review`'s own `_claim_jobs()`/`_dispatch_one()`, claims
+  and may dispatch plan-review jobs the same way that file's own `worker`
+  subcommand does — this file adds no second writer of `plan_review_job`
+  either. One check runs only here, between the claim and `_dispatch_one`:
+  `bin/orchestrator`'s `review_quota_hold`, which `_dispatch_one` itself
+  never calls — holding (no attempt spent) while the owner's
+  session/weekly/model gates are closed, since this wake, unlike a
+  hand-run `fleet-plan-review worker`, fires unattended. It also never
+  reclaims the one job still ready after holding it within the SAME pass,
+  so a transient failure spends at most one of `MAX_DISPATCH_ATTEMPTS`
+  before the next, separately-timed pass.
+- Forge: beyond `recompute()`'s own reads, a `pull_request` delivery reads
+  the pull request once (its current head) and, unless it is already a
+  draft, closed or merged, its changed-file list (to confirm the change is
+  plan-only before any row is written); the reconciliation pass pages
+  through each chosen repository's open pull requests (bounded per pass —
+  see docs/depsd.md) and reads every one's changed-file list the same way;
+  a dispatched job may post a plan review to the pull request under the
+  fleet's existing reviewer identity, exactly as `bin/fleet-plan-review
+  worker` posting one itself would.
+- Subprocesses: plan 0189's worker pass, through `bin/fleet-plan-review`'s
+  own `_forge()`, runs the SAME token helper `bin/orchestrator`'s own
+  "authoring" role does (`FLEET_AUTHOR_TOKEN_CMD`) — the write-scoped
+  credential every forge call in that file makes, read or write — and
+  holds it in memory for the rest of this process's life, cached once by
+  `_forge()`'s own module-level singleton — a FOURTH in-memory credential
+  beside `recompute()`'s own read-only watch token and the webhook secret
+  and attest token documented above, and the only one of the four that can
+  write to a repository. A dispatched job, through
+  `bin/fleet-plan-review`'s `_dispatch_one()` and `bin/orchestrator`'s
+  `dispatch_review()`, spawns `dispatch-review.py` as a subprocess (given
+  `--post --no-followups`) — this is the one place that actually posts the
+  review; this process never reads or logs that credential itself, and
+  never reads a verdict from the subprocess's own output, only from the
+  forge afterward (`bin/fleet-plan-review`'s own `_dispatch_one`).
+- Stdout: `attestations` prints one line per attested slug (slug, latest
+  actor, note) or the `--json` array, and `no dependency_attestation rows`
+  when the table is empty; `serve --once` prints the holds and wakes it
+  recorded (or, with `--dry-run`, would have); `serve` (resident) prints one
+  line per webhook delivery (its id, the repository and the outcome code —
+  never a header or the body), one per refused attestation write (the
+  peer address only), and one per bounded worker pass that claimed at least
+  one plan-review job (how many, and how many completed without raising).
+
+### bin/fleet-drift
+
+declared
+
+**Purpose.** A read-only watcher, meant to run on a schedule, that polls
+each configured service's own health URL for its verdict on whether it is
+running the default branch's code, and pages once when a service has stayed
+behind (or unanswerable) for longer than its allowance. It never deploys,
+restarts, or rolls back, and never computes a verdict of its own.
+
+**Exit codes.**
+- `0`: the run completed, whatever the services said.
+- `2`: the configuration was refused (a malformed line, an unknown service
+  name, or a duplicate) or the invocation was malformed.
+
+**Writes.**
+- One small state file (JSON) per watched service under the fleet state
+  directory: when the current spell of non-current samples began, the latest
+  state and its reason, and whether the spell has been paged.
+- One page per spell once it outlasts the allowance, worded by the latest
+  state, and one "current again" page when a paged spell ends; each page is
+  recorded in the page log with this unit's name. A spell that was never
+  paged ends silently.
+- Page reasons come from a fixed vocabulary, never a response body or an
+  exception message. `--dry-run` prints each classification and writes and
+  pages nothing.
+- Stdout: one line per run summarising the counts.
 
 ### bin/fleet-emit
 
@@ -491,6 +917,46 @@ modes; `2` on malformed flags. No other exit path exists.
 never prompt or assistant text — so a credential a tool call surfaced can
 be caught without scanning the model's own reasoning or output.
 
+### bin/fleet-merge
+
+declared
+
+**Purpose.** Merges, as the agent merger account, the pull requests ADR-0019 §4
+allows on an autonomous repository: a `src` pull request under a live plan, or
+that plan's `tests` pull request. Every other pull request is left alone and
+the deciding check is logged. It is mechanical: no model is called. Subcommand:
+`once` (one pass).
+
+**Exit codes.**
+- `0`: a pass completed, including one where some pull requests were
+  undecidable (those page) or the repository list could not be read (paged,
+  nothing checked).
+- `2`: a refused run (no token from the configured helper, or the token's
+  account is not the agent merger; nothing is merged and it pages), or a
+  missing or unknown subcommand.
+
+**Writes.**
+- A merge of a pull request that passed every check, with the checked head
+  commit as the expected head so a later push makes the forge refuse it. Never
+  schedules an auto-merge, never rebases, never pushes, never retries a failed
+  merge in the same pass.
+- One log line per merge and per refusal past the autonomy check, naming the
+  pull request, the head commit and the deciding check; a pull request blocked
+  on the same check at the same head is logged once. A `src` pull request
+  touching a protected path (check 4) does not stop there: every later check
+  still runs, and the refusal logged is whichever one of those fails, or check
+  4 again if none do.
+- A push notification for an undecidable read or an identity failure, through
+  the same channel as the other watchers, and marker files recording which
+  episodes have been paged. The same channel also carries, once per pull
+  request head, a page for a `src` pull request refused only at check 4 with
+  every later check holding: title "Ready for your merge", body naming the
+  repository, pull request number, plan, head and protected path, and the
+  pull request's web URL. A pull request refused at any other check, or at
+  check 4 together with a later one, never pages.
+- Never touches a critical repository, not even to comment.
+- Stdout: the log lines.
+
 ### bin/fleet-models
 
 declared
@@ -523,6 +989,9 @@ routine able to rebuild the table from that ledger alone.
   database transaction commits. `detail` carries the change id, source,
   position, ordinal, and old/new runner and disabled values — documented
   as never carrying a credential.
+- Event `seat-access-changed` appended per reviewer-seat access change
+  (`access set`), before the transaction commits. `detail` carries the
+  change id, source, position, ordinal and old/new access — never a credential.
 - Stdout: `list` prints one line per row; `get` prints one line per
   position with the resolved runner and which layer resolved it, or a
   marker if nothing resolves (an unresolvable runner name prints an error
@@ -656,7 +1125,8 @@ declared
 **Writes.**
 - Nothing on disk by default — every subcommand except `graph --out` is
   read-only over the plan files, the pointed-at database (opened
-  read-only for `ledger`), and, for `ledger --verdict`, the forge.
+  read-only for `ledger`), and, for `ledger --verdict` or
+  `ledger --with-filings`, the forge.
 - `graph --out PATH` writes the chosen format (a graph document, a diagram
   description, or an image) to that path; with no `--out`, the same text
   goes to stdout.
@@ -671,26 +1141,160 @@ edge carrying its form (a plan dependency, a path dependency, or an
 external one) and whether it is satisfied. `ledger` emits per-plan rows
 (status, run count, outcome, pull-request state, review rounds, a
 classification of claimed/stalled) alongside a fixed set of caveat notes
-explaining what that classification does and doesn't mean.
+explaining what that classification does and doesn't mean. In
+`--format json` only (plan 0196), every row also carries `submitted_by`
+(`"intakeapp"`, `"cli"`, or `null`) and `stages` — a fixed-order object
+keyed `submitted`/`approved`/`implementation`/`review`/`test`/`merged`,
+each naming its own state (`empty`/`running`/`completed`/`failed`/
+`unknown`), timestamps, attempt count, budget and token usage; see
+`docs/plan-ledger.md` for the full shape. `--with-filings` additionally
+reads the forge for each row's filing pull request (same effect on
+`submitted`/`submitted_by` as `--verdict`) and appends rows, `status:
+"in-review"`, for plan files added by an open pull request not yet on
+`main`.
+
+### bin/fleet-plan-review
+
+declared
+
+**Purpose.** A durable queue and bounded worker so a plan-filing pull
+request's review survives the session (or worker run) that filed it:
+`enqueue <repo> <pr>`, `status`, `worker`.
+
+**Exit codes.**
+- `0`: `enqueue` queued the job or found it already tracked; `status`,
+  whatever rows it found or didn't; `worker`, whatever it claimed, including
+  zero jobs.
+- `1`: `enqueue` could not read the pull request or its head sha from the
+  forge; any command whose authoring token could not be resolved.
+- argparse's own exit 2 on a missing or unknown subcommand or an invalid
+  argument.
+
+**Writes.**
+- Database (`plan_review_job`, keyed uniquely on repo, pull request and
+  head sha; `plan_review_job_change`, its append-only history, one row per
+  transition with an actor and a timestamp): `enqueue` inserts a `queued`
+  row if none exists for that exact head; `worker` claims ready rows
+  (`queued`, `held`, or an abandoned `claimed` row past its TTL) and moves
+  each to `held`, `claimed`, `done`, `superseded`, `skipped`, or `failed`
+  after re-reading the pull request, its changed-file list and its CI
+  status from the forge.
+- Forge: `worker` posts no review itself; on an eligible job it calls the
+  same dispatcher the orchestrator uses, which may post a plan review to
+  the pull request under the fleet's existing reviewer identity. A head
+  that moves between claim and dispatch supersedes the row and enqueues a
+  fresh one for the new head rather than posting against stale content.
+- No event. Stdout: `enqueue` prints the job id and whether it was newly
+  created; `status` prints one line per row (or the same as JSON with
+  `--json`); `worker` prints how many jobs it claimed.
+
+### bin/fleet-quota
+
+declared
+
+**Purpose.** The one writer of the usage-limit gate (plan 0094): one row per
+scope (`session`, `weekly`, `model:<bucket>`) saying whether new work may
+start. `observe` reads UsageBar's `latest.json`; `close` records a stop;
+`open` is the owner's override (`open review-path:<repo> --by owner [--for <hours>]`, default 24, 1–168, also holds the gate open against failing review-path probes for that window); `check` answers a one-off script; `status`
+prints the rows. `probe-review-path <repo>` (plan 0095) runs the review
+dispatcher's pinned prerequisites for one repo and writes `review-path:<repo>`
+from the result; `close` refuses a `review-path` scope, which only that
+subcommand closes. `observe`, `close`, `open`, `check` and `status` read one
+local file and never contact a network service; `probe-review-path` also reads
+the review dispatcher's published call contract (`FLEET_REVIEW_CONTRACT`) and
+execs the pinned programs (`FLEET_REVIEW_PINS`) as subprocesses with the
+token-helper variables removed from their environment.
+
+**Exit codes.**
+- `0`: every subcommand but `check` succeeds, including a write that changed
+  nothing; `check` finds the scope (or, with none named, session and weekly)
+  open.
+- `75` — `check`: a gate is closed. A script stops here and starts no further
+  run. `check` with no `--scope` ignores `review-path:*` scopes;
+  `check --scope review-path:<repo>` reports that one. `probe-review-path`: a
+  pinned call failed, or a pinned program or the pin directory is missing.
+- `1` — `check`: no gate is recorded for the scope, so its state is unknown.
+  `probe-review-path`: the probe cannot judge (contract missing or unparseable,
+  `v` not 1, an unknown rule, or an `argv` that does not render); it changes
+  nothing.
+- argparse's own exit 2 on an unknown scope, an unparseable `--resets-at` or
+  malformed CLI arguments.
+
+**Writes.**
+- `fleet.db`: the `quota_gate` table (one row per scope) and the
+  `quota_transition` table (one row per close or open), both created on first
+  use.
+- One `quota-closed` or `quota-opened` event per transition, through
+  `fleet-emit`, `detail` carrying scope, by, evidence, `resets_at` and
+  `percent` when a meter read one. A write that changes nothing emits nothing.
+- For `session` and `weekly` only, one page per transition through
+  `bin/orchestrator`'s `notify()`: `fleet held: <scope> limit, until <time|unknown>`
+  or `fleet released: <scope> reset (<by>)`.
+- `probe-review-path` on exit 75 closes `review-path:<repo>` `by probe`, on 0
+  opens it, on 1 writes nothing; the gate's `evidence` is
+  `probe:<UTC timestamp>:<entry id>` and never stderr. `open review-path:<repo>
+  --by owner --for <hours>` (1–168, default 24) also records an `override`
+  transition: for that long a failing probe prints and pages but does not
+  close the gate. `--for` is refused for any other scope, and validated before
+  the gate opens.
+- Stdout: `closed`/`opened`/`unchanged`, one line per gate for `status`, for
+  `probe-review-path` the one-line result, and for `check` the line `closed <scope> until <resets_at or unknown>`,
+  `open <scopes>` or `unknown <scopes>`.
+
+### bin/fleet-record
+
+declared
+
+**Purpose.** Writes one change record per pull request merged to `main` of
+a fleet repository into a local clone of `operator/recordstore`, then
+pushes it over ssh. Runs as the recorder account, never the author,
+reviewer or merger, and records what the forge shows without judging it.
+Subcommands: `once`, `backfill --since DATE`, `publish`.
+
+**Exit codes.**
+- `0`: the pass completed; nothing to record is also `0`.
+- `1`: an identity failure, a repository the recorder could not read, a
+  record that failed schema validation, or a push still rejected after its
+  one retry. Each also pages through `fleet-watch notify`.
+- `2`: malformed flags.
+
+**Writes.**
+- `records/<owner>/<repo>/<YYYY>/<MM>/<merge_sha>.json` in the evidence
+  clone: one JSON object per merge, shaped by `config/change-record.schema.json`.
+  An existing record is never rewritten.
+- `backfill/<owner>/<repo>.json` once a backfill of that repository finishes.
+- Under `publish`: files from the attestation spool under `reports/**` and
+  `protection/**`, never overwriting an existing path.
+- One git commit per pass, pushed to `origin/main` of the evidence clone.
+- Stdout: one line per record written.
 
 ### bin/fleet-release
 
 declared
 
 **Purpose.** Release a lease you hold. Refuses to release another
-session's lease unless forced.
+session's lease unless forced. `--expect-orphaned HOLDER` (plan 0179 D4,
+ADR-0029 §3) is the check a caller that is NOT the holder uses — under the
+lease's lock it re-reads the record and re-derives orphanhood, the same
+re-derivation `fleet-claim --takeover` makes, and refuses unless the lease is
+still orphaned and its holder is still `HOLDER`. `--reason TOKEN` is recorded
+in the event; `TOKEN` must be exactly `plan-done` or `plan-abandoned`, a
+closed allowlist enforced by argparse's own `choices`.
 
 **Exit codes.** `0`: released, or idempotently already released (releasing
-twice is not an error). `2`: a missing lease-id argument or malformed
-flags. `1`: no such lease exists; the lease is held by a different session
-and force wasn't given.
+twice is not an error). `2`: a missing lease-id argument, a malformed flag,
+or a `--reason` value outside the closed allowlist. `1`: no such lease
+exists; the lease is held by a different session and force wasn't given; or
+`--expect-orphaned` found the lease no longer orphaned, or held by someone
+else, re-derived under the lock.
 
 **Writes.**
 - The lease's own record: sets its state to released, written under the
-  lease's own lock.
+  lease's own lock. `--expect-orphaned`'s refusal writes nothing.
 - Deletes the lease's orphan marker if present.
-- Event `lease-released`, `detail` present only on a forced release of
-  someone else's lease, naming the previous holder.
+- Event `lease-released`, `detail` present when the release was forced
+  (`forced`, `holder_was`, naming the previous holder), when `--reason` was
+  given (`reason`), or both; absent when neither was given.
 - Stdout: the lease id, on success.
 
 ### bin/fleet-repo
@@ -739,6 +1343,64 @@ live check decides dispatch eligibility at run time.
 - Stdout: per-repository listing lines, a post-enable summary, and
   `check`'s eligible/refused/undeterminable line.
 
+### bin/fleet-requeue
+
+declared
+
+**Purpose.** Hand a failed dispatch back to the watcher. Releases the plan's
+dispatch lease only when it is the single live lease for the (repo, plan),
+is dead, has a `plan-failed` event newer than its activation, and no marked
+PR exists (and the forge could be read). Never spawns; has no force flag.
+
+**Exit codes.** `0`: released, or `--dry-run` and every check passed. `1`: a
+check refused (the message names which), or `fleet-release` failed. `2`:
+missing arguments or malformed flags.
+
+**Writes.**
+- Via `bin/fleet-release --force`, the one writer: the lease's record set to
+  released, its orphan marker deleted, and event `lease-released` with
+  `detail` `{forced: true, holder_was}`, actor `EUNOMIA_SESSION` or
+  `owner-<user>`.
+- Nothing on `--dry-run`.
+- Stdout: the lease id, the recorded failure reason, and a line saying the
+  watcher re-dispatches under the cap.
+
+### bin/fleet-rebase
+
+declared
+
+**Purpose.** Rebases an open pull request's head branch onto the base
+branch in a fresh temporary clone and force-pushes it with a lease, so CI
+runs again on the new head. Runs on one pull request by hand, or as a
+sweep that acts on the owner's `rebase` comments. It refuses, saying which
+check failed, when the pull request is merged, closed, not based on the
+default branch or from a fork; when any undismissed approval exists; when a
+live session lease holds the branch or its plan, or the lease ledger is
+unreadable; when the branch already contains the base; when the rebase
+conflicts; or when the rebase delta touches only plan files, because CI
+would then skip the `CI / tests` suite and leave the new head without that
+status; or when the rebase delta is empty.
+
+**Exit codes.**
+- `0`: the branch was rebased and pushed, would be (`--dry-run`), or was
+  already current; a sweep that completed.
+- `1`: a refusal, another instance holding the lock, or a sweep that could
+  not read a repository or post a reply.
+- `2`: a sweep started without its repository list or the owner's numeric
+  id, or no token from the author-role helper.
+- argparse's own exit 2 on malformed CLI arguments.
+
+**Writes.**
+- Force-with-lease push of the pull request's head branch only, never
+  against an approved pull request and never a bare force.
+- In sweep mode, one reply comment per owner request acted on, starting
+  with a line `rebase: <comment id>`. Not under `--dry-run`.
+- A non-blocking lock file in the fleet's lock directory.
+- A temporary clone, removed on every path. It touches no shared checkout,
+  pin or worktree.
+- Reads the forge, the lease ledger, and the repository over ssh. Adds no
+  event type and dispatches no review.
+
 ### bin/fleet-reviews
 
 declared
@@ -762,17 +1424,35 @@ can't reconstruct which pull request or repository a review was about.
 - Database: creates (if absent) a review table and migrates in any
   missing columns on an older one; rows are upserted keyed on the forge's
   own review id, so a review's state can be corrected on re-run without
-  duplicating rows.
+  duplicating rows. Plan 0197: `--backfill` now also reads each review's
+  own body for talos plan 0042's `Review-provenance-usage:` line (tokens
+  and seconds a reviewer's harness reported) and for its HIGH/MEDIUM/LOW
+  finding counts, by the same two rules talos `file-followups.py` uses
+  (its ```findings fenced block, exact, and its heading/bold-section prose
+  tiers otherwise); both sets of columns fill once and are never
+  overwritten on a later backfill, the same rule the session-id column
+  already followed. A body that cannot be read this way stores every such
+  column `NULL`, never `0`.
 - No write back to the forge — every call is a read; no forge object is
   created or modified.
+- Reads `config/model-prices.json`, an owner-maintained price sheet (plan
+  0197), fresh on every `--report` call; a malformed file (missing
+  `checked_on`/`source`, a negative price, or two rows for one model at
+  the same `effective_from`) is caught and reported to stderr rather than
+  raised, and the report continues with every cost shown as `—`.
 - Stdout: `--backfill` prints a one-line count summary; `--report` prints
   a fixed-width table (repository, pull-request number, review rounds,
-  approval count, review time span) and a total, followed by a standing
-  caveat about a field this table cannot reliably report.
+  approval count, finding counts by severity, an API-equivalent cost, and
+  review time span), a totals line naming how many of the underlying
+  reviews that cost excludes, a second fixed-width table of the same
+  facts grouped by model, and a standing caveat about a field this table
+  cannot reliably report.
 
-`UNDECIDED:` a second table for future pricing data is created by every
-run but nothing in this file ever reads or writes to it — declared as
-future-use schema only.
+`UNDECIDED:` a second table for pricing data (`model_price`) is created by
+every run but nothing in this file ever reads or writes to it — plan 0197
+answered the same need with a file instead (`config/model-prices.json`,
+above), and this table remains declared as future-use schema only, now
+with no plan expected to claim it.
 
 ### bin/fleet-snapshot
 
@@ -807,6 +1487,33 @@ filename prefix from `fleet-db-snapshot`.
   pruned-file lines, and, with `--verify`, a small report on whether
   backup tooling is installed and configured.
 
+### bin/fleet-followups
+
+declared
+
+**Purpose.** Meant to run hourly, on a per-repository timer
+(`config/followups.conf`, hours; `-1`, the default for every repository,
+is off): re-checks the open `Follow-ups from review of #N` issues
+(implementer-authored, in enrolled repositories whose timer is due)
+against `main`, at most `followup_triage_batch` per run, with one
+read-only model session per issue, under the repo's `followup_triage`
+seat (`bin/fleet-models`, plan 0186 — independent of `mediator`; falls
+back to `sub-sonnet` when unset). It posts one wrapper-written triage
+comment per issue and acts only on the owner's `close`, `keep` and `fix`
+verbs. See `docs/followups.md`.
+
+**Exit codes.** `0` on a run (including a paused one, one with every
+repository off or none due, which reads nothing from the forge, and one
+that lost the lock), `2` on a refused runner, a bad timeout or no token.
+
+**Writes.** Issue comments; on the owner's `close`, ticks the `gone`
+items and closes the issue. `followup-triaged` and `followup-closed`
+events, and one page per run that triaged anything. After a completed
+run, the time of that run for each repository it covered, in a small
+state file under the fleet directory (a refused run records nothing, so
+the timer stays due). It opens no pull request and edits nothing without
+the owner's verb.
+
 ### bin/fleet-stalled
 
 declared
@@ -816,29 +1523,54 @@ and pages once for each open pull request stuck unreviewed (CI green,
 never reviewed), with a stale review (a review predates the current
 head), with a stale-base failure (CI red only because the base branch
 moved on and is itself green), or genuinely red. It never rebases,
-dispatches a review, or comments — it only detects and pages.
+dispatches a review, or comments — it only detects and pages. A sixth
+state, `failed-plan` (plan 0194), is per PLAN rather than per pull
+request: a `status: ready` plan on main whose newest `fleet.db` dispatch
+is terminal with a non-`merged` outcome, has no live dispatch lease
+(fleetlib's TTL/heartbeat verdict, never the lease's `state` field), and
+has no open pull request a live steward still owns. It is named with
+`fleet-requeue`, a `respawn` comment, or a status decision, depending on
+whether a marked pull request exists and what state it is in — this tool
+never runs any of the three itself.
 
 **Exit codes.**
 - `0`: clean scan, nothing stalled, nothing unreadable.
-- `1`: at least one stalled pull request found, no scan trouble.
+- `1`: at least one stalled pull request or failed plan found, no scan
+  trouble.
 - `2`: one or more scan troubles occurred (takes priority over reporting
   findings) — a bad configuration row, a token-helper failure (the whole
   scan is then skipped), a per-repository mode that is named but not yet
   built (refused explicitly rather than silently treated as the default
-  mode), or an unreadable/truncated read of pull requests, reviews, or
-  commit statuses.
+  mode), an unreadable/truncated read of pull requests, reviews, or
+  commit statuses, or (for `failed-plan`) an unreadable `plans/` listing
+  or an unreadable marked-pull-request dedupe scan. A `fleet.db` that is
+  absent or lacks the `dispatch` view (eunomia plan 0036) is NOT a
+  trouble — a normal state on a host whose pin has not advanced —
+  `failed-plan` simply finds nothing there.
 - argparse's own exit 2 on malformed CLI arguments.
 
 **Writes.**
-- A dedupe/state file recording pages already sent (keyed by repository,
-  pull request, and head commit, so a new push re-pages and an unchanged
-  head stays silent) and scan troubles already paged once per reason per
-  day. Written atomically; not written under `--dry-run`.
+- A dedupe/state file recording pages already sent — per-head
+  (repository, pull request, head commit) for the five pull-request
+  states, so a new push re-pages and an unchanged head stays silent; per
+  (repository, plan id, newest dispatch lease, UTC day) for `failed-plan`,
+  so it re-pages at most once a day until the plan is settled — and scan
+  troubles already paged once per reason per day. Written atomically; not
+  written under `--dry-run`. A stored page entry only satisfies dedupe
+  once `delivered` is true; an entry left `delivered: false` (the
+  notification channel was down) is retried on the next run rather than
+  treated as sent, for every state.
 - One push notification per new finding and per new trouble, through a
   configurable channel if set, recorded either way to the fleet's shared
   page log.
-- Only reads from the forge — commit statuses, pull-request lists, review
-  lists; no forge object created or modified.
+- Reads from the forge (commit statuses, pull-request lists, review
+  lists, and, for `failed-plan`, the plans tree on main and marked
+  pull-request listings, through `bin/fleet-watch`'s own functions); no
+  forge object created or modified. Reads `fleet.db` (`$FLEET_DB`, default
+  `$EUNOMIA_FLEET_DIR/fleet.db`) read-only for `failed-plan`; never writes
+  it. Reads dispatch-lease records on disk read-only, through fleetlib,
+  for `failed-plan`'s liveness check; never claims, releases, or touches
+  one.
 - One subprocess: the configured token-helper command.
 - Stdout: a scanning summary line, then one line per finding. Stderr: one
   line per trouble, and a refusal line for any repository configured to
@@ -933,7 +1665,12 @@ continues.
 - Lease records for each dispatched plan and for its own resident-mode
   singleton lease, created and released by shelling out to the lease
   tools described above — this program decides when and what, the lease
-  tools own the record shape.
+  tools own the record shape. This includes releasing an orphaned dispatch
+  lease (implementation or test-lane) once its plan reads `done` or
+  `abandoned` on `main` (plan 0179 D2, ADR-0029) — through
+  `fleet-release --force --expect-orphaned`, recording `plan-done` or
+  `plan-abandoned` as the release's reason. A lease of a plan still `ready`
+  is never released here, whatever its pull requests say.
 - One-shot notification markers: empty marker files, created once per
   distinct condition (a real lease id, or a synthetic key for a condition
   like a rejected token, an unreachable broker, or a blocked plan),
@@ -949,12 +1686,44 @@ continues.
   Written only on a state transition, never under `--dry-run`.
 - A session liveness file (resident mode only), touched once per cycle.
 - Its own process lock file — a pure mutex, holds no data.
+- Resident mode only (plan 0187): between cycles, rotates its own
+  `watch.log` (the file `StandardOutPath`/`StandardErrorPath` both name)
+  once it is about seven days old, to a dated, gzipped weekly archive under
+  `logs/archive/` beside it — `logs/archive/watch-<start>-<end>.log.gz`,
+  both dates UTC and inclusive, `-2`/`-3`/... appended on a name collision.
+  Every archive is kept; nothing here prunes one. Publication is atomic: a
+  `.`-prefixed, non-`watch-*.log.gz`-matching partial name is fsynced and
+  checked with `gzip -t` before the final rename, and the uncompressed
+  intermediate is deleted only after that rename succeeds, so a crash mid-
+  gzip leaves either the intermediate or a recoverable partial, never a
+  truncated archive. Reopens its own stdout/stderr onto a fresh file at the
+  active path immediately after the rename, so the inherited descriptor
+  launchd handed it at start never keeps writing into the now-archived
+  inode. A `.partial` left by an interrupted rotation is cleaned up and its
+  gzip redone on the next attempt, independent of whether a new rotation is
+  due that cycle.
+- Reads, and (outside `--dry-run`) deletes, the wake spool `bin/fleet-depsd`
+  writes (plan 0181): one small JSON file per `(repo, plan)` whose last
+  dependency hold just cleared, named by a content hash so a burst of writes
+  coalesces. A matching file is removed before its plan is dispatched
+  (consume-once); under `--dry-run` nothing is removed, matching every other
+  mutation this program skips in that mode — a dry run must not spend the
+  one real wake an armed rerun needs. A file this program cannot parse is
+  removed with a warning (even under `--dry-run`, since it will never parse
+  differently) rather than left to jam every later pass. A wake is a hint,
+  never an instruction — this program re-checks every gate (the quota hold,
+  the cap, the protection verdict, main's own health, dependencies, overlap,
+  dedupe, the review path and the human-merge gate) before acting on one,
+  the same as it would on its own next cycle.
 - Events (appended to the fleet's shared event ledger): `plan-dispatched`
   on every successful spawn (detail: plan id, session, branch, lease,
   spawn mechanism); `plan-failed` with a reason of "lease assign failed"
   or "spawn failed"; `plan-blocked`, emitted only on a transition in the
   blocking reason, never once per cycle (detail: plan id, the unmet
-  dependency, its form, and the reason); `pin-drift`, with the pin's path,
+  dependency, its form, and the reason — plan 0180 adds `unattested`,
+  `not a slug` and `store unreadable` for an `external:<slug>` entry, and
+  `unmet`/`dangling`/`abandoned`/`unreadable` under form `plan` for a
+  `plan:<owner/repo>:<id>` entry); `pin-drift`, with the pin's path,
   ref, head, target, and its state transition.
 - A push-notification attempt log: one row per attempt, delivered or not,
   appended to the fleet's shared page log, whether delivery succeeds,
@@ -974,7 +1743,9 @@ continues.
   pull-request and comment bodies but never writes them.
 - Database: reads (never writes) a settings table to resolve the dispatch
   concurrency cap, opened read-only, falling back to a configured default
-  if unset.
+  if unset. Also reads (never writes, never caches) `dependency_attestation`
+  for each unmet `external:<slug>` entry, opened read-only (plan 0180); a
+  missing database or table reads as unmet, never met.
 - Subprocesses it runs: a token-helper command to mint a forge API token
   (its output is never logged); read-only git commands for worktree/pin
   inspection (never a push, checkout, or reset); a process-table read
@@ -1097,7 +1868,13 @@ flag the watcher polls before it will arm at all.
   through the shared handler — the steward unable to release the lease
   after the pull request reached a terminal state, which pages but does
   **not** emit a `plan-failed` event, since it is treated as an operator
-  problem rather than a failed plan.
+  problem rather than a failed plan. Every exit above, once the lease
+  activated, passes afterward through a last settling step (plan 0179 D1,
+  ADR-0029): it reads the plan file on `main` and, when that reads `done` or
+  `abandoned`, releases the lease there too — recording the fact as the
+  release's reason — rather than leaving it held. A lease that would not
+  release at that point pages (but, like the steward's own case, emits no
+  `plan-failed`) and the run's own exit code is unchanged either way.
 - `2`: wrong number of positional arguments, or no session identity set
   (both warn-only, logged/emitted/paged); the lease failing to activate
   (this one does log, emit, and page).
@@ -1136,7 +1913,9 @@ flag the watcher polls before it will arm at all.
 - Forge objects: never creates a pull request, issue, or label, and never
   posts an approving or any other review — asserted by this program's own
   design and covered by a test asserting zero approval calls; all pull
-  request creation is left to the spawned session. It edits an existing
+  request creation is left to the spawned session. The final lease-settling
+  step (plan 0179 D1) reads the plan file's contents at `main`, and nothing
+  else — never a pull request — to decide whether to release. It edits an existing
   pull request's body exactly once, appending (never replacing) a plan
   marker line, only after independently verifying the pull request is
   this run's own. It posts several fixed shapes of issue-thread comment:
@@ -1148,6 +1927,29 @@ flag the watcher polls before it will arm at all.
   routed/opened/failed, session-timeout notices, a frozen-branch-moved
   alert, a re-review outcome, a worktree-checkout failure). All comments
   are redacted before posting.
+- A spec-regression-gate checklist comment (plan 0191), posted whenever its
+  computed state differs from the state of the newest such comment already
+  on this exact implementation head (so a state that recurs at a head is
+  reposted, not silently skipped), on an implementation pull request whose
+  plan's own `paths` lease reaches a `spec_watch` rule from the target
+  repo's `governance.yaml` — a plan reaching none gets no comment at all.
+  `passing` is `fleet-meet`'s own `all_passed`, never re-derived from
+  per-test outcomes alone: a refused or timed-out lane, a dispatched lane
+  never read, and an empty suite are all evidence against a pass, even
+  though none of them is itself a non-passing test. It opens with
+  `<!-- eunomia:spec-regression-gate plan=<id> head=<sha12> state=<state> -->`
+  and `state` is exactly one of `missing`, `stale`, `failing`, `passing` or
+  `waived`; see `docs/spec-regression-flow.md`. It carries the sha256 of
+  every spec document the pull request's own diff touched, the mediator's
+  identity when `fleet-triage` has already run, and, when waived, the
+  waiving owner's login and reason. It is never a commit status and never a
+  review, it asserts the same way `fleet-triage`'s own comment does that it
+  carries no `Ack:` line, no `Plan:` line, and no second `eunomia:` marker,
+  and it never spawns `fleet-meet`, `fleet-triage` or an implementer
+  session — it only reads their already-written `findings.json` and
+  `triage.json`, and the thread, for an owner-authored two-line
+  `Spec-gate-waive: <reason>` / `Head: <sha>` exception scoped to the exact
+  head.
 - Event `plan-failed` only, `detail` carrying the plan id, lease id,
   reason, and optionally a log/transcript reference, pull request number,
   or round count. A failed emit is swallowed, never blocking the exit
@@ -1189,23 +1991,26 @@ rather than relying on any local file.
 
 declared
 
-**Purpose.** The collector: ingests four local and remote sources into the
-fleet's shared database — session transcripts, the event ledger, per-lease
-run logs, and (by default only against the live fleet area) CI task data
-from the forge and a remote log archive.
+**Purpose.** The collector: ingests local and remote sources into the
+fleet's shared database — session transcripts (Claude's own, and, plan
+0197, every other writer family's own raw output), the event ledger,
+per-lease run logs, and (by default only against the live fleet area) CI
+task data from the forge and a remote log archive.
 
 **Exit codes.**
 - `0`: the sweep completed with zero per-file or per-source ingest
   failures, and no failure reconstructing the settings table.
 - `1`, grouped (all converge on the same final code, so the cause is not
   distinguishable from the exit code alone): one or more transcript files
-  failed to parse or ingest; one or more event-ledger files (current or
-  rotated) failed to ingest; one or more run-log files failed to ingest;
-  the settings-table reconstruction step raised while replaying ledger
-  events; the CI source raised outright, or reported one or more
-  individual log-fetch failures; the target database's schema version is
-  newer than this build understands — refused unconditionally before any
-  source is scanned.
+  failed to parse or ingest; one or more writer transcripts could not yet
+  be correlated to the run log that names the runner and model that
+  produced it (plan 0197 D1 — retried on the next sweep, not dropped);
+  one or more event-ledger files (current or rotated) failed to ingest;
+  one or more run-log files failed to ingest; the settings-table
+  reconstruction step raised while replaying ledger events; the CI source
+  raised outright, or reported one or more individual log-fetch failures;
+  the target database's schema version is newer than this build
+  understands — refused unconditionally before any source is scanned.
 - No argparse (its only input is an optional positional database path),
   so there is no argparse exit-2 path.
 
@@ -1222,7 +2027,11 @@ from the forge and a remote log archive.
   they are absent or empty, by replaying `fleet-setting-changed` events
   just ingested.
 - Reads three local sources under the fleet area it is pointed at (a
-  transcript tree, the event ledger, and per-lease run logs); a fourth,
+  transcript tree, the event ledger, and per-lease run logs); a fourth
+  local source, the orchestrator's own writer-output tree (plan 0197 D1),
+  runs under the same default-area gate as the CI source below — a
+  relocated fleet area (every test's own) reads nothing there unless told
+  to, so a test cannot read the real tree of the host running it; a fifth,
   network source runs by default only against the live fleet area (or
   when explicitly enabled): the forge's task list over HTTPS, and one
   remote call per sweep to fetch a compressed CI-log archive, decompressed
@@ -1386,6 +2195,50 @@ make room.
 - No event, no forge interaction, no database write.
 - Stdout: the target identifier, on success.
 
+### bin/fleet-style
+
+declared
+
+**Purpose.** The one decision on whether a pull request takes the style review
+(ADR-0025 §3) and whether the screenshots committed for it are valid evidence
+(§6-§7). It reads `config/style-review.json` beside itself and changes nothing.
+
+**Exit codes.**
+- `0`: `declared`, `route` and `verify` decided, including "the repository is not
+  declared", "routed to the full review" and "the evidence is not ok".
+- `1`: a decision could not be made (an unreadable input, a failing git call, a
+  value that is not a commit hash). A caller treats this as the full review.
+- `2`: `declared` found the declaration file malformed, naming the line and the
+  rule; also argparse's own exit on malformed CLI arguments.
+
+**Writes.** None. `route` asks `fleet-models reviewers` for the ordinals and
+`verify` reads the producer's record under the fleet directory; neither is
+modified.
+
+**Shape.** `route` prints `position`, `review`, `reasons`, `evidence_id`,
+`evidence_folder` and `screenshot`; `verify` prints `ok`, `folder`, `code_head`,
+`problems`, `images` and `total_bytes`. Both are specified in `docs/style-review.md`.
+
+### bin/fleet-style-evidence
+
+declared
+
+**Purpose.** Produces the screenshots a style pull request carries (ADR-0025
+§6): photographs the base and the head with the repository's declared command,
+run from the base commit, commits the images to the pull request branch in one
+commit after the code, records their hashes outside every repository, pushes,
+and writes the before/after grid into the marked section of the pull request
+body. Specified in `docs/style-evidence.md`.
+
+**Exit codes.**
+- `0`: `produce` completed and the body section was verified by reading it back.
+- non-zero: any other outcome; the message names the step that stopped.
+
+**Writes.** The evidence folder commit pushed to the pull request branch, the
+producer's record under the fleet directory, and the marked section of the pull
+request body. It creates and deletes its own simulator and holds a `sim` lease
+for the run.
+
 ### bin/fleet-svc
 
 declared
@@ -1416,7 +2269,9 @@ or enrols anything.
   one with a row that fails to parse; a malformed unit identifier, or one
   naming a host other than the machine this is running on; a unit not
   enrolled at all; an unrecognised supervisor-domain value configured for
-  a row; the lease store unreachable (fails closed for every mutating
+  a row (refused when the enrolment config is read, for every verb
+  including `audit` — `system|gui` for launchd, `system|user` for
+  systemd); the lease store unreachable (fails closed for every mutating
   verb); no active lease held by the invoking session for this unit
   (distinguishing unclaimed from held-by-someone-else); more than one
   active lease on the same unit with different holders (refuses rather
@@ -1425,7 +2280,11 @@ or enrols anything.
   supervisor reports right now no longer matching what the held lease's
   binding recorded (refuses rather than risk signalling a respawned
   process), or no permission to signal it; `edit-config` — no gated
-  config file configured for the target, or it can't be read.
+  config file configured for the target, or it can't be read;
+  `bootstrap` — no installed plist for the unit in the directory its
+  domain names (the per-user LaunchAgents directory for `gui`,
+  `/Library/LaunchDaemons` for `system`), refused before the supervisor
+  is called.
 
 **Writes.**
 - The lease record for the resource being operated on: after every
@@ -1535,16 +2394,26 @@ commit: builds the repository's generated contract, hands it to one of the
 repository's resolved `tester` runners (an omitted `--runner` means ordinal
 1) with no filesystem or tool access of its own,
 validates what comes back, and lands it as a draft pull request. One
-runner, one invocation, no loop and no retry.
+runner, one invocation, no loop and no retry. A subscription CLI whose own
+process can otherwise read anywhere (`sub-codex`, `sub-muse`) is spawned
+under an outer `sandbox-exec` profile named in its own adapter entry
+(`config/codex-tester.sb`, `config/muse-tester.sb`); the profile, never a
+CLI flag, is what confines it (ADR-0006 §6).
 
 **Exit codes.**
 - `0`: a dry run completed, or a real run validated the vendor's result and
-  opened the pull request.
+  opened the pull request; on success it prints `pr: <repo>#<number>` on
+  standard output.
 - `1`: any gate refused (plan zone, a runner that is not one of the repository's resolved tester
   rows or no tester at ordinal 1, unmeasured or unwired
-  runner, a settings precondition, a mandatory bundle gap), the vendor's
-  result failed validation or path confinement, or a git or forge step
+  runner, a settings precondition, a mandatory bundle gap, or a
+  `lane_run_cap` that is unset, unreadable, `0` or silent about the runner),
+  the vendor's result failed validation or path confinement, the vendor
+  stopped on an error that is not a usage limit, or a git or forge step
   after that point failed.
+- `75`: "later, unchanged, this may pass" — the runner has reached its
+  `lane_run_cap` in the last 24 hours (`capped`), or the vendor refused on
+  a usage limit (`quota`). The `lane_run` row's outcome tells them apart.
 - `2`: a malformed CLI argument, including argparse's own exit 2.
 
 **Writes.**
@@ -1553,13 +2422,197 @@ runner, one invocation, no loop and no retry.
   work area, keyed by plan id and runner name; none of it is committed.
 - A per-run log recording each gate and phase, appended under the fleet's
   work area's log directory.
+- One `lane_run` row in the fleet database per run (a durable table): repo,
+  plan, runner, commit, prompt hash, the usage the CLI reported and how the
+  run ended. The cap is checked and the row reserved in one transaction just
+  before the vendor is spawned; a run that a gate refuses is recorded as
+  unspawned and never counts against the cap.
 - On success: one new branch under `agent/tests/<plan>/<runner>`, pushed to
   the target repository, and one pull request against its `main`, titled
-  with a `WIP: ` prefix, carrying a `Tests-for: <plan>` marker (never the
-  dispatcher's own `Plan: <id>` marker) and the vendor's reported gaps.
+  with a `WIP: ` prefix. Its body opens with a header block (the lines before
+  the first blank line): `Tests-for: <plan>` (never the dispatcher's own
+  `Plan: <id>` marker), `runner:`, `sha:`, `prompt sha256:` and `usage:` (the
+  same JSON the `lane_run` row stores, or `-`). Everything a vendor wrote —
+  each gap and the notes — follows, every line prefixed `> `. Files land only
+  under `tests/lane/`, mode 0644, and a returned file whose basename repeats a
+  test module already under `tests/` is refused.
 - One page (delivered or not) recording a refusal or the opened pull
-  request, through the same durable page log every other fleet unit writes.
+  request, through the same durable page log every other fleet unit writes;
+  a vendor usage-limit stop sends its own separate page.
 - No review is ever dispatched on the pull request this program opens.
+
+### bin/fleet-meet
+
+declared
+
+**Purpose.** Runs a test lane's pull-request files against an implementation
+pull request's head, in a confined runner, and writes one findings document.
+Invoked as `fleet-meet <owner/repo> <plan-id> --impl <pr> [--lane <pr>]...
+[--dry-run]`. A lane runs only after the fleet's human position has approved
+the lane pull request at the exact commit that will run; nothing of an
+unapproved lane is imported. Every test gets one outcome — pass, fail, error or
+skip — and a skip is never counted as a pass. It only reads the forge: it posts
+no comment, status or review.
+
+**Exit codes.**
+- `0`: a findings document was written, even one full of failures or of
+  lanes that were refused for their paths or timed out (findings are output),
+  or a dry run completed.
+- `1`: a host-level failure, and no document is written — the sandbox tool is
+  missing or its start-up probe failed, a forge read or listing ended on an HTTP error status,
+  the object store could not fetch — or the implementation pull request is not
+  open or merged, is not authored by the author role, or lacks a `Plan: <id>`
+  line of its own, or a named lane is not a lane of that plan.
+- `2`: a usage error, including argparse's own exit 2.
+- `75`: "later, unchanged, this may pass" — no lane has an approval by the
+  human position at its current head, the review list could not be read, or a
+  forge read failed in transport (timeout, connection refused or reset, DNS).
+  Nothing ran and no document is written.
+
+**Writes.**
+- One document under the fleet work area, at
+  `meetings/<plan>/<first 12 hex of the implementation head>/findings.json`,
+  validated against `config/meeting-findings.schema.json` before it is renamed
+  into place; its path is printed on standard output. A rerun for the same head
+  keeps the old document beside it as `findings.<its generated_at>.json`.
+- Nothing else durable: each lane's worktree and scratch directory are removed
+  when its run ends, and no process carrying the run's nonce outlives it.
+
+**Shape.** By reference to the schema. Per lane: the pull request, the
+approved head, the branch, the runner, the prompt hash and whether it was
+verified against the `lane_run` row, who read it and when, the files, the run
+outcome (`ran`, `timeout`, `collection-error` or `refused`) and one entry per
+test with `outcome` (`pass`, `fail`, `error`, `skip`), the raw pytest outcome,
+the redacted reason and the source path. `comparable` is true only for two or
+more lanes whose verified prompt hashes are equal. `all_passed` is false when
+any skip, failure, error, unread or refused lane exists.
+
+### bin/fleet-triage
+
+declared
+
+**Purpose.** Triages every test that did not pass in a meeting's findings
+document, by a runner that can read the implementation, and posts the result once
+per outcome as a comment on the implementation pull request. Invoked as
+`fleet-triage <owner/repo> <plan-id> --impl-sha <sha> [--dry-run] [--no-post]`. It
+refuses unless the findings validate and match the plan and sha, the plan on
+`main` (never at `--impl-sha`, which is implementer-authored) says
+`zone: public`, the repository resolves a `mediator` at ordinal 1, and that
+runner is `sub-opus` (the one runner in its adapter table). The triager holds
+`Read`, `Grep` and `Glob`, confined to its working directories by `--restricted`
+(measured on the installed CLI, not assumed), over an exported copy of the
+implementation and no other tool. Every citation it returns is checked against
+the files, and the wrapper, not the triager, decides what counts as verified. It
+never posts a commit status or a review and never starts a fix round. After the
+comment is decided (or, when every test passed or none ran, in its place), it
+also acts on every lane PR this findings document names a non-pass test for,
+or that never ran at all (plan 0176): closed when every one of its non-pass
+tests verified `test-harness-gap`, kept open with one shared issue when a
+defect verified, kept open with a contract-needed comment, or kept open and
+paged once (a lane that never ran gets this last one, with no test of its own
+to show). A lane whose own tests all passed gets no disposition at all —
+`docs/meeting-triage.md`, "What happens to the lane".
+
+**Exit codes.**
+- `0`: the comment was posted, was already posted for this findings digest, every
+  test passed or no test ran for this meeting (nothing to triage either way), or
+  a dry run or `--no-post` completed.
+- `1`: refused — findings missing, invalid or for another plan or sha, a zone that
+  is not `public`, no `mediator`, a runner outside the adapter table, a thread
+  that could not be read in full, a comment that failed the assert-before-post, or
+  a post that failed. Nothing was spawned by a refusal at a gate.
+- `2`: a usage error, including argparse's own exit 2.
+- `3`: the triager timed out, exited non-zero or returned output that was not a
+  valid document; the comment listing every non-pass as not triaged was still
+  posted.
+
+**Writes.**
+- Beside the findings document, `triage.json` (the findings digest, the runner,
+  the model the CLI reported, the prompt hash, the triager's raw document, each
+  item's verification result, the posted comment id, and every lane's
+  disposition with its pending steps) and `prompt.txt`.
+- One comment on the implementation pull request, opening with
+  `<!-- eunomia:meeting-triage findings=<digest> status=ok -->` or
+  `... status=failed -->`. At most one `status=ok` comment per findings digest;
+  a `status=failed` comment does not count as done, so a by-hand rerun for the
+  same digest spawns the triager again.
+- Per lane PR (plan 0176): a comment (capped at the main triage comment's own
+  size; one that would exceed it pages instead of being sent), opening with
+  `<!-- eunomia:lane-disposition plan=<plan> digest=<findings digest>
+  head=<lane head> action=<action> -->` — this is the dedup marker a retry of
+  the SAME digest is found by, never the triage comment's own url (which
+  changes on every hand rerun of a FAILED digest); a genuinely new digest,
+  even at the same implementation or lane head, always posts its own,
+  accurate comment rather than recovering an earlier digest's — and — only
+  when every one of that lane's non-pass tests verified `test-harness-gap` —
+  a PATCH closing it, carrying
+  `<!-- eunomia:lane-closed plan=<plan> head=<lane head sha> -->` (proof a
+  close was attempted, never that it completed), followed, once that PATCH
+  actually returns success, by a SECOND comment carrying
+  `<!-- eunomia:lane-closed-confirmed plan=<plan> head=<lane head sha> -->`.
+  Before every close attempt, a later run checks the lane's own thread for
+  that confirmed marker at this exact lane head, from ANY digest — found, a
+  close for this head genuinely completed before and the PR is open now only
+  because a person reopened it, so the rule leaves it alone until the head
+  moves. This is read straight off the forge, never from local history: an
+  earlier design inferred the same fact from whichever implementation head's
+  `triage.json` on disk still recorded a confirmed close, which broke once
+  that one record was overwritten by a later digest's own write at the same
+  implementation head. The gate re-reading a lane before acting also treats
+  one further shape as a completed close rather than a terminal skip: the
+  close step still pending, the comment step already done, and the PR found
+  closed (not merged) at exactly this lane head — D2a's measured lie, where
+  the close PATCH landed despite its own write reporting failure; the confirm
+  step still runs in that case, never abandoned. A lane found closed before
+  this program ever attempted its own comment keeps the ordinary "already
+  closed" skip. `fleetforge` gains no verb for any of this: both
+  comments and the close PATCH, and the one issue per `(repo, plan)` a
+  verified `implementation-defect` or `spec-or-contract-defect` gets filed
+  under (`Lane-defects-for: <plan>`, created or edited — its STATE never
+  changed, whatever the lookup finds it in, since this rule holds no
+  issue-reopen capability any more than an issue-close one — never
+  duplicated), go through `fleetforge`'s transport directly, the
+  `fleet-rebase` `_close_relanded` precedent. A lane the gate finds closed or
+  moved is skipped, silently, forever at that head; one the gate could not
+  even read is paged, like any other failed step, and retried. A write still
+  failing after three tries, 2s/8s apart, pages once naming the retry
+  command, worded for whether that retry replays pending steps or (a digest
+  recorded with a failure) re-spawns the triager; a comment post is never
+  blindly retried (it is not idempotent) — each attempt first checks the
+  thread for its own already-landed copy. The issue lookup behind all of this
+  is a single read per call, never retried AS A READ within the run (its own
+  failure pages immediately instead); the one exception is the issue CREATE
+  path, whose own retries repeat this same listing first, to find a duplicate
+  its earlier POST actually wrote, the identical idempotency pattern comment
+  posts use.
+- One comment on the shared `Lane-defects-for: <plan>` issue, only while it is
+  open, when this run keeps no lane for a defect and every lane GENUINELY
+  passed — the strongest form of "no lane kept for a defect"
+  (`docs/meeting-triage.md`, "A defect"). This fires even on the "nothing to
+  triage" exit `0` path, which otherwise posts no comment on the
+  implementation pull request at all; it never fires when the triager itself
+  failed (exit `3`), nor when no lane ran at all (one refused, timed out or
+  failed to collect — the same empty-tests shape as "every test passed", but
+  `findings["all_passed"]` is false), because nothing was classified in
+  either case, and it posts nothing when the issue the lookup finds is
+  closed. The issue this looks up is re-checked "still open" immediately
+  before every post, never cached from an earlier attempt; more than one
+  marked issue is logged and resolved to the lowest-numbered,
+  deterministically; its body carries the same size cap the main triage
+  comment does. The lookup's own listing is capped at 20 pages; hitting the
+  cap pages and retries like any other unreadable prerequisite, never reads
+  as "no issue".
+- A run log under the fleet work area. No database table and no event — plan
+  0176 left `lane-closed`/`lane-kept` event-type registration (`bin/fleet-emit`,
+  `bin/fleet-events`) as a follow-up, because the event set needs a SPEC PR.
+
+**Shape.** The comment lists the plan, the implementation sha, each lane pull
+request with its head and prompt hash, and the triager's runner and reported
+model, then a table of classifications whose evidence verified, the verified gap
+contradictions, the items whose evidence did not verify, and the tests not
+triaged. Classes are `implementation-defect`, `spec-or-contract-defect`,
+`test-harness-gap`, `skip-needs-contract` and `undetermined`. A verified citation
+proves the cited text exists, not that the class is right.
 
 ### docs/diagrams/check-svg-layout.py
 
@@ -1595,6 +2648,15 @@ undeclared — diagram tool
 Generates a simplified variant of the plan-dispatch flow diagram for an
 audience outside the project. A standalone script producing a static
 image.
+
+### docs/diagrams/gen-pr-ledger.py
+
+undeclared — diagram tool
+
+Generates the two plan-0209 diagrams: what runs where for the webhook-fed
+pull-request ledger, and how a sample fleet's pull requests are read. A
+standalone script writing two static images beside itself, checked
+afterward by `check-svg-layout.py`.
 
 ### tools/ctr-bench.py
 
@@ -1688,6 +2750,11 @@ section. Additions require a change to that section.
 `cr-filed` `cr-applied` `pr-opened` `pr-pushed` `review-posted` `pr-armed`
 `candidate-testing` `pr-merged` `pr-bounced` `token-minted`
 `token-revoked` `deploy-started` `deploy-verified` `budget-checkpoint`
-`plan-dispatched` `plan-done` `plan-failed` `plan-blocked`
-`capability-published` `pin-drift` `repo-model-changed`
-`fleet-setting-changed` `plan-requeued`.
+`plan-dispatched` `plan-done` `plan-failed` `plan-blocked` `plan-question` `question-answered`
+`capability-published` `pin-drift` `repo-model-changed` `seat-access-changed`
+`fleet-setting-changed` `plan-requeued` `review-requeued` `followup-triaged`
+`followup-closed` `quota-closed` `quota-opened` `lane-dispatched`
+`lane-skipped` `lane-ended` `credits-window-opened`
+`credits-window-closed` `credits-spent` `credits-cap-reached`
+`credits-reservation-expired` `credits-refused` `credits-grant-given`
+`credits-grant-revoked` `credits-job-spent`.

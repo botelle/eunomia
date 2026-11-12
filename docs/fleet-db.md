@@ -22,20 +22,195 @@ session reading the old sentence designed around a constraint that no longer
 held (plan 0048, ADR-0010 §3). See "Two tiers" below for exactly which table
 is which, and why it matters on a schema bump.
 
+## Schema
+
+Every durable table is created by `CREATE TABLE IF NOT EXISTS` from its owner's
+own `SCHEMA` constant:
+
+- `bin/fleet-config` — `fleet_setting`, `repo_setting` and their `*_change` tables;
+- `bin/fleet-models` — `repo_model`, `repo_model_change`;
+- `bin/fleet-reviews` — `review`, `model_price`, plus its `_migrate()`;
+- `bin/fleet-lane` — `lane_run`, one row per test-lane run (plan 0100);
+- `bin/fleet-depsd` — `dependency_attestation`, `dependency_attestation_change`
+  (plan 0180): an owner attestation of an `external:<slug>` dependency, and
+  its history. This program has no write path of its own in plan 0180; plan
+  0181's `serve`, through its authenticated POST/DELETE, is the only writer.
+  Plan 0181 also adds `dependency_hold` (one row per unmet `depends_on` entry
+  of a `ready` plan, PK `(repo, plan, dep)`) and `dependency_scan` (one row
+  per repository, PK `repo`, recording when it was last scanned and whether
+  the read succeeded) — both rebuilt whole, one repository at a time, by
+  `serve`'s own `recompute()`, and written by nothing else;
+- `bin/fleet-plan-review` — `plan_review_job`, `plan_review_job_change` (plan
+  0188): the durable queue for a plan-filing PR's review, keyed by (repo, pr,
+  head_sha), and its history;
+- `bin/fleet-collect` — its derived tables, under `PRAGMA user_version`; it
+  rebuilds them itself on every sweep, and `fleet-db-migrate` never touches them;
+- `bin/mopsus` — `review_probe` and `resume_request`, created inline at write
+  time (not yet in a `SCHEMA` constant, so not covered by the migrate);
+- talos creates its own tables (`review_attempt`, its `review` writes).
+
+Only a write path used to create a table, so a strict reader on a host that had
+never written there refused the store (`no such table: repo_setting`, 2026-09-28).
+`bin/fleet-db-migrate` closes that: it applies the `SCHEMA` of `fleet-config`,
+`fleet-models`, `fleet-reviews`, `fleet-lane` and `fleet-depsd` (and
+`fleet-reviews`'s `_migrate`) in one connection, prints `ok <owner> (<n> tables)`
+or `FAILED <owner>: <error>`, and exits 0 only if every owner succeeded.
+`--dry-run` lists what would be created. Additive DDL only; `FLEET_DB` is respected.
+
+- It is the install step on a new host.
+- `fleet-pin-advance` runs the pin's own copy after a verified advance of the
+  eunomia pin (never the advancer's). A failure pages once and does not
+  un-advance the pin.
+- An owner that adds a table to its `SCHEMA` needs nothing else, UNLESS the
+  addition is a column on a table `CREATE TABLE IF NOT EXISTS` has already
+  created elsewhere — that statement adds no column to a table that already
+  exists, so the owner also needs an idempotent `_migrate(con)` (the same
+  shape `fleet-reviews`'s own `_migrate` uses for `review.dismissed`/`stale`,
+  and `fleet-lane`'s own uses for `lane_run.requested_model`/`model_source`
+  below): `_apply` in `bin/fleet-db-migrate` calls it if present, on both the
+  real connection and the scratch one `_owner_tables` builds.
+
+### `lane_run.model`, `requested_model` and `model_source` (plan 0190)
+
+A test-lane run's model identity is two separate facts, not one:
+
+- **`requested_model`** — the model `bin/fleet-lane` PINNED before anything
+  was spawned (`orchestrator.RUNNERS[runner].model`, the same registry value
+  `fleet-models` reads). Known at reservation time, before the vendor CLI
+  ever runs, and never overwritten afterwards.
+- **`model`** — the model this program BELIEVES actually answered. It starts
+  equal to `requested_model`, and is overwritten only when the vendor's own
+  result metadata explicitly names a served model (Claude's `modelUsage`,
+  muse's `run.usage` event) — never inferred from free-form stdout text,
+  which no adapter trusts for this.
+- **`model_source`** — which of the two above `model` currently holds:
+  `launch-config` (the pin, untouched) or `cli-report` (a vendor's own
+  trusted metadata overwrote it). `NULL` on a row written before this column
+  existed — an **unknown** attribution, never backfilled from a runner's
+  CURRENT registry pin, which can move after the row was written and would
+  misattribute history if it were used to guess the row's past.
+
+Codex and antigravity are measured to never report a served model in their
+usage metadata, so their rows carry `model_source = 'launch-config'` — the
+registry pin, correctly labelled as unconfirmed rather than left `NULL` (the
+original gap this plan closes) or claimed as served when it was not.
+
+```sql
+-- how often a reported served model differs from what was launched
+SELECT runner, requested_model, model, model_source
+  FROM lane_run WHERE model_source = 'cli-report' AND model != requested_model;
+```
+
+### Tokens, findings and cost, for every model (plan 0197)
+
+**`session` rows for a non-Claude writer (D1).** `fleet-collect` also reads
+`~/dev/.orchestrator-transcripts/*.log` — the orchestrator's own writer
+output, `bin/orchestrator`'s `transcript_dir()` — and, for a Codex, antigravity
+or Muse writer only, writes one `session` row per transcript, `kind` =
+`writer-codex` / `writer-antigravity` / `writer-muse`, `id` = `writer/<the
+transcript's filename>`, `session_uuid` = the lease it ran under. A Claude
+writer transcript is skipped (never a row): that writer is already counted
+from `~/.claude/projects`, and `turns`/`tool_calls` stay `NULL` on every
+writer row — there is no per-turn breakdown to give them, and `NULL` says so,
+where `0` would claim one. The runner and model come from the matching run
+log's `writer-start` (or, for an older run or an epeius/hosted writer that
+logs no such phase, `routed`) line, found by an exact string match on
+`implementer-exit`'s own `transcript` fact — not by parsing the filename, which
+cannot safely separate a lease id from an appended fix-round tag. A transcript
+this cannot yet correlate (the run log has not landed this sweep) is retried
+next sweep, recorded in `ingest.error`, never silently dropped. The runner →
+family map comes from `bin/orchestrator`'s own `RUNNERS` registry, loaded
+fresh each sweep; if that load fails, the **whole** writer-transcript sweep
+is skipped for this run rather than falling back to an empty map — an empty
+map would miss every transcript the same way an out-of-scope family does,
+and (wrongly) mark each one seen with no error, excluding it from every
+future sweep even once the load succeeds again.
+
+**`review.usage_*` and `review.findings_*` (D2/D3).** `fleet-reviews
+--backfill` now also reads, from each review's own body:
+- `usage_in`, `usage_cached`, `usage_cache_write`, `usage_out`,
+  `usage_seconds`, from talos plan 0042's `Review-provenance-usage:` line
+  (not yet shipped there as of 2026-11-08, so every column is `NULL` against
+  today's reviews). A key the harness wrote `unknown` for is `NULL`, same as
+  a body with no such line at all — never a guessed `0`.
+- `findings_high`, `findings_medium`, `findings_low`, by the same two rules
+  talos `file-followups.py` uses: its ```findings fenced block, exact; its
+  `_HEADING`/`_BOLD_SECTION` prose tiers otherwise. A severity a clean read
+  never mentions is `0` (a review that states no findings) **only once the
+  body opens at least one severity section** — otherwise it never engaged
+  the findings format at all, and there is no "states no findings" to read;
+  every severity is `NULL`. A block or section this cannot trust —
+  malformed, truncated, or prose in a shape neither tier reads — is also
+  `NULL`.
+
+The usage columns fill once, like `session_uuid`: `COALESCE(review.col,
+excluded.col)` on every re-backfill, because the source is the review's own
+posted (immutable) body. `findings_*` does NOT: it is read by this module's
+own `count_findings()`, not a fixed-format provenance line, so a bug in it
+can write a wrong value, and COALESCE would make that value permanent (`0`
+is not `NULL`). `findings_*` always takes the freshly computed value instead
+— exactly as idempotent when the parser is right, and the only way a parser
+fix ever reaches a row already written.
+
+**`config/model-prices.json` and the API-equivalent cost (D4).** An
+owner-maintained, dated, sourced price sheet — never fetched, never derived —
+read fresh by `bin/fleet-reviews`' `load_prices()` on every `--report` (a
+price correction takes effect on the next run, not the next deploy) and
+validated on every read (a missing `checked_on`/`source`, a negative price, or
+two rows for one model at the same `effective_from` is a `PriceFileError`, not
+a silently mispriced run). `cost_for()` picks the row whose `effective_from`
+is the latest on or before the review's own date, prices the run's four token
+buckets at that row's per-million-token rates, and returns `None` — never `0`
+— for a model with no row at all, or a review with no usage recorded. A
+`cache_write` count prices at the row's `cache_write_short` rate: every usage
+source this plan reads reports one undifferentiated cache-write count, never
+split by TTL, and 5-minute ephemeral caching is every harness's default.
+`--report`'s per-model and per-PR sections both show it, labelled
+"API-equivalent" even for a subscription run, with a count of how many runs a
+missing price or a missing usage record excluded from the total.
+
 ## Two tiers, and why the difference is load-bearing
 
 | tier | tables | who writes it | survives a schema-version bump? |
 |---|---|---|---|
 | derived | `session`, `turn`, `tool_use`, `ingest`, `event`, `dispatch_phase` | `bin/fleet-collect`, from transcripts/ledger/run logs | **No** — dropped and rebuilt from source (see `SCHEMA_VERSION` below) |
 | derived from a source that prunes | `ci_task`, `ci_log`, `ci_sync` | `bin/fleet-collect` (through `bin/fleet-ci`), from Forgejo's task list and cihost's `actions_log` | **Yes** — deliberately absent from the drop tuple; see "CI results" below |
-| durable | `review`, `model_price`, `repo_model`, `repo_model_change`, `fleet_setting`, `fleet_setting_change` | `bin/fleet-reviews`, `bin/fleet-models`, `bin/fleet-config` | **Yes** — `fleet-collect` never names them, so its `DROP TABLE` sweep cannot reach them |
+| durable | `review`, `model_price`, `repo_model`, `repo_model_change`, `fleet_setting`, `fleet_setting_change`, `repo_setting`, `repo_setting_change`, `lane_run` | `bin/fleet-reviews`, `bin/fleet-models`, `bin/fleet-config`, `bin/fleet-lane` | **Yes** — `fleet-collect` never names them, so its `DROP TABLE` sweep cannot reach them |
 
-Both sets are **named in `bin/fleet-collect`** — `DERIVED_TABLES` (the six above
-plus the three `ci_*`) and `DURABLE_TABLES` (the last row) — disjoint, and a
+`DERIVED_TABLES` (the six above plus the three `ci_*`) and `DURABLE_TABLES`
+(the last row) are both **named in `bin/fleet-collect`**, disjoint, and a
 completeness test in `tests/test_config_durability.py` fails when a table in
-`sqlite_master` is in neither, so a new table is unclassified until someone
-decides. The views (`dispatch`, `ci_task_dispatch`, `dispatch_session`,
-`dispatch_cost`) hold no data and belong to neither set.
+`sqlite_master` is in neither, so a new table owned by one of THOSE FIVE
+WRITERS (`fleet-collect`, `fleet-models`, `fleet-config`, `fleet-reviews`,
+`fleet-lane`) is unclassified until someone decides. The views (`dispatch`,
+`ci_task_dispatch`, `dispatch_session`, `dispatch_cost`) hold no data and
+belong to neither set.
+
+**`bin/fleet-depsd`'s four tables are outside both sets, and outside that
+test**, because `tests/test_config_durability.py`'s own `_full_schema` builds
+its test database from exactly those five writers' `SCHEMA` constants — it
+never executes `fleet-depsd`'s. Classified here instead, by what each one
+actually is:
+
+- `dependency_attestation`, `dependency_attestation_change` (plan 0180) ARE
+  durable in the sense this page means — an owner's decision, recorded
+  nowhere else `fleet-collect`'s three sources could re-derive it from — but
+  that classification lives in this paragraph, not in `DURABLE_TABLES`.
+- `dependency_hold`, `dependency_scan` (plan 0181) are **derived**, not
+  durable: `serve`'s own `recompute()` rebuilds both whole, one repository at
+  a time, from `plan_files()` + `_plan_dependency_blocks()` — a source that
+  survives — every pass. Losing the file costs nothing a later pass does not
+  simply recompute. Dropping them on a schema bump would not erase a
+  decision; `fleet-collect`'s `SCHEMA_VERSION` bump never reaches them either
+  way, since its drop tuple, like its two named sets, only ever names tables
+  from the five writers above.
+
+All four are created by `fleet-depsd`'s own `SCHEMA` (`CREATE TABLE IF NOT
+EXISTS`, the same idiom every writer here uses) and migrated by
+`fleet-db-migrate` alongside the five writers' tables — that part of "Schema",
+above, is accurate for all four. What is classified above is only the
+derived/durable distinction and `fleet-collect`'s own sets, which do not
+reach `fleet-depsd` at all.
 
 The derived tier can always be thrown away and rebuilt, because everything in
 it is a re-read of a source that still exists on disk. The durable tier
@@ -65,6 +240,8 @@ else" exists, per table:
 |---|---|---|
 | `repo_model`, `repo_model_change` | the ledger: one `repo-model-changed` event per write (SPEC.md), and the daily snapshot below | `reconstruct_repo_model` in `bin/fleet-models` replays the events into an **absent or empty** `repo_model`; otherwise restore the newest snapshot |
 | `fleet_setting`, `fleet_setting_change` | the ledger: one `fleet-setting-changed` event per write (SPEC.md), and the daily snapshot below | `reconstruct_fleet_setting` in `bin/fleet-config`, replayed the same way — and, unlike `repo_model`'s, **wired into `fleet-collect`'s own sweep** (plan 0068 D4), so it runs on every 120-second tick, not only under test |
+| `repo_setting`, `repo_setting_change` | the ledger: one `fleet-setting-changed` event per write, carrying `repo` in `detail` and `new: null` for an `unset` (plan 0085) | `reconstruct_repo_setting` in `bin/fleet-config`, wired into `fleet-collect` beside `reconstruct_fleet_setting`; replays the events in order into an **absent or empty** `repo_setting` — never from `repo_setting_change`, which lives in the same file. `reconstruct_fleet_setting` skips these events |
+| `lane_run` | the daily snapshot only (plan 0100): a lane run is a fact no source on this host can re-derive, and no event carries it (`lane-*` events are plan 0104's) | restore the newest snapshot |
 | `review`, `model_price` | the forge — the authority for both | `bin/fleet-reviews --backfill` |
 
 **`repo_model` was the only durable state with no second copy** (`fleet.db` had
@@ -131,8 +308,8 @@ readers (`collect.log` had recorded `database is locked`, and the lynceus API
 reads the same file the collector writes). It is set by each writer *at open*,
 not by a one-off pragma: journal mode is persistent, so a hand-run pragma looks
 fixed until a copy restored in `delete` mode arrives with nothing to set it
-again. `bin/fleet-models`, `bin/fleet-config`, `bin/fleet-collect` and
-`bin/fleet-reviews` each do this at open.
+again. `bin/fleet-models`, `bin/fleet-config`, `bin/fleet-collect`,
+`bin/fleet-reviews` and `bin/fleet-depsd` each do this at open.
 
 ## `dispatch_session` and `dispatch_cost`: what a run and its reviews cost (plan 0076)
 
@@ -442,7 +619,7 @@ on cihost, where Forgejo runs. The ledger is on opshost, so:
 
 The `dispatch` view has no sha column, and `event.sha` is only ever filled by hand.
 The orchestrator writes the **8-character** head sha into the run-log facts of
-`ci-waiting`, `ci-resolved`, `ci-none`, `ci-timeout`, `ci-unreadable`,
+`ci-bound`, `ci-waiting`, `ci-slow`, `ci-resolved`, `ci-none`, `ci-timeout`, `ci-unreadable`,
 `review-dispatch` and `review-round`, so that is the key that exists:
 
 ```sql

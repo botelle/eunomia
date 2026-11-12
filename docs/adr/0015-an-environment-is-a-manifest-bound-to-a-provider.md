@@ -10,7 +10,7 @@
   (the `deploy` kind and `deploy_reviewer`), `bin/fleet-pin-advance` (plan
   0034), `bin/fleet-svc` and `config/services.conf` (plan 0029), SPEC's
   `deploy-started`/`deploy-verified` events, `operator/infra` `lib/deploy.sh`,
-  `operator/portunus` `docs/DESIGN.md` §5 (the deploy plane).
+  `operator/deployplane` `docs/DESIGN.md` §5 (the deploy plane).
 - **Spec-impact:** `SPEC.md` (a Revision recording §4–§6) and a new
   `docs/deploy.md`, each in a following `docs` pull request.
 
@@ -64,7 +64,7 @@ the environment and the SHA. A rollback is a `deploy-started` for the older
 SHA.
 
 **7. `stage` and `prod` are reached only by promotion**, never by a merge.
-Promotion is its own gated action, as `operator/portunus` `docs/DESIGN.md` §5
+Promotion is its own gated action, as `operator/deployplane` `docs/DESIGN.md` §5
 describes, and is decided in a later ADR when a cloud provider exists.
 
 ## Consequences

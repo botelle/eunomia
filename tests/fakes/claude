@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""A scripted stand-in for the `claude -p` implementer session (plan 0099 D3).
+
+The orchestrator spawns `claude` from PATH with the whole briefing on stdin, the
+worktree as cwd, and an ALLOWLISTED environment — so nothing here can be passed
+through env by the test. The scenario puts a two-line `claude` shim on PATH that
+exports the variables below and execs this file.
+
+Env (exported by that shim):
+  FAKE_CLAUDE_SCRIPT  JSON list of actions, one per invocation, in order
+  FAKE_FORGE_URL      the fake forge (tests/fakes/forge.py)
+  FAKE_CLAUDE_TOKEN   the author account's token on that forge
+
+Actions:
+  {"action": "work"}                 commit a file, flip the plan to `done`,
+                                     push the current branch to origin; the
+                                     FIRST work also opens the pull request
+  {"action": "noop"}                 exit 0 having changed nothing
+  {"action": "exit", "code": N, "stderr": "..."}   exit N having changed nothing
+
+A fix round is simply the next invocation. Sidecars, next to the script:
+`<script>.state` (invocations so far) and `<script>.prompts/<n>.txt` (the stdin
+each invocation was given, for a row to assert on).
+
+Exhausting the script exits 97, loudly.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+
+def _git(*args):
+    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stderr.write(f"fake claude: git {' '.join(args)}: {r.stderr}\n")
+        raise SystemExit(96)
+    return r.stdout.strip()
+
+
+def _load(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def _open_pull(branch, plan_id):
+    body = json.dumps({"title": f"Implement {plan_id}", "head": branch,
+                       "base": "main",
+                       "body": f"Implements the plan.\n\nPlan: {plan_id}\n"}).encode()
+    req = urllib.request.Request(
+        os.environ["FAKE_FORGE_URL"].rstrip("/") + "/api/v1/repos/operator/demo/pulls",
+        data=body, method="POST")
+    req.add_header("Authorization", "token " + os.environ["FAKE_CLAUDE_TOKEN"])
+    req.add_header("Content-Type", "application/json")
+    urllib.request.urlopen(req, timeout=20).read()
+
+
+def main():
+    prompt = sys.stdin.read()
+    script_path = os.environ["FAKE_CLAUDE_SCRIPT"]
+    script = _load(script_path, [])
+    state_path = script_path + ".state"
+    state = _load(state_path, {"runs": 0, "opened": False})
+    n = state["runs"]
+    state["runs"] = n + 1
+
+    prompts = script_path + ".prompts"
+    os.makedirs(prompts, exist_ok=True)
+    with open(os.path.join(prompts, f"{n + 1}.txt"), "w") as fh:
+        fh.write(prompt)
+
+    def save():
+        with open(state_path, "w") as fh:
+            json.dump(state, fh)
+
+    if n >= len(script):
+        save()
+        sys.stderr.write(f"fake claude: invocation {n + 1} but only "
+                         f"{len(script)} scripted\n")
+        return 97
+    step = script[n]
+    action = step.get("action", "work")
+    if action == "exit":
+        save()
+        sys.stderr.write(step.get("stderr", "") + "\n")
+        return int(step.get("code", 1))
+    if action == "noop":
+        save()
+        print(json.dumps({"type": "result", "subtype": "success",
+                          "is_error": False, "result": "nothing to change"}))
+        return 0
+    if action != "work":
+        save()
+        sys.stderr.write(f"fake claude: unknown action {action!r}\n")
+        return 99
+
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+    plans = [f for f in os.listdir("plans") if f.endswith(".md")]
+    plan_path = os.path.join("plans", plans[0])
+    text = open(plan_path).read()
+    plan_id = re.search(r"^id:\s*(\S+)", text, re.M).group(1)
+    with open(plan_path, "w") as fh:
+        fh.write(re.sub(r"^status:\s*ready\s*$", "status: done", text, flags=re.M))
+    with open(f"work-{n + 1}.txt", "w") as fh:
+        fh.write(f"invocation {n + 1}\n")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", f"round {n + 1}")
+    _git("push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+    if not state["opened"]:
+        _open_pull(branch, plan_id)
+        state["opened"] = True
+    save()
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                      "result": f"pushed round {n + 1}"}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

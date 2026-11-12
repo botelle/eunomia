@@ -95,6 +95,20 @@ def _quiet_resident(mod, monkeypatch, lease_id="service--x--001"):
     return retired
 
 
+_MAX_CYCLES = 10
+
+
+def _bounded(calls):
+    """Fail once a test that expects `resident()` to end on its own has run
+    more cycles than it can need (eunomia#605). Without this, a restart that
+    never happens does not fail the test: `watch_interval` is patched to 0 and
+    the loop spins forever -- one ran for nearly three days on opshost, committing
+    on every cycle. `pytest.fail` raises a BaseException, which is what gets it
+    past the `except Exception` that keeps one bad cycle from ending the loop."""
+    if calls["n"] > _MAX_CYCLES:
+        pytest.fail(f"resident() did not restart after {_MAX_CYCLES} cycles")
+
+
 # --------------------------------------------------------------- the cases
 
 def test_head_unchanged_never_calls_pin_status(tmp_path, monkeypatch):
@@ -136,8 +150,11 @@ def test_head_advanced_and_current_restarts(tmp_path, monkeypatch):
     mod = _load(tmp_path / "fleet")
     mod.BIN = pin
     retired = _quiet_resident(mod, monkeypatch)
+    calls = {"n": 0}
 
     def fake_cycle(dry_run=False):
+        calls["n"] += 1
+        _bounded(calls)
         _advance(work, pin)          # simulate fleet-pin-advance, mid-cycle
         return 0
 
@@ -191,6 +208,7 @@ def test_running_child_declines_then_restarts_once_it_exits(tmp_path, monkeypatc
 
     def fake_cycle(dry_run=False):
         calls["n"] += 1
+        _bounded(calls)
         if calls["n"] == 1:
             _advance(work, pin)
         if calls["n"] == 2:

@@ -347,6 +347,48 @@ def test_domain_gui_vs_system_target_strings_differ(tmp_path):
     assert any(l.strip().startswith("kickstart system/com.example.s") for l in lines)
 
 
+def test_bootstrap_passes_the_installed_plist_path_never_the_label(tmp_path):
+    # 2026-09-28 opshost: `bootstrap gui/501 org.eunomia.fleet-pin-advance` fails
+    # `5: Input/output error` — launchctl bootstrap loads a plist PATH.
+    conf = _conf(tmp_path, [
+        _row(key=f"{HOST}:g", domain="gui", primary="com.example.g"),
+        _row(key=f"{HOST}:s", domain="system", primary="com.example.s"),
+    ])
+    agents, daemons = tmp_path / "LaunchAgents", tmp_path / "LaunchDaemons"
+    agents.mkdir()
+    daemons.mkdir()
+    (agents / "com.example.g.plist").write_text("<plist/>")
+    (daemons / "com.example.s.plist").write_text("<plist/>")
+    stub, log = _stub_launchctl(tmp_path)
+    env, fleet = _env(tmp_path, conf=conf, launchctl=stub)
+    env["FLEET_LAUNCH_AGENTS_DIR"] = str(agents)
+    env["FLEET_LAUNCH_DAEMONS_DIR"] = str(daemons)
+    for unit in ("g", "s"):
+        _lease(fleet, f"service--{HOST}-{unit}--001",
+              {"type": "service", "host": HOST, "service": f"{HOST}:{unit}"},
+              "sess-a")
+        r = _run(["bootstrap", f"{HOST}:{unit}"], env)
+        assert r.returncode == 0, r.stderr
+    boots = [l.split() for l in log.read_text().splitlines()
+             if l.startswith("bootstrap")]
+    assert boots == [
+        ["bootstrap", f"gui/{os.getuid()}", str(agents / "com.example.g.plist")],
+        ["bootstrap", "system", str(daemons / "com.example.s.plist")],
+    ], boots
+
+
+def test_bootstrap_refuses_without_calling_launchctl_when_plist_absent(tmp_path):
+    stub, log = _stub_launchctl(tmp_path)
+    env, fleet = _env(tmp_path, launchctl=stub)
+    env["FLEET_LAUNCH_AGENTS_DIR"] = str(tmp_path / "empty")
+    _lease(fleet, _lease_id(), _resource(), "sess-a")
+    r = _run(["bootstrap", f"{HOST}:thing"], env)
+    assert r.returncode != 0
+    assert "no installed plist" in r.stderr
+    assert str(tmp_path / "empty" / "com.example.thing.plist") in r.stderr
+    assert not log.exists() or log.read_text() == ""
+
+
 def test_systemd_row_drives_systemctl_never_launchctl(tmp_path):
     conf = _conf(tmp_path, [_row(key=f"{HOST}:svc", supervisor="systemd",
                                  domain="system", primary="svc.service")])

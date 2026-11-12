@@ -49,6 +49,12 @@ EVENT_TYPES = {
     # blocked, or the reason changes), never once per cycle. No `plan-unblocked`:
     # a plan that clears its block already produces `plan-dispatched`.
     "plan-blocked",
+    # plan 0161 (ADR-0027): an implementer stopped on a question the plan does
+    # not decide. The lease is held; this is not a failure.
+    "plan-question",
+    # plan 0162 (ADR-0027 §3): the owner or the intakebot gateway answered it. `detail`
+    # carries ids and times only -- the answer text stays in the forge thread.
+    "question-answered",
     "budget-checkpoint",
     # plan 0025: a capability (skill, script, policy, repo) changed under
     # long-running sessions. Awareness only — never an input to automation.
@@ -61,15 +67,47 @@ EVENT_TYPES = {
     # ledger after `fleet.db` is lost. `detail` carries runner names, positions and
     # ordinals ONLY — never a credential; see SPEC.md "repo-model-changed".
     "repo-model-changed",
+    # plan 0178: a reviewer seat's repo/change access setting changed
+    # (`bin/fleet-models access set`, one event per `seat_access_change` row);
+    # makes `seat_access` derivable from the ledger. `detail` carries position,
+    # ordinal and old/new access ONLY; see SPEC.md "seat-access-changed".
+    "seat-access-changed",
     # plan 0068: a fleet-scoped setting changed (`bin/fleet-config`, one event
     # per `fleet_setting_change` row) — the same durability shape as
     # `repo-model-changed`, on a plainer table. `detail` carries the setting's
     # key and its old/new value ONLY; see SPEC.md "fleet-setting-changed".
+    # plan 0085: a repo-scoped key adds `repo` to `detail`, and `new: null`
+    # means unset. No validation here -- the closed set is the event type.
     "fleet-setting-changed",
     # plan 0078 / ADR-0012: `bin/mopsus` (mechanical mode) released a failed
     # dispatch lease so the watcher can dispatch the plan again. `detail`:
     # plan, lease, class, attempt, limit.
     "plan-requeued",
+    # plan 0090 / ADR-0016: `bin/mopsus` retried a review that stopped on a
+    # usage limit, once the limit reset. `detail`: kind, repo, pr, head,
+    # plan, lease, attempt, limit.
+    "review-requeued",
+    # plan 0083: `bin/fleet-followups` posted a triage comment on a deferred-
+    # findings issue (`detail`: issue, sha, counts, recommendation), or closed
+    # one on the owner's `close` verb (`detail`: issue, verb_author).
+    "followup-triaged", "followup-closed",
+    # plan 0094: `bin/fleet-quota` moved a usage-limit gate. `detail`: scope
+    # (session, weekly, model:<bucket>), by, evidence, resets_at, and percent
+    # when a meter read one. Awareness and the ledger record -- never an input
+    # to a decision other than the gate's own row.
+    "quota-closed", "quota-opened",
+    # plan 0104: the watcher started (`lane-dispatched`) or declined to start
+    # (`lane-skipped`) a test lane beside a plan's implementation lane, and
+    # `fleet-lane --lease` (or the watcher, for `dead`) recorded how one ended.
+    # `detail`: see SPEC.md "lane-dispatched". NEVER carried on
+    # `plan-dispatched`: fleet-collect builds its dispatch rows from that type.
+    "lane-dispatched", "lane-skipped", "lane-ended",
+    # plan 0146 / ADR-0023: `bin/fleet-credits`, the owner's credits window and
+    # its ledger. `detail`: see SPEC.md "credits-window-opened".
+    "credits-window-opened", "credits-window-closed", "credits-spent",
+    "credits-cap-reached", "credits-reservation-expired", "credits-refused",
+    # plan 0166: intakebot jobs billed by grant. `detail`: see SPEC.md "credits-grant-given".
+    "credits-grant-given", "credits-grant-revoked", "credits-job-spent",
 }
 
 
@@ -116,9 +154,10 @@ def emit(event_type, actor, repo=None, pr=None, sha=None, lease=None, detail=Non
     is_lease_event = event_type.startswith("lease-")
     if is_lease_event and not lease:
         sys.exit(f"fleet-emit: {event_type} is a lease-* event and requires --lease")
-    # plan-requeued (plan 0078) is the one non-lease-* type that names a lease:
-    # the failed lease mopsus released.
-    if not is_lease_event and lease is not None and event_type != "plan-requeued":
+    # plan-requeued (plan 0078) names a lease: the failed lease mopsus released.
+    # lane-dispatched / lane-ended (plan 0104) name the test lane's own lease.
+    if (not is_lease_event and lease is not None
+            and event_type not in ("plan-requeued", "lane-dispatched", "lane-ended")):
         sys.exit(f"fleet-emit: {event_type} is not a lease-* event — SPEC requires lease=null")
 
     record = {

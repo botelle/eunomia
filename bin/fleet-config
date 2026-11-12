@@ -33,6 +33,26 @@ never hold a change the ledger does not also carry. `reconstruct_fleet_setting`
 replays those events into an ABSENT (or empty) `fleet_setting` table — a
 restore, never an edit of a table that survived.
 
+REPO-SCOPED KEYS (plan 0085). `review_bar` is chosen per repo, so it lives in
+`REPO_SETTINGS`, beside `SETTINGS` but never mixed with it: a repo key needs
+`--repo <owner/repo|default>`, a fleet key refuses one. Storage is
+`repo_setting` / `repo_setting_change`; the event is the same
+`fleet-setting-changed` with `repo` in its detail, and `new: null` for an
+`unset`. `get` on a repo key is STRICT (`resolve_repo_setting`): a database it
+cannot read is an error, never `builtin` — a loosened bar is the outcome the
+key exists to prevent.
+
+  fleet-config get review_bar --repo <owner/repo> [--json]
+  fleet-config set review_bar <high|medium|low> --repo <owner/repo|default>
+  fleet-config unset review_bar --repo <owner/repo>
+
+`autonomy` (plan 0105) is the second repo key: `autonomous` or `critical`,
+builtin `critical`, and the `default` layer may only be `critical`.
+
+`intakebot_filing` (plan 0165) is the third: `enabled` or `disabled`, builtin
+`disabled`, and the `default` layer may only be `disabled`. It records intent
+only; granting intakebot write access is the hosttools reconciler's job.
+
 The journal mode is WAL, set at every open (`connect`), not by a one-off
 pragma on the live file, for the same reason `bin/fleet-models` sets it: the
 lynceus API reads the same file this CLI writes.
@@ -42,6 +62,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -96,6 +117,228 @@ def _validate_retry_limit(raw):
     return value
 
 
+def _validate_review_retry_limit(raw):
+    """An integer 0..5, from a str or an int (plan 0090 D6). `0` turns the
+    review-retry off. Each retry buys one more reviewer session, the same
+    spend `retry_limit` bounds above — same refusals, same range."""
+    if isinstance(raw, bool):
+        raise ValueError("review_retry_limit must be an integer, not a bool")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        s = str(raw).strip()
+        if not s or not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            raise ValueError(f"{raw!r} is not an integer")
+        value = int(s)
+    if not 0 <= value <= 5:
+        raise ValueError(f"review_retry_limit must be between 0 and 5, got {value}")
+    return value
+
+
+def _validate_review_drain_concurrency(raw):
+    """An integer 1..4, from a str or an int (plan 0169 D4, ADR-0028 §3). How
+    many retries a reopened usage limit's drain may run at once. `0` is refused,
+    not a switch: `review_retry_limit` `0` already turns the whole review-retry
+    section off, and a drain that starts nothing would only hide that."""
+    if isinstance(raw, bool):
+        raise ValueError("review_drain_concurrency must be an integer, not a bool")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        s = str(raw).strip()
+        if not s or not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            raise ValueError(f"{raw!r} is not an integer")
+        value = int(s)
+    if not 1 <= value <= 4:
+        raise ValueError(
+            f"review_drain_concurrency must be between 1 and 4, got {value}")
+    return value
+
+
+def _validate_review_probe_minutes(raw):
+    """An integer 15..1440, from a str or an int (plan 0090 D6). Each probe
+    also spends a reviewer request, so the floor keeps mopsus from hammering
+    a still-limited model; the ceiling keeps a held review from waiting a
+    week for the next check."""
+    if isinstance(raw, bool):
+        raise ValueError("review_probe_minutes must be an integer, not a bool")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        s = str(raw).strip()
+        if not s or not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            raise ValueError(f"{raw!r} is not an integer")
+        value = int(s)
+    if not 15 <= value <= 1440:
+        raise ValueError(
+            f"review_probe_minutes must be between 15 and 1440, got {value}")
+    return value
+
+
+def _validate_main_tests_context_prefix(raw):
+    """A non-empty single-line string (plan 0144 D5): the prefix that names a
+    commit status context as one that runs the tests. Empty is refused, since
+    an empty prefix would match every context and read a plan-only commit's
+    `Plans / lint` as a test result."""
+    if not isinstance(raw, str):
+        raise ValueError("main_tests_context_prefix must be a string")
+    value = raw.strip()
+    if not value or "\n" in value or "\r" in value:
+        raise ValueError("main_tests_context_prefix must be a non-empty single line")
+    return value
+
+
+def _validate_inherited_red_wait_hours(raw):
+    """An integer 1..72, from a str or an int (plan 0144 D5)."""
+    if isinstance(raw, bool):
+        raise ValueError("inherited_red_wait_hours must be an integer, not a bool")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        s = str(raw).strip()
+        if not s or not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            raise ValueError(f"{raw!r} is not an integer")
+        value = int(s)
+    if not 1 <= value <= 72:
+        raise ValueError(
+            f"inherited_red_wait_hours must be between 1 and 72, got {value}")
+    return value
+
+
+def _validate_credits_usd(key, raw, ceiling=200):
+    """A non-negative number, from a str, int or float (plan 0146), at most
+    `ceiling` when there is one. `0` makes `fleet-credits decide` answer `hold`.
+    The per-PR and per-job keys keep the 200 ceiling: each bounds one spend and
+    becomes the review's `budget_usd`, so a typo of `5000` there must refuse, not
+    spend. The monthly keys have none (ceiling=None): the owner sets the month,
+    and what bounds it is the prepaid Console balance with auto-reload off, the
+    same reasoning plan 0156 used for the OpenRouter balance. Integral values
+    come back as ints so they print and compare as the owner typed them."""
+    if isinstance(raw, bool):
+        raise ValueError(f"{key} must be a number, not a bool")
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    else:
+        s = str(raw).strip()
+        if not re.fullmatch(r"\d+(\.\d+)?", s):
+            raise ValueError(f"{raw!r} is not a non-negative number")
+        value = float(s)
+    if value < 0:
+        raise ValueError(f"{key} must not be negative, got {raw}")
+    if ceiling is not None and value > ceiling:
+        raise ValueError(f"{key} must be between 0 and {ceiling}, got {raw}")
+    return int(value) if value == int(value) else value
+
+
+def _validate_credits_per_pr_usd(raw):
+    return _validate_credits_usd("credits_per_pr_usd", raw)
+
+
+def _validate_credits_monthly_usd(raw):
+    return _validate_credits_usd("credits_monthly_usd", raw, ceiling=None)
+
+
+def _validate_credits_intakebot_job_usd(raw):
+    return _validate_credits_usd("credits_intakebot_job_usd", raw)
+
+
+def _validate_credits_intakebot_monthly_usd(raw):
+    return _validate_credits_usd("credits_intakebot_monthly_usd", raw, ceiling=None)
+
+
+def _validate_followup_triage_batch(raw):
+    """An integer 0..50, from a str or an int (plan 0083 D2). `0` pauses the
+    follow-up triage job. Each issue triaged is one model session, so unlike
+    `dispatch_cap` this key has an upper bound as well as a lower one: a typo
+    of `500` must refuse, not spend."""
+    if isinstance(raw, bool):
+        raise ValueError("followup_triage_batch must be an integer, not a bool")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        s = str(raw).strip()
+        if not s or not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            raise ValueError(f"{raw!r} is not an integer")
+        value = int(s)
+    if not 0 <= value <= 50:
+        raise ValueError(
+            f"followup_triage_batch must be between 0 and 50, got {value}")
+    return value
+
+
+def _validate_question_limit(raw):
+    """An integer 1..10, from a str or an int (plan 0164 D1). How many times
+    intakebot's answers may resume one plan; past it only the owner's do. `0` would
+    make intakebot's answers useless and `11+` would leave the bound decorative."""
+    if isinstance(raw, bool):
+        raise ValueError("question_limit must be an integer, not a bool")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        s = str(raw).strip()
+        if not s or not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            raise ValueError(f"{raw!r} is not an integer")
+        value = int(s)
+    if not 1 <= value <= 10:
+        raise ValueError(f"question_limit must be between 1 and 10, got {value}")
+    return value
+
+
+def _validate_question_page_minutes(raw):
+    """An integer 30..2880, from a str or an int (plan 0162 D4). How long a
+    `plan-question` may sit unanswered before fleet-watch pages. Bounded both
+    ways: a typo of `5` would page before anyone could read the question, and
+    `5000` would be a question that never pages in practice."""
+    if isinstance(raw, bool):
+        raise ValueError("question_page_minutes must be an integer, not a bool")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        s = str(raw).strip()
+        if not s or not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            raise ValueError(f"{raw!r} is not an integer")
+        value = int(s)
+    if not 30 <= value <= 2880:
+        raise ValueError(
+            f"question_page_minutes must be between 30 and 2880, got {value}")
+    return value
+
+
+LANE_RUN_CAP_MAX = 24
+_LANE_RUNNER_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def _validate_lane_run_cap(raw):
+    """A comma-separated `<runner>=<n>` list (plan 0100 D1), returned as the
+    canonical string. `<runner>` matches `[a-z0-9][a-z0-9-]*` and appears once;
+    `<n>` is an integer 0..24 (`0` pauses that runner). Same refusals as the
+    other integer keys: no bool, no float string, no sign. Anything else
+    refuses before any write."""
+    if not isinstance(raw, str):
+        raise ValueError("lane_run_cap must be a string like 'sub-opus=4,sub-antigravity=2'")
+    seen, parts = set(), []
+    for piece in raw.split(","):
+        name, eq, n = (x.strip() for x in piece.partition("="))
+        if not eq or not _LANE_RUNNER_RE.fullmatch(name):
+            raise ValueError(f"{piece.strip()!r} is not '<runner>=<n>' "
+                             "(runner matches [a-z0-9][a-z0-9-]*)")
+        if name in seen:
+            raise ValueError(f"runner {name!r} appears more than once")
+        if not (n.isascii() and n.isdigit()):
+            raise ValueError(f"{n!r} is not an integer")
+        if int(n) > LANE_RUN_CAP_MAX:
+            raise ValueError(f"lane_run_cap for {name!r} must be between 0 and "
+                             f"{LANE_RUN_CAP_MAX}, got {int(n)}")
+        seen.add(name)
+        parts.append(f"{name}={int(n)}")
+    return ",".join(parts)
+
+
+def parse_lane_run_cap(value):
+    """{runner: n} from a validated `lane_run_cap` string."""
+    return {k: int(v) for k, v in (p.split("=") for p in value.split(","))}
+
+
 # The closed key set (plan 0068 boundary: one key per plan). Each entry names
 # its validator, the env var `get`'s own fallback reads (the SAME one
 # `bin/fleet-watch` falls back to), and the default below that.
@@ -112,13 +355,154 @@ SETTINGS = {
         "env": "FLEET_RETRY_LIMIT",
         "default": 2,
     },
+    # plan 0090 / ADR-0016: how many times `bin/mopsus` may retry a review
+    # that stopped at a usage limit, per repo/PR/head, before it escalates.
+    "review_retry_limit": {
+        "validate": _validate_review_retry_limit,
+        "env": "FLEET_REVIEW_RETRY_LIMIT",
+        "default": 2,
+    },
+    # plan 0090 / ADR-0016 §3: how often `bin/mopsus` may probe a model that
+    # a review stopped on, per model.
+    "review_probe_minutes": {
+        "validate": _validate_review_probe_minutes,
+        "env": "FLEET_REVIEW_PROBE_MINUTES",
+        "default": 60,
+    },
+    # plan 0169 / ADR-0028 §3: how many retries `bin/mopsus` runs at once when a
+    # reopened usage limit drains the reviews it stopped.
+    "review_drain_concurrency": {
+        "validate": _validate_review_drain_concurrency,
+        "env": "FLEET_REVIEW_DRAIN_CONCURRENCY",
+        "default": 2,
+    },
+    # plan 0146 / ADR-0023: the most API credit one pull request, and the whole
+    # fleet, may spend per UTC month inside an owner-opened credits window.
+    "credits_per_pr_usd": {
+        "validate": _validate_credits_per_pr_usd,
+        "env": "FLEET_CREDITS_PER_PR_USD",
+        "default": 50,
+    },
+    "credits_monthly_usd": {
+        "validate": _validate_credits_monthly_usd,
+        "env": "FLEET_CREDITS_MONTHLY_USD",
+        "default": 100,
+    },
+    # plan 0166 / ADR-0023 §6: what one intakebot job, and all intakebot jobs together, may
+    # spend per UTC month on credits. `credits_intakebot_monthly_usd` at 0 is the kill
+    # switch for every intakebot credits spend, granted or not.
+    "credits_intakebot_job_usd": {
+        "validate": _validate_credits_intakebot_job_usd,
+        "env": "FLEET_CREDITS_INTAKEBOT_JOB_USD",
+        "default": 5,
+    },
+    "credits_intakebot_monthly_usd": {
+        "validate": _validate_credits_intakebot_monthly_usd,
+        "env": "FLEET_CREDITS_INTAKEBOT_MONTHLY_USD",
+        "default": 25,
+    },
+    # plan 0083 D2: how many follow-up issues `bin/fleet-followups triage`
+    # sends to a model session per run. 0 pauses the job.
+    "followup_triage_batch": {
+        "validate": _validate_followup_triage_batch,
+        "env": "FLEET_FOLLOWUP_TRIAGE_BATCH",
+        "default": 10,
+    },
+    # plan 0144 D5: which commit-status contexts on main run the tests, and how
+    # long a review loop waits out a red it inherited from main.
+    "main_tests_context_prefix": {
+        "validate": _validate_main_tests_context_prefix,
+        "env": "FLEET_MAIN_TESTS_CONTEXT_PREFIX",
+        "default": "CI / tests",
+    },
+    "inherited_red_wait_hours": {
+        "validate": _validate_inherited_red_wait_hours,
+        "env": "FLEET_INHERITED_RED_WAIT_HOURS",
+        "default": 12,
+    },
+    # plan 0162 D4 / ADR-0027 §4: minutes an unanswered `plan-question` waits
+    # before fleet-watch pages; it pages once more after four times that.
+    "question_page_minutes": {
+        "validate": _validate_question_page_minutes,
+        "env": "FLEET_QUESTION_PAGE_MINUTES",
+        "default": 240,
+    },
+    # plan 0164 D1 / ADR-0027 §4: intakebot answers that may resume one plan; counted
+    # per plan over `question-answered` events from FLEET_INTAKEBOT_UID. The owner's
+    # answers are never counted.
+    "question_limit": {
+        "validate": _validate_question_limit,
+        "env": "FLEET_QUESTION_LIMIT",
+        "default": 3,
+    },
+    # plan 0100 D1: how many runs per rolling 24h each `bin/fleet-lane` runner
+    # may spend on the owner's subscription. Deliberately NO `env` and NO
+    # `default`: an absent row refuses the lane (a constant is a setting nobody
+    # wrote), and `get` answers `unset`.
+    "lane_run_cap": {
+        "validate": _validate_lane_run_cap,
+    },
 }
+
+def _validate_review_bar(raw):
+    """One of high|medium|low (plan 0085). No fourth value and no `none`: a
+    bar that blocks nothing would make APPROVE unconditional, and HIGH always
+    blocks."""
+    if not isinstance(raw, str) or raw.strip() not in REVIEW_BARS:
+        raise ValueError(f"review_bar must be one of {list(REVIEW_BARS)}, got {raw!r}")
+    return raw.strip()
+
+
+REVIEW_BARS = ("high", "medium", "low")
+
+
+def _validate_autonomy(raw):
+    """One of autonomous|critical (plan 0105, ADR-0019 §1). No third value: the
+    readers (plans 0107, 0108) would each have to guess what it meant."""
+    if not isinstance(raw, str) or raw.strip() not in AUTONOMY_VALUES:
+        raise ValueError(f"autonomy must be one of {list(AUTONOMY_VALUES)}, got {raw!r}")
+    return raw.strip()
+
+
+AUTONOMY_VALUES = ("autonomous", "critical")
+
+
+def _validate_intakebot_filing(raw):
+    """One of enabled|disabled (plan 0165). No third value: the readers (intakebot,
+    hosttools, lynceus) would each have to guess what it meant."""
+    if not isinstance(raw, str) or raw.strip() not in INTAKEBOT_FILING_VALUES:
+        raise ValueError(
+            f"intakebot_filing must be one of {list(INTAKEBOT_FILING_VALUES)}, got {raw!r}")
+    return raw.strip()
+
+
+INTAKEBOT_FILING_VALUES = ("enabled", "disabled")
+
+# Repo-scoped keys (plan 0085). Closed like SETTINGS, and disjoint from it.
+# `default` is what a repo with no override of its own resolves to when a
+# `default`-layer row exists; `builtin` is the value when the tables hold
+# nothing at all.
+REPO_SETTINGS = {
+    "review_bar": {"validate": _validate_review_bar, "builtin": "high"},
+    # plan 0105: critical is the builtin, and the `default` layer may only say
+    # critical (`default_values`), so no one command makes every unclassified
+    # repo autonomous.
+    "autonomy": {"validate": _validate_autonomy, "builtin": "critical",
+                 "default_values": ("critical",)},
+    # plan 0165: disabled is the builtin, and the `default` layer may only say
+    # disabled, so no one command makes intakebot write-capable in every repo.
+    "intakebot_filing": {"validate": _validate_intakebot_filing, "builtin": "disabled",
+                     "default_values": ("disabled",)},
+}
+DEFAULT_REPO = "default"
 
 # The `detail` keys of a `fleet-setting-changed` event, and nothing else —
 # pinned by a test the way `repo-model-changed`'s EVENT_DETAIL_KEYS are.
 # `events.jsonl` is read by `fleet-events`, which does not redact, so a future
 # setting that holds a credential must NOT ride this event.
 EVENT_DETAIL_KEYS = ("key", "old", "new")
+# A repo-scoped change (plan 0085) adds `repo`; `new` is None for an unset.
+REPO_EVENT_DETAIL_KEYS = ("key", "repo", "old", "new")
 EVENT_TYPE = "fleet-setting-changed"
 
 SCHEMA = """
@@ -138,7 +522,27 @@ CREATE TABLE IF NOT EXISTS fleet_setting_change (
   new_value   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS fleet_setting_change_key ON fleet_setting_change(key, ts);
+
+CREATE TABLE IF NOT EXISTS repo_setting (
+  repo        TEXT NOT NULL,              -- 'owner/repo' | 'default'
+  key         TEXT NOT NULL,
+  value       TEXT NOT NULL,
+  changed_at  TEXT NOT NULL,
+  PRIMARY KEY (repo, key)
+);
+
+CREATE TABLE IF NOT EXISTS repo_setting_change (
+  repo        TEXT NOT NULL,
+  key         TEXT NOT NULL,
+  old         TEXT,                       -- NULL on first write
+  new         TEXT,                       -- NULL means unset
+  changed_at  TEXT NOT NULL,
+  actor       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS repo_setting_change_key ON repo_setting_change(repo, key, changed_at);
 """
+
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -254,6 +658,118 @@ def set_value(con, key, raw_value, actor="cli:unknown", source="fleet-config"):
     return True, new_value
 
 
+class ReadFailed(RuntimeError):
+    """A repo-scoped read could not be answered from the database. Not a
+    fallback: the caller must treat it as an error (plan 0085 D1)."""
+
+
+def _check_repo(repo):
+    if repo != DEFAULT_REPO and not (
+            isinstance(repo, str) and REPO_RE.fullmatch(repo)):
+        raise ValueError(f"{repo!r} is not 'owner/repo' or {DEFAULT_REPO!r}")
+
+
+def _check_repo_key(key):
+    if key not in REPO_SETTINGS:
+        raise UnknownSetting(
+            f"{key!r} is not a repo-scoped setting (known: {sorted(REPO_SETTINGS)})")
+
+
+def _check_layer_value(key, repo, value):
+    """Refuse a value the `default` layer may not hold (plan 0105)."""
+    allowed = REPO_SETTINGS[key].get("default_values")
+    if repo == DEFAULT_REPO and allowed and value not in allowed:
+        raise ValueError(f"the {DEFAULT_REPO!r} layer of {key} may only be "
+                         f"{list(allowed)}, got {value!r}")
+
+
+def _write_repo_change(con, key, repo, old, new, actor):
+    now = _now()
+    if new is None:
+        con.execute("DELETE FROM repo_setting WHERE repo=? AND key=?", (repo, key))
+    else:
+        con.execute(
+            "INSERT INTO repo_setting (repo, key, value, changed_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(repo, key) DO UPDATE SET value=excluded.value, "
+            "changed_at=excluded.changed_at", (repo, key, new, now))
+    con.execute(
+        "INSERT INTO repo_setting_change (repo, key, old, new, changed_at, actor) "
+        "VALUES (?,?,?,?,?,?)", (repo, key, old, new, now, actor))
+    try:
+        _emit_event(con, actor, {"key": key, "repo": repo, "old": old, "new": new})
+    except Exception:
+        con.rollback()
+        raise
+    con.commit()
+
+
+def _repo_row(con, key, repo):
+    row = con.execute("SELECT value FROM repo_setting WHERE repo=? AND key=?",
+                      (repo, key)).fetchone()
+    return row[0] if row else None
+
+
+def set_repo_value(con, key, repo, raw_value, actor="cli:unknown"):
+    """(changed, new_value). Refused before any write on an unknown key, a bad
+    repo or an invalid value; a set to the value in force is a no-op."""
+    _check_repo_key(key)
+    _check_repo(repo)
+    new_value = REPO_SETTINGS[key]["validate"](raw_value)
+    _check_layer_value(key, repo, new_value)
+    old = _repo_row(con, key, repo)
+    if old == new_value:
+        return False, new_value
+    _write_repo_change(con, key, repo, old, new_value, actor)
+    return True, new_value
+
+
+def unset_repo_value(con, key, repo, actor="cli:unknown"):
+    """True if an override was removed. `default` cannot be unset: it is the
+    layer every other repo falls back to."""
+    _check_repo_key(key)
+    _check_repo(repo)
+    if repo == DEFAULT_REPO:
+        raise ValueError(f"the {DEFAULT_REPO!r} layer cannot be unset")
+    old = _repo_row(con, key, repo)
+    if old is None:
+        return False
+    _write_repo_change(con, key, repo, old, None, actor)
+    return True
+
+
+def resolve_repo_setting(key, repo, db_path=None):
+    """(value, layer, source, changed_at) for a repo-scoped key. STRICT, unlike
+    `resolve_setting`: a database that is missing, locked past the timeout, or
+    lacks the tables raises ReadFailed, because answering `builtin` for a
+    store that could not be read would loosen the bar silently. `builtin` is
+    only ever the answer to tables that were read and hold nothing."""
+    _check_repo_key(key)
+    _check_repo(repo)
+    path = db_path or DB
+    if not os.path.exists(path):
+        raise ReadFailed(f"{path} does not exist")
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
+        try:
+            rows = {r[0]: (r[1], r[2]) for r in con.execute(
+                "SELECT repo, value, changed_at FROM repo_setting "
+                "WHERE key=? AND repo IN (?,?)", (key, repo, DEFAULT_REPO))}
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        raise ReadFailed(f"could not read repo_setting in {path}: {e}") from None
+    for layer, name in (("repo", repo), ("default", DEFAULT_REPO)):
+        if name in rows:
+            raw, changed_at = rows[name]
+            try:
+                value = REPO_SETTINGS[key]["validate"](raw)
+                _check_layer_value(key, name, value)
+            except ValueError as e:
+                raise ReadFailed(f"stored {key} for {name!r} is invalid: {e}") from None
+            return value, layer, "repo_setting", changed_at
+    return REPO_SETTINGS[key]["builtin"], "builtin", "builtin", None
+
+
 def resolve_setting(key, fallback, fallback_source, db_path=None):
     """(value, source, changed_at). Tier 1: the `fleet_setting` row in an
     existing, readable database, opened READ-ONLY (this CLI is the one
@@ -290,6 +806,8 @@ def resolve_setting(key, fallback, fallback_source, db_path=None):
 
 def _env_fallback(key):
     spec = SETTINGS[key]
+    if "env" not in spec and "default" not in spec:
+        return None, "unset"           # plan 0100: a key with no fallback at all
     raw = os.environ.get(spec["env"], "").strip()
     if raw:
         try:
@@ -314,6 +832,8 @@ def replay_events(rows):
     for detail_json in rows:
         try:
             d = json.loads(detail_json)
+            if "repo" in d:              # repo-scoped (plan 0085): not ours
+                continue
             key, new = d["key"], d.get("new")
             if key not in SETTINGS or not isinstance(new, str) or not new:
                 raise ValueError
@@ -330,6 +850,22 @@ def _table_rows(con):
         return {r[0]: r[1] for r in con.execute("SELECT key, value FROM fleet_setting")}
     except sqlite3.OperationalError:
         return None
+
+
+def _ledger_rows(con):
+    try:
+        return con.execute(
+            "SELECT detail_json FROM event WHERE type=? ORDER BY source, line",
+            (EVENT_TYPE,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def _is_repo_scoped(detail_json):
+    try:
+        return "repo" in json.loads(detail_json)
+    except (ValueError, TypeError):
+        return False
 
 
 def reconstruct_fleet_setting(con, ledger_complete=True):
@@ -351,12 +887,7 @@ def reconstruct_fleet_setting(con, ledger_complete=True):
     adopted this file must still fall through to the CLI's own env/default
     fallback, not read an empty table as 'configured to nothing'),
     "reconstructed", "refused", or "compared"."""
-    try:
-        rows = con.execute(
-            "SELECT detail_json FROM event WHERE type=? ORDER BY source, line",
-            (EVENT_TYPE,)).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
+    rows = [r for r in _ledger_rows(con) if not _is_repo_scoped(r[0])]
     report = {"action": "none", "events": len(rows), "rows": 0, "skipped": 0,
               "differs": [], "ledger_only": [], "table_only": []}
     if not rows:
@@ -388,6 +919,110 @@ def reconstruct_fleet_setting(con, ledger_complete=True):
             report["differs"].append((key, have, value))
     report["table_only"] = sorted(set(existing) - set(state))
     return report
+
+
+def replay_repo_events(rows):
+    """Fold repo-scoped `fleet-setting-changed` events (those whose detail
+    carries `repo`), in ledger order, into `{(repo, key): value}`. `new: null`
+    is a delete, so a set-then-unset override stays absent. Returns
+    `(state, skipped)`; events without `repo` belong to `replay_events`."""
+    state, skipped = {}, 0
+    for detail_json in rows:
+        try:
+            d = json.loads(detail_json)
+            if "repo" not in d:
+                continue
+            repo, key, new = d["repo"], d["key"], d.get("new")
+            _check_repo(repo)
+            _check_repo_key(key)
+            if new is not None:
+                if not isinstance(new, str):
+                    raise ValueError
+                value = REPO_SETTINGS[key]["validate"](new)
+                _check_layer_value(key, repo, value)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            skipped += 1
+            continue
+        if new is None:
+            state.pop((repo, key), None)
+        else:
+            state[(repo, key)] = new
+    return state, skipped
+
+
+def reconstruct_repo_setting(con, ledger_complete=True):
+    """Rebuild `repo_setting` from the ledger (plan 0085 D2), never from
+    `repo_setting_change` — that table lives in the file being rebuilt. Same
+    rules as `reconstruct_fleet_setting`: written only into an absent or empty
+    table, a surviving table is compared and reported, an incomplete ledger
+    refuses. Returns the same report shape."""
+    rows = [r for r in _ledger_rows(con) if _is_repo_scoped(r[0])]
+    report = {"action": "none", "events": len(rows), "rows": 0, "skipped": 0,
+              "differs": [], "ledger_only": [], "table_only": []}
+    if not rows:
+        return report
+    state, skipped = replay_repo_events(r[0] for r in rows)
+    report["skipped"] = skipped
+    try:
+        existing = {(r[0], r[1]): r[2] for r in con.execute(
+            "SELECT repo, key, value FROM repo_setting")}
+    except sqlite3.OperationalError:
+        existing = None
+
+    if not existing:
+        if not ledger_complete:
+            report["action"] = "refused"
+            return report
+        con.executescript(SCHEMA)
+        now = _now()
+        con.executemany(
+            "INSERT INTO repo_setting (repo, key, value, changed_at) VALUES (?,?,?,?)",
+            [(r, k, v, now) for (r, k), v in sorted(state.items())])
+        con.commit()
+        if state:
+            report["action"] = "reconstructed"
+            report["rows"] = len(state)
+        return report
+
+    report["action"] = "compared"
+    for rk, value in sorted(state.items()):
+        have = existing.get(rk)
+        if have is None:
+            report["ledger_only"].append((rk, value))
+        elif have != value:
+            report["differs"].append((rk, have, value))
+    report["table_only"] = sorted(set(existing) - set(state))
+    return report
+
+
+def describe_repo_reconstruction(report, limit=10):
+    action = report["action"]
+    if action == "none":
+        return []
+    lines = []
+    if action == "reconstructed":
+        lines.append(f"repo_setting: was absent — reconstructed {report['rows']} "
+                     f"row(s) from {report['events']} repo-scoped event(s)")
+    elif action == "refused":
+        lines.append("repo_setting: absent but NOT reconstructed — an events "
+                     "file failed to ingest, so the ledger is incomplete")
+    elif action == "compared":
+        for (repo, key), have, want in report["differs"][:limit]:
+            lines.append(f"repo_setting: ledger disagrees on {repo} {key}: table "
+                         f"has {have!r}, ledger says {want!r} — table left unchanged")
+        for (repo, key), value in report["ledger_only"][:limit]:
+            lines.append(f"repo_setting: ledger names {repo} {key} = {value!r}, "
+                         f"table has no such row — table left unchanged")
+        n = len(report["differs"]) + len(report["ledger_only"])
+        if n > limit:
+            lines.append(f"repo_setting: ... and {n - limit} more disagreement(s)")
+        if report["table_only"]:
+            lines.append(f"repo_setting: {len(report['table_only'])} row(s) have "
+                         f"no ledger event — covered by the snapshot only")
+    if report["skipped"]:
+        lines.append(f"repo_setting: {report['skipped']} repo-scoped event(s) "
+                     f"could not be read and were skipped")
+    return lines
 
 
 def describe_reconstruction(report, limit=10):
@@ -431,19 +1066,55 @@ def _actor(args):
 def cmd_list(con, args):
     rows = con.execute(
         "SELECT key, value, changed_at FROM fleet_setting ORDER BY key").fetchall()
-    if not rows:
+    repo_rows = con.execute(
+        "SELECT repo, key, value, changed_at FROM repo_setting ORDER BY key, repo"
+    ).fetchall()
+    if not rows and not repo_rows:
         print("no fleet_setting rows")
         return 0
     for key, value, changed_at in rows:
         print(f"{key:16} {value:8} changed {changed_at}")
+    for repo, key, value, changed_at in repo_rows:
+        print(f"{key:16} {value:8} changed {changed_at}  repo {repo}")
     return 0
 
 
+def _scope_error(key, repo):
+    """Why (key, repo) is the wrong scope, or None. The two scopes never mix
+    (plan 0085 D1): a repo key needs --repo, a fleet key refuses it."""
+    if key in REPO_SETTINGS:
+        if not repo:
+            return f"{key} is repo-scoped: --repo <owner/repo|{DEFAULT_REPO}> is required"
+    elif key in SETTINGS:
+        if repo:
+            return f"{key} is fleet-scoped: --repo is not accepted"
+    else:
+        return (f"{key!r} is not a known setting "
+                f"(known: {sorted(SETTINGS) + sorted(REPO_SETTINGS)})")
+    return None
+
+
 def cmd_show(args):
-    if args.key not in SETTINGS:
-        print(f"fleet-config: {args.key!r} is not a known setting "
-             f"(known: {sorted(SETTINGS)})", file=sys.stderr)
+    args.repo = getattr(args, "repo", None)
+    err = _scope_error(args.key, args.repo)
+    if err:
+        print(f"fleet-config: {err}", file=sys.stderr)
         return 1
+    if args.key in REPO_SETTINGS:
+        try:
+            _check_repo(args.repo)
+            value, layer, source, changed_at = resolve_repo_setting(args.key, args.repo)
+        except (ValueError, ReadFailed) as e:
+            print(f"fleet-config: {e}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps({"key": args.key, "repo": args.repo, "value": value,
+                              "layer": layer, "source": source,
+                              "changed_at": changed_at}))
+        else:
+            suffix = f" (changed {changed_at})" if changed_at else ""
+            print(f"{args.key} = {value}  [{layer}]{suffix}")
+        return 0
     fallback, fallback_source = _env_fallback(args.key)
     value, source, changed_at = resolve_setting(args.key, fallback, fallback_source)
     if args.json:
@@ -451,19 +1122,36 @@ def cmd_show(args):
                           "changed_at": changed_at}))
     else:
         suffix = f" (changed {changed_at})" if changed_at else ""
-        print(f"{args.key} = {value}  [{source}]{suffix}")
+        shown = "unset" if value is None else value
+        print(f"{args.key} = {shown}  [{source}]{suffix}")
     return 0
 
 
 def cmd_set(con, args):
     try:
-        changed, value = set_value(con, args.key, args.value, actor=_actor(args),
-                                   source=args.source)
+        if args.key in REPO_SETTINGS:
+            changed, value = set_repo_value(con, args.key, args.repo, args.value,
+                                            actor=_actor(args))
+            where = f" (repo {args.repo})"
+        else:
+            changed, value = set_value(con, args.key, args.value, actor=_actor(args),
+                                       source=args.source)
+            where = ""
     except (UnknownSetting, ValueError, LedgerAppendFailed) as e:
         print(f"fleet-config: {e}", file=sys.stderr)
         return 1
     verb = "set" if changed else "unchanged"
-    print(f"{verb}: {args.key} = {value}")
+    print(f"{verb}: {args.key} = {value}{where}")
+    return 0
+
+
+def cmd_unset(con, args):
+    try:
+        removed = unset_repo_value(con, args.key, args.repo, actor=_actor(args))
+    except (UnknownSetting, ValueError, LedgerAppendFailed) as e:
+        print(f"fleet-config: {e}", file=sys.stderr)
+        return 1
+    print(f"{'unset' if removed else 'unchanged'}: {args.key} (repo {args.repo})")
     return 0
 
 
@@ -476,15 +1164,23 @@ def build_parser():
 
     p = sub.add_parser("get")
     p.add_argument("key")
+    p.add_argument("--repo")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_show, needs_con=False)
 
     p = sub.add_parser("set")
     p.add_argument("key")
     p.add_argument("value")
+    p.add_argument("--repo")
     p.add_argument("--actor")
     p.add_argument("--source", default="fleet-config")
     p.set_defaults(func=cmd_set, needs_con=True)
+
+    p = sub.add_parser("unset")
+    p.add_argument("key")
+    p.add_argument("--repo")
+    p.add_argument("--actor")
+    p.set_defaults(func=cmd_unset, needs_con=True)
 
     return ap
 
@@ -493,6 +1189,25 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if not args.needs_con:
         return args.func(args)
+    if args.cmd in ("set", "unset"):
+        # Scope is checked before connecting: `connect` creates the schema, and
+        # a refused command must leave the database as it found it.
+        err = _scope_error(args.key, args.repo)
+        if err is None and args.cmd == "unset" and args.key not in REPO_SETTINGS:
+            err = f"{args.key} is fleet-scoped: there is nothing to unset"
+        if err is None and args.key in REPO_SETTINGS:
+            try:
+                _check_repo(args.repo)
+                if args.cmd == "set":
+                    _check_layer_value(args.key, args.repo,
+                                       REPO_SETTINGS[args.key]["validate"](args.value))
+                elif args.repo == DEFAULT_REPO:
+                    raise ValueError(f"the {DEFAULT_REPO!r} layer cannot be unset")
+            except ValueError as e:
+                err = str(e)
+        if err:
+            print(f"fleet-config: {err}", file=sys.stderr)
+            return 1
     con = connect()
     try:
         return args.func(con, args)

@@ -1,0 +1,138 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "plan 0103 D2 \u2014 the one document the triager may return. Everything in it is a CLAIM: bin/fleet-triage verifies every citation against the files (D3) and never trusts a class, a line number or a quote because this schema accepted it. `undetermined` is a class on purpose: a forced guess is the measured failure. The shape is pinned here; the `lines` pair and the per-class evidence rules are checked by the wrapper. The citation shape is written out twice because the validator bin/fleet-lane owns supports no $ref. `root` is a plain string here on purpose: a citation into meeting/ must fail ITS item's verification and be kept, not fail the whole document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "items",
+    "gaps"
+  ],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "lane",
+          "test",
+          "class",
+          "evidence",
+          "rationale"
+        ],
+        "properties": {
+          "lane": {
+            "type": "string"
+          },
+          "test": {
+            "type": "string"
+          },
+          "class": {
+            "type": "string",
+            "enum": [
+              "implementation-defect",
+              "spec-or-contract-defect",
+              "test-harness-gap",
+              "skip-needs-contract",
+              "undetermined"
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "root",
+                "path",
+                "lines",
+                "quote"
+              ],
+              "properties": {
+                "root": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lines": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                "quote": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "rationale": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "lane",
+          "index",
+          "verdict",
+          "evidence",
+          "rationale"
+        ],
+        "properties": {
+          "lane": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "contradiction"
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "root",
+                "path",
+                "lines",
+                "quote"
+              ],
+              "properties": {
+                "root": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lines": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                "quote": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "rationale": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

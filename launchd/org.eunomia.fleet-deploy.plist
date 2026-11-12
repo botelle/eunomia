@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-deploy — carry a merge to a bound dev service (plans 0087, 0088;
+  ADR-0015).
+
+  Every five minutes: for each binding in config/environments.conf whose host
+  is this machine (today, dev:lynceus), notice a new commit on the pin's
+  origin/main, move the pin, restart the unit, verify, and roll back to the
+  last verified SHA if verification fails. A merge is live within about five
+  minutes, or has rolled back and paged.
+
+  IT DOES NOT RESTART ANYTHING BARE. Restarts go through bin/fleet-svc's gate
+  under a `service` lease (plan 0029), never a raw launchctl. It does not
+  install dependencies (a `deps` change is paged and the pin stays put), does
+  not retry a commit that already failed, does not roll back twice, and does
+  not deploy a `main` the broker does not vouch for. See the docstring in
+  bin/fleet-deploy for the reasoning.
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia — the rule every unit here
+  follows: a scheduled job is the worst place to discover the shared clone was
+  left on someone else's branch.
+
+  Install (opshost only — the owner's step, in this order):
+    cp launchd/org.eunomia.fleet-deploy.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-deploy.plist
+  Reload after editing (a frozen job needs bootout+bootstrap, not kickstart):
+    launchctl bootout gui/$(id -u)/org.eunomia.fleet-deploy
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-deploy.plist
+
+  No Forgejo token anywhere in this unit. "Is main protected" is answered by
+  the broker (a local unix socket, per FLEET_BROKER_SOCKET), which vouches for
+  `main`; fleet-deploy never calls the Forgejo API itself, so it needs neither
+  FLEET_TOKEN_CMD nor FLEET_FORGEJO_URL. The broker connection is the ssh
+  forward org.eunomia.fleet-broker-tunnel provides.
+
+  Cadence: 300s. Overlap is safe: fleet-deploy holds a single-instance flock
+  for its whole run, so a slow cycle degrades to fewer cycles, never two
+  racing one pin. KeepAlive is false: a run that ends is a run that ended, and
+  the next interval starts the next one.
+
+  Logs are at absolute paths: launchd does not expand `~`.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-deploy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-deploy</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- the ssh forward from org.eunomia.fleet-broker-tunnel lands here -->
+    <key>FLEET_BROKER_SOCKET</key><string>/Users/operator/run/forgejo-broker.sock</string>
+    <!-- replace with the real Fleet-ops push URL at install; empty = log-only -->
+    <key>FLEET_NTFY_URL</key><string></string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/operator/dev/.fleet/deploy.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/operator/dev/.fleet/deploy.log</string>
+</dict>
+</plist>

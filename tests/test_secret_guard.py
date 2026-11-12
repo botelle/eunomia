@@ -65,6 +65,104 @@ def test_no_in_band_override(tmp_path):
         assert _guard(_bash(cmd), tmp_path).returncode == 2, cmd
 
 
+# ------------------------------------------- guard: Keychain reads (plan 0074)
+
+_FGP = "security find-generic-password"
+_CLAUDE_TOK = "CLAUDE_CODE_OAUTH_TOKEN=\"$(security find-generic-password -w -s claude-code-oauth-token)\""
+# the three shapes of the fleet's own review dispatch in circulation on 2026-09-23
+_DISPATCH_SHAPES = (
+    "cd ~/agent && python3 dispatch-review.py operator/eunomia 536 --post",
+    f"{_CLAUDE_TOK} python3 ~/agent/dispatch-review.py --pr 999 --post",
+    f"cd ~/agent && {_CLAUDE_TOK} python3 dispatch-review.py operator/eunomia 536 "
+    "--post --out /tmp/r.md",
+)
+
+
+def test_every_keychain_display_form_is_refused(tmp_path):
+    for cmd, rule in (
+        (f"{_FGP} -w -s keyvault-root", "keychain-read"),
+        (f"{_FGP} -g -s keyvault-root", "keychain-read"),
+        (f"{_FGP} -ws keyvault-root", "keychain-read"),
+        ("security find-internet-password -s forge.example -w", "keychain-read"),
+        ("security -q find-generic-password -w -s keyvault-root", "keychain-read"),
+        ("security -p 'PR> ' find-generic-password -w -s keyvault-root", "keychain-read"),
+        (f"/usr/bin/{_FGP} -w -s keyvault-root", "keychain-read"),
+        (f"FOO=1 {_FGP} -s keyvault-root -w", "keychain-read"),
+        ("security dump-keychain -d", "keychain-dump"),
+        ("security dump-keychain -ad login.keychain", "keychain-dump"),
+    ):
+        r = _guard(_bash(cmd), tmp_path)
+        assert r.returncode == 2, cmd
+        assert rule in r.stderr, cmd
+
+
+def test_attribute_only_keychain_reads_and_the_write_form_pass(tmp_path):
+    for cmd in (
+        f"{_FGP} -s keyvault-root",                      # presence check, no value
+        f"{_FGP} -G somevalue -s keyvault-root",         # -G matches, displays nothing
+        f"{_FGP} -D kind -s keyvault-root",
+        "security -q find-generic-password -s keyvault-root",
+        "security add-generic-password -a x -s y -w",    # a write prompts for the value
+        "security add-generic-password -s keyvault-unseal -w",
+        "security dump-keychain",
+        "security dump-keychain -a",
+        "security dump-keychain -r",                     # raw encrypted data
+        "security list-keychains",
+        "security find-certificate -a -p",               # public
+        "security find-key -t private -w",               # -w is a search predicate here
+        f"{_FGP} -s keyvault-root; ls -w",               # separator bounds the rule
+        "cat README.md",
+    ):
+        assert _guard(_bash(cmd), tmp_path).returncode == 0, cmd
+
+
+def test_review_dispatch_has_no_keychain_carve_out(tmp_path):
+    # The record of the round-2 decision (plan 0074 §2): a carve-out cannot be
+    # expressed in a deny-only conf without a bypass. The dispatch is refused
+    # until it takes its token from ~/bin/fetch-claude-oauth-token.sh.
+    for cmd in _DISPATCH_SHAPES[1:]:
+        r = _guard(_bash(cmd), tmp_path)
+        assert r.returncode == 2, cmd
+        assert "keychain-read" in r.stderr, cmd
+    # the token-less documented shape reads no Keychain, so it is not this rule's
+    assert _guard(_bash(_DISPATCH_SHAPES[0]), tmp_path).returncode == 0
+
+
+def test_merger_and_second_reviewer_token_helpers_are_refused(tmp_path):
+    # plan 0109: ADR-0019's mergebot and rev2bot identities are not a session's to hold
+    for name, rule in (("mergebot", "mergebot-token-helper"), ("rev2bot", "rev2bot-token-helper")):
+        h = f"fetch-forgejo-{name}-token.sh"
+        for cmd in (
+            h,
+            f"$(~/bin/{h})",
+            f"bash -c '{h}'",
+            f"~/bin/{h}",
+            f"/Users/operator/bin/{h} | wc -c",
+        ):
+            r = _guard(_bash(cmd), tmp_path)
+            assert r.returncode == 2, cmd
+            assert rule in r.stderr, cmd
+
+
+def test_other_token_helpers_and_the_sanctioned_holder_still_pass(tmp_path):
+    for cmd in (
+        "~/bin/fetch-forgejo-token.sh",
+        "~/bin/fetch-forgejo-revbot-token.sh",
+        "python3 ~/agent/dispatch-review.py operator/x 1 --post",
+    ):
+        assert _guard(_bash(cmd), tmp_path).returncode == 0, cmd
+
+
+def test_keychain_refusal_cannot_be_talked_out_of(tmp_path):
+    tok = "claude-code-oauth-token"
+    for cmd in (
+        f"{_FGP} -w -s {tok} # dispatch-review.py",
+        f"echo \"$({_FGP} -w -s {tok})\" dispatch-review.py",
+        f"{_FGP} -w -s {tok}\necho dispatch-review.py",
+    ):
+        assert _guard(_bash(cmd), tmp_path).returncode == 2, cmd
+
+
 # --------------------------------------------------------------- guard: allows
 
 def test_benign_traffic_passes(tmp_path):
@@ -677,3 +775,184 @@ def test_documented_matcher_covers_write():
     assert '"matcher": "Bash|Read|Grep|Write|Edit"' in src, (
         "the documented matcher does not list Write|Edit, so the branch that "
         "protects the guard from being overwritten never executes")
+
+
+# ------------------------------------------------- plan 0071: one list, new families
+
+import random  # noqa: E402
+import re  # noqa: E402
+import string  # noqa: E402
+
+import pytest  # noqa: E402
+
+_ALNUM = string.ascii_letters + string.digits
+_URLSAFE = _ALNUM + "-_"
+_HEX = "0123456789abcdef"
+
+
+def _rand(alphabet, n, seed):
+    """A mixed-alphabet run. Seeded so a failure reproduces, and generated rather
+    than written out so this file carries no literal token for a transcript
+    that echoes it to page on."""
+    rng = random.Random(seed)
+    while True:
+        s = "".join(rng.choice(alphabet) for _ in range(n))
+        # bao-legacy needs a digit; make every fixture carry one of each class
+        if any(c.isdigit() for c in s) and any(c.isalpha() for c in s):
+            return s
+
+
+# family -> (text carrying the fixture, paranoid tier?)
+def _families():
+    import base64
+    tunnel = base64.b64encode(json.dumps(
+        {"a": _rand(_HEX, 32, 1), "t": _rand(_ALNUM, 44, 2), "s": _rand(_ALNUM, 24, 3)}
+    ).encode()).decode().rstrip("=")
+    return {
+        "bao-token": ("hvs." + _rand(_ALNUM, 30, 4), False),
+        "bao-legacy": ("s." + _rand(_ALNUM, 24, 5), False),
+        "anthropic-key": ("sk-ant-api03-" + _rand(_URLSAFE, 40, 6), False),
+        "cf-tunnel": (tunnel, False),
+        "forgejo-pat": ("Authorization: token " + _rand(_HEX, 40, 7), False),
+        "forgejo-pat-context": ("forgejo pat is " + _rand(_HEX, 40, 8), True),
+        "angelia-token": ('{"token": "' + _rand(_URLSAFE, 43, 9) + '"}', True),
+    }
+
+
+@pytest.mark.parametrize("family", sorted(_families()))
+def test_each_new_family_pages_once_and_not_twice(family, tmp_path, monkeypatch):
+    mod = _load_watch()
+    text, paranoid = _families()[family]
+    rules = dict(mod.PARANOID_FINDINGS if paranoid else mod.FINDINGS)
+    assert family in rules, f"{family} not in the {'paranoid' if paranoid else 'always'} tier"
+    m = rules[family].search(text)
+    assert m, "fixture is not shaped like the family"
+    # a future tightening of _synthetic must fail here, not silently mute a family
+    assert mod._synthetic(m.group(0)) is False
+
+    projects = tmp_path / "projects"
+    _transcript(projects, "s1.jsonl", [_result_line(f"output: {text}")])
+    monkeypatch.setattr(mod, "PROJECTS", projects)
+    monkeypatch.setenv("EUNOMIA_FLEET_DIR", str(tmp_path))
+    alerts = []
+    monkeypatch.setattr(mod, "_alert", lambda rel, ln, f: alerts.append(f))
+    argv = ["--paranoid"] if paranoid else []
+
+    mod.main(argv)
+    assert alerts.count(family) == 1, alerts
+    alerts.clear()
+    mod.main(argv)
+    assert alerts == [], "an unchanged file must not page twice"
+    assert text.encode() not in (tmp_path / "leak-watch.state.json").read_bytes()
+
+
+def test_the_always_tier_is_not_the_noisy_tier():
+    """long-hex is every git SHA and redact() runs over PR comments, where a head
+    SHA is what an approval binds to (SPEC 4.6). The context-cued forgejo row and
+    the angelia row are paranoid for the same reason: a commit URL on
+    forge.example sits inside the 40-character cue."""
+    mod = _load_watch()
+    always = {n for n, _ in mod.FINDINGS}
+    paranoid = {n for n, _ in mod.PARANOID_FINDINGS}
+    assert {"long-hex", "assignment", "angelia-token", "forgejo-pat-context"} <= paranoid
+    assert not (always & paranoid)
+    sha = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+    for text in (f"head {sha}", f"https://forge.example/operator/eunomia/commit/{sha}"):
+        assert not any(rx.search(text) for _, rx in mod.FINDINGS), text
+
+
+# the watcher's shapes as they stand on main at plan 0071's merge, verbatim
+_OLD_WATCHER = [
+    ("github-pat", r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}"),
+    ("slack-token", r"\bxox[abprs]-[A-Za-z0-9-]{20,}"),
+    ("openai-key", r"\bsk-[A-Za-z0-9_-]{20,}"),
+    ("jwt-or-tunnel", r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"),
+    ("private-key", r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----"),
+    ("aws-key", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+]
+_OLD_PARANOID = [
+    ("assignment", r"(?i)\b(?:bearer|api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*\S{8,}"),
+    ("long-hex", r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{40,}(?![A-Fa-f0-9])"),
+]
+_OLD_SAMPLES = {
+    "github-pat": ["ghp_" + _rand(_ALNUM, 36, 11), "gho_" + _rand(_ALNUM, 36, 12),
+                   "ghu_" + _rand(_ALNUM, 36, 13), "ghs_" + _rand(_ALNUM, 36, 14),
+                   "ghr_" + _rand(_ALNUM, 36, 15), "github_pat_" + _rand(_URLSAFE, 60, 16)],
+    "slack-token": ["xoxb-" + _rand(_ALNUM + "-", 30, 17), "xoxa-" + _rand(_ALNUM, 25, 18)],
+    "openai-key": ["sk-" + _rand(_ALNUM, 40, 19), "sk-proj-" + _rand(_URLSAFE, 40, 20),
+                   "sk-ant-api03-" + _rand(_URLSAFE, 40, 21),
+                   "sk-ant-oat01-" + _rand(_URLSAFE, 40, 22)],
+    "jwt-or-tunnel": ["eyJ" + _rand(_URLSAFE, 20, 23) + "." + _rand(_URLSAFE, 12, 24)],
+    "private-key": ["-----BEGIN PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----",
+                    "-----BEGIN EC PRIVATE KEY-----", "-----BEGIN OPENSSH PRIVATE KEY-----"],
+    "aws-key": ["AKIA" + "".join(random.Random(25).choices(string.ascii_uppercase, k=16)),
+                "ASIA" + "".join(random.Random(26).choices(string.ascii_uppercase, k=16))],
+    "assignment": ["password = " + _rand(_ALNUM, 20, 27), "Bearer: " + _rand(_ALNUM, 20, 28),
+                   "api_key=" + _rand(_ALNUM, 20, 29)],
+    "long-hex": [_rand(_HEX, 40, 30), _rand(_HEX, 64, 31)],
+}
+
+
+def test_union_nothing_the_watcher_matched_before_is_lost():
+    mod = _load_watch()
+    now = mod.FINDINGS + mod.PARANOID_FINDINGS
+    for name, rx in _OLD_WATCHER + _OLD_PARANOID:
+        old = re.compile(rx)
+        for s in _OLD_SAMPLES[name]:
+            assert old.search(s), f"sample for {name} is not shaped like {name}"
+            assert any(r.search(s) for _, r in now), f"{name}: a shape the watcher caught is lost"
+        # ... and the named row still exists, in the tier it was in
+        tier = mod.FINDINGS if (name, rx) in _OLD_WATCHER else mod.PARANOID_FINDINGS
+        assert name in {n for n, _ in tier}, name
+
+
+def test_conf_rows_are_widened_to_the_union_for_the_cr_gate():
+    """The conf's old openai-key missed sk-ant- and its github-pat missed gho_;
+    validate_cr reads these rows, so the widening is asserted on that path."""
+    sys.path.insert(0, str(BIN))
+    import fleetlib
+    gate = [(n, rx) for n, rx, tier in fleetlib._content_rules() if tier == "always"]
+    for s in _OLD_SAMPLES["github-pat"] + _OLD_SAMPLES["openai-key"] + _OLD_SAMPLES["aws-key"]:
+        assert any(rx.search(s) for _, rx in gate), "CR gate lost a shape"
+    # the paranoid tier never reaches the CR gate: a patch may carry a git SHA
+    assert not any(rx.search("bump to " + _rand(_HEX, 40, 32)) for _, rx in gate)
+
+
+def test_a_content_row_without_the_tier_column_reads_as_always(tmp_path):
+    root = tmp_path / "r"
+    (root / "bin").mkdir(parents=True)
+    (root / "config").mkdir()
+    (root / "config" / "secret-patterns.conf").write_text("content\told-row\tzzz[0-9]+\n")
+    lib = root / "bin" / "fleetlib.py"
+    lib.write_text((BIN / "fleetlib.py").read_text())
+    spec = importlib.util.spec_from_file_location("fleetlib_scratch", lib)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    assert [(n, t) for n, _, t in m._content_rules()] == [("old-row", "always")]
+
+
+def test_watcher_import_survives_an_unreadable_conf(tmp_path, capsys):
+    """orchestrator._redaction_patterns has no error path: the module must fall
+    back to the built-in shapes, loudly, rather than raise at import."""
+    import shutil
+    (tmp_path / "bin").mkdir()
+    shutil.copy(BIN / "fleetlib.py", tmp_path / "bin" / "fleetlib.py")
+    shutil.copy(BIN / "fleet-leak-watch", tmp_path / "bin" / "fleet-leak-watch")
+    loader = importlib.machinery.SourceFileLoader("lw_nc", str(tmp_path / "bin" / "fleet-leak-watch"))
+    spec = importlib.util.spec_from_loader("lw_nc", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)          # no config/ dir at all
+    assert {n for n, _ in mod.FINDINGS} == {n for n, _ in _OLD_WATCHER}
+    assert {n for n, _ in mod.PARANOID_FINDINGS} == {n for n, _ in _OLD_PARANOID}
+    assert "fallback" in capsys.readouterr().err
+
+
+def test_guard_parses_the_extended_conf_and_still_blocks_the_historical_leaks(tmp_path):
+    assert re.search(r"^content\t[^\t]+\t[^\t]+\t(always|paranoid)$", REAL_CONF, re.M)
+    for cmd in ('ssh tunnelhost "systemctl cat cloudflared"',
+                'grep -B2 WEBHOOK_SECRET ~/minos/minos.env',
+                'sed -n 1,5p ~/sniff-cf.env'):
+        r, _ = _guard_with_conf(_bash(cmd), tmp_path, REAL_CONF)
+        assert r.returncode == 2, (cmd, r.stderr)
+    r, _ = _guard_with_conf(BENIGN, tmp_path, REAL_CONF)
+    assert r.returncode == 0, r.stderr

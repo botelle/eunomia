@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+"""fleet-rebase — an owner can rebase a stale pull request from a comment (plan 0115).
+
+  fleet-rebase <repo> <pr> [--reland] [--dry-run]
+  fleet-rebase --sweep [--dry-run]
+
+Why this exists: a red status on a pull request head is replaced only by a new
+push. The forge has no rerun endpoint, workflow dispatch writes a separate
+`(workflow_dispatch)` status beside the red `(push)` one, and the web Re-run
+route is a browser session route. When `main` was fixed under two open pull
+requests (2026-09-30) they stayed red until a person rebased them by hand.
+`fleet-stalled` names that state `stale-base` and deliberately never acts; this
+is the explicit request from a person that plan 0060 left as the fix.
+docs/rebase.md has the whole account, every refusal, and the Minos step.
+
+The verb rebases the pull request's head branch onto `main` in a FRESH
+temporary clone and pushes with `--force-with-lease` against the head SHA it
+checked. It refuses — and says which check failed — unless:
+
+  1. the pull request is open, based on `main`, with its head branch in the
+     same repository;
+  2. it carries no undismissed APPROVED review (re-read right before the push);
+  3. no live session holds the branch: a live `branch` lease, or a live
+     dispatch lease for the plan the pull request is marked with. An
+     unreadable ledger refuses too — this verb starts a write nobody watches,
+     so it fails CLOSED;
+  4. `main` is not already an ancestor of the head (nothing to rebase), the
+     rebase does not conflict, and the rebase delta is not plans-only (ci.yml's
+     `paths-ignore` would skip the `CI / tests` suite and leave the new head with
+     NO such status, which is worse than the red it replaces; `Plans / lint`
+     still runs), and is not empty.
+
+`--sweep` is the comment gesture: for each pull request in a `dispatch`
+repository of config/repos.conf,
+a line reading `rebase` (the `respawn` shape) from FLEET_OPERATOR_UID, posted
+since the head commit's COMMITTER time, with no `rebase: <comment id>` reply
+from the author account, runs the verb and posts exactly one reply.
+
+`reland` (plan 0129) is the verb for the pull request `rebase` refuses in check
+2: one that IS approved and no longer merges. It never touches the approved
+branch. It replays the commits onto a fresh `<head>-relanded-<n>` branch off
+`main`, pushes it with ~/bin/forgejo-safe-push.sh, opens a replacement pull
+request with ~/bin/forgejo-open-pr.sh (body `Follows: #<pr>`, no `Plan:` marker),
+and replies `reland: <comment id> → #<new>` on the old one. A conflicting replay
+pushes nothing. The sweep closes the old pull request once the replacement is
+merged. docs/rebase.md has the whole account.
+
+Dispatches no review and comments no other verb. Never touches ~/dev/<repo>, a
+pin or a worktree. Adds no event type: the reply comment is the record.
+
+Config (env):
+  FLEET_OPERATOR_UID       numeric uid of the owner (required for --sweep)
+  FLEET_AUTHOR_TOKEN_CMD  command printing the author account's token
+                          (default ~/bin/fetch-forgejo-token.sh)
+  FLEET_GIT_SSH_BASE      git transport (fleetlib.git_ssh_base)
+  FLEET_SAFE_PUSH_CMD     the guarded push (default ~/bin/forgejo-safe-push.sh)
+  FLEET_OPEN_PR_CMD       the PR opener (default ~/bin/forgejo-open-pr.sh)
+  FLEET_FORGEJO_URL, FLEET_FORGE_TIMEOUT   as fleet-watch
+"""
+import argparse
+import contextlib
+import fcntl
+import importlib.machinery
+import importlib.util
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+# fleet-watch is IMPORTED, never copied (plan 0115 §3): a second copy of
+# dispatch_leases or of the comment read would drift from the ones dedupe uses.
+watch = _load("fleet_watch", BIN / "fleet-watch")
+
+ROLES = lib.agent_roles()
+
+# A whole line reading `rebase`, optionally in backticks — fleet-watch's
+# _RESPAWN_RE shape, so Minos's `_via minos (...)_` signature does not stop the
+# match and "please rebase it" does not trigger it.
+_REBASE_RE = re.compile(r"(?im)^\s*`?rebase`?\s*$")
+_RELAND_RE = re.compile(r"(?im)^\s*`?reland`?\s*$")
+_REPLY_RE = re.compile(r"(?m)^rebase: (\d+)\s*$")
+# `reland: <comment id>` alone is a refusal; with ` → #<new>` it is a re-land.
+_RELAND_REPLY_RE = re.compile(r"(?m)^reland: (\d+)(?: → #(\d+))?\s*$")
+_OPENED_RE = re.compile(r"#(\d+) by ")
+_PLAN_RE = re.compile(r"(?m)^Plan: (\S+)\s*$")
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+EXIT_OK, EXIT_REFUSED, EXIT_CONFIG = 0, 1, 2
+
+_STDERR_MAX = 1500
+
+
+class Refusal(Exception):
+    """A check failed. The message is what the owner reads, check named."""
+
+
+# --- the single-instance lock ----------------------------------------------
+
+
+def _single_instance():
+    """fleet-watch's `_single_instance` pattern on this verb's own lock. Without
+    it a hand run beside the sweep would observe one head, both would rebase,
+    one lease push would win, and the other would post a contradictory
+    refusal on the same request."""
+    lock = lib.locks_dir()
+    lock.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock / "fleet-rebase.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+# --- the checks -------------------------------------------------------------
+
+
+def _drain(pages):
+    out = []
+    for page in pages:
+        out.extend(page)
+    if pages.outcome != fleetforge.EXHAUSTED:
+        return None
+    return out
+
+
+def _check_pull(forge, repo, pr):
+    """Check 1. Returns the pull request body (a dict) or raises Refusal."""
+    st, body = forge.get_pull(repo, pr)
+    if st != 200 or not isinstance(body, dict):
+        raise Refusal(f"check 1 (pull request): could not read {repo}#{pr} "
+                      f"(HTTP {st})")
+    if body.get("merged") or (body.get("state") or "").lower() == "merged":
+        raise Refusal(f"check 1 (open): {repo}#{pr} is merged")
+    if (body.get("state") or "").lower() != "open":
+        raise Refusal(f"check 1 (open): {repo}#{pr} is {body.get('state')!r}, "
+                      "not open")
+    base = body.get("base") or {}
+    if base.get("ref") != "main":
+        raise Refusal(f"check 1 (base): the base is {base.get('ref')!r}, not "
+                      "`main`")
+    head = body.get("head") or {}
+    head_repo = ((head.get("repo") or {}).get("full_name") or "").lower()
+    if head_repo != repo.lower():
+        raise Refusal(f"check 1 (fork): the head branch is in {head_repo or 'an unknown repository'}, "
+                      f"not {repo} — a fork's branch is not the fleet's to push")
+    ref, sha = head.get("ref") or "", head.get("sha") or ""
+    if not ref or not _SHA_RE.match(sha):
+        raise Refusal("check 1 (head): the head branch or SHA is unreadable")
+    return body
+
+
+def _approver(forge, repo, pr):
+    """The login of an undismissed APPROVED review at any head, or None.
+    Unreadable reviews refuse — an unknown is not a no-approval."""
+    reviews = _drain(fleetforge.paged(forge.list_reviews, repo, pr))
+    if reviews is None:
+        raise Refusal("check 2 (approval): the reviews could not be read in "
+                      "full, so absence of an approval is unproven")
+    for r in reviews:
+        if (r.get("state") or "").upper() == "APPROVED" and not r.get("dismissed"):
+            return (r.get("user") or {}).get("login") or "someone"
+    return None
+
+
+def _check_approval(forge, repo, pr):
+    """Check 2: no approval, at any head, that has not been dismissed."""
+    who = _approver(forge, repo, pr)
+    if who is not None:
+        raise Refusal(f"check 2 (approval): approved by {who} — an "
+                      "approved pull request is frozen, because it is "
+                      "merged the moment the approval lands")
+
+
+def _read_ledger():
+    """fleetlib's own reader and fleetlib's own signal, never a second parser.
+    `all_leases()` returns [] for a missing directory and skips an unparseable
+    file with a `fleet: WARN` line, so unreadability is detected from those two
+    signals."""
+    d = lib.leases_dir()
+    if not d.is_dir():
+        raise Refusal("check 3 (ledger): the lease ledger is unreadable "
+                      "(its directory is missing), so a live session cannot "
+                      "be ruled out")
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        recs = lib.all_leases()
+    if "fleet: WARN" in buf.getvalue():
+        raise Refusal("check 3 (ledger): the lease ledger is unreadable (a "
+                      "lease file did not parse), so a live session cannot be "
+                      "ruled out")
+    return recs
+
+
+def _check_sessions(repo, branch, body_text):
+    """Check 3: no live session holds the branch."""
+    recs = _read_ledger()
+    repo = repo.lower()       # check 1 compares case-insensitively; so must this
+    for rec in recs:
+        if rec.get("state") not in ("assigned", "active"):
+            continue
+        res = lib.resource_of(rec)
+        if (res.get("type") == "branch"
+                and (res.get("repo") or "").lower() == repo
+                and res.get("branch") == branch and not lib.is_orphaned(rec)):
+            raise Refusal(f"check 3 (session): a live branch lease "
+                          f"{rec.get('id')} holds {branch} — its worktree is "
+                          "on this branch (ADR-0005)")
+    m = _PLAN_RE.search(body_text or "")
+    if m:
+        rec = next((r for (rp, plan), r in watch.dispatch_leases().items()
+                    if rp.lower() == repo and plan == m.group(1)), None)
+        if rec is not None and not lib.is_orphaned(rec):
+            raise Refusal(f"check 3 (session): plan {m.group(1)} has a live "
+                          f"dispatch lease {rec.get('id')} — its orchestrator "
+                          "holds this pull request through CI-fix rounds and "
+                          "stewarding, and its worktree is on this branch "
+                          "(ADR-0005)")
+
+
+def _gate(forge, repo, pr):
+    """Checks 1-3, in one place so the pre-push re-check is the same code as
+    the first one. Returns the pull request body."""
+    body = _check_pull(forge, repo, pr)
+    _check_approval(forge, repo, pr)
+    _check_sessions(repo, body["head"]["ref"], body.get("body"))
+    return body
+
+
+def _gate_reland(forge, repo, pr):
+    """`reland`'s checks: 1 and 3 as `rebase` has them, and check 2 inverted —
+    the pull request must BE approved; an unapproved one is `rebase`'s case."""
+    body = _check_pull(forge, repo, pr)
+    if _approver(forge, repo, pr) is None:
+        raise Refusal("check 2 (not approved): no undismissed approval, so this "
+                      "pull request is not frozen — use `rebase`, not `reland`")
+    _check_sessions(repo, body["head"]["ref"], body.get("body"))
+    return body
+
+
+# --- git, in a fresh temporary clone ----------------------------------------
+
+
+def _committer():
+    ident = ROLES["author"].commit_identity or ""
+    m = re.match(r"^(.*?)\s*<([^>]+)>\s*$", ident)
+    if not m or not m.group(1):
+        return ROLES["author"].account, f"{ROLES['author'].account}@example.org"
+    return m.group(1), m.group(2)
+
+
+def _git(clone, *args, check=True):
+    name, email = _committer()
+    env = dict(os.environ)
+    env.update({"GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email,
+                "GIT_TERMINAL_PROMPT": "0"})
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    r = subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+         "-c", f"user.name={name}", "-c", f"user.email={email}", *args],
+        cwd=clone, env=env, capture_output=True, text=True, timeout=900)
+    if check and r.returncode != 0:
+        raise Refusal(f"git {args[0]} failed: "
+                      f"{(r.stderr or r.stdout).strip()[-_STDERR_MAX:]}")
+    return r
+
+
+def _remote_url(repo):
+    return f"{lib.git_ssh_base()}/{repo}.git"
+
+
+class Outcome:
+    def __init__(self, kind, text, old=None, new=None):
+        self.kind, self.text, self.old, self.new = kind, text, old, new
+        self.pr = self.branch = None        # a re-land's replacement
+
+
+def rebase_pull(forge, repo, pr, dry_run=False):
+    """D1. Returns an Outcome of kind rebased | would | already; raises
+    Refusal otherwise. The temporary clone is removed on every path."""
+    body = _gate(forge, repo, pr)
+    branch, old = body["head"]["ref"], body["head"]["sha"]
+
+    tmp = tempfile.mkdtemp(prefix="fleet-rebase-")
+    try:
+        _git(tmp, "clone", "--quiet", "--no-checkout", _remote_url(repo), "clone")
+        clone = os.path.join(tmp, "clone")
+        if _git(clone, "checkout", "--quiet", "--detach", old,
+                check=False).returncode != 0:
+            raise Refusal(f"check 1 (head): {old[:12]} is not in the clone — "
+                          "the branch moved since it was read")
+        if _git(clone, "rev-parse", "--verify", "--quiet",
+                "refs/remotes/origin/main", check=False).returncode != 0:
+            raise Refusal("check 4: the clone has no origin/main")
+        if _git(clone, "merge-base", "--is-ancestor", "origin/main", old,
+                check=False).returncode == 0:
+            return Outcome("already", f"already on main: {old[:12]} contains "
+                           "main's head, so there is nothing to rebase", old, old)
+
+        r = _git(clone, "rebase", "origin/main", check=False)
+        if r.returncode != 0:
+            paths = _git(clone, "diff", "--name-only", "-z", "--diff-filter=U",
+                         check=False).stdout.split("\0")
+            paths = [p for p in paths if p]
+            _git(clone, "rebase", "--abort", check=False)
+            if paths:
+                raise Refusal("check 4 (conflict): the rebase conflicts in "
+                              + ", ".join(f"`{p}`" for p in paths)
+                              + "; nothing was pushed")
+            raise Refusal("check 4 (rebase): git rebase failed: "
+                          f"{(r.stderr or r.stdout).strip()[-_STDERR_MAX:]}")
+        new = _git(clone, "rev-parse", "HEAD").stdout.strip()
+
+        # -z: a path with a space or a non-ASCII name is one NUL-terminated
+        # entry, not quoted or split.
+        delta = [p for p in _git(clone, "diff", "--name-only", "-z", old,
+                                 new).stdout.split("\0") if p]
+        if not delta:
+            raise Refusal("check 4 (empty): the rebase leaves the tree "
+                          "unchanged, so a push would only change the commit "
+                          "id and CI would skip it; nothing was pushed")
+        if all(p.startswith("plans/") for p in delta):
+            raise Refusal("check 4 (plans-only): a rebase cannot re-run CI "
+                          "here, because `main` has moved only in `plans/`. "
+                          "The push would be judged by that delta, CI's path "
+                          "filter would skip the `CI / tests` suite, and the new "
+                          "head would carry no such status (only `Plans / lint` "
+                          "runs)")
+
+        if dry_run:
+            return Outcome("would", f"would push {old[:12]} -> {new[:12]}",
+                           old, new)
+
+        # Re-read everything the first pass read, immediately before the push:
+        # the rebase took time, and an approval landing in that window means
+        # the pull request is already as good as merged.
+        again = _gate(forge, repo, pr)
+        if again["head"]["sha"] != old:
+            raise Refusal("check 1 (head): the head moved while rebasing "
+                          f"({old[:12]} -> {again['head']['sha'][:12]}); nothing "
+                          "was pushed")
+        r = _git(clone, "push", "--quiet",
+                 f"--force-with-lease={branch}:{old}", "origin",
+                 f"HEAD:refs/heads/{branch}", check=False)
+        if r.returncode != 0:
+            raise Refusal("the push was refused: "
+                          f"{(r.stderr or r.stdout).strip()[-_STDERR_MAX:]}")
+        return Outcome("rebased", f"rebased {old[:12]} -> {new[:12]}", old, new)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _tool(env, default):
+    return os.path.expanduser(os.environ.get(env, "").strip() or default)
+
+
+def _run_tool(clone, cmd, *args):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    return subprocess.run([cmd, *args], cwd=clone, env=env, capture_output=True,
+                          text=True, timeout=900)
+
+
+def _free_branch(clone, head):
+    taken = {line.split("\t", 1)[1][len("refs/heads/"):]
+             for line in _git(clone, "ls-remote", "--heads", "origin").stdout.splitlines()
+             if "\t" in line}
+    n = 1
+    while f"{head}-relanded-{n}" in taken:
+        n += 1
+    return f"{head}-relanded-{n}"
+
+
+def _reland_body(pr, old_body):
+    kept = _PLAN_RE.sub("", old_body or "").strip()
+    return (f"Follows: #{pr}\n\nThis replaces #{pr}, which was approved and then "
+            "no longer merged with `main`. The same commits are replayed onto a "
+            "fresh branch off `main`; nothing was pushed into the approved "
+            "branch. The plan marker stays on the original.\n\n"
+            f"--- body of #{pr} ---\n\n{kept}\n")
+
+
+def reland_pull(forge, repo, pr, dry_run=False):
+    """Plan 0129 D1. Returns an Outcome of kind relanded | would; raises
+    Refusal otherwise. Never pushes to the pull request's own branch."""
+    body = _gate_reland(forge, repo, pr)
+    head, old = body["head"]["ref"], body["head"]["sha"]
+
+    tmp = tempfile.mkdtemp(prefix="fleet-reland-")
+    try:
+        _git(tmp, "clone", "--quiet", "--no-checkout", _remote_url(repo), "clone")
+        clone = os.path.join(tmp, "clone")
+        if _git(clone, "checkout", "--quiet", "--detach", old,
+                check=False).returncode != 0:
+            raise Refusal(f"check 1 (head): {old[:12]} is not in the clone — "
+                          "the branch moved since it was read")
+        if _git(clone, "rev-parse", "--verify", "--quiet",
+                "refs/remotes/origin/main", check=False).returncode != 0:
+            raise Refusal("check 4: the clone has no origin/main")
+        base = _git(clone, "merge-base", "origin/main", old, check=False).stdout.strip()
+        if not base:
+            raise Refusal("check 4 (history): the head shares no history with `main`")
+        if base == old:
+            raise Refusal("check 4 (nothing to re-land): every commit of the head "
+                          "is already in `main`")
+        if _git(clone, "merge-base", "--is-ancestor", "origin/main", old,
+                check=False).returncode == 0:
+            raise Refusal("check 4 (already on main): the head contains main's "
+                          "head, so there is nothing to re-land")
+
+        new_branch = _free_branch(clone, head)
+        r = _git(clone, "rebase", "--onto", "origin/main", base, check=False)
+        if r.returncode != 0:
+            paths = [p for p in _git(clone, "diff", "--name-only", "-z",
+                                     "--diff-filter=U", check=False).stdout.split("\0") if p]
+            _git(clone, "rebase", "--abort", check=False)
+            if paths:
+                raise Refusal("check 4 (conflict): the replay onto `main` conflicts in "
+                              + ", ".join(f"`{p}`" for p in paths)
+                              + "; nothing was pushed. A conflicted re-land needs a "
+                              "session: instruct the steward to rebase onto main on a "
+                              "fresh branch and open a replacement PR")
+            raise Refusal("check 4 (replay): git rebase failed: "
+                          f"{(r.stderr or r.stdout).strip()[-_STDERR_MAX:]}")
+        new = _git(clone, "rev-parse", "HEAD").stdout.strip()
+        _git(clone, "checkout", "--quiet", "-B", new_branch)
+
+        if dry_run:
+            return Outcome("would", f"would push {new_branch} ({new[:12]}) off "
+                           f"main and open a replacement for #{pr}, which stays "
+                           "open until it merges", old, new)
+
+        again = _gate_reland(forge, repo, pr)
+        if again["head"]["sha"] != old:
+            raise Refusal("check 1 (head): the head moved while replaying "
+                          f"({old[:12]} -> {again['head']['sha'][:12]}); nothing "
+                          "was pushed")
+        # Call into operator/hosttools, bin/forgejo-safe-push.sh at 5feaa10
+        # (ADR-0022: no contract entry; eunomia is not a contract repository).
+        # Contract relied on: run inside a worktree, `forgejo-safe-push.sh origin
+        # <branch>`; refuses a branch whose PR is merged, closed or approved, and a
+        # forge host it does not know; a branch with no PR yet is allowed. Never
+        # a bare `git push`: the guard is the owner's standing rule.
+        r = _run_tool(clone, _tool("FLEET_SAFE_PUSH_CMD", "~/bin/forgejo-safe-push.sh"),
+                      "origin", new_branch)
+        if r.returncode != 0:
+            raise Refusal("the push was refused: "
+                          f"{(r.stderr or r.stdout).strip()[-_STDERR_MAX:]}")
+
+        bodyfile = os.path.join(tmp, "body.md")
+        with open(bodyfile, "w") as f:
+            f.write(_reland_body(pr, body.get("body")))
+        # Call into operator/hosttools, bin/forgejo-open-pr.sh at bb7b638
+        # (ADR-0022, as above). Contract relied on: `<repo> <head> <base> <title>
+        # [body-file]` opens the PR as implbot and prints
+        # `<repo>#<n> by implbot — <url>` on success; non-zero otherwise.
+        r = _run_tool(clone, _tool("FLEET_OPEN_PR_CMD", "~/bin/forgejo-open-pr.sh"),
+                      repo, new_branch, "main",
+                      f"{body.get('title') or new_branch} (re-land of #{pr})", bodyfile)
+        m = _OPENED_RE.search(r.stdout or "")
+        if r.returncode != 0 or not m:
+            raise Refusal(f"branch {new_branch} was pushed but the replacement pull "
+                          "request was not opened: "
+                          f"{(r.stderr or r.stdout).strip()[-_STDERR_MAX:]}")
+        out = Outcome("relanded", f"re-landed as #{m.group(1)} from {new_branch}", old, new)
+        out.pr, out.branch = int(m.group(1)), new_branch
+        return out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_one(forge, repo, pr, dry_run, verb="rebase"):
+    """(Outcome-or-None, message). None means refused."""
+    try:
+        if verb == "reland":
+            out = reland_pull(forge, repo, pr, dry_run=dry_run)
+        else:
+            out = rebase_pull(forge, repo, pr, dry_run=dry_run)
+    except Refusal as e:
+        return None, f"refused: {e}"
+    except (subprocess.SubprocessError, OSError) as e:
+        return None, f"refused: {e.__class__.__name__} while " + (
+            "re-landing" if verb == "reland" else "rebasing")
+    return out, out.text
+
+
+# --- the sweep --------------------------------------------------------------
+
+
+def _committer_time(forge, repo, sha):
+    """The head commit's COMMITTER date — never get_branch's author-date
+    `timestamp`, which `git rebase` preserves, so a bound built on it would
+    never move past the request that caused the rebase."""
+    st, body = forge.list_commits(repo, sha=sha, limit=1)
+    if st != 200 or not isinstance(body, list) or not body:
+        return None
+    return (((body[0].get("commit") or {}).get("committer") or {}).get("date"))
+
+
+def sweep(token, uid, dry_run):
+    """Returns the exit code."""
+    forge = watch._forge(token)
+    rc = EXIT_OK
+    repos = watch.repos()
+    print(f"fleet-rebase: sweeping {len(repos)} repositories"
+          + (" (dry run)" if dry_run else ""))
+    for repo in repos:
+        pulls = _drain(fleetforge.paged(forge.list_pulls, repo, state="open"))
+        if pulls is None:
+            print(f"fleet-rebase: {repo}: pull requests unreadable", file=sys.stderr)
+            rc = EXIT_REFUSED
+            continue
+        for pull in pulls:
+            num = pull.get("number")
+            sha = (pull.get("head") or {}).get("sha") or ""
+            if not num or not sha:
+                continue
+            ctime = _committer_time(forge, repo, sha)
+            since = watch._ts_utc(ctime)
+            if since is None:
+                print(f"fleet-rebase: {repo}#{num}: head commit time unreadable",
+                      file=sys.stderr)
+                rc = EXIT_REFUSED
+                continue
+            comments = watch._comments_since(repo, num, token, ctime)
+            if comments is None:
+                print(f"fleet-rebase: {repo}#{num}: comments unreadable",
+                      file=sys.stderr)
+                rc = EXIT_REFUSED
+                continue
+            if _sweep_pull(forge, repo, num, comments, since, uid, dry_run):
+                rc = EXIT_REFUSED
+    return rc
+
+
+def _sweep_pull(forge, repo, num, comments, since, uid, dry_run):
+    """Acts on this pull request's requests, oldest first, then closes it if
+    its re-land has merged. True on a post failure."""
+    fresh = [c for c in comments
+             if (watch._ts_utc(c.get("created_at")) or since) >= since]
+    answered, relands = set(), []
+    for c in fresh:
+        if watch._is_implementer(c.get("user") or {}):
+            text = c.get("body") or ""
+            answered.update(_REPLY_RE.findall(text))
+            for cid, new in _RELAND_REPLY_RE.findall(text):
+                answered.add(cid)
+                if new:
+                    relands.append(int(new))
+    failed = False
+    for c in sorted(fresh, key=lambda c: (c.get("created_at") or "", c.get("id") or 0)):
+        if str((c.get("user") or {}).get("id")) != uid:
+            continue
+        text = c.get("body") or ""
+        verb = ("rebase" if _REBASE_RE.search(text)
+                else "reland" if _RELAND_RE.search(text) else None)
+        if verb is None:
+            continue
+        cid = str(c.get("id"))
+        if cid in answered:
+            continue
+        out, msg = run_one(forge, repo, num, dry_run, verb)
+        if verb == "reland" and out is not None and out.kind == "relanded":
+            reply = f"reland: {cid} → #{out.pr}\n{msg}\nbranch: {out.branch}"
+            relands.append(out.pr)
+        else:
+            reply = f"{verb}: {cid}\n{msg}"
+        if verb == "rebase" and out is not None and out.kind == "rebased":
+            reply += f"\nold head: {out.old}\nnew head: {out.new}"
+        if dry_run:
+            print(f"fleet-rebase: {repo}#{num}: comment {cid}: {msg}")
+        else:
+            st, _ = forge.create_issue_comment(repo, num, reply)
+            print(f"fleet-rebase: {repo}#{num}: comment {cid}: {msg}")
+            if st not in (200, 201):
+                print(f"fleet-rebase: {repo}#{num}: the reply to {cid} was not "
+                      f"posted (HTTP {st})", file=sys.stderr)
+                failed = True
+        if verb == "rebase" and out is not None and out.kind == "rebased":
+            break              # the head moved; later requests are now stale
+    return _close_relanded(forge, repo, num, relands, dry_run) or failed
+
+
+def _close_relanded(forge, repo, num, relands, dry_run):
+    """Plan 0129 D2: close `num` once a replacement named in one of its
+    `reland: … → #<new>` replies has merged. A replacement closed unmerged, or
+    still open, leaves it alone. True on a failure."""
+    for new in relands:
+        st, body = forge.get_pull(repo, new)
+        if st != 200 or not isinstance(body, dict) or not (
+                body.get("merged") or (body.get("state") or "").lower() == "merged"):
+            continue
+        print(f"fleet-rebase: {repo}#{num}: replacement #{new} is merged"
+              + (" (would close)" if dry_run else ""))
+        if dry_run:
+            return False
+        # Close BEFORE commenting: a closed pull request is not swept again, so
+        # a failed close is retried and a failed comment costs only the note.
+        # fleetforge has no close verb and this plan's lane does not reach it, so
+        # the one PATCH goes through its transport.
+        st, _ = forge._request("PATCH", f"/repos/{repo}/pulls/{num}",
+                               body={"state": "closed"})
+        if st not in (200, 201):
+            print(f"fleet-rebase: {repo}#{num}: could not close (HTTP {st})",
+                  file=sys.stderr)
+            return True
+        st, _ = forge.create_issue_comment(
+            repo, num, f"Closed: its replacement #{new} was merged.")
+        if st not in (200, 201):
+            print(f"fleet-rebase: {repo}#{num}: the closing note was not posted "
+                  f"(HTTP {st})", file=sys.stderr)
+            return True
+        return False
+    return False
+
+
+# --- entry ------------------------------------------------------------------
+
+
+def _token():
+    """The author account's token, from an operator host tool OUTSIDE this repo.
+
+    Provider: ~/bin/fetch-forgejo-token.sh on the host. ~/bin is not a git
+    checkout, so there is no providing repo or commit to cite; the tool's own
+    header names ~/agent/IMPLBOT-PRS.md as its documentation. It is the same
+    helper bin/fleet-ci, bin/fleet-stalled and bin/orchestrator's role table
+    default to.
+    Contract relied on: takes NO arguments, prints the implbot PAT on stdout
+    and nothing else, exits non-zero (empty stdout) on failure, refuses a tty.
+    watch._run_token_helper keeps the value out of argv and error text.
+    FLEET_AUTHOR_TOKEN_CMD overrides it, as the orchestrator's authoring role."""
+    cmd = (os.environ.get("FLEET_AUTHOR_TOKEN_CMD", "").strip()
+           or os.path.expanduser("~/bin/fetch-forgejo-token.sh"))
+    return watch._run_token_helper(cmd)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-rebase", description=__doc__.split("\n\n")[0])
+    ap.add_argument("repo", nargs="?", help="owner/repo")
+    ap.add_argument("pr", nargs="?", type=int, help="pull request number")
+    ap.add_argument("--sweep", action="store_true",
+                    help="act on `rebase` comments from the owner")
+    ap.add_argument("--reland", action="store_true",
+                    help="for an APPROVED pull request: replay it onto a fresh "
+                         "branch off main and open a replacement")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="run every check and a trial rebase; push and post nothing")
+    args = ap.parse_args(argv)
+    if args.sweep == bool(args.repo or args.pr):
+        ap.error("give either <repo> <pr> or --sweep")
+    if args.sweep and args.reland:
+        ap.error("--reland takes <repo> <pr>; the sweep reads `reland` comments")
+    if not args.sweep and (not args.repo or args.pr is None):
+        ap.error("give both <repo> and <pr>")
+
+    uid = ""
+    if args.sweep:
+        if not watch.repos():
+            print("fleet-rebase: config/repos.conf is unreadable or lists no "
+                  "`dispatch` repository — the sweep would be a silent no-op",
+                  file=sys.stderr)
+            return EXIT_CONFIG
+        uid = os.environ.get("FLEET_OPERATOR_UID", "").strip()
+        if not uid.isdigit():
+            print("fleet-rebase: FLEET_OPERATOR_UID is empty or not numeric — "
+                  "the sweep would never act", file=sys.stderr)
+            return EXIT_CONFIG
+
+    fd = _single_instance()
+    if fd is None:
+        print("fleet-rebase: another fleet-rebase is running", file=sys.stderr)
+        return EXIT_REFUSED
+
+    token, err = _token()
+    if token is None:
+        print(f"fleet-rebase: {err}", file=sys.stderr)
+        return EXIT_CONFIG
+    if args.sweep:
+        return sweep(token, uid, args.dry_run)
+
+    out, msg = run_one(watch._forge(token), args.repo, args.pr, args.dry_run,
+                        "reland" if args.reland else "rebase")
+    print(f"fleet-rebase: {args.repo}#{args.pr}: {msg}")
+    if out is None:
+        return EXIT_REFUSED
+    if out.kind in ("rebased", "would") and not args.reland:
+        print(f"old head: {out.old}\nnew head: {out.new}")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

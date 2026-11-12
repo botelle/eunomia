@@ -145,7 +145,13 @@ def _mod(tmp_path, plan_text=PLAN, path_extra=None, **env):
     path = env.pop("PATH", None) or os.environ["PATH"]
     if path_extra:
         path = f"{path_extra}{os.pathsep}{path}"
+    # plan 0116: every Claude run fetches a minted token first. A stub helper, so
+    # no test here touches the vault; the value is not token-shaped.
+    helper = tmp_path / "claude-token-stub.sh"
+    helper.write_text("#!/bin/sh\necho stub-claude-oauth-value\n")
+    helper.chmod(0o755)
     defaults = {"FLEET_WORK_ROOT": str(tmp_path / "work"),
+                "FLEET_CLAUDE_TOKEN_CMD": str(helper),
                 "FLEET_GIT_SSH_BASE": ssh, "EUNOMIA_SESSION": "orch-test",
                 "EUNOMIA_TRANSCRIPT_DIR": str(tmp_path / "transcripts"),
                 "PATH": path}
@@ -208,7 +214,7 @@ def test_an_unset_initiator_is_the_operator(tmp_path):
     """Unset is the normal production path, not an error to be defaulted past."""
     mod = _mod(tmp_path)
     cred = mod.resolve_credential()
-    assert cred.kind == "local_cli" and cred.initiator == "operator"
+    assert cred.kind == "oauth_token" and cred.initiator == "operator"
 
 
 def test_an_unrecognised_initiator_stops_the_run_loudly(tmp_path):
@@ -237,7 +243,7 @@ def test_the_default_runner_is_a_registry_entry_not_a_model_name(tmp_path):
     mod = _mod(tmp_path)
     assert mod.DEFAULT_RUNNER in mod.RUNNERS
     r = mod.RUNNERS[mod.DEFAULT_RUNNER]
-    assert r.name == "sub-sonnet" and r.needs == "local_cli" and r.local is False
+    assert r.name == "sub-sonnet" and r.needs == "oauth_token" and r.local is False
 
 
 def test_the_override_selects_a_runner_and_an_unknown_name_stops(tmp_path):
@@ -251,14 +257,14 @@ def test_the_override_selects_a_runner_and_an_unknown_name_stops(tmp_path):
 
 
 def test_a_runner_needing_a_credential_kind_we_do_not_have_is_a_hard_stop(tmp_path):
-    """`api-sonnet` served by `local_cli` silently spends the operator's
+    """`api-sonnet` served by `oauth_token` silently spends the operator's
     subscription while every event and cost report calls it metered."""
     mod = _mod(tmp_path, EUNOMIA_IMPL_RUNNER="api-sonnet")
     cred = mod.resolve_credential()
-    assert cred.kind == "local_cli"
+    assert cred.kind == "oauth_token"
     with pytest.raises(mod.Stop) as e:
         mod.route_implementer({"zone": "public"}, cred)
-    assert "api-sonnet" in e.value.reason and "local_cli" in e.value.reason
+    assert "api-sonnet" in e.value.reason and "oauth_token" in e.value.reason
 
 
 @pytest.mark.parametrize("zone", ["private", "", "Public", "PUBLIC", "publick"])
@@ -284,21 +290,23 @@ def test_the_zone_rule_matches_the_documented_rule(tmp_path):
     adr = (ROOT / "docs" / "adr" / "0006-blackbox-test-lanes.md").read_text()
     assert "Only `zone: public` dispatches an external lane." in adr
     assert "anything else, including absent, malformed or unreadable" in adr
-    # exactly one runner may carry a non-public plan, and it is the local one
+    # only a local runner may carry a non-public plan; every one is an epeius
+    # runner (plan 0154)
     local = {n for n, r in mod.RUNNERS.items() if r.local}
-    assert local == {"local-qwen"}
+    assert "local-qwen" in local and all(n.startswith("local-") for n in local)
+    assert all(mod.is_epeius_runner(mod.RUNNERS[n]) for n in local)
     cred = mod.resolve_credential()
     assert mod.route_implementer({"zone": "public"}, cred).local is False
 
 
 def test_a_declared_but_unwired_runner_stops_with_its_own_reason(tmp_path):
-    """`local-qwen` is the only runner a `zone: private` plan can resolve to and
-    is expected to land unexercised — so it must fail loudly and legibly rather
-    than as a generic spawn OSError."""
+    """A runner declared `unwired` must fail loudly and legibly rather than as a
+    generic spawn OSError (`local-qwen` was one until plan 0154 wired it)."""
     mod = _mod(tmp_path, EUNOMIA_IMPL_RUNNER="local-qwen")
     cred = mod.resolve_credential()
     route = mod.route_implementer({"zone": "private"}, cred)
-    assert route.local is True
+    assert route.local is True and not route.unwired
+    route = route._replace(unwired="a test reason: see plan 0010 task file")
     with pytest.raises(mod.Stop) as e:
         mod.harness_argv(route)
     assert "declared but not wired" in e.value.reason
@@ -373,7 +381,10 @@ def test_the_child_environment_is_an_allowlist(tmp_path):
     assert "EUNOMIA_SESSION" not in child, (
         "not until fleet-install-hooks runs against the store — and then "
         "FLEET_PUSH_OVERRIDE stays forbidden")
-    assert not [k for k in child if k.split("_")[0] in
+    assert child.get("CLAUDE_CODE_OAUTH_TOKEN") == "stub-claude-oauth-value", (
+        "sub-sonnet declares it (plan 0116)")
+    assert not [k for k in child if k != "CLAUDE_CODE_OAUTH_TOKEN"
+                and k.split("_")[0] in
                 ("FLEET", "EUNOMIA", "ANTHROPIC", "CLAUDE", "OPENAI", "GITHUB",
                  "AWS", "FORGEJO", "VAULT", "BAO")], sorted(child)
     # What is passed IS the allowlist. What the child then OBSERVES can be a
@@ -385,7 +396,8 @@ def test_the_child_environment_is_an_allowlist(tmp_path):
     # machine that is behaving correctly.
     injected = {"__CF_USER_TEXT_ENCODING", "SDKROOT", "CPATH", "LIBRARY_PATH",
                 "MANPATH", "__PYVENV_LAUNCHER__", "PYTHONHOME", "PYTHONPATH"}
-    assert set(child) - set(mod._ENV_ALLOW) <= injected, sorted(set(child) - set(mod._ENV_ALLOW))
+    declared = set(mod.RUNNERS["sub-sonnet"].extra_env)
+    assert set(child) - set(mod._ENV_ALLOW) - declared <= injected, sorted(set(child) - set(mod._ENV_ALLOW))
     assert child["HOME"] == os.environ["HOME"]
 
 
@@ -908,11 +920,30 @@ class _FakeForge:
             return 401, None
         return (200, self.pulls if page == 1 else [])
 
+    def get_pull_by_branch(self, repo, base, head):
+        """Mirrors the real forge's own base+head matching (measured live
+        against operator/eunomia, plan 0215 D1 — see fleetforge's own
+        docstring): a PR whose head matches but whose base does not is a
+        404 here too, never found-then-rejected."""
+        if self.fail_at == "pulls":
+            return 401, None
+        for pr in self.pulls:
+            if (((pr.get("head") or {}).get("ref") or "") == head
+                    and ((pr.get("base") or {}).get("ref") or "") == base):
+                return 200, pr
+        return 404, None
+
     def get_pull(self, repo, n):
         for pr in self.pulls:
             if pr.get("number") == n:
                 return 200, pr
         return 404, None
+
+    def get_repo(self, repo):
+        """Confirms a 404 from `get_pull_by_branch` as "no PR", never
+        "repo unreachable" (`_repo_reachable`) — this fake's repo always
+        exists."""
+        return 200, {"full_name": repo}
 
     def edit_pull_body(self, repo, n, body):
         """Mutates the stored pull, so a read-back sees the stamp — the thing
@@ -966,7 +997,13 @@ def test_a_missing_pr_a_wrong_base_and_a_wrong_author_each_fail(tmp_path):
             (_FakeForge([], {}), "no pull request with head"),
             (_FakeForge([_pull(branch="feat/other")], {}), "no pull request with head"),
             (_FakeForge([_pull(login="operator")], {"abc1234": DONE}), "not an implementer"),
-            (_FakeForge([_pull(base="develop")], {"abc1234": DONE}), "not main"),
+            # The real forge's by-branch read is keyed on base AND head (plan
+            # 0215 D1, measured live) — a PR on this head targeting anything
+            # but main reads as no PR at all, never "found, wrong base". See
+            # verify_marked_pr's own docstring for why the base check stays
+            # in the function regardless.
+            (_FakeForge([_pull(base="develop")], {"abc1234": DONE}),
+             "no pull request with head"),
             # an unmarked PR is no longer a failure — it is STAMPED (see below);
             # what still fails is a stamp that cannot be made to stick
             (_FakeForge([_pull(body="did some work")], {"abc1234": DONE},
@@ -1076,23 +1113,23 @@ def test_no_approval_api_call_exists_anywhere_in_this_lane():
 
 # --------------------------------------------- the retry that salvages a run
 class _FlakyForge(_FakeForge):
-    """Fails the pull listing `fail_times` times, then answers normally."""
+    """Fails the by-branch read `fail_times` times, then answers normally."""
 
     def __init__(self, pulls, contents=None, fail_times=0):
         super().__init__(pulls, contents)
         self.fail_times, self.calls = fail_times, 0
 
-    def list_pulls(self, repo, state="all", page=1, limit=50, sort=None):
-        if page == 1:
-            self.calls += 1
-            if self.calls <= self.fail_times:
-                return 401, None
-        return (200, self.pulls if page == 1 else [])
+    def get_pull_by_branch(self, repo, base, head):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            return 401, None
+        return super().get_pull_by_branch(repo, base, head)
 
 
-def _read(mod, forge, slept):
+def _read(mod, forge, slept, branch="feat/0042-a-feature"):
     fmod = mod._load_sibling("fleetforge.py", "_fleetforge")
-    return mod.read_pulls(fmod, forge, "operator/demo", sleep=slept.append)
+    return mod.read_pull_by_branch(fmod, forge, "operator/demo", "main", branch,
+                                   sleep=slept.append)
 
 
 def test_a_transient_read_is_retried_rather_than_discarding_the_run(tmp_path):
@@ -1102,16 +1139,16 @@ def test_a_transient_read_is_retried_rather_than_discarding_the_run(tmp_path):
     the same read worked on every attempt minutes afterwards."""
     mod = _mod(tmp_path)
     slept = []
-    pulls, outcome = _read(mod, _FlakyForge([_pull()], fail_times=1), slept)
-    assert outcome is None and len(pulls) == 1
+    pr, outcome = _read(mod, _FlakyForge([_pull()], fail_times=1), slept)
+    assert outcome is None and pr is not None
     assert slept == [40], "did not back off before retrying"
 
 
 def test_it_recovers_on_the_last_attempt(tmp_path):
     mod = _mod(tmp_path)
     slept = []
-    pulls, outcome = _read(mod, _FlakyForge([_pull()], fail_times=4), slept)
-    assert outcome is None and len(pulls) == 1
+    pr, outcome = _read(mod, _FlakyForge([_pull()], fail_times=4), slept)
+    assert outcome is None and pr is not None
     assert slept == [40, 80, 160, 320]
 
 
@@ -1119,8 +1156,8 @@ def test_it_gives_up_after_five_attempts_and_says_so(tmp_path):
     mod = _mod(tmp_path)
     slept = []
     forge = _FlakyForge([_pull()], fail_times=99)
-    pulls, outcome = _read(mod, forge, slept)
-    assert pulls is None and outcome
+    pr, outcome = _read(mod, forge, slept)
+    assert pr is None and outcome
     assert forge.calls == mod.READ_ATTEMPTS == 5
     assert slept == [40, 80, 160, 320], "must not sleep after the last attempt"
 
@@ -1138,8 +1175,8 @@ def test_the_backoff_is_exponential_and_spans_ten_minutes(tmp_path):
 def test_a_clean_read_never_sleeps(tmp_path):
     mod = _mod(tmp_path)
     slept = []
-    pulls, outcome = _read(mod, _FlakyForge([_pull()], fail_times=0), slept)
-    assert outcome is None and len(pulls) == 1 and slept == []
+    pr, outcome = _read(mod, _FlakyForge([_pull()], fail_times=0), slept)
+    assert outcome is None and pr is not None and slept == []
 
 
 def test_verification_survives_a_flaky_listing_end_to_end(tmp_path):

@@ -21,6 +21,10 @@
   configuration change, not a reviewed merge.
   **Plan 0070, 2026-09-22** — §6's settings-source sentence is refined: a pin
   where the CLI has a flag for it, a checked precondition where it does not.
+  **Plan 0101, 2026-10-11** — §6's isolation outside the CLI now exists for codex as a
+  sandbox profile ([plan](../../plans/0101-the-codex-tester-is-confined.md)); §6's text
+  stays true (the CLI still cannot confine reads). The runner was wired on 2026-10-13,
+  on that plan's live measurement.
 - **Relates:** [ADR-0005](0005-pinned-repo-reads.md), whose tool-grant rule this
   depends on; `plans/0013-fleet-repo-enable.md`, whose unbuilt second half is
   a hard prerequisite (§1).

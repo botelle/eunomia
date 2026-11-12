@@ -55,20 +55,27 @@ def _write_transcript(root, project, sid, lines, subagent_of=None):
     return p
 
 
-def _collect(tmp_path, monkeypatch, projects, fleet_dir=None, work_root=None):
+def _collect(tmp_path, monkeypatch, projects, fleet_dir=None, work_root=None,
+             writer_transcripts=None):
     """Run the collector against a fake ~/.claude/projects, return db path.
 
     FLEET_DIR/WORK_ROOT are ALWAYS isolated to a tmp path too, even when the
     caller has no interest in events or run logs: this collector's default
     FLEET_DIR is the real `~/dev/.fleet`, and every session running this
     suite is itself a fleet worker with a real one on disk. Leaving it
-    unmocked would ingest live production events into a test's throwaway DB."""
+    unmocked would ingest live production events into a test's throwaway DB.
+    `writer_transcripts` is similarly isolated, but defaults to UNSET rather
+    than a throwaway path: `_writer_transcripts_root()` already reads nothing
+    once FLEET_DIR is relocated (plan 0197 D1), so most callers need not set
+    it at all."""
     mod = _load("fleet-collect")
     db = tmp_path / "fleet.db"
     monkeypatch.setattr(mod, "PROJECTS", projects)
     monkeypatch.setattr(mod, "DB", db)
     monkeypatch.setattr(mod, "FLEET_DIR", fleet_dir or (tmp_path / "no-fleet-dir"))
     monkeypatch.setattr(mod, "WORK_ROOT", work_root or (tmp_path / "no-work-root"))
+    if writer_transcripts is not None:
+        monkeypatch.setenv("FLEET_WRITER_TRANSCRIPTS", str(writer_transcripts))
     mod.main()
     return db
 
@@ -494,6 +501,13 @@ def _write_run_log(fleet_dir, lease, lines):
     d = fleet_dir / "work" / "logs"
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{lease}.log"
+    p.write_text("\n".join(lines) + "\n")
+    return p
+
+
+def _write_writer_transcript(root, filename, lines):
+    root.mkdir(parents=True, exist_ok=True)
+    p = root / filename
     p.write_text("\n".join(lines) + "\n")
     return p
 
@@ -1101,3 +1115,223 @@ def test_the_views_are_classified_as_neither_table_set(tmp_path):
     views = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='view'")}
     assert {"dispatch", "dispatch_session", "dispatch_cost"} <= views
     assert not views & (fc.DERIVED_TABLES | fc.DURABLE_TABLES)
+
+
+# -------------------------------------------- plan 0197 D1: writer transcripts
+def test_writer_transcript_codex_ingests_tokens_and_model(tmp_path, monkeypatch):
+    fleet = tmp_path / "fleet"
+    wt = tmp_path / "wt"
+    lease = "branch--0197-codex--001"
+    transcript = _write_writer_transcript(wt, f"{lease}.log", [
+        json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 120, "cached_input_tokens": 20,
+            "cache_write_input_tokens": 5, "output_tokens": 30,
+            "reasoning_output_tokens": 10}}),
+    ])
+    _write_run_log(fleet, lease, [
+        _phase("2026-11-08T10:00:00Z", "routed", runner="sub-codex"),
+        _phase("2026-11-08T10:00:01Z", "writer-start", runner="sub-codex", model="gpt-6-astra"),
+        _phase("2026-11-08T10:00:30Z", "implementer-exit", rc=0, timed_out=False,
+               seconds=29, transcript=str(transcript.resolve()), shapes="-",
+               peak_rss_mb=10, rss_samples=1, orch_rss_mb=5),
+    ])
+    db = _collect(tmp_path, monkeypatch, tmp_path / "projects", fleet_dir=fleet,
+                  work_root=fleet / "work", writer_transcripts=wt)
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM session WHERE id=?",
+                      (f"writer/{lease}.log",)).fetchone()
+    assert row is not None
+    assert row["kind"] == "writer-codex"
+    assert row["session_uuid"] == lease
+    assert row["in_tok"] == 100          # 120 input - 20 cached (a subset, not an addition)
+    assert row["out_tok"] == 40          # 30 output + 10 reasoning
+    assert row["cache_read_tok"] == 20
+    assert row["cache_write_tok"] == 5
+    assert json.loads(row["models"]) == ["gpt-6-astra"]
+
+
+def test_writer_transcript_antigravity_ingests_tokens_and_model(tmp_path, monkeypatch):
+    fleet = tmp_path / "fleet"
+    wt = tmp_path / "wt"
+    lease = "branch--0197-antigravity--001"
+    transcript = _write_writer_transcript(wt, f"{lease}.log", [
+        json.dumps({"event": "result", "result": {
+            "response": "done", "usage": {
+                "promptTokenCount": 200, "cachedContentTokenCount": 50,
+                "candidatesTokenCount": 60, "thoughtsTokenCount": 15}}}),
+    ])
+    _write_run_log(fleet, lease, [
+        _phase("2026-11-08T10:00:00Z", "routed", runner="sub-antigravity"),
+        _phase("2026-11-08T10:00:01Z", "writer-start", runner="sub-antigravity",
+               model="gemini-4-argon-high"),
+        _phase("2026-11-08T10:00:30Z", "implementer-exit", rc=0, timed_out=False,
+               seconds=29, transcript=str(transcript.resolve()), shapes="-",
+               peak_rss_mb=10, rss_samples=1, orch_rss_mb=5),
+    ])
+    db = _collect(tmp_path, monkeypatch, tmp_path / "projects", fleet_dir=fleet,
+                  work_root=fleet / "work", writer_transcripts=wt)
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM session WHERE id=?",
+                      (f"writer/{lease}.log",)).fetchone()
+    assert row is not None
+    assert row["kind"] == "writer-antigravity"
+    assert row["in_tok"] == 150          # 200 prompt - 50 cached
+    assert row["out_tok"] == 75          # 60 candidates + 15 thoughts
+    assert row["cache_read_tok"] == 50
+    assert row["cache_write_tok"] is None    # Gemini's usageMetadata has no such field
+    assert json.loads(row["models"]) == ["gemini-4-argon-high"]
+
+
+def test_writer_transcript_muse_ingests_tokens_and_model(tmp_path, monkeypatch):
+    fleet = tmp_path / "fleet"
+    wt = tmp_path / "wt"
+    lease = "branch--0197-muse--001"
+    transcript = _write_writer_transcript(wt, f"{lease}.log", [
+        json.dumps({"payload_type": "run.usage", "payload": {"models": [
+            {"model": "muse-wonder-1.0", "input_tokens": 80, "cached_tokens": 10,
+             "output_tokens": 25, "reasoning_tokens": 5, "calls": 1}]}}),
+    ])
+    _write_run_log(fleet, lease, [
+        _phase("2026-11-08T10:00:00Z", "routed", runner="sub-muse"),
+        _phase("2026-11-08T10:00:01Z", "writer-start", runner="sub-muse",
+               model="muse-wonder-1.0"),
+        _phase("2026-11-08T10:00:30Z", "implementer-exit", rc=0, timed_out=False,
+               seconds=29, transcript=str(transcript.resolve()), shapes="-",
+               peak_rss_mb=10, rss_samples=1, orch_rss_mb=5),
+    ])
+    db = _collect(tmp_path, monkeypatch, tmp_path / "projects", fleet_dir=fleet,
+                  work_root=fleet / "work", writer_transcripts=wt)
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM session WHERE id=?",
+                      (f"writer/{lease}.log",)).fetchone()
+    assert row is not None
+    assert row["kind"] == "writer-muse"
+    assert row["in_tok"] == 80            # muse's cached_tokens is its own bucket, not a subset
+    assert row["out_tok"] == 30           # 25 output + 5 reasoning
+    assert row["cache_read_tok"] == 10
+    assert row["cache_write_tok"] is None
+    assert json.loads(row["models"]) == ["muse-wonder-1.0"]
+
+
+def test_writer_transcript_reingest_is_idempotent(tmp_path, monkeypatch):
+    fleet = tmp_path / "fleet"
+    wt = tmp_path / "wt"
+    lease = "branch--0197-codex-again--001"
+    transcript = _write_writer_transcript(wt, f"{lease}.log", [
+        json.dumps({"type": "turn.completed",
+                    "usage": {"input_tokens": 10, "output_tokens": 5}}),
+    ])
+    _write_run_log(fleet, lease, [
+        _phase("2026-11-08T10:00:00Z", "routed", runner="sub-codex"),
+        _phase("2026-11-08T10:00:01Z", "writer-start", runner="sub-codex", model="gpt-6-astra"),
+        _phase("2026-11-08T10:00:30Z", "implementer-exit", rc=0, timed_out=False,
+               seconds=29, transcript=str(transcript.resolve()), shapes="-",
+               peak_rss_mb=10, rss_samples=1, orch_rss_mb=5),
+    ])
+    for _ in range(2):
+        db = _collect(tmp_path, monkeypatch, tmp_path / "projects", fleet_dir=fleet,
+                      work_root=fleet / "work", writer_transcripts=wt)
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT COUNT(*) FROM session WHERE id=?",
+                        (f"writer/{lease}.log",)).fetchone()[0] == 1
+    assert con.execute("SELECT COUNT(*) FROM ingest WHERE path=?",
+                        (f"writer/{lease}.log",)).fetchone()[0] == 1
+    assert con.execute("SELECT in_tok, out_tok FROM session WHERE id=?",
+                        (f"writer/{lease}.log",)).fetchone() == (10, 5)
+
+
+def test_claude_writer_transcript_is_not_counted_twice(tmp_path, monkeypatch):
+    """A Claude writer logs no `writer-start` at all (only non-Claude writers do,
+    via `_run_writer`), so this also exercises the `routed`-only fallback."""
+    fleet = tmp_path / "fleet"
+    wt = tmp_path / "wt"
+    lease = "branch--0197-claude--001"
+    transcript = _write_writer_transcript(wt, f"{lease}.log", [
+        "whatever claude's own stream-json happened to say",
+    ])
+    _write_run_log(fleet, lease, [
+        _phase("2026-11-08T10:00:00Z", "routed", runner="sub-sonnet"),
+        _phase("2026-11-08T10:00:01Z", "implementer-start", runner="sub-sonnet"),
+        _phase("2026-11-08T10:00:30Z", "implementer-exit", rc=0, timed_out=False,
+               seconds=29, transcript=str(transcript.resolve()), shapes="-",
+               peak_rss_mb=10, rss_samples=1, orch_rss_mb=5),
+    ])
+    db = _collect(tmp_path, monkeypatch, tmp_path / "projects", fleet_dir=fleet,
+                  work_root=fleet / "work", writer_transcripts=wt)
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT COUNT(*) FROM session WHERE id=?",
+                        (f"writer/{lease}.log",)).fetchone()[0] == 0
+    # Recorded as seen (decided, not retried), never as a failure.
+    assert con.execute("SELECT error FROM ingest WHERE path=?",
+                        (f"writer/{lease}.log",)).fetchone() == (None,)
+
+
+def test_writer_transcript_without_a_matching_run_log_is_not_silently_dropped(tmp_path, monkeypatch):
+    wt = tmp_path / "wt"
+    p = _write_writer_transcript(wt, "branch--0197-orphan--001.log", ["{}"])
+    db = _collect(tmp_path, monkeypatch, tmp_path / "projects", writer_transcripts=wt)
+    con = sqlite3.connect(db)
+    key = f"writer/{p.name}"
+    assert con.execute("SELECT COUNT(*) FROM session WHERE id=?", (key,)).fetchone()[0] == 0
+    err = con.execute("SELECT error FROM ingest WHERE path=?", (key,)).fetchone()
+    assert err is not None and err[0], "no correlation must be recorded, not silent"
+
+
+def test_failed_runners_load_defers_the_whole_sweep_not_marks_seen(tmp_path, monkeypatch):
+    """A failed `_load_orchestrator()` must not fall back to an empty mapping
+    and sweep anyway: every transcript would then miss `_WRITER_FAMILIES`
+    the same way an out-of-scope family does, and get written to `ingest`
+    with NO error -- "seen, nothing to do", which `seen` then matches on
+    every later sweep forever (review of #1432, round 2). The whole sweep
+    must defer instead: nothing ingested, nothing marked seen, so a sweep
+    once RUNNERS loads again picks the transcript up in full."""
+    fleet = tmp_path / "fleet"
+    wt = tmp_path / "wt"
+    lease = "branch--0197-runners-fail--001"
+    transcript = _write_writer_transcript(wt, f"{lease}.log", [
+        json.dumps({"type": "turn.completed",
+                    "usage": {"input_tokens": 10, "output_tokens": 5}}),
+    ])
+    _write_run_log(fleet, lease, [
+        _phase("2026-11-08T10:00:00Z", "routed", runner="sub-codex"),
+        _phase("2026-11-08T10:00:01Z", "writer-start", runner="sub-codex", model="gpt-6-astra"),
+        _phase("2026-11-08T10:00:30Z", "implementer-exit", rc=0, timed_out=False,
+               seconds=29, transcript=str(transcript.resolve()), shapes="-",
+               peak_rss_mb=10, rss_samples=1, orch_rss_mb=5),
+    ])
+    mod = _load("fleet-collect")
+    db = tmp_path / "fleet.db"
+    monkeypatch.setattr(mod, "PROJECTS", tmp_path / "projects")
+    monkeypatch.setattr(mod, "DB", db)
+    monkeypatch.setattr(mod, "FLEET_DIR", fleet)
+    monkeypatch.setattr(mod, "WORK_ROOT", fleet / "work")
+    monkeypatch.setenv("FLEET_WRITER_TRANSCRIPTS", str(wt))
+    good_load = mod._load_orchestrator
+    mod._load_orchestrator = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    mod.main()
+    con = sqlite3.connect(db)
+    key = f"writer/{lease}.log"
+    assert con.execute("SELECT COUNT(*) FROM session WHERE id=?", (key,)).fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM ingest WHERE path=?", (key,)).fetchone()[0] == 0
+    con.close()
+
+    mod._load_orchestrator = good_load
+    mod.main()
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT kind FROM session WHERE id=?", (key,)).fetchone()
+    assert row == ("writer-codex",)
+    con.close()
+
+
+def test_writer_transcripts_root_is_not_read_from_a_relocated_fleet_dir(tmp_path, monkeypatch):
+    """`_writer_transcripts_root()` must not default to the REAL
+    ~/dev/.orchestrator-transcripts once FLEET_DIR has been relocated — every
+    other test in this file relies on exactly this to stay isolated from the
+    host running the suite."""
+    mod = _load("fleet-collect")
+    monkeypatch.delenv("FLEET_WRITER_TRANSCRIPTS", raising=False)
+    monkeypatch.setattr(mod, "FLEET_DIR", tmp_path / "no-fleet-dir")
+    assert mod._writer_transcripts_root() is None

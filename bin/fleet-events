@@ -53,6 +53,12 @@ EVENT_TYPES = {
     # blocked, or the reason changes), never once per cycle. No `plan-unblocked`:
     # a plan that clears its block already produces `plan-dispatched`.
     "plan-blocked",
+    # plan 0161 (ADR-0027): an implementer stopped on a question the plan does
+    # not decide. The lease is held; this is not a failure.
+    "plan-question",
+    # plan 0162 (ADR-0027 §3): the owner or the intakebot gateway answered it. `detail`
+    # carries ids and times only -- the answer text stays in the forge thread.
+    "question-answered",
     "budget-checkpoint",
     # plan 0025: a capability (skill, script, policy, repo) changed under
     # long-running sessions. Awareness only — never an input to automation.
@@ -65,6 +71,11 @@ EVENT_TYPES = {
     # ledger after `fleet.db` is lost. `detail` carries runner names, positions and
     # ordinals ONLY — never a credential; see SPEC.md "repo-model-changed".
     "repo-model-changed",
+    # plan 0178: a reviewer seat's repo/change access setting changed
+    # (`bin/fleet-models access set`, one event per `seat_access_change` row);
+    # makes `seat_access` derivable from the ledger. `detail` carries position,
+    # ordinal and old/new access ONLY; see SPEC.md "seat-access-changed".
+    "seat-access-changed",
     # plan 0068: a fleet-scoped setting changed (`bin/fleet-config`, one event
     # per `fleet_setting_change` row) — the same durability shape as
     # `repo-model-changed`, on a plainer table. `detail` carries the setting's
@@ -74,6 +85,26 @@ EVENT_TYPES = {
     # dispatch lease so the watcher can dispatch the plan again. `detail`:
     # plan, lease, class, attempt, limit.
     "plan-requeued",
+    # plan 0090 / ADR-0016: `bin/mopsus` retried a review that stopped on a
+    # usage limit, once the limit reset. `detail`: kind, repo, pr, head,
+    # plan, lease, attempt, limit.
+    "review-requeued",
+    # plan 0083: `bin/fleet-followups` posted a triage comment on a deferred-
+    # findings issue (`detail`: issue, sha, counts, recommendation), or closed
+    # one on the owner's `close` verb (`detail`: issue, verb_author).
+    "followup-triaged", "followup-closed",
+    # plan 0094: `bin/fleet-quota` moved a usage-limit gate. `detail`: scope
+    # (session, weekly, model:<bucket>), by, evidence, resets_at, and percent
+    # when a meter read one. Awareness and the ledger record -- never an input
+    # to a decision other than the gate's own row.
+    "quota-closed", "quota-opened",
+    # plan 0104: test-lane dispatch, skip and end (see bin/fleet-emit).
+    "lane-dispatched", "lane-skipped", "lane-ended",
+    # plan 0146: the credits window (see bin/fleet-emit).
+    "credits-window-opened", "credits-window-closed", "credits-spent",
+    "credits-cap-reached", "credits-reservation-expired", "credits-refused",
+    # plan 0166: intakebot jobs billed by grant (see bin/fleet-emit).
+    "credits-grant-given", "credits-grant-revoked", "credits-job-spent",
 }
 
 _ARCHIVE_RE = re.compile(r"^events-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.jsonl$")

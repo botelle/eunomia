@@ -1,0 +1,131 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "plan 0102 D5 — the one document bin/fleet-meet writes, to <work root>/meetings/<plan>/<impl-sha12>/findings.json. Plan 0103 reads only this plus code. Structured fields (shas, hashes, outcomes) are values and are pinned by `pattern` and `enum`; `reason` is vendor-authored free text, redacted and bounded to 4000 characters. A skip is its own outcome and is never a pass; `all_passed` is false whenever one exists. additionalProperties is false at every level on purpose.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "plan", "generated_at", "impl", "lanes", "not_run", "comparable", "comparability", "all_passed", "confinement"],
+  "properties": {
+    "schema": {"type": "string", "enum": ["meeting-findings/1"]},
+    "repo": {"type": "string"},
+    "plan": {"type": "string"},
+    "generated_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+    "impl": {
+      "type": "object", "additionalProperties": false, "required": ["pr", "head_sha"],
+      "properties": {"pr": {"type": "integer"}, "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}}
+    },
+    "lanes": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["pr", "head_sha", "branch", "runner", "dispatch_sha", "prompt_sha256", "prompt_sha256_source",
+                     "prompt_sha256_verified", "prompt_sha256_reason", "prompt_sha256_lane_run", "review_id", "read_by",
+                     "read_at", "independent_reader", "files", "run", "counts", "tests"],
+        "properties": {
+          "pr": {"type": "integer"},
+          "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$", "$comment": "the APPROVED sha: read once, fetched and run, never re-read from the branch"},
+          "branch": {"type": "string"},
+          "runner": {"type": "string"},
+          "dispatch_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+          "prompt_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+          "prompt_sha256_source": {"type": ["string", "null"], "enum": ["pr-body", "lane_run", null]},
+          "prompt_sha256_verified": {"type": "boolean"},
+          "prompt_sha256_reason": {"type": ["string", "null"]},
+          "prompt_sha256_lane_run": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+          "review_id": {"type": ["integer", "null"]},
+          "read_by": {"type": "string"},
+          "read_at": {"type": "string"},
+          "reader": {"type": "string", "enum": ["human", "reviewers"], "$comment": "plan 0138: who read the lane. `human` is the merger role's approval, accepted on any repository. `reviewers` is both code reviewers' tool-less approvals at the head with different models, accepted only on an autonomous repository (ADR-0019 §3-§4); then read_by is their accounts joined with ',', review_id is the first one's, and read_at the later submission. Optional so a document written before plan 0138 still validates."},
+          "review_ids": {"type": "array", "items": {"type": "integer"}, "$comment": "every reading review's id, in read_by order; a review the forge returned without an id is left out, never written as null"},
+          "independent_reader": {"type": "boolean", "enum": [false], "$comment": "always false: the human also approves the implementation (ADR-0006 §5), and on an autonomous repository so do the two reviewers who read the lane (plan 0138) — recorded, not counted as independent"},
+          "files": {"type": "array", "items": {"type": "string"}},
+          "run": {
+            "type": "object", "additionalProperties": false,
+            "required": ["outcome", "pytest_exit", "duration_s", "reason"],
+            "properties": {
+              "outcome": {"type": "string", "enum": ["ran", "timeout", "collection-error", "refused"]},
+              "pytest_exit": {"type": ["integer", "null"]},
+              "duration_s": {"type": "number"},
+              "reason": {"type": ["string", "null"]}
+            }
+          },
+          "counts": {
+            "type": "object", "additionalProperties": false, "required": ["pass", "fail", "error", "skip"],
+            "properties": {"pass": {"type": "integer"}, "fail": {"type": "integer"},
+                           "error": {"type": "integer"}, "skip": {"type": "integer"}}
+          },
+          "tests": {
+            "type": "array",
+            "items": {
+              "type": "object", "additionalProperties": false,
+              "required": ["id", "outcome", "pytest_outcome", "reason", "reason_redacted", "source_path", "duration_s"],
+              "properties": {
+                "id": {"type": "string"},
+                "outcome": {"type": "string", "enum": ["pass", "fail", "error", "skip"]},
+                "pytest_outcome": {"type": "string", "enum": ["passed", "failed", "error", "skipped", "xfailed", "xpassed"]},
+                "reason": {"type": ["string", "null"]},
+                "reason_redacted": {"type": "array", "items": {"type": "string"}},
+                "source_path": {"type": "string"},
+                "duration_s": {"type": "number"},
+                "covers": {"type": "array", "items": {"type": "string"}, "$comment": "plan 0142: the plan item ids the test's `covers` markers name. Optional so a document written before plan 0142 still validates."},
+                "covers_unknown": {"type": "array", "items": {"type": "string"}, "$comment": "plan 0142: ids in `covers` that the plan at the implementation head does not list; absent when that plan could not be read"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "not_run": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["pr", "head_sha", "reason"],
+        "properties": {"pr": {"type": "integer"}, "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+                       "reason": {"type": "string"}}
+      }
+    },
+    "comparable": {"type": ["boolean", "null"]},
+    "comparability": {"type": ["string", "null"]},
+    "comparison": {
+      "type": "object", "additionalProperties": false,
+      "required": ["items", "untagged", "lanes_missing", "partial", "gaps"],
+      "$comment": "plan 0143: present only when `comparable` is true. A count over recorded outcomes; no model writes it. Optional so a document written before plan 0143 still validates.",
+      "properties": {
+        "items": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "text", "lanes", "verdict"],
+          "properties": {
+            "id": {"type": "string"},
+            "text": {"type": "string", "$comment": "the item's first line, from the plan at the implementation head; empty when that plan could not be read"},
+            "lanes": {"type": "object", "$comment": "runner -> counts", "additionalProperties": {"type": "object", "additionalProperties": false, "required": ["tests", "pass", "fail", "skip"], "properties": {"tests": {"type": "integer"}, "pass": {"type": "integer"}, "fail": {"type": "integer", "$comment": "failed and errored"}, "skip": {"type": "integer"}}}},
+            "verdict": {"type": "string", "enum": ["agree-pass", "agree-fail", "disagree", "one-lane", "uncovered", "inconclusive"], "$comment": "inconclusive: every lane covers the item, no lane's tests all pass, and not every lane has a failure (skips)"}
+          }}},
+        "untagged": {"type": "object", "$comment": "runner -> the tests with no `covers`", "additionalProperties": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "outcome"],
+          "properties": {"id": {"type": "string"}, "outcome": {"type": "string", "enum": ["pass", "fail", "error", "skip"]}}}}},
+        "lanes_missing": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["runner", "pr", "reason"],
+          "properties": {"runner": {"type": ["string", "null"]}, "pr": {"type": ["integer", "null"]}, "reason": {"type": "string"}}}},
+        "partial": {"type": "boolean"},
+        "gaps": {"type": "object", "$comment": "runner -> the lane's gaps as written, or null when its PR body's block did not parse", "additionalProperties": {"type": ["array", "null"], "items": {"type": "string"}}}
+      }
+    },
+    "all_passed": {"type": "boolean"},
+    "confinement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profile_sha256", "network", "env_keys", "timeout_seconds"],
+      "properties": {
+        "profile_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "network": {
+          "type": "object", "additionalProperties": false,
+          "required": ["outbound", "bind", "denied_ports"],
+          "$comment": "#677's measured record: SBPL cannot express a loopback-only bind on this host, so this says what the profile actually does, pinned exactly (this repo's validate_schema has no `const`, so each value is a one-member `enum`). The string 'loopback-only' appears nowhere in this document. A profile change that alters what these mean has to change this schema and say so.",
+          "properties": {
+            "outbound": {"type": "string", "enum": ["this-host-only"]},
+            "bind": {"type": "string", "enum": ["any-local-address"]},
+            "denied_ports": {"type": "array", "items": {"type": "integer"}, "enum": [[8200]]}
+          }
+        },
+        "env_keys": {"type": "array", "items": {"type": "string"}},
+        "timeout_seconds": {"type": "integer"}
+      }
+    }
+  }
+}

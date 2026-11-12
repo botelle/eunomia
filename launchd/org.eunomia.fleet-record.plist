@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-record — records each merge's change evidence (plans 0119, 0121).
+
+  Runs `fleet-record once` every 300 s, so a merge is recorded inside the
+  15-minute `observed` window. The repositories come from the pinned
+  config/repos.conf (plan 0134); FLEET_WATCH_REPOS is not read by the recorder.
+  The token comes from the recordbot helper named by FLEET_RECORD_TOKEN_CMD.
+
+  Install (opshost):
+    mkdir -p ~/dev/.fleet
+    cp launchd/org.eunomia.fleet-record.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.eunomia.fleet-record.plist
+
+  RUNS FROM THE PINNED WORKTREE, not ~/dev/eunomia (ADR-0005). The pin is a
+  detached worktree of this repo at ~/.local/share/pins/eunomia.
+
+  No ProcessType, deliberately: Background throttles a job about 4x on these
+  hosts, which is no way to treat a job with a deadline. No token is set here.
+
+  PIN PROVENANCE: ~/.local/share/pins/eunomia/bin/fleet-record below is
+  provided by operator/eunomia (plan 0119, added in c766c6a; the pinned
+  config/repos.conf read is from plan 0136, 7437a4d). The unit must not be
+  bootstrapped until the pin contains that file:
+    test -x ~/.local/share/pins/eunomia/bin/fleet-record   # must succeed
+  fleet-pin-advance moves the pin; confirm it before install.
+
+  TOKEN HELPER (ADR-0022 section 4): FLEET_RECORD_TOKEN_CMD below is
+  ~/bin/fetch-forgejo-recordbot-token.sh, provided by operator/hosttools,
+  bin/fetch-forgejo-recordbot-token.sh, installed at ~/bin/, at d663d23 (its
+  last change). Contract relied on: takes NO arguments, prints the recordbot
+  PAT on stdout, exits non-zero when it cannot.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.eunomia.fleet-record</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/operator/.local/share/pins/eunomia/bin/fleet-record</string>
+    <string>once</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>FLEET_RECORDER_ACCOUNT</key><string>recordbot</string>
+    <key>FLEET_RECORD_TOKEN_CMD</key><string>/Users/operator/bin/fetch-forgejo-recordbot-token.sh</string>
+    <key>FLEET_ATTEST_SPOOL</key><string>/Users/operator/dev/.fleet/recordstore-spool</string>
+  </dict>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/operator/dev/.fleet/fleet-record.log</string>
+  <key>StandardErrorPath</key><string>/Users/operator/dev/.fleet/fleet-record.log</string>
+</dict>
+</plist>

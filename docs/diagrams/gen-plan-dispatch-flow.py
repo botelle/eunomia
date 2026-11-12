@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan-dispatch flow, v1.10 — ignition gate, implementation lane, and black-box test lanes.
+"""Plan-dispatch flow, v1.11 — ignition gate, implementation lane, and black-box test lanes.
 
 Publishable by construction: no third-party name, no client name, and no
 per-repo enrollment example. What a repo decided is its own business; what the
@@ -87,9 +87,9 @@ e('''<style>
 e(f'<rect class="bg" x="0" y="0" width="{W}" height="{H}" fill="#ffffff"/>')
 
 label(950, 52, "Plan dispatch — the gate, the lane, and black-box tests", "t", "middle")
-label(950, 76, "Version 1.10 — 2026-09-13 by Fleet Operator", "sub", "middle")
+label(950, 76, "Version 1.11 — 2026-09-27 by Fleet Operator", "sub", "middle")
 label(60, 46, "Tracing: one feature plan, from draft to merge.", "n")
-label(60, 62, "Test lanes are opt-in per repo, default off. Setting the flag is a configuration change.", "n")
+label(60, 62, "Every repository has a test lane. Who tests and who reviews is per-repo configuration (ADR-0013).", "n")
 label(60, 78, "The implementation lane is built; the test lanes are not.", "n")
 
 # legend
@@ -111,9 +111,9 @@ label(1578, ly + 12, "HUMAN", "b"); label(1640, ly + 12, "a person decides", "b"
 # --- row 1
 box(140, 150, 360, 156, "ship", "① Planning session",
     ["A prompt from any stakeholder. Opus turns", "it into one plan file per feature, opened", "as a plan PR."],
-    ["Via intakebot it also routes the architecture,", "security and privacy questions to a human", "BEFORE there is a plan to review."], "SHIPPED", act="agent")
+    ["Via the gateway it also routes architecture,", "security and privacy questions to a human", "BEFORE there is a plan to review."], "SHIPPED", act="agent")
 # mopsus sits under the planning session on purpose: a failure re-enters the
-# flow the same way new work does — through a human, reachable by intakebot — and
+# flow the same way new work does — through a human, reachable through the gateway — and
 # drawing it anywhere else hides that they are one door.
 box(140, 360, 360, 150, "ship", "mopsus — a failure gets a handle",
     ["Composes a brief from the failed run and", "pages it with a handle. Opens a session", "holding the plan, the reason and the log."],
@@ -122,7 +122,7 @@ box(140, 360, 360, 150, "ship", "mopsus — a failure gets a handle",
 poly([(140, 1470), (80, 1470), (80, 435), (136, 435)], "fail")
 label(88, 1430, "failures", "n")
 poly([(320, 360), (320, 314)], "ret")
-label(330, 336, "a handle, via intakebot or a page", "n")
+label(330, 336, "a handle, via the gateway or a page", "n")
 
 e('<rect class="zone" x="580" y="150" width="420" height="180" rx="8"/>')
 label(596, 174, "plans/ on a branch", "h")
@@ -175,14 +175,13 @@ box(140, 1420, 420, 100, "gate", "Minos: you merge the code PR",
     ["Records which test lanes ran — a PR that", "silently lost them is a false green."], act="human")
 
 # --- test lane
-box(1020, 946, 420, 136, "todo", "Repo opted in?",
-    ["config/repos.conf, default off — an untouched", "repo discloses nothing.",
-     "Setting it either way is a configuration", "change, not a reviewed merge."],
-    (), "TO BUILD", act="mech")
-poly([(1230, 1082), (1230, 1108)])
-box(1020, 1112, 420, 130, "ship", "Bundle builder — first party",
-    ["Generated contract only: OpenAPI or --help,", "event names, config keys, harness entry."],
-    ["No source. Nothing is present unless code put it there."], "SHIPPED", act="mech")
+box(1020, 946, 420, 296, "ship", "Every repo's test lane — no consent flag",
+    ["No flag in config/repos.conf gates this: every repo", "has a test lane. Which runner holds `tester` is the",
+     "disclosure decision, made per repo in fleet-models.",
+     "Ordinal 1 resolves from the repo's own row, else the", "'default' row (`sub-opus` — Anthropic, which already",
+     "holds the code, so the default discloses nothing new)."],
+    ["Bundle builder — first party. Generated contract only:", "OpenAPI or --help, event names, config keys, harness",
+     "entry. No source. Nothing is present unless code put", "it there."], "SHIPPED", act="mech")
 poly([(1230, 1242), (1230, 1276)], "bus")
 poly([(1120, 1276), (1340, 1276)], "bus")
 poly([(1120, 1276), (1120, 1312)])
@@ -227,14 +226,14 @@ for i, s in enumerate(["A tester who reads the source writes", "tests shaped by 
 
 e('<rect class="panel" x="1560" y="798" width="300" height="250" rx="8"/>')
 label(1578, 826, "Where the decision lives", "h")
-for i, s in enumerate(["Mechanism and default-off: an ADR", "in eunomia.", "",
-                       "Per-repo answer: config/repos.conf,", "read from main. Setting it is a", "configuration change, not a merge.", "",
-                       "A refusal: an ADR in the repo", "that refused, so the absence reads", "as decided, not overlooked."]):
+for i, s in enumerate(["Every repo is tested: ADR-0013, not a", "flag in config/repos.conf.", "",
+                       "Who tests, who reviews: fleet-models,", "read from main. Setting either is a", "configuration change, not a merge.", "",
+                       "A same-family check: recorded, not", "refused — the review or test names", "its model (ADR-0013 §5-6)."]):
     label(1578, 852 + i * 18, s, "b")
 
 e('<rect class="panel" x="1560" y="1082" width="300" height="214" rx="8"/>')
 label(1578, 1110, "What is actually built", "h")
-for i, s in enumerate(["fleet-watch, the plan format,", "repo enrollment, plan review,", "bin/fleet-bundle and mopsus:", "shipped. Orchestrator: the whole", "wrapper — lease, session, review", "loop, steward, freeze.", "",
+for i, s in enumerate(["fleet-watch, the plan format,", "repo enrollment, plan review,", "bin/fleet-bundle, the tester gate", "in fleet-lane, and mopsus: shipped.", "Orchestrator: the whole wrapper —", "lease, session, review loop, steward.", "",
                        "The IGNITION GATE and the test", "lane are specified and not built."]):
     label(1578, 1136 + i * 18, s, "b")
 

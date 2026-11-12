@@ -9,14 +9,20 @@ migrated this tool onto `fleetforge.Forge`, that dispatcher is wrapped by
 Fake, so the Fake's own routing table needed no changes; only the injection
 point (`_wire`, below) moved from `om._api` to `om._forge`.
 """
+import base64
 import importlib.machinery
 import importlib.util
 import json
+import os
 import re
+import stat
+import time
 import urllib.parse
 from pathlib import Path
 
 import pytest
+
+from test_fleet_watch import _broker_double
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 
@@ -976,3 +982,340 @@ def test_every_forge_call_is_a_read_verb(om, monkeypatch, tmp_path):
     om.main([])
     assert fake.forge_double.verbs_used
     assert set(fake.forge_double.verbs_used) <= _READ_VERBS
+
+
+# --- plan 0091: a `respawn` whose marked PR is open resumes rather than -----
+# --- rebuilds the branch -----------------------------------------------------
+#
+# These load `bin/fleet-watch` directly rather than `bin/fleet-orphans` — the
+# feature lives in `spawn()`/`orphan_sweep`, not in this file's own tool. A
+# fresh, minimal double is built here rather than reusing
+# `tests/test_fleet_watch._ForgeDouble`: that class predates the `get_contents`
+# read `_branch_on_origin` makes at `ref=<branch>`, and it is a fixture this
+# plan's `paths:` lease does not cover.
+
+FW_BIN = Path(__file__).resolve().parent.parent / "bin"
+
+# Every env var `bin/fleet-watch` reads at import (mirrors
+# `tests/test_fleet_watch._WATCH_ENV`) — reset before each load so one test's
+# environment cannot leak into the next.
+_FW_ENV = ("FLEET_WATCH_REPOS", "FLEET_WATCH_CAP", "FLEET_OPERATOR_UID",
+           "FLEET_PR_PAGE_CAP", "FLEET_ORCHESTRATOR", "FLEET_NTFY_URL",
+           "FLEET_IMPLEMENTER_UIDS", "FLEET_IMPLEMENTER_LOGINS",
+           "FLEET_AGENT_ACCOUNTS", "FLEET_PINS", "FLEET_FORGEJO_URL",
+           "FLEET_DISPATCH_IMPL", "FLEET_VERDICT_SOURCE",
+           "FLEET_DIRECT_TOKEN_CMD", "FLEET_PIN_ADVANCE_PLIST",
+           "FLEET_PIN_PAGE_MARGIN", "FLEET_DB", "FLEET_WORK_ROOT")
+
+FW_PLAN = """---
+id: 0009-thing
+status: ready
+repo: operator/sniff
+zone: public
+tier: 2
+---
+# Thing
+"""
+
+
+def _load_fw(fleet_dir, **env):
+    os.environ["EUNOMIA_FLEET_DIR"] = str(fleet_dir)
+    os.environ["EUNOMIA_SESSION"] = "watch-resume-test"
+    os.environ.pop("EUNOMIA_LEDGER_HOST", None)
+    for k in _FW_ENV:
+        os.environ.pop(k, None)
+    os.environ["FLEET_SPAWN"] = "popen"
+    os.environ["FLEET_PIN_ADVANCE_PLIST"] = str(
+        Path(fleet_dir) / "no-such-pin-advance.plist")
+    for k, v in env.items():
+        os.environ[k] = v
+    loader = importlib.machinery.SourceFileLoader(
+        "fleet_watch_resume", str(FW_BIN / "fleet-watch"))
+    spec = importlib.util.spec_from_loader("fleet_watch_resume", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    mod.fleetjob.JOB_DIR = Path(fleet_dir) / "jobs"
+    return mod
+
+
+class _FwForge:
+    """The five `fleetforge.Forge` verbs `bin/fleet-watch` calls, built from a
+    `(method, path, body=None, token=None) -> (status, body)` dispatcher —
+    the same shape `tests/test_fleet_watch._ForgeDouble` uses, kept as its own
+    small class here rather than imported from that file (out of this plan's
+    lease)."""
+
+    def __init__(self, dispatch, token=None):
+        self._dispatch = dispatch
+        self.token = token
+        self.paths = []
+
+    def __call__(self, method, path, body=None, token=None):
+        self.paths.append(path)
+        return self._dispatch(method, path, body,
+                              token if token is not None else self.token)
+
+    def get_branch_protections(self, repo):
+        return self("GET", f"/repos/{repo}/branch_protections")
+
+    def list_contents(self, repo, dir, ref=None):
+        q = f"?ref={ref}" if ref else ""
+        return self("GET", f"/repos/{repo}/contents/{dir}{q}")
+
+    def get_contents(self, repo, path, ref=None):
+        q = f"?ref={ref}" if ref else ""
+        return self("GET", f"/repos/{repo}/contents/{path}{q}")
+
+    def list_pulls(self, repo, state="all", page=1, limit=50, sort=None):
+        q = f"state={state}&limit={limit}&page={page}"
+        if sort:
+            q += f"&sort={sort}"
+        return self("GET", f"/repos/{repo}/pulls?{q}")
+
+    def list_pull_issues(self, repo, state="all", page=1, limit=50):
+        return self("GET", f"/repos/{repo}/issues?type=pulls&state={state}"
+                           f"&limit={limit}&page={page}")
+
+    def list_issue_comments(self, repo, n, since=None, page=1, limit=50):
+        path = f"/repos/{repo}/issues/{n}/comments"
+        if since:
+            path += f"?since={urllib.parse.quote(str(since))}"
+        return self("GET", path)
+
+
+def _fw_contents_file(text):
+    return {"content": base64.b64encode(text.encode()).decode()}
+
+
+def _fw_contents_list(names):
+    return [{"name": n, "type": "file"} for n in names]
+
+
+def _fw_issue_shape(pr):
+    """One `pulls=` fixture row reshaped the way the issues index carries it
+    (plan 0218): `merged`/`merged_at` nested under `pull_request`, `head`
+    dropped."""
+    rest = {k: v for k, v in pr.items() if k not in ("merged", "merged_at", "head")}
+    rest["pull_request"] = {"merged": pr.get("merged"), "merged_at": pr.get("merged_at")}
+    return rest
+
+
+def _fw_api(plan_text=FW_PLAN, plans=("0009-thing.md",), pulls=None,
+           comments=None, branch_status=200):
+    """A minimal Forgejo double for `bin/fleet-watch`.
+
+    `branch_status` is what a `get_contents` read at `ref=<the candidate
+    branch>` answers — 200 (branch present on origin), 404 (absent), or
+    anything else to model an inconclusive/unreadable forge read. A read at
+    `ref=main` always succeeds, matching `_plan_by_id`'s own expectation."""
+    def _api(method, path, body=None, token=None):
+        if path.endswith("/contents/plans?ref=main"):
+            return 200, _fw_contents_list(plans)
+        if "/contents/plans/" in path:
+            if "ref=main" in path:
+                return 200, _fw_contents_file(plan_text)
+            if branch_status == 200:
+                return 200, _fw_contents_file(plan_text)
+            return branch_status, None
+        if "/pulls?" in path:
+            return 200, ((pulls or []) if "page=1" in path else [])
+        if "/issues?" in path and "type=pulls" in path:
+            # `_pull_pages`'s own listing since plan 0218 — the same rows as
+            # `/pulls?` above, reshaped into the issues index's item shape.
+            rows = [_fw_issue_shape(p) for p in (pulls or [])]
+            return 200, (rows if "page=1" in path else [])
+        if "/issues/" in path and "/comments" in path:
+            return 200, list(comments or [])
+        return 404, None
+    return _FwForge(_api)
+
+
+def _wire_fw(mod, api):
+    def _forge_builder(token):
+        api.token = token
+        return api
+    mod._forge = _forge_builder
+    mod._token = lambda: ("tok", "")
+    # The protection verdict is its own well-tested subsystem
+    # (tests/test_fleet_watch.py); stubbed straight to PROT_OK here so these
+    # tests exercise only the resume-mode decision plan 0091 adds.
+    mod.verdict = lambda repo: (mod.PROT_OK, "", None)
+    # Likewise the human-merge dispatch check (plan 0106 D6, ADR-0019 §2) is
+    # tested in tests/test_fleet_watch.py; these tests exercise resume only.
+    mod.plan_merged_by_human = lambda repo, path, token: (True, "")
+    # `cycle()` still runs the broker pre-flight (`broker_reachable()`) before
+    # any per-repo verdict, and `_load_fw` pops FLEET_VERDICT_SOURCE so the
+    # broker source is always selected. Without the double that pre-flight
+    # dials the real ~/run/forgejo-broker.sock: on a host without it `cycle()`
+    # scans nothing, and on a host with it a unit test calls production.
+    mod._broker_get = _broker_double(mod)
+
+
+def _fw_stub_orchestrator(tmp_path):
+    """Records the FULL argv (not fixed positional slots, unlike
+    `tests/test_fleet_watch._stub_orchestrator`) — DoD 1 is about where
+    `--resume` lands in that argv, which a fixed-slot log would hide."""
+    log = tmp_path / "argv.log"
+    s = tmp_path / "orch-resume-stub.sh"
+    s.write_text('#!/bin/sh\n[ "$1" = "--ready" ] && exit 0\n'
+                 f'echo "$@" >> {log}\n')
+    s.chmod(s.stat().st_mode | stat.S_IXUSR)
+    return str(s), log
+
+
+def _wait_lines(log, n, timeout=5.0):
+    """Spawns are DETACHED (same reason as
+    `tests/test_fleet_watch._wait_spawns`) — wait for a KNOWN line count
+    rather than reading the log bare."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        cur = log.read_text().splitlines() if log.exists() else []
+        if len(cur) >= n:
+            return cur
+        time.sleep(0.05)
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def test_spawn_without_resume_produces_todays_argv(tmp_path):
+    fd = tmp_path / "fleet"
+    mod = _load_fw(fd, FLEET_WATCH_REPOS="operator/sniff")
+    orch, log = _fw_stub_orchestrator(tmp_path)
+    os.environ["FLEET_ORCHESTRATOR"] = orch
+    _wire_fw(mod, _fw_api())
+    sid = mod.spawn("operator/sniff", "plans/0009-thing.md", {"id": "0009-thing"})
+    assert sid
+    parts = _wait_lines(log, 1)[0].split()
+    assert parts[0] == "operator/sniff"
+    assert parts[1] == "plans/0009-thing.md"
+    assert "--resume" not in parts
+
+
+def test_spawn_resume_true_puts_resume_flag_second(tmp_path):
+    """DoD 1: `spawn(…, resume=True)` produces an argv whose SECOND element
+    (argv[1], right after the orchestrator path itself) is `--resume`."""
+    fd = tmp_path / "fleet"
+    mod = _load_fw(fd, FLEET_WATCH_REPOS="operator/sniff")
+    orch, log = _fw_stub_orchestrator(tmp_path)
+    os.environ["FLEET_ORCHESTRATOR"] = orch
+    _wire_fw(mod, _fw_api())
+    sid = mod.spawn("operator/sniff", "plans/0009-thing.md",
+                    {"id": "0009-thing"}, resume=True)
+    assert sid
+    parts = _wait_lines(log, 1)[0].split()
+    assert parts[0] == "--resume"
+    assert parts[1] == "operator/sniff"
+    assert parts[2] == "plans/0009-thing.md"
+
+
+def _dead_lease(mod, fd, orch):
+    """A lease `spawn()` would leave behind, backdated past the activate
+    timeout — the same shape `tests/test_fleet_watch._orphaned_lease` builds,
+    reproduced here since that helper lives outside this plan's lease."""
+    os.environ["FLEET_ORCHESTRATOR"] = orch
+    mod.spawn("operator/sniff", "plans/0009-thing.md", {"id": "0009-thing"})
+    lid = [l["id"] for l in mod.lib.all_leases()][0]
+    p = fd / "leases" / f"{lid}.json"
+    rec = json.loads(p.read_text())
+    rec["created"] = "2020-01-01T00:00:00Z"
+    p.write_text(json.dumps(rec))
+    return lid
+
+
+def _fresh_respawn_comments():
+    return [{"user": {"id": 3}, "body": "respawn",
+             "created_at": "2030-01-01T00:00:00Z"}]
+
+
+def test_orphan_sweep_resumes_when_the_open_marked_prs_branch_is_on_origin(
+        tmp_path):
+    """DoD 2: a fresh owner `respawn`, a dead lease, and a marked PR stubbed
+    open with its branch on origin — `orphan_sweep` calls `spawn` with
+    `resume=True`."""
+    fd = tmp_path / "fleet"
+    mod = _load_fw(fd, FLEET_WATCH_REPOS="operator/sniff", FLEET_OPERATOR_UID="3")
+    orch, _log = _fw_stub_orchestrator(tmp_path)
+    pulls = [{"user": {"login": "implbot"}, "state": "open", "number": 7,
+              "body": "Plan: 0009-thing"}]
+    _wire_fw(mod, _fw_api(pulls=pulls, comments=_fresh_respawn_comments(),
+                         branch_status=200))
+    _dead_lease(mod, fd, orch)
+    mod.notify = lambda t, b: None
+    calls = []
+
+    def fake_spawn(repo, path, fm, dry_run=False, resume=False):
+        calls.append(resume)
+        return "fake-successor"
+    mod.spawn = fake_spawn
+    assert mod.cycle() == 1
+    assert calls == [True]
+
+
+def test_orphan_sweep_does_not_resume_when_the_branch_is_absent(tmp_path):
+    """DoD 3 (first half): the same case with the branch confirmed absent
+    from origin calls `spawn` with `resume=False`."""
+    fd = tmp_path / "fleet"
+    mod = _load_fw(fd, FLEET_WATCH_REPOS="operator/sniff", FLEET_OPERATOR_UID="3")
+    orch, _log = _fw_stub_orchestrator(tmp_path)
+    pulls = [{"user": {"login": "implbot"}, "state": "open", "number": 7,
+              "body": "Plan: 0009-thing"}]
+    _wire_fw(mod, _fw_api(pulls=pulls, comments=_fresh_respawn_comments(),
+                         branch_status=404))
+    _dead_lease(mod, fd, orch)
+    mod.notify = lambda t, b: None
+    calls = []
+
+    def fake_spawn(repo, path, fm, dry_run=False, resume=False):
+        calls.append(resume)
+        return "fake-successor"
+    mod.spawn = fake_spawn
+    assert mod.cycle() == 1
+    assert calls == [False]
+
+
+def test_orphan_sweep_never_spawns_when_the_branch_read_is_unreadable(
+        tmp_path):
+    """DoD 3 (second half): a forge read that answers neither 200 nor 404 for
+    the branch check must not spawn a guess either way — `spawn` is not
+    called at all, and the plan is left for a later cycle."""
+    fd = tmp_path / "fleet"
+    mod = _load_fw(fd, FLEET_WATCH_REPOS="operator/sniff", FLEET_OPERATOR_UID="3")
+    orch, _log = _fw_stub_orchestrator(tmp_path)
+    pulls = [{"user": {"login": "implbot"}, "state": "open", "number": 7,
+              "body": "Plan: 0009-thing"}]
+    api = _fw_api(pulls=pulls, comments=_fresh_respawn_comments(),
+                  branch_status=500)
+    _wire_fw(mod, api)
+    _dead_lease(mod, fd, orch)
+    mod.notify = lambda t, b: None
+    calls = []
+
+    def fake_spawn(repo, path, fm, dry_run=False, resume=False):
+        calls.append(resume)
+        return "fake-successor"
+    mod.spawn = fake_spawn
+    assert mod.cycle() == 0
+    assert calls == []
+    # "Nothing spawned" also holds when `cycle()` bails before the sweep (a
+    # failed broker pre-flight, say), so prove the sweep reached the branch
+    # read and got the 500 it is meant to refuse to guess on.
+    assert any("/contents/plans/" in p and "ref=" in p and "ref=main" not in p
+               for p in api.paths), api.paths
+
+
+def test_primary_dispatch_never_passes_resume_true(tmp_path):
+    """DoD 4: the primary dispatch loop — a plan with no marked PR and no
+    prior lease at all — never passes `resume=True` (it has no branch to
+    adopt in the first place; D3)."""
+    fd = tmp_path / "fleet"
+    mod = _load_fw(fd, FLEET_WATCH_REPOS="operator/sniff")
+    orch, _log = _fw_stub_orchestrator(tmp_path)
+    os.environ["FLEET_ORCHESTRATOR"] = orch
+    _wire_fw(mod, _fw_api(pulls=[]))
+    calls = []
+
+    def fake_spawn(repo, path, fm, dry_run=False, resume=False):
+        calls.append(resume)
+        return "fake-sid"
+    mod.spawn = fake_spawn
+    assert mod.cycle() == 1
+    assert calls == [False]

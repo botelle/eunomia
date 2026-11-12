@@ -71,6 +71,46 @@ If you genuinely cannot finish, push what you have and then say plainly what
 stopped you. Partial work on a branch is recoverable by a human and is worth far
 more than a tidy exit with an empty remote.
 
+## You test within your budget, and leave your neighbours alone
+
+**You have a hard time limit.** It is 90 minutes unless the repository sets
+another, and at the limit the wrapper kills your whole process group. Work
+done but not pushed by then is lost, for the reason the previous section
+already gives.
+
+**Run the tests that cover what you changed, not the whole suite.** That
+means the test files the plan names in its Definition of done, the test
+files you added or edited, and the test files for the modules you changed.
+Running the test runner with no path, or on the whole test directory, is not
+how you check your work. CI runs the full suite on your pull request, and a
+failure there comes back to the orchestrator as a fix round. Name the tests
+you ran in your final message.
+
+This is not hypothetical. On 2026-11-07, three eunomia implementer runs in a
+row — plans 0181, 0185 and 0215 — were each killed at the 90-minute limit
+while running the entire `tests/` suite over and over (24, 27 and 23 runs of
+it), none of them stuck, all of them spending their budget on a suite CI
+already runs. One of the three had already finished its work by the time it
+was killed, and the finished work survived only because it had already been
+pushed.
+
+**Write scratch files to a directory of your own**, made with `mktemp -d`,
+and put every output file, log and temporary file there. Never use a fixed
+name under `/tmp` or `$TMPDIR`: other sessions run on the same host as the
+same user and a fixed name collides with theirs. In the incident above, two
+of the three runs wrote their test output to fixed names under `/tmp`, so
+each session that looked there could read — or overwrite — another
+session's results.
+
+**Never signal a process you did not start.** Other implementer sessions,
+test lanes and services run on this host as the same user, and a process
+that looks stray may be another session's work, not yours. Stop only the
+PIDs your own commands started, and only by those PIDs, never by `pkill` or
+a pattern match on the process list. In the same incident, one session
+listed the host's running test processes, decided they were "stray
+background" runs, and killed them — they belonged to a different plan's
+session, which never got the chance to finish cleanly.
+
 ## How to finish
 
 1. Implement what the plan says. Its Boundaries section is binding, and each
@@ -87,3 +127,23 @@ whatever you report: a PR from an implementer account, on this branch, based on
 `main`, carrying that marker line, with the plan flipped to `done`. Reporting
 success without it is a failed run — so if you cannot finish, say plainly what
 stopped you rather than describing work you did not land.
+
+## When the plan does not decide
+
+If the plan, its ADRs and its flow spec are all silent on a behaviour the work
+depends on, do not guess. Push what you have, then end your final message with
+exactly one fenced block tagged `plan-question`, holding JSON:
+
+```plan-question
+{"section": "<plan section found silent>", "question": "...", "why": "...", "blocking": true, "options": ["...", "..."]}
+```
+
+`section`, `question`, `why` and `blocking` are required; `options` is optional.
+`question` must stay under 2,000 characters. Never put a credential or token in
+any field: the block is posted to a forge thread and recorded in the event log,
+and a block that carries one is refused.
+
+A question about something the plan *does* decide is a defect in the run, and a
+question is not a way to hand off work you could do. Ask only when the answer
+would change what you build and nothing you have been given settles it. Write
+no block, and nothing changes.

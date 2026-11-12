@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""fleet-plan-review — a plan-filing PR's review survives the session that
+filed it (plan 0188).
+
+A plan is filed as a pull request that is itself nothing but prose: the new
+plan document, maybe an ADR, maybe a line in another plan's `depends_on`.
+Today that review happens only if the filing session is still alive when CI
+goes green, or a human remembers to run `dispatch-review.py` by hand. Neither
+survives the session ending, which it always does — CI takes minutes, the
+session does not wait.
+
+This is the durable queue and its bounded worker:
+
+  fleet-plan-review enqueue <owner/repo> <pr> [--db PATH]
+  fleet-plan-review status [--repo R] [--pr N] [--json] [--db PATH]
+  fleet-plan-review worker [--limit N] [--claim-ttl SECS] [--db PATH]
+
+`enqueue` is idempotent on (repo, pr, head_sha) — filing twice, or a sweep
+that finds the same open PR twice, writes one row. `worker` runs ONE bounded
+pass: it claims up to `--limit` ready jobs (default 5), re-reads each one's
+ground truth from the forge, and either dispatches, holds, skips, or finishes
+it. It is not a daemon and this file ships no launchd unit — see "Automatic
+dispatch" below for why.
+
+## What a job holds for, skips, or dispatches
+
+Eligibility is re-derived from the forge on every claim, never trusted from
+what `enqueue` saw:
+
+  - closed, merged or draft            -> skipped, terminal
+  - repo not in config/repos.conf      -> skipped, terminal
+  - the changed-file list is incomplete or unreadable
+                                        -> held, re-read next sweep
+  - the change is not plan-only (talos's `reviewer_position` would hand it to
+    `code_reviewer`, not `plan_reviewer`)
+                                        -> skipped, terminal — it is not a
+                                           plan filing, so nothing here is
+                                           the right reviewer for it
+  - CI pending, red, or unreadable      -> held, re-read next sweep (a red
+                                           build is rechecked, not abandoned:
+                                           the fix for it is usually a second
+                                           push to the SAME head's status, and
+                                           a job here is keyed by head only
+                                           when the push actually moves it).
+                                           `eunomia/deps` (plan 0107) is
+                                           dropped from this check before it
+                                           runs: ADR-0028 §4 says a plan PR's
+                                           dependency edges gate DISPATCH onto
+                                           main, not review, so a filing whose
+                                           named plan or `depends_on` is not
+                                           yet met still gets its review.
+  - the head moved since this row was filed
+                                        -> superseded, terminal for this row;
+                                           a fresh row is enqueued for the new
+                                           head
+  - a live review from EVERY currently configured plan-reviewer seat
+    (`bin/fleet-models`' `repo_model` for `plan_reviewer`, ordinal 1 the
+    `reviewer` role's account, ordinal 2 `second_reviewer`'s — ADR-0028 §1:
+    only each ordinal's own review settles that ordinal) already stands at
+    this head (talos's own `post-review.py` idempotence notwithstanding — a
+    crash between posting and recording completion must not pay for a second
+    round)
+                                        -> done, no spend
+  - CI green (or the repo configures none at all) and nothing above fired
+                                        -> dispatched through the SAME
+                                           `dispatch_review()` the orchestrator
+                                           uses — which runs every configured
+                                           seat in one round, skipping
+                                           whichever ordinal already has a
+                                           standing review (talos's own
+                                           `standing_ordinals()`), so a prior
+                                           partial round is completed, not
+                                           re-paid for
+
+## Automatic dispatch — why this ships with no launchd unit
+
+Plan 0188 D4 requires proving coordination with mopsus's retry lock and
+Talos's standing review checks, and says plainly: if the existing contracts
+cannot prevent two live launches, name the missing one and stop before
+wiring automatic dispatch. That check was made, not assumed:
+
+  - mopsus's one-at-a-time slot (`bin/mopsus`'s `_review_slot`, ADR-0016 §4)
+    is taken here before every dispatch (see `_dispatch_one`), and the
+    pending-ordinal check is RE-READ immediately after taking it, so a
+    caller that ALSO takes this same slot before posting (mopsus's own
+    `_dispatch_session_retry`, its `kind="session"` retry) can never post
+    between this worker's decision to spend and the spend itself.
+  - `dispatch-review.py` posts through `post-review.py`'s own per-SHA
+    idempotence, and this worker re-reads `reviews_at()` immediately before
+    taking the slot, again right after taking it, and again after spending,
+    so a review already standing at the head is read, never re-paid for.
+  - `dispatch-review.py` itself DOES check for an existing review before
+    posting — `standing_ordinals()` (read at ~/agent 2db65f5, line 4391; read
+    from `/repos/{repo}/pulls/{pr}/reviews` at line 4405; used in `main()` at
+    lines 5121-5162, which skips any ordinal already approved at the head
+    and `sys.exit(0)`s before posting anything if every configured ordinal's
+    own approval already stands, line 5161-5162). That is a real check, not
+    none — "grepped: no `list_reviews` call" is true of the literal name but
+    false of the behaviour; `standing_ordinals()` IS the pre-post check,
+    reading the SAME `/pulls/{pr}/reviews` endpoint `list_reviews` elsewhere
+    in this fleet wraps.
+  - But that check is a single read with no lock around it: two
+    `dispatch-review.py` processes started close enough together can each
+    read "nothing stands yet" before either has posted, and both then spend.
+    THAT — a TOCTOU in `standing_ordinals()`, not an absent check — is the
+    real gap, and it is what a hand-run `dispatch-review.py` on the same
+    (repo, pr, head), the orchestrator's own first-attempt review loop
+    (`orchestrator.py`'s `dispatch_review`, called with no lock at all for a
+    PR it owns), AND a resumed orchestrator session reached through mopsus's
+    OWN `kind="plan"` retry (see below) can all fall into — none of those
+    three takes mopsus's slot or any other lock before reaching it.
+  - The `kind="plan"` case is not hypothetical for this worker's own jobs: a
+    plan-filing PR is routinely itself the deliverable of a dispatched
+    implementer session (this very plan's filing is), so it CAN carry an
+    orchestrator lease. `bin/mopsus`'s `_resume_review_path` takes the slot
+    only to decide whether to retry and to write a `resume_request` row
+    (`_write_resume_request`) — it never dispatches inside that slot for
+    this kind. The actual spend happens LATER, in a brand-new
+    `orchestrator --resume` process `fleet-watch`'s `orphan_sweep` starts
+    after consuming that row, and THAT process reaches its own unlocked
+    first-attempt review loop — the exact same uncovered path named above
+    for an orchestrator-owned PR, just reached one step later. So "mopsus's
+    slot" only ever serializes this worker against mopsus's `kind="session"`
+    retry (`_dispatch_session_retry`, called from inside the SAME slot); it
+    does not, and cannot, serialize this worker against a `kind="plan"`
+    retry's eventual spend.
+
+  For a genuine plan-filing PR the hand-run race is the SAME one
+  `docs/plans-need-parsing/0026-reviewer-trigger.md` already names as a
+  documented convention rather than a code contract ("a session about to
+  dispatch by hand checks the queue first"); the orchestrator-lease race
+  (direct, or via a mopsus plan-case resume) is the same missing contract
+  under a different trigger. So this worker is built, tested, and safe to
+  run ON DEMAND — but nothing here schedules it unattended, and no launchd
+  plist is added by this plan. Wiring a timer is a later change, after that
+  convention becomes a contract or the race is otherwise closed, and it is
+  named here for whoever makes that change.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+ACTOR = "fleet-plan-review"
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+lib = _load("fleetlib", BIN / "fleetlib.py")
+fleetforge = _load("fleetforge", BIN / "fleetforge.py")
+# `read_conf()` is fleet-repo's own parse of the one enrolment registry
+# (plan 0013) — reused so "enrolled" here can never disagree with
+# `fleet-repo list`. Lightweight (no sandbox or config dependency beyond
+# `config/repos.conf` itself), so loaded eagerly like `lib`/`fleetforge`.
+fleet_repo = _load("fleet_repo", BIN / "fleet-repo")
+
+_ORCH = None
+_MOPSUS = None
+_FLEET_MODELS = None
+
+
+def _orch_mod():
+    """`bin/orchestrator`, loaded lazily. Importing it runs its own
+    module-level `RUNNERS` table, which reads `config/implementer-sandbox.json`
+    relative to `BIN` (`sandbox_settings()`, called while building `RUNNERS`)
+    and raises if that file is absent — true of a bare `bin/` with no sibling
+    `config/`, which `fleet-db-migrate`'s own tests build to check a NEW
+    owner's table is picked up with no other change. Loading it only when a
+    caller actually needs `dispatch_review()`/`reviews_at()`/`_forge()` keeps
+    `SCHEMA` (all `fleet-db-migrate` needs) importable with no fleet
+    environment at all, exactly like every other owner's module."""
+    global _ORCH
+    if _ORCH is None:
+        _ORCH = _load("orchestrator", BIN / "orchestrator")
+    return _ORCH
+
+
+def _mopsus_mod():
+    """`bin/mopsus`, loaded lazily for the same reason as `_orch_mod()` — it
+    loads `orchestrator`, `fleet-watch`, `fleet-config` and `fleet-quota`
+    itself. `_review_slot` is mopsus's one-at-a-time slot (ADR-0016 §4): a
+    fleet-wide, non-blocking fcntl lock at the exact path mopsus itself uses
+    (`lib.fleet_dir()/"locks"/"review-retry.lock"`). Loaded, not re-locked by
+    hand, so a change to that path or that lock's semantics cannot drift
+    between the two callers."""
+    global _MOPSUS
+    if _MOPSUS is None:
+        _MOPSUS = _load("mopsus", BIN / "mopsus")
+    return _MOPSUS
+
+
+def _fleet_models_mod():
+    """`bin/fleet-models`, loaded lazily — not for the same reason as
+    `_orch_mod()`/`_mopsus_mod()` (it has no sandbox or RUNNERS-table startup
+    cost: its own module-level code is `fleetlib` plus a handful of regexes
+    and constants), but to match the pattern every other owner module here
+    is loaded by, and because the only thing this worker ever calls on it
+    (`active_ordinals`) is a plain SQL read it has no other reason to
+    import for."""
+    global _FLEET_MODELS
+    if _FLEET_MODELS is None:
+        _FLEET_MODELS = _load("fleet_models", BIN / "fleet-models")
+    return _FLEET_MODELS
+
+DB = os.path.expanduser(os.environ.get("FLEET_DB", str(lib.fleet_dir() / "fleet.db")))
+
+# Additive DDL only, applied by `fleet-db-migrate` like every other owner's
+# (plan 0096). `plan_review_job` holds CURRENT state, one row per (repo, pr,
+# head_sha); `plan_review_job_change` is its append-only history, in the exact
+# shape plan 0180's `dependency_attestation`/`dependency_attestation_change`
+# established — non-null REAL Unix `created_at`/`updated_at`, an `actor` on
+# every change, stamped through the one writer below (`_transition`/
+# `_enqueue`), never by hand at a call site.
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS plan_review_job (
+  id          TEXT NOT NULL PRIMARY KEY,
+  repo        TEXT NOT NULL,
+  pr          INTEGER NOT NULL,
+  head_sha    TEXT NOT NULL,
+  state       TEXT NOT NULL,   -- queued|held|claimed|done|superseded|skipped|failed
+  reason      TEXT,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  claimed_by  TEXT,
+  claimed_at  REAL,
+  created_at  REAL NOT NULL,
+  updated_at  REAL NOT NULL,
+  UNIQUE(repo, pr, head_sha)
+);
+CREATE INDEX IF NOT EXISTS plan_review_job_repo_pr ON plan_review_job(repo, pr);
+CREATE INDEX IF NOT EXISTS plan_review_job_state ON plan_review_job(state);
+
+CREATE TABLE IF NOT EXISTS plan_review_job_change (
+  id          TEXT NOT NULL PRIMARY KEY,
+  job_id      TEXT NOT NULL,
+  action      TEXT NOT NULL,   -- enqueue|claim|hold|skip|supersede|fail|done
+  detail      TEXT,
+  actor       TEXT NOT NULL,
+  created_at  REAL NOT NULL,
+  updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS plan_review_job_change_job ON plan_review_job_change(job_id, created_at);
+"""
+
+OPEN_STATES = ("queued", "held")
+# A dispatch failure that is not quota/no-verdict/budget (mopsus's own retry
+# territory, ADR-0016/0021/0029) gets this many of ITS OWN attempts before
+# this worker stops trying — bounded like every other retry in this fleet
+# (`retry_limit`'s own default is 2; this is a worker-local constant, not a
+# `fleet-config` key, because nothing here is a human-tunable policy yet).
+MAX_DISPATCH_ATTEMPTS = 3
+# Jobs mopsus's own retry policy owns (ADR-0016 quota, ADR-0021 no-verdict,
+# plan 0029 budget) are held, not failed: redispatching here while mopsus is
+# already retrying the SAME review would pay twice for one stop.
+MOPSUS_OWNED_OUTCOMES = ("quota", "no-verdict", "budget")
+# `orchestrator.dispatch_review`'s OWN default `timeout` (its signature, not
+# re-derived from it — a change there must not silently change this worker's
+# margin below without someone noticing the drift). Passed explicitly to
+# every call so the two numbers can never read as "2400" here and something
+# else there.
+DISPATCH_TIMEOUT = 2400
+# D1: a claim this worker still legitimately holds — mid-dispatch, inside
+# `dispatch_review`'s own subprocess, which can run up to `DISPATCH_TIMEOUT`
+# — must never be read as abandoned and reclaimed out from under it. 600s of
+# headroom over the dispatch's own ceiling covers the forge reads
+# `_dispatch_one` makes before ever reaching it.
+DEFAULT_CLAIM_TTL = DISPATCH_TIMEOUT + 600
+
+
+def _connect(path=None):
+    con = sqlite3.connect(path or DB, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.executescript(SCHEMA)
+    return con
+
+
+def _new_id():
+    return uuid.uuid4().hex
+
+
+def _enqueue(con, repo, pr, head_sha, *, actor=ACTOR, reason=None):
+    """Idempotent on (repo, pr, head_sha): a job already tracked for this
+    exact head is returned unchanged, whatever its state — re-filing a PR
+    that is already queued, held or even done must not duplicate the row or
+    reset its history."""
+    row = con.execute(
+        "SELECT id FROM plan_review_job WHERE repo=? AND pr=? AND head_sha=?",
+        (repo, pr, head_sha)).fetchone()
+    if row:
+        return row[0], False
+    now = time.time()
+    job_id = _new_id()
+    con.execute(
+        "INSERT INTO plan_review_job (id, repo, pr, head_sha, state, reason, "
+        "attempts, claimed_by, claimed_at, created_at, updated_at) VALUES "
+        "(?,?,?,?,'queued',?,0,NULL,NULL,?,?)",
+        (job_id, repo, pr, head_sha, reason, now, now))
+    con.execute(
+        "INSERT INTO plan_review_job_change (id, job_id, action, detail, actor, "
+        "created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+        (_new_id(), job_id, "enqueue", reason, actor, now, now))
+    con.commit()
+    return job_id, True
+
+
+def _transition(con, job_id, state, *, actor, action, reason=None,
+                 bump_attempt=False, claim=False, holder=None,
+                 expect_states=None, claim_cutoff=None, expect_holder=None):
+    """The one writer for `plan_review_job` and `plan_review_job_change`.
+    Every state change — including a claim — goes through here, so
+    `created_at`/`updated_at` are stamped exactly once and every change carries
+    an actor (D2).
+
+    `expect_states`/`claim_cutoff`, given together or alone, make the write
+    CONDITIONAL on the row's state still being one of `expect_states`, or
+    being `claimed` with `claimed_at` older than `claim_cutoff` (an abandoned
+    claim). That conditional UPDATE is the ONLY mechanism that resolves two
+    workers racing for the same job: the loser's `rowcount` is 0 and this
+    returns False, which its caller treats as "someone else already has it",
+    never as an error (D3's atomic claim and crash recovery).
+
+    `expect_holder`, given alone or alongside `expect_states`, additionally
+    requires `claimed_by` to still equal it. `_fenced()` is the one caller
+    that sets it: every write `_dispatch_one` makes is conditional on THIS
+    worker still holding the claim, so a claim reclaimed out from under a
+    dispatch slower than `--claim-ttl` (D1 — `dispatch_review`'s own timeout
+    can exceed a short `--claim-ttl`) cannot have its outcome overwritten by
+    the worker that lost that race; the reclaiming worker's own pass
+    re-derives the same ground truth and writes it instead."""
+    now = time.time()
+    claimed_by = holder if claim else None
+    claimed_at = now if claim else None
+    attempt_sql = ", attempts = attempts + 1" if bump_attempt else ""
+    params = [state, reason, claimed_by, claimed_at, now]
+    sql = ("UPDATE plan_review_job SET state=?, reason=?, claimed_by=?, "
+           f"claimed_at=?, updated_at=?{attempt_sql} WHERE id=?")
+    params.append(job_id)
+    if expect_states is not None:
+        placeholders = ",".join("?" for _ in expect_states)
+        where = f" AND (state IN ({placeholders})"
+        params.extend(expect_states)
+        if claim_cutoff is not None:
+            where += " OR (state='claimed' AND claimed_at < ?)"
+            params.append(claim_cutoff)
+        where += ")"
+        sql += where
+    if expect_holder is not None:
+        sql += " AND claimed_by=?"
+        params.append(expect_holder)
+    cur = con.execute(sql, params)
+    if cur.rowcount != 1:
+        con.rollback()
+        return False
+    con.execute(
+        "INSERT INTO plan_review_job_change (id, job_id, action, detail, actor, "
+        "created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+        (_new_id(), job_id, action, reason, actor, now, now))
+    con.commit()
+    return True
+
+
+def _fenced(con, job, holder, state, action, reason, bump_attempt=False):
+    """Every write `_dispatch_one` makes to the job it was handed, conditional
+    on `holder` still owning its claim (see `_transition`'s `expect_holder`).
+    A lost race is not an error here any more than it is in `_claim_jobs`: it
+    means some other worker's abandoned-claim recovery already took this job
+    back, and that worker's own pass will reconcile it against the forge."""
+    return _transition(con, job["id"], state, actor=holder, action=action,
+                       reason=reason, bump_attempt=bump_attempt,
+                       expect_states=("claimed",), expect_holder=holder)
+
+
+# --------------------------------------------------------------------------
+# The filing classifier, ported from talos's dispatch-review.py.
+#
+# Source: operator/talos `dispatch-review.py`, functions `_is_prose_path` and
+# `reviewer_position` (the classifier), and `changed_files_for_position` (the
+# rename-pairing rule the classifier is fed). Read from ~/agent, a pinned
+# checkout of that repository's `main`, at commit 2db65f5 (2026-11-04,
+# "0040-subscription-reviewers-can-inspect-the-pr-checkout" merged). Ported
+# rather than imported: talos is a different repository with no installed
+# package this one may depend on, and ADR-0013's reviewer-position contract
+# is exactly the four-way split (plan-only / mixed / renamed / unreadable)
+# `tests/test_plan_review_queue.py` proves this port agrees with, verbatim
+# against the cited source's own behaviour.
+# --------------------------------------------------------------------------
+
+_PROSE_PREFIXES = ("plans/", "docs/")
+_PROMPT_BASENAMES = ("skill.md", "agents.md")
+
+
+def _is_prose_path(path):
+    """Verbatim port of talos `_is_prose_path` (see module header)."""
+    if not path.startswith(_PROSE_PREFIXES):
+        return False
+    if not path.lower().endswith(".md"):
+        return False
+    parts = path.split("/")
+    if any(part.lower() == ".claude" for part in parts):
+        return False
+    basename = parts[-1].lower()
+    if basename.startswith("claude") or basename in _PROMPT_BASENAMES:
+        return False
+    return True
+
+
+def reviewer_position(paths):
+    """Verbatim port of talos `reviewer_position` (see module header):
+    `plan_reviewer` when `paths` is non-empty and every path in it is prose
+    under `plans/` or `docs/`, else `code_reviewer`."""
+    return ("plan_reviewer" if paths and all(_is_prose_path(p) for p in paths)
+            else "code_reviewer")
+
+
+def changed_paths_for_position(forge, repo, pr):
+    """(paths, complete, reason) — the change set `reviewer_position()`
+    judges, adapted from talos `changed_files_for_position` to this module's
+    own `fleetforge.Forge.list_pull_files` (which already pages to a
+    confirmed-empty page or fails closed to `(0, None)`, so there is no
+    separate ceiling case to track here the way talos's hand-rolled pager
+    needs one).
+
+    Each renamed entry contributes BOTH its new filename and its
+    `previous_filename`, so a file moved INTO or OUT OF `plans/`/`docs/` is
+    judged by what it used to be too — the exact fix talos made on eunomia#509
+    for a forge that reports a move as a `deleted` entry plus an unrelated
+    `added` one as often as a true `renamed` entry with both names on it."""
+    st, files = forge.list_pull_files(repo, pr)
+    if st != 200 or not isinstance(files, list):
+        return [], False, f"the changed-file list is unavailable from the forge (status {st})"
+    paths, missing = [], 0
+    for f in files:
+        name = f.get("filename") if isinstance(f, dict) else None
+        if not name:
+            missing += 1
+            continue
+        paths.append(name)
+        prev = f.get("previous_filename")
+        if prev:
+            paths.append(prev)
+    if missing:
+        return paths, False, f"{missing} changed-file entry(ies) carried no filename"
+    return paths, True, None
+
+
+# --------------------------------------------------------------------------
+# A minimal CI verdict, ported (simplified) from talos's `ci_verdict`.
+#
+# Source: same file and commit as above, function `ci_verdict`. Simplified:
+# this drops talos's REQUIRED_CI context check and returns a bare state
+# instead of talos's (ok, message) pair, because this caller needs to tell
+# "pending" from "red" from "absent" apart (D3: both pending and red CI hold
+# and are rechecked; absent CI is a go), where talos's two-value return
+# collapses pending and red into one `False`.
+#
+# REQUIRED_CI dropped WITHOUT a re-check elsewhere, unlike the claim this
+# comment used to make: read against `~/agent` at the cited commit,
+# `_required_context_missing` only escalates to a refusal (`sys.exit`) when
+# `--require-ci` is given (dispatch-review.py:4896-4898); otherwise it is a
+# WARN that still spends the round. `orchestrator.dispatch_review()`'s argv
+# (`review_command() + [repo, str(pr), "--post", "--no-followups"]`) never
+# passes `--require-ci`, so the dispatcher this worker calls does not enforce
+# it either — omitting it here loses nothing a live dispatch would have kept.
+# --------------------------------------------------------------------------
+
+# `eunomia/deps` (plan 0107, posted by `bin/fleet-deps`) names whether a plan
+# filing's OWN dependency edges — the plan it names, or that plan's
+# `depends_on` — are met on `main`. That gates whether `fleet-merge` will
+# MERGE the filing, never whether it gets reviewed: ADR-0028 §4, "A plan PR is
+# never held, because its edges gate dispatch, not review (plan 0159)", and
+# `docs/deps-status.md` "The review dispatcher": "a PR held on a dependency is
+# still reviewed." A plan filing whose dependency is not yet on `main` is the
+# NORMAL case for a plan that depends on one still being reviewed itself, so
+# treating its `failure` as a build break would hold the review this worker
+# exists to run, indefinitely, on a fact review can't change. Filtered out of
+# `statuses` before any pending/red decision — never read as a vote either way.
+_PLAN_HOLD_IGNORED_CONTEXTS = ("eunomia/deps",)
+
+
+def ci_verdict(forge, repo, sha):
+    """("green"|"pending"|"red"|"absent"|"unreadable", message)."""
+    st, body = forge.get_commit_status(repo, sha)
+    if st != 200 or not isinstance(body, dict):
+        return "unreadable", f"CI status unreadable (forge status {st})"
+    statuses = [s for s in (body.get("statuses") or [])
+               if (s.get("context") or "") not in _PLAN_HOLD_IGNORED_CONTEXTS]
+    if not statuses:
+        return "absent", f"head {sha[:8]} has no CI status"
+    failed = [s.get("context") or "?" for s in statuses
+              if (s.get("status") or "").lower() in ("failure", "error")]
+    if failed:
+        return "red", f"CI is red on {sha[:8]}: {', '.join(failed)}"
+    if any((s.get("status") or "").lower() == "pending" for s in statuses):
+        return "pending", f"CI is still running on {sha[:8]}"
+    return "green", f"CI green on {sha[:8]} ({len(statuses)} check(s))"
+
+
+def _enrolled(repo):
+    repos, _errs, _kept = fleet_repo.read_conf()
+    return repo in repos
+
+
+def _required_ordinals(con, repo):
+    """The plan-reviewer ordinals this repo currently has configured —
+    `bin/fleet-models`' own `active_ordinals(con, repo, "plan_reviewer")`, read
+    directly off THIS worker's `con` (the same `repo_model` table
+    `fleet-models reviewers` resolves from; no subprocess, so no risk of it
+    reading a DIFFERENT `fleet.db` than this worker's own `--db`).
+
+    Plan 0188 D3: "Honor the current plan reviewer seats." In this fleet that
+    is ordinarily `[1, 2]` — `fleet-models list` carries a `default` row at
+    both ordinals for `plan_reviewer`, and every per-repo override seen in
+    production adds, never removes, ordinal 2. A `repo_model` table that does
+    not exist at all (every test fixture here; `_connect`'s own `SCHEMA` never
+    creates it) or carries no row for this repo or `'default'` falls back to
+    `[1]`: the one ordinal that always exists (`_role`'s own `RoleError`
+    refuses `agent_roles()` to come up without a `reviewer` account) and the
+    cardinality `fleet-models`' own docstring calls `plan_reviewer`'s
+    default."""
+    try:
+        ordinals = _fleet_models_mod().active_ordinals(con, repo, "plan_reviewer")
+    except sqlite3.OperationalError:
+        return [1]
+    return ordinals or [1]
+
+
+def _account_for_ordinal(ordinal):
+    """Ordinal -> lowercased account, the SAME mapping `bin/mopsus` uses
+    (`held_review_queue`, `_not_superseded_review_attempts`: `second_reviewer`
+    at ordinal 2, `reviewer` otherwise) — read from `lib.agent_roles()` here
+    rather than restated, so the two callers can never resolve a different
+    account for the same ordinal."""
+    roles = lib.agent_roles()
+    role = roles["second_reviewer"] if ordinal == 2 else roles["reviewer"]
+    return role.account.lower()
+
+
+def _pending_ordinals(reviews, ordinals):
+    """The ordinals in `ordinals` with no live review of their OWN at this
+    head (`reviews`, already filtered to one SHA by `reviews_at`) yet.
+
+    ADR-0028 §1 / ADR-0021 §4: only ordinal N's own review settles ordinal N —
+    the other reviewer's review settles nothing. `reviews_at`'s own docstring
+    says `rev2bot` (ordinal 2's account on every repo that has one) posts
+    independently of ordinal 1, so a job is not complete just because SOME
+    review stands at the head; each required ordinal needs its own."""
+    logins = {((r.get("user") or {}).get("login") or "").lower() for r in reviews}
+    return [o for o in ordinals if _account_for_ordinal(o) not in logins]
+
+
+def _latest_review_attempt_outcome(con, repo, pr, head_sha, ordinal):
+    """The most recent talos `review_attempt` row's outcome for this exact
+    head AND ordinal, or None if the table does not exist or holds no such
+    row. Read-only: this worker never writes talos's table, only mopsus's
+    existing retry path (ADR-0016/0021/0029) does.
+
+    Filtered to one ordinal, not merely the newest row at the head: with two
+    configured seats the newest row can belong to the OTHER ordinal and prove
+    nothing about this one's stop — the same identity rule mopsus's own
+    `_not_superseded_review_attempts` applies with its `AND ordinal IS ?`
+    (ADR-0028 §1)."""
+    try:
+        row = con.execute(
+            "SELECT outcome FROM review_attempt WHERE repo=? AND pr=? AND "
+            "head_sha=? AND ordinal IS ? ORDER BY rowid DESC LIMIT 1",
+            (repo, pr, head_sha, ordinal)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row[0] if row else None
+
+
+def _seat_outcome(reviews, ordinal):
+    """The latest review from `ordinal`'s own account at this head,
+    classified `approved` or `not approved (terminal...)` — plan 0188 D5:
+    "Record per-seat Forgejo outcomes. A HIGH is terminal for this head."
+    `_pending_ordinals` already treats a withheld verdict (posted as
+    COMMENT, never APPROVED) as settling its ordinal exactly like an
+    approval — a push to a NEW head is the only thing that reopens it, never
+    a redispatch at this one. This only makes that per-seat result visible in
+    `reason` instead of collapsing both into a bare "posted"."""
+    account = _account_for_ordinal(ordinal)
+    mine = [r for r in reviews
+            if ((r.get("user") or {}).get("login") or "").lower() == account]
+    if not mine:
+        return None
+    latest = max(mine, key=lambda r: r.get("id") or 0)
+    return ("approved" if latest.get("state") == "APPROVED"
+            else "not approved (terminal — see the review on the pull request)")
+
+
+def _seat_outcomes_reason(reviews, ordinals):
+    return "; ".join(f"ordinal {o}: {_seat_outcome(reviews, o) or 'no review'}"
+                     for o in ordinals)
+
+
+def _owned_pending_ordinal(con, repo, pr, head_sha, pending):
+    """(ordinal, outcome) for the first ordinal in `pending` whose latest
+    `review_attempt` at this head is mopsus-owned (quota/no-verdict/budget),
+    or (None, None) if none of them are. Checked per ordinal, never by the
+    single newest row across all of them — see `_latest_review_attempt_outcome`."""
+    for ordinal in pending:
+        outcome = _latest_review_attempt_outcome(con, repo, pr, head_sha, ordinal)
+        if outcome in MOPSUS_OWNED_OUTCOMES:
+            return ordinal, outcome
+    return None, None
+
+
+def _dispatch_one(con, job, holder):
+    """Re-derive ground truth for one claimed job and act on it. Every branch
+    ends in exactly one `_fenced` call (or none, when the claim itself was
+    lost to a racing worker — see `_claim_jobs`). Every write is fenced to
+    `holder` (D1/D3): a claim this worker lost to an abandoned-claim
+    recovery, however that happened, is left for its new holder to resolve
+    rather than overwritten by whatever this worker was about to conclude."""
+    repo, pr, head_sha = job["repo"], job["pr"], job["head_sha"]
+    forge = _forge()
+
+    st, pr_body = forge.get_pull(repo, pr)
+    if st != 200 or not isinstance(pr_body, dict):
+        _fenced(con, job, holder, "held", "hold",
+               f"the pull request is unreadable from the forge (status {st})")
+        return
+
+    cur_sha = ((pr_body.get("head") or {}).get("sha")) or None
+    if not cur_sha:
+        # Status 200 but no readable head sha at all is the SAME "unreadable"
+        # case as above, not a head move: superseding here (the old code's
+        # bug) would commit no replacement row (the `if cur_sha:` guard below
+        # skips `_enqueue` when it's falsy) and strand the job terminal with
+        # nothing left to pick the review back up. Held, re-read next sweep.
+        _fenced(con, job, holder, "held", "hold",
+               "the pull request's head sha is unreadable from the forge")
+        return
+    if cur_sha != head_sha:
+        # The replacement row is committed FIRST. `_fenced` and `_enqueue`
+        # each commit on their own, so a crash between the two calls must land
+        # on the side that loses nothing: if the new row exists but the old
+        # one never flips to `superseded`, the old row is simply re-claimed
+        # later, re-reads the same moved head, and retries this same
+        # supersede (`_enqueue` is idempotent on (repo, pr, head_sha), so that
+        # retry writes no duplicate). The other order — superseded committed
+        # first — can crash with the old row terminal and no replacement row
+        # at all, which silently drops the review this worker exists to run.
+        _enqueue(con, repo, pr, cur_sha, actor=ACTOR,
+                 reason="filed by supersede: the PR's head moved")
+        _fenced(con, job, holder, "superseded", "supersede", f"head moved to {cur_sha}")
+        return
+
+    if pr_body.get("state") != "open" or pr_body.get("merged"):
+        _fenced(con, job, holder, "skipped", "skip", f"PR is {pr_body.get('state')!r}, not open")
+        return
+    if pr_body.get("draft"):
+        _fenced(con, job, holder, "skipped", "skip", "PR is a draft")
+        return
+    if not _enrolled(repo):
+        _fenced(con, job, holder, "skipped", "skip",
+               f"{repo} is not enrolled in config/repos.conf")
+        return
+
+    paths, complete, reason = changed_paths_for_position(forge, repo, pr)
+    if not complete:
+        _fenced(con, job, holder, "held", "hold", f"changed-file list: {reason}")
+        return
+    position = reviewer_position(paths)
+    if position != "plan_reviewer":
+        _fenced(con, job, holder, "skipped", "skip",
+               "not a plan filing — the change touches more than "
+               "plans/ or docs/ prose (talos would hand it to code_reviewer)")
+        return
+
+    ci_state, ci_message = ci_verdict(forge, repo, cur_sha)
+    if ci_state in ("pending", "red", "unreadable"):
+        _fenced(con, job, holder, "held", "hold", ci_message)
+        return
+
+    required = _required_ordinals(con, repo)
+    reviews = _orch_mod().reviews_at(repo, pr, cur_sha, forge, fleetforge)
+    if reviews is None:
+        _fenced(con, job, holder, "held", "hold",
+               "existing reviews at this head are unreadable from the forge")
+        return
+    pending = _pending_ordinals(reviews, required)
+    if not pending:
+        _fenced(con, job, holder, "done", "done",
+               "every configured plan-reviewer seat's own review already "
+               f"stands at this head ({_seat_outcomes_reason(reviews, required)})")
+        return
+
+    owned_ordinal, owned_outcome = _owned_pending_ordinal(con, repo, pr, cur_sha, pending)
+    if owned_ordinal is not None:
+        _fenced(con, job, holder, "held", "hold",
+               f"ordinal {owned_ordinal}: outcome={owned_outcome} — "
+               "mopsus's own retry policy (ADR-0016/0021/plan 0029) "
+               "owns this stop, not this worker")
+        return
+
+    with _mopsus_mod()._review_slot() as free:
+        if not free:
+            _fenced(con, job, holder, "held", "hold",
+                   "mopsus's review-retry slot is held — waiting for it")
+            return
+
+        # Re-read NOW, inside the slot, rather than trusting `pending` above:
+        # that was read BEFORE this worker had the slot, so a caller that
+        # ALSO takes it before posting (mopsus's own `_dispatch_session_retry`,
+        # its `kind="session"` retry) could have posted in the gap between
+        # that read and this worker's own turn at the lock. This is what makes
+        # "decide to spend" and "spend" atomic with respect to that one
+        # caller — see the module docstring's "Automatic dispatch" section for
+        # the callers this does NOT cover.
+        reviews = _orch_mod().reviews_at(repo, pr, cur_sha, forge, fleetforge)
+        if reviews is None:
+            _fenced(con, job, holder, "held", "hold",
+                   "existing reviews at this head are unreadable from the forge")
+            return
+        pending = _pending_ordinals(reviews, required)
+        if not pending:
+            _fenced(con, job, holder, "done", "done",
+                   "every configured plan-reviewer seat's own review already "
+                   f"stands at this head, seen after taking the retry slot "
+                   f"({_seat_outcomes_reason(reviews, required)})")
+            return
+        owned_ordinal, owned_outcome = _owned_pending_ordinal(con, repo, pr, cur_sha, pending)
+        if owned_ordinal is not None:
+            _fenced(con, job, holder, "held", "hold",
+                   f"ordinal {owned_ordinal}: outcome={owned_outcome} — "
+                   "mopsus's own retry policy (ADR-0016/0021/plan 0029) "
+                   "owns this stop, not this worker")
+            return
+
+        # A call into operator/talos: `dispatch-review.py <repo> <pr> --post
+        # --no-followups`, via `orchestrator.dispatch_review()` (same argv, same
+        # call `bin/orchestrator`'s own first-attempt review loop makes). Read
+        # at `~/agent`, commit 2db65f5 (the same pin as the classifier port
+        # above), to confirm what this call site relies on:
+        #  - the argv is accepted for a PR the orchestrator holds no lease on:
+        #    `main()` never checks one (grepped: no `lease`/`orchestrator`
+        #    reference gates it) — only an open, non-merged PR is required.
+        #  - a quota/no-verdict/budget stop writes its `review_attempt` row
+        #    BEFORE the process exits non-zero (dispatch-review.py:5352-5367 for
+        #    the single-ordinal path, :4560-4601 for the two-ordinal one) — the
+        #    read `_owned_pending_ordinal` does above and after this call relies
+        #    on that ordering, not a race with the exit code.
+        #  - this argv passes no `--require-ci`, so talos's REQUIRED_CI gate
+        #    (dispatch-review.py:4894-4899) never refuses here — it only WARNs
+        #    — matching this worker's own `ci_verdict`, which was simplified on
+        #    exactly that evidence (see its module comment above).
+        #  - `standing_ordinals()` (dispatch-review.py:4391-4443, used at
+        #    5121-5162) skips any ordinal already approved at this head, so a
+        #    round that completes a PARTIAL prior one spends on the missing
+        #    seat only — proven here only against the fake dispatcher in
+        #    `tests/test_plan_review_queue.py`'s `post_accounts` mode, never
+        #    against the real one, which this citation stands in for.
+        ok, detail = _orch_mod().dispatch_review(repo, pr, cur_sha, None, timeout=DISPATCH_TIMEOUT)
+
+        if not ok:
+            owned_ordinal, owned_outcome = _owned_pending_ordinal(con, repo, pr, cur_sha, pending)
+            if owned_ordinal is not None:
+                _fenced(con, job, holder, "held", "hold",
+                       f"ordinal {owned_ordinal}: outcome={owned_outcome} — "
+                       "mopsus's own retry policy owns this stop, not "
+                       "this worker", bump_attempt=True)
+                return
+            attempts = job["attempts"] + 1
+            state = "failed" if attempts >= MAX_DISPATCH_ATTEMPTS else "held"
+            _fenced(con, job, holder, state, "fail" if state == "failed" else "hold",
+                   detail or "dispatch failed with no detail", bump_attempt=True)
+            return
+
+        reviews = _orch_mod().reviews_at(repo, pr, cur_sha, forge, fleetforge)
+        pending = _pending_ordinals(reviews or [], required)
+        if not pending:
+            _fenced(con, job, holder, "done", "done",
+                   "review posted and verified at this head "
+                   f"({_seat_outcomes_reason(reviews or [], required)})")
+            return
+        owned_ordinal, owned_outcome = _owned_pending_ordinal(con, repo, pr, cur_sha, pending)
+        if owned_ordinal is not None:
+            _fenced(con, job, holder, "held", "hold",
+                   f"ordinal {owned_ordinal}: outcome={owned_outcome} — "
+                   "mopsus's own retry policy owns this stop, not this "
+                   "worker", bump_attempt=True)
+            return
+        attempts = job["attempts"] + 1
+        state = "failed" if attempts >= MAX_DISPATCH_ATTEMPTS else "held"
+        pending_str = ", ".join(str(o) for o in pending)
+        _fenced(con, job, holder, state, "fail" if state == "failed" else "hold",
+               f"the dispatcher exited 0 but ordinal(s) {pending_str} still "
+               "have no review at this head — exit is not a verdict",
+               bump_attempt=True)
+
+
+def _claim_jobs(con, holder, limit, claim_ttl):
+    """Claim up to `limit` ready jobs — `queued`/`held`, or `claimed` past
+    `claim_ttl` (an abandoned claim recovered the same way) — least-recently-
+    touched first, one atomic `_transition` per job so a racing worker's loss
+    is silent (D3). Returns the full row for each job actually won.
+
+    Ordered by `updated_at`, NOT `created_at`: every `_transition` (a hold
+    included) bumps `updated_at` to now, so a job held repeatedly — CI stuck
+    red, a slow quota drain, anything that keeps re-qualifying as `held` sweep
+    after sweep — sinks behind every job this worker has not touched yet,
+    instead of keeping its spot at the front of the line forever because it
+    happened to be filed first. `created_at` breaks ties so two untouched jobs
+    still claim oldest-first, exactly as `created_at` ordering did on its own
+    before any of them had been held once."""
+    now = time.time()
+    cutoff = now - claim_ttl
+    candidates = con.execute(
+        "SELECT id FROM plan_review_job WHERE state IN ('queued','held') "
+        "OR (state='claimed' AND claimed_at < ?) ORDER BY updated_at, created_at LIMIT ?",
+        (cutoff, max(limit * 4, limit))).fetchall()
+    won = []
+    for (job_id,) in candidates:
+        if len(won) >= limit:
+            break
+        if _transition(con, job_id, "claimed", actor=holder, action="claim",
+                       claim=True, holder=holder,
+                       expect_states=OPEN_STATES, claim_cutoff=cutoff):
+            row = con.execute(
+                "SELECT id, repo, pr, head_sha, state, reason, attempts, "
+                "claimed_by, claimed_at FROM plan_review_job WHERE id=?",
+                (job_id,)).fetchone()
+            won.append({"id": row[0], "repo": row[1], "pr": row[2], "head_sha": row[3],
+                        "state": row[4], "reason": row[5], "attempts": row[6],
+                        "claimed_by": row[7], "claimed_at": row[8]})
+    return won
+
+
+_FORGE = None
+
+
+def _forge():
+    """A `fleetforge.Forge`, built the same way `orch.reviews_at`'s own
+    default (`forge=None`) builds one: `orch._forge()`, the orchestrator's
+    authoring token (`token_for("authoring")`) and timeout. Reused rather than
+    restated so this worker's forge reads can never disagree with the
+    dispatcher's about the url, the token role or the timeout."""
+    global _FORGE
+    if _FORGE is None:
+        try:
+            _mod, _FORGE = _orch_mod()._forge()
+        except _orch_mod().Stop as e:
+            sys.exit(f"fleet-plan-review: {e}")
+    return _FORGE
+
+
+def cmd_enqueue(args):
+    con = _connect(args.db)
+    forge = _forge()
+    st, pr_body = forge.get_pull(args.repo, args.pr)
+    if st != 200 or not isinstance(pr_body, dict):
+        sys.exit(f"fleet-plan-review: could not read {args.repo}#{args.pr} "
+                 f"from the forge (status {st})")
+    head_sha = ((pr_body.get("head") or {}).get("sha")) or None
+    if not head_sha:
+        sys.exit(f"fleet-plan-review: {args.repo}#{args.pr} has no readable head sha")
+    job_id, created = _enqueue(con, args.repo, args.pr, head_sha)
+    print(f"{'enqueued' if created else 'already tracked'} {args.repo}#{args.pr} "
+          f"@ {head_sha[:8]} ({job_id})")
+    return 0
+
+
+def _row_dict(row, cols):
+    return dict(zip(cols, row))
+
+
+def cmd_status(args):
+    con = _connect(args.db)
+    cols = ("id", "repo", "pr", "head_sha", "state", "reason", "attempts",
+            "claimed_by", "claimed_at", "created_at", "updated_at")
+    sql = f"SELECT {', '.join(cols)} FROM plan_review_job"
+    where, params = [], []
+    if args.repo:
+        where.append("repo=?")
+        params.append(args.repo)
+    if args.pr:
+        where.append("pr=?")
+        params.append(args.pr)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at"
+    rows = [_row_dict(r, cols) for r in con.execute(sql, params).fetchall()]
+    if args.json:
+        print(json.dumps(rows))
+        return 0
+    if not rows:
+        print("no plan_review_job rows")
+        return 0
+    for r in rows:
+        print(f"{r['repo']}#{r['pr']:<6} {r['head_sha'][:8]:9} {r['state']:11} "
+              f"attempts={r['attempts']:<2} {r['reason'] or ''}")
+    return 0
+
+
+def cmd_worker(args):
+    con = _connect(args.db)
+    # Resolved (or refused, via `_forge`'s own `sys.exit` on a `Stop`) BEFORE
+    # claiming anything: a token failure here must not strand jobs this
+    # process already claimed, unworked, for the full `--claim-ttl` — nothing
+    # claimed below is reachable by any OTHER worker until then either.
+    _forge()
+    holder = os.environ.get("EUNOMIA_SESSION") or f"pid:{os.getpid()}"
+    jobs = _claim_jobs(con, holder, args.limit, args.claim_ttl)
+    done = 0
+    for job in jobs:
+        try:
+            _dispatch_one(con, job, holder)
+            done += 1
+        except Exception as e:
+            # One job's exception must not strand the rest of this sweep's
+            # claims for the full `--claim-ttl`, nor abort the batch with no
+            # trace. Release this job back to `held`, fenced to `holder` so a
+            # job already reclaimed by someone else before the exception is
+            # left alone, and move on to the next claimed job.
+            _fenced(con, job, holder, "held", "hold",
+                   f"the worker raised {e.__class__.__name__}: {e}")
+    print(f"fleet-plan-review: worker claimed {len(jobs)} job(s), "
+          f"{done} completed without raising")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-plan-review", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("enqueue")
+    p.add_argument("repo")
+    p.add_argument("pr", type=int)
+    p.add_argument("--db", default=None)
+
+    p = sub.add_parser("status")
+    p.add_argument("--repo", default=None)
+    p.add_argument("--pr", type=int, default=None)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--db", default=None)
+
+    p = sub.add_parser("worker")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--claim-ttl", type=float, default=DEFAULT_CLAIM_TTL)
+    p.add_argument("--db", default=None)
+
+    args = ap.parse_args(argv)
+    if args.db:
+        args.db = os.path.expanduser(args.db)
+    return {"enqueue": cmd_enqueue, "status": cmd_status, "worker": cmd_worker}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

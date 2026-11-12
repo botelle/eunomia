@@ -28,7 +28,7 @@ user-level skill directories on this fleet are re-synced and keep only
 
 ## The second figure: processes and data
 
-`dispatch-dataflow.svg` (v1.0, 2026-09-22) is the companion cut for a reader
+`dispatch-dataflow.svg` (v1.1, 2026-09-27) is the companion cut for a reader
 who has the first figure's *who decides* and wants *what runs and what it
 writes*: every box is a program, every `writes` line is a file, table or forge
 object, and the right rail lists each store with its writer and readers.
@@ -75,14 +75,14 @@ changes, both scripts change.
 
 ## What the current diagram shows, and what it does not
 
-Version 1.10 depicts the plan-dispatch design as of 2026-09-13: the ignition gate,
-the implementation lane, and black-box test lanes. **The left lane is built; the
-right one is not.** The legend's colours are the honest part of the picture —
-read them before reading the boxes.
+Version 1.11 depicts the plan-dispatch design as of 2026-09-27 (ADR-0013): the
+ignition gate, the implementation lane, and black-box test lanes. **The left
+lane is built; the right one is not.** The legend's colours are the honest part
+of the picture — read them before reading the boxes.
 
-| shipped | `fleet-watch`, the plan format, repo enrollment, plan review, `bin/fleet-bundle` and `mopsus`; the orchestrator wrapper entire — lease, heartbeat, worktree, prompt, implementer session (0010), review loop (0011), comment/ack and steward (0031), post-approval freeze (0032). `UNBUILT_PHASES` is empty and `--ready` exits 0 |
+| shipped | `fleet-watch`, the plan format, repo enrollment, plan review, `bin/fleet-bundle`, the tester gate in `bin/fleet-lane`, and `mopsus`; the orchestrator wrapper entire — lease, heartbeat, worktree, prompt, implementer session (0010), review loop (0011), comment/ack and steward (0031), post-approval freeze (0032). `UNBUILT_PHASES` is empty and `--ready` exits 0 |
 | partly built | — |
-| specified, not built | the ignition gate (0015), the test lane itself (0016, parked under `docs/plans-need-parsing/`), the meeting step, the mediator. **Not** 0017 — the `extlane` consent flag shipped; what is missing is the reader that makes it fire |
+| specified, not built | the ignition gate (0015), the test-PR wrapper, the meeting step, and the mediator (0016, parked under `docs/plans-need-parsing/`). **Not** the opt-in box — ADR-0013 removed it: `extlane` and its 0017 flag are gone, every repository has a test lane, and which runner holds `tester` is per-repo configuration in `bin/fleet-models` (default `sub-opus`) |
 
 **This section was wrong for three versions, which is the failure the page below
 is about.** It said 1.7 while the figure said 1.10, and it listed the bundle
@@ -102,11 +102,11 @@ already argued for.
 
 **The published figure carries no third-party name, no client name, and no
 per-repo enrollment example**, and it must stay that way — true of 1.7 through
-1.10, and a rule rather than a fact about one version. The diagram shows a
-MECHANISM; which repo
-opted in, which opted out, and who the second human reviewer is are facts about
-this estate, not about how plan dispatch works — and they are the only reason
-the picture ever needed a sanitising pass before it could be shown to anyone.
+1.11, and a rule rather than a fact about one version. The diagram shows a
+MECHANISM; which runner holds a given repo's `tester` row, and who its second
+human reviewer is, are facts about this estate, not about how plan dispatch
+works — and they are the only reason the picture ever needed a sanitising pass
+before it could be shown to anyone.
 
 v1.6 named two private repos in the opt-in box, a third in the "Where the
 decision lives" panel, and a client by first name on the test-approval gate. The

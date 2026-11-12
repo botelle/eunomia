@@ -1,0 +1,73 @@
+{
+  "_comment": "Plan 0073 D2. `base` is every Claude runner's sandbox; `runners` holds the per-runner overlay (its own model endpoint, and any credential variable stripped from the shell). Read by sandbox_settings() in bin/orchestrator. sandbox.enabled is FALSE: measured 2026-10-11 on CLI 2.1.296, enabling it with this allowlist refuses loopback :8200, ssh :3022 and writes to the shared .git-store, so every dispatch would fail at the push. Enable only after the docs/implementer-sandbox.md measurement is redone. allowUnsandboxedCommands is false so the model cannot retry a refusal with dangerouslyDisableSandbox.",
+  "base": {
+    "sandbox": {
+      "enabled": false,
+      "network": {
+        "allowedDomains": [
+          "forge.example",
+          "127.0.0.1"
+        ]
+      },
+      "allowUnsandboxedCommands": false
+    }
+  },
+  "runners": {
+    "sub-sonnet": {
+      "allowedDomains": [
+        "api.anthropic.com"
+      ],
+      "denyEnv": [
+        "CLAUDE_CODE_OAUTH_TOKEN"
+      ]
+    },
+    "sub-opus": {
+      "allowedDomains": [
+        "api.anthropic.com"
+      ],
+      "denyEnv": [
+        "CLAUDE_CODE_OAUTH_TOKEN"
+      ]
+    },
+    "sub-fable": {
+      "allowedDomains": [
+        "api.anthropic.com"
+      ],
+      "denyEnv": [
+        "CLAUDE_CODE_OAUTH_TOKEN"
+      ]
+    },
+    "sub-opus-5-5": {
+      "allowedDomains": [
+        "api.anthropic.com"
+      ],
+      "denyEnv": [
+        "CLAUDE_CODE_OAUTH_TOKEN"
+      ]
+    },
+    "sub-sonnet-5": {
+      "allowedDomains": [
+        "api.anthropic.com"
+      ],
+      "denyEnv": [
+        "CLAUDE_CODE_OAUTH_TOKEN"
+      ]
+    },
+    "api-sonnet": {
+      "allowedDomains": [
+        "api.anthropic.com"
+      ],
+      "denyEnv": [
+        "ANTHROPIC_API_KEY"
+      ]
+    },
+    "sub-haiku": {
+      "allowedDomains": [
+        "api.anthropic.com"
+      ],
+      "denyEnv": [
+        "CLAUDE_CODE_OAUTH_TOKEN"
+      ]
+    }
+  }
+}

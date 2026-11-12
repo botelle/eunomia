@@ -11,6 +11,9 @@ import argparse
 import importlib.machinery
 import importlib.util
 import json
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -26,13 +29,25 @@ def _load(name, path):
 
 
 @pytest.fixture
-def st():
+def st(monkeypatch):
+    # bin/fleet-stalled and the modules it loads read FLEET_* settings at
+    # IMPORT (REVIEWER, FORGEJO_URL, TOKEN_CMD, ...), before `_wire` runs, so
+    # clearing them there is too late. Load with none set: a test needs its
+    # results to depend on this file, not on the shell that ran it. A test
+    # that wants one sets it itself. (#1441 review, 2026-11-09.)
+    for key in [k for k in os.environ if k.startswith("FLEET_")]:
+        monkeypatch.delenv(key)
     return _load("fleet_stalled", BIN / "fleet-stalled")
 
 
 @pytest.fixture(autouse=True)
 def _wire(st, monkeypatch, tmp_path):
     monkeypatch.setenv("EUNOMIA_FLEET_DIR", str(tmp_path / ".fleet"))
+    # FLEET_DB wins over EUNOMIA_FLEET_DIR in `_dispatch_db_path`, so any
+    # FLEET_DB in the environment the suite runs in points every failed-plan
+    # test at another database, and seven of them fail with `assert 0 == 1`
+    # (#1438, 2026-11-09). Where #1438's CI run got one is not established.
+    monkeypatch.delenv("FLEET_DB", raising=False)
     monkeypatch.delenv("FLEET_NTFY_URL", raising=False)
     monkeypatch.delenv("FLEET_ANGELIA_URL", raising=False)
     # notify() is bin/orchestrator's real angelia/ntfy sender — replaced with a
@@ -348,8 +363,7 @@ def test_process_repo_reports_one_finding_per_stalled_pr(st):
 
 
 def _write_lease(tmp_path, lease_id, repo, branch, state="active", activated=None,
-                 ttl_minutes=240):
-    from datetime import datetime, timedelta, timezone
+                 ttl_minutes=240, note=None):
     leases = tmp_path / ".fleet" / "leases"
     leases.mkdir(parents=True, exist_ok=True)
     activated = activated or datetime.now(timezone.utc)
@@ -358,6 +372,8 @@ def _write_lease(tmp_path, lease_id, repo, branch, state="active", activated=Non
           "activated": activated.strftime("%Y-%m-%dT%H:%M:%SZ"),
           "created": activated.strftime("%Y-%m-%dT%H:%M:%SZ"),
           "resource": {"type": "branch", "repo": repo, "branch": branch}}
+    if note is not None:
+        rec["note"] = note
     (leases / f"{lease_id}.json").write_text(json.dumps(rec))
 
 
@@ -573,5 +589,411 @@ def test_run_returns_ok_when_nothing_is_stalled(st, monkeypatch, tmp_path, _wire
     stalled_conf = _stalled_conf(tmp_path, default="report")
     args = _args(repos_conf, stalled_conf)
 
+    assert st.run(args) == st.EXIT_OK
+    assert _wire == []
+
+
+# --- held (plan 0170) ----------------------------------------------------------
+
+WAITS = "plan 0002-b waits on 0001-a: not done on main"
+
+
+class HoldForge(FakeForge):
+    def __init__(self):
+        super().__init__()
+        self.deps_statuses = {}          # sha -> [status, ...] newest first
+
+    def list_statuses(self, repo, sha, page=1, limit=50):
+        if page > 1:
+            return 200, []
+        return 200, self.deps_statuses.get(sha, [])
+
+
+def _ctx(context, status):
+    return {"context": context, "status": status}
+
+
+def _combined(state, *ctxs):
+    return 200, {"state": state, "statuses": list(ctxs)}
+
+
+def _deps_status(status, desc, i=1):
+    return {"id": i, "context": "eunomia/deps", "status": status, "description": desc,
+            "created_at": "2026-10-27T10:00:00Z", "creator": {"login": "mergebot"}}
+
+
+def _classify(st, forge, head="h1"):
+    troubles = []
+    got = st.classify_pr(forge, "o/r", _pr(1, head), troubles)
+    return got, troubles
+
+
+def test_red_only_on_deps_with_waits_on_is_held(st):
+    f = HoldForge()
+    f.statuses[("o/r", "h1")] = _combined("failure", _ctx("eunomia/deps", "failure"))
+    f.deps_statuses["h1"] = [_deps_status("failure", WAITS)]
+    (state, detail), troubles = _classify(st, f)
+    assert (state, detail) == ("held", WAITS) and not troubles
+
+
+def test_red_only_on_deps_other_failure_is_red(st):
+    f = HoldForge()
+    f.statuses[("o/r", "h1")] = _combined("failure", _ctx("eunomia/deps", "failure"))
+    f.deps_statuses["h1"] = [_deps_status("failure", "plan id 'x' is not a plan id")]
+    (state, _), _t = _classify(st, f)
+    assert state == "red"
+
+
+def test_deps_pending_alone_and_unreviewed_pages_without_trouble(st):
+    f = HoldForge()
+    f.statuses[("o/r", "h1")] = _combined("pending", _ctx("eunomia/deps", "pending"))
+    (state, _), troubles = _classify(st, f)
+    assert state == "unreviewed" and not troubles
+
+
+def test_deps_and_another_context_red_is_red(st):
+    f = HoldForge()
+    f.statuses[("o/r", "h1")] = _combined(
+        "failure", _ctx("eunomia/deps", "failure"), _ctx("ci/test", "failure"))
+    f.deps_statuses["h1"] = [_deps_status("failure", WAITS)]
+    (state, _), _t = _classify(st, f)
+    assert state == "red"
+
+
+def test_another_context_rerun_green_with_deps_failing_is_held(st):
+    f = HoldForge()
+    # the combined endpoint is de-duplicated: only the latest ci/test is shown
+    f.statuses[("o/r", "h1")] = _combined(
+        "failure", _ctx("eunomia/deps", "failure"), _ctx("ci/test", "success"))
+    f.deps_statuses["h1"] = [_deps_status("failure", WAITS)]
+    (state, _), _t = _classify(st, f)
+    assert state == "held"
+
+
+def test_plan_pr_with_green_ci_and_no_review_is_unreviewed(st):
+    f = HoldForge()
+    f.statuses[("o/r", "h1")] = _combined(
+        "success", _ctx("eunomia/deps", "success"), _ctx("ci/test", "success"))
+    (state, _), _t = _classify(st, f)
+    assert state == "unreviewed"
+
+
+def test_unreadable_deps_statuses_is_a_trouble(st):
+    f = HoldForge()
+    f.statuses[("o/r", "h1")] = _combined("failure", _ctx("eunomia/deps", "failure"))
+    f.list_statuses = lambda *a, **k: (500, None)
+    (state, _), troubles = _classify(st, f)
+    assert state is None and troubles
+
+
+def test_held_is_never_paged_and_clearing_pages_once(st, monkeypatch, tmp_path, _wire):
+    monkeypatch.setattr(st, "_token", lambda: ("tok", ""))
+    f = HoldForge()
+    monkeypatch.setattr(st, "_forge", lambda token: f)
+    f.statuses[("o/r", "h1")] = _combined("failure", _ctx("eunomia/deps", "failure"))
+    f.deps_statuses["h1"] = [_deps_status("failure", WAITS)]
+    f.pulls["o/r"] = [_pr(1, "h1")]
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+
+    assert st.run(args) == st.EXIT_OK
+    assert st.run(args) == st.EXIT_OK
+    assert _wire == []
+
+    # the hold clears on the same head; the PR is unreviewed and pages once
+    f.statuses[("o/r", "h1")] = _combined("success", _ctx("eunomia/deps", "success"))
+    assert st.run(args) == st.EXIT_STALLED
+    assert st.run(args) == st.EXIT_STALLED
+    assert len(_wire) == 1
+
+
+# --- failed-plan (plan 0194) --------------------------------------------------
+
+
+def _write_dispatch_db(tmp_path, rows):
+    """A `dispatch` TABLE, not the real VIEW — `newest_dispatch`'s query reads
+    columns, not the view-ness of the thing holding them, and a table is a
+    plain `CREATE TABLE` + `INSERT` away."""
+    db_path = tmp_path / ".fleet" / "fleet.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path))
+    con.execute("""CREATE TABLE dispatch (
+        lease TEXT, repo TEXT, plan_id TEXT, outcome TEXT, terminal INTEGER,
+        failure_reason TEXT, log_path TEXT, current_phase TEXT,
+        current_phase_ts TEXT)""")
+    for r in rows:
+        con.execute(
+            "INSERT INTO dispatch (lease, repo, plan_id, outcome, terminal, "
+            "failure_reason, log_path, current_phase, current_phase_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (r["lease"], r["repo"], r["plan_id"], r.get("outcome"),
+             int(r.get("terminal", 1)), r.get("failure_reason"),
+             r.get("log_path"), r.get("current_phase"), r.get("current_phase_ts")))
+    con.commit()
+    con.close()
+    return db_path
+
+
+def _plan_fm(plan_id, status="ready"):
+    return {"id": plan_id, "status": status, "paths": [], "depends_on": []}
+
+
+def _ts(days_ago=1):
+    when = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _dispatch_row(repo="o/r", plan_id="0001-x", lease="branch--x--001",
+                  outcome="failed", terminal=1, current_phase_ts=None,
+                  failure_reason="boom", current_phase="implementer-exit"):
+    return {"repo": repo, "plan_id": plan_id, "lease": lease, "outcome": outcome,
+           "terminal": terminal, "failure_reason": failure_reason,
+           "log_path": "/x/run.log", "current_phase": current_phase,
+           "current_phase_ts": current_phase_ts or _ts()}
+
+
+def _wire_failed_plan_run(st, monkeypatch, plans=(("0001-x", "ready"),), marked_pr=None):
+    monkeypatch.setattr(st, "_token", lambda: ("tok", ""))
+    forge = FakeForge()
+    monkeypatch.setattr(st, "_forge", lambda token: forge)
+    monkeypatch.setattr(
+        st.fwatch, "plan_files",
+        lambda repo, token: [(f"plans/{pid}.md", _plan_fm(pid, status))
+                             for pid, status in plans])
+    monkeypatch.setattr(st.fwatch, "marked_pr", lambda repo, plan_id, token: marked_pr)
+    return forge
+
+
+# ---------------------------------------------------------------- newest_dispatch
+
+
+def test_newest_dispatch_picks_the_row_with_the_latest_phase_ts(st, tmp_path):
+    db_path = _write_dispatch_db(tmp_path, [
+        _dispatch_row(lease="branch--x--001", current_phase_ts=_ts(5)),
+        _dispatch_row(lease="branch--x--002", current_phase_ts=_ts(1)),
+    ])
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    row = st.newest_dispatch(con, "o/r", "0001-x")
+    assert row["lease"] == "branch--x--002"
+
+
+def test_newest_dispatch_is_none_for_an_undispatched_plan(st, tmp_path):
+    db_path = _write_dispatch_db(tmp_path, [_dispatch_row(plan_id="0001-x")])
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    assert st.newest_dispatch(con, "o/r", "0002-never-dispatched") is None
+
+
+# ------------------------------------------------------------- action_for_failed_plan
+
+
+def test_action_for_failed_plan_with_no_pr_names_fleet_requeue(st):
+    finding = {"repo": "o/r", "plan": "0001-x", "pr": None, "pr_state": None}
+    assert st.action_for_failed_plan(finding) == "fleet-requeue o/r 0001-x"
+
+
+def test_action_for_failed_plan_with_an_open_pr_names_respawn(st):
+    finding = {"repo": "o/r", "plan": "0001-x", "pr": 42, "pr_state": "open"}
+    action = st.action_for_failed_plan(finding)
+    assert "respawn" in action and "o/r#42" in action
+
+
+def test_action_for_failed_plan_with_a_closed_pr_names_the_status_decision(st):
+    finding = {"repo": "o/r", "plan": "0014-x", "pr": 102, "pr_state": "closed"}
+    action = st.action_for_failed_plan(finding)
+    assert "o/r#102 is closed" in action
+    assert "fleet-requeue o/r" not in action
+
+
+# -------------------------------------------------------------------- run(): failed-plan
+
+
+def test_a_failed_plan_with_no_marked_pr_is_named_with_fleet_requeue(
+        st, monkeypatch, tmp_path, _wire):
+    _wire_failed_plan_run(st, monkeypatch, marked_pr=None)
+    _write_dispatch_db(tmp_path, [_dispatch_row()])
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_STALLED
+    assert len(_wire) == 1
+    title, body = _wire[0]
+    assert title == "fleet-stalled: failed-plan"
+    assert "fleet-requeue o/r 0001-x" in body
+
+
+def test_a_failed_plan_with_an_open_pr_and_a_dead_steward_is_named_with_respawn(
+        st, monkeypatch, tmp_path, _wire):
+    pr = {"number": 42, "state": "open", "head": {"ref": "feat/x-r2"}}
+    _wire_failed_plan_run(st, monkeypatch, marked_pr=pr)
+    _write_dispatch_db(tmp_path, [_dispatch_row()])
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_STALLED
+    assert len(_wire) == 1
+    title, body = _wire[0]
+    assert "respawn" in body and "o/r#42" in body
+
+
+def test_a_failed_plan_with_an_open_pr_and_a_live_steward_is_not_named(
+        st, monkeypatch, tmp_path, _wire):
+    pr = {"number": 42, "state": "open", "head": {"ref": "feat/x-r2"}}
+    _wire_failed_plan_run(st, monkeypatch, marked_pr=pr)
+    _write_dispatch_db(tmp_path, [_dispatch_row()])
+    _write_lease(tmp_path, "branch--steward--001", "o/r", "feat/x-r2")
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_OK
+    assert _wire == []
+
+
+@pytest.mark.parametrize("outcome", ["closed", "failed"])
+def test_a_ready_plan_whose_marked_pr_is_closed_is_named_with_the_status_decision(
+        st, monkeypatch, tmp_path, _wire, outcome):
+    pr = {"number": 102, "state": "closed", "head": {"ref": "feat/x"}}
+    _wire_failed_plan_run(st, monkeypatch, plans=(("0014-x", "ready"),), marked_pr=pr)
+    _write_dispatch_db(tmp_path, [_dispatch_row(plan_id="0014-x", outcome=outcome)])
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_STALLED
+    assert len(_wire) == 1
+    title, body = _wire[0]
+    assert "o/r#102 is closed" in body
+    assert "fleet-requeue o/r" not in body
+
+
+def test_a_plan_with_a_live_lease_is_not_named(st, monkeypatch, tmp_path, _wire):
+    _wire_failed_plan_run(st, monkeypatch, marked_pr=None)
+    _write_dispatch_db(tmp_path, [_dispatch_row()])
+    _write_lease(tmp_path, "branch--x--001", "o/r", "feat/x-r2", note="plan:0001-x")
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_OK
+    assert _wire == []
+
+
+def test_a_plan_with_only_a_dead_orphaned_lease_is_still_named(
+        st, monkeypatch, tmp_path, _wire):
+    """D1's liveness check is fleetlib's TTL/heartbeat verdict, never the
+    lease's `state` field: an `active` lease whose orchestrator stopped
+    heartbeating is not alive, and must not hide a genuinely failed plan."""
+    _wire_failed_plan_run(st, monkeypatch, marked_pr=None)
+    _write_dispatch_db(tmp_path, [_dispatch_row()])
+    old = datetime.now(timezone.utc) - timedelta(hours=2)
+    _write_lease(tmp_path, "branch--x--001", "o/r", "feat/x-r2",
+                note="plan:0001-x", activated=old, ttl_minutes=5)
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_STALLED
+    assert len(_wire) == 1
+
+
+@pytest.mark.parametrize("status", ["done", "abandoned"])
+def test_a_plan_not_status_ready_is_not_named(st, monkeypatch, tmp_path, _wire, status):
+    checked = []
+    _wire_failed_plan_run(st, monkeypatch, plans=(("0001-x", status),))
+    monkeypatch.setattr(st.fwatch, "marked_pr",
+                        lambda repo, plan_id, token: checked.append(1))
+    _write_dispatch_db(tmp_path, [_dispatch_row()])
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_OK
+    assert _wire == []
+    assert checked == [], "a plan not status: ready must not even cost a marked-PR read"
+
+
+def test_a_plan_whose_newest_dispatch_merged_is_not_named(st, monkeypatch, tmp_path, _wire):
+    _wire_failed_plan_run(st, monkeypatch, marked_pr=None)
+    _write_dispatch_db(tmp_path, [_dispatch_row(outcome="merged")])
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_OK
+    assert _wire == []
+
+
+def test_a_second_run_on_the_same_utc_day_is_silent_and_the_next_day_repages(
+        st, monkeypatch, tmp_path, _wire):
+    _wire_failed_plan_run(st, monkeypatch, marked_pr=None)
+    _write_dispatch_db(tmp_path, [_dispatch_row()])
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_STALLED
+    assert len(_wire) == 1
+
+    assert st.run(args) == st.EXIT_STALLED
+    assert len(_wire) == 1, "a second run the same UTC day must stay silent"
+
+    data = json.loads(st._state_path().read_text())
+    for p in data["pages"]:
+        if p.get("state") == st.FAILED_PLAN:
+            p["day"] = "2000-01-01"
+    st._state_path().write_text(json.dumps(data))
+
+    assert st.run(args) == st.EXIT_STALLED
+    assert len(_wire) == 2, "a new UTC day re-pages"
+
+
+def test_a_new_dispatch_lease_stops_the_page(st, monkeypatch, tmp_path, _wire):
+    _wire_failed_plan_run(st, monkeypatch, marked_pr=None)
+    _write_dispatch_db(tmp_path, [_dispatch_row()])
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_STALLED
+    assert len(_wire) == 1
+
+    _write_lease(tmp_path, "branch--x--002", "o/r", "feat/x-r2", note="plan:0001-x")
+    assert st.run(args) == st.EXIT_OK
+    assert len(_wire) == 1, "a live dispatch lease stops the page entirely"
+
+
+def test_an_undelivered_page_is_retried_then_stays_silent_once_delivered(
+        st, monkeypatch, tmp_path, _wire):
+    monkeypatch.setattr(st, "_token", lambda: ("tok", ""))
+    forge = FakeForge()
+    monkeypatch.setattr(st, "_forge", lambda token: forge)
+    forge.statuses[("o/r", "head1")] = _status("success")
+    forge.pulls["o/r"] = [_pr(1, "head1", head_ref="feat/x")]
+
+    outcomes = [False, True]
+    monkeypatch.setattr(st.orch, "notify", lambda title, body: outcomes.pop(0))
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+
+    assert st.run(args) == st.EXIT_STALLED
+    data = json.loads(st._state_path().read_text())
+    assert data["pages"][0]["delivered"] is False
+
+    assert st.run(args) == st.EXIT_STALLED
+    data = json.loads(st._state_path().read_text())
+    assert len(data["pages"]) == 1
+    assert data["pages"][0]["delivered"] is True
+
+    def fail_notify(title, body):
+        raise AssertionError("must not re-notify once delivered")
+    monkeypatch.setattr(st.orch, "notify", fail_notify)
+    assert st.run(args) == st.EXIT_STALLED
+
+
+def test_a_repo_with_no_plans_tree_is_not_a_trouble(st, monkeypatch, tmp_path, _wire):
+    """`plan_files` returning None (Forgejo 404s a repo with no `plans/` tree
+    exactly like a genuine read failure) must not page — most of
+    `config/repos.conf` is not plan-driven, and `bin/fleet-watch`'s own
+    `cycle()` treats this identically, a warn and a skip, never a page."""
+    monkeypatch.setattr(st, "_token", lambda: ("tok", ""))
+    forge = FakeForge()
+    monkeypatch.setattr(st, "_forge", lambda token: forge)
+    monkeypatch.setattr(st.fwatch, "plan_files", lambda repo, token: None)
+    _write_dispatch_db(tmp_path, [])
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
+    assert st.run(args) == st.EXIT_OK
+    assert _wire == []
+
+
+def test_a_missing_fleet_db_is_not_a_trouble_and_finds_nothing(
+        st, monkeypatch, tmp_path, _wire):
+    """plan 0036's `dispatch` view never installed on this host is a normal
+    state (mirrors operator/lynceus's own read of it), never a scan trouble."""
+    _wire_failed_plan_run(st, monkeypatch, marked_pr=None)
+    # no fleet.db written at all
+
+    args = _args(_repos_conf(tmp_path, "o/r"), _stalled_conf(tmp_path, default="report"))
     assert st.run(args) == st.EXIT_OK
     assert _wire == []

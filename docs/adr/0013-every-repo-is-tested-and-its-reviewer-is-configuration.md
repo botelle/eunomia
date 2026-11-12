@@ -8,12 +8,24 @@
   amended below. The Fable-only reviewer rule of
   `plans/0065-a-reviewer-is-configurable-and-always-fable.md` (the owner's
   ruling of 2026-08-26, "Fable on every PR, hard stop").
+- **Amended by:** [ADR-0026](0026-any-runner-may-hold-any-position.md) §7 (2026-11-05) — §4: a repository whose reviewer seats are all the owner's has no agent review. *(Withdrawn 2026-11-05.)*
 - **Amends:** [ADR-0009](0009-a-lane-may-have-a-supervisor.md) §4 (the tester
   minimum now binds every repository); [ADR-0011](0011-a-runner-has-a-provenance-class.md)
   §2 and §4 (which cited plan 0065's rule).
+- **Amended 2026-10-06 by the owner** — §4: a configured second reviewer posts its own
+  verdict as `rev2bot` on every repository, critical or not.
 - **Relates:** `bin/fleet-models` (the per-repo table this makes authoritative),
   `bin/fleet-repo` and `bin/fleet-lane` (the flag's writer and reader),
   `~/agent/dispatch-review.py` in `operator/talos` (the reviewer's hardcoded model).
+- **Amended by:** [ADR-0019](0019-on-an-autonomous-repo-the-plan-is-the-human-approval.md),
+  2026-09-29 — §4: on an autonomous repository each of two reviewers posts its own
+  verdict under its own account.
+- **Amended 2026-09-28 by the owner** — §3: the ADR no longer names the default
+  reviewer; §4: every configured reviewer runs before the verdict is posted, and
+  a HIGH from any of them withholds the approval.
+- **Amended by:** [ADR-0024](0024-no-review-requires-a-named-model.md), 2026-10-21 — §4:
+  the two reviewers may run the same model; `revbot` and `rev2bot` name ordinals, not models.
+- **Amended by:** [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22 — §2, §3: any runner, not any ADR-0011 §2 allows.
 
 ## Context
 
@@ -42,7 +54,7 @@ repository in `bin/fleet-models`. ADR-0006 §7 is unchanged: only a
 ones.** Ordinal 1 must resolve, from the repository's own row or the `'default'`
 row, or dispatch refuses. The `'default'` row names `sub-opus`: the contract
 then goes only to Anthropic, which already holds the code, so the default
-discloses nothing new. Any runner ADR-0011 §2 allows at `tester` may replace it.
+discloses nothing new. Any runner ADR-0011 §2 allows at `tester` may replace it. *(Amended by [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22: any runner.)*
 Where two testers disagree, the specification was ambiguous (ADR-0006 §3),
 which is the reason to configure a second.
 
@@ -50,12 +62,63 @@ which is the reason to configure a second.
 rule.** `plan_reviewer` and `code_reviewer` ordinal 1 resolve through
 `bin/fleet-models` like every other position. The `'default'` row names the
 runner pinned to `claude-fable-5-1`. Any runner ADR-0011 §2 allows at a
-reviewer position may be configured. No reviewer runner may name a model by
+reviewer position may be configured. *(Amended by [ADR-0026](0026-any-runner-may-hold-any-position.md), 2026-10-22: any runner;
+ADR-0011 §2 is withdrawn.)* No reviewer runner may name a model by
 alias: an A/B comparison needs to know which model produced each review.
 
-**4. Ordinal 1 gives the verdict; additional reviewers annotate.** This is
-ADR-0009 §4's rule, and it is what makes an A/B arm cheap: a second reviewer runs
-on the same pull request, and its review is recorded without approving.
+*(Amended by the owner, 2026-09-28. The sentence naming the Fable runner as the
+`'default'` row is withdrawn: which runner the `'default'` rows name is
+configuration, set in `bin/fleet-models`, and this ADR does not fix it. The rest
+of §3 stands.)*
+
+**4. Every configured reviewer runs before the verdict is posted, and a HIGH
+from any of them withholds the approval.** Ordinal 1 still posts the pull
+request's single forge verdict, since every ordinal posts as the same reviewer
+identity and a second approval would dismiss the first. It posts an approval
+only when every enabled ordinal at that position produced a review and none of
+them holds a HIGH finding. Otherwise it posts a comment, and each other
+ordinal's review is posted beside it. A reviewer that did not produce a review
+withholds the approval as a HIGH would.
+
+*(Amended by the owner, 2026-09-28. It read: "Ordinal 1 gives the verdict;
+additional reviewers annotate. This is ADR-0009 §4's rule, and it is what makes
+an A/B arm cheap: a second reviewer runs on the same pull request, and its
+review is recorded without approving." An annotation posted after an approval
+arrives after the merge, so it could not act as a check. What survives: one
+forge verdict per pull request, posted by ordinal 1, and a repository with one
+reviewer is unaffected.)*
+
+*(Amended by [ADR-0019](0019-on-an-autonomous-repo-the-plan-is-the-human-approval.md),
+2026-09-29, for autonomous repositories only. Two reviewers, `revbot` and `rev2bot`,
+run different models in fresh sessions, and each posts its own forge verdict under its
+own account. A fallback may not put both on one model. What survives: a reviewer that
+did not produce a review withholds, and a single verdict per account.)*
+
+*(Amended by the owner, 2026-10-06, for every repository. Where a position has a
+second configured reviewer, that reviewer posts its own forge verdict as `rev2bot`,
+critical or not, and everything it writes on the pull request comes from that
+account. One reviewer's HIGH no longer withholds the other's approval; it blocks
+as that reviewer's own non-approval. A critical repository never gets less review
+than an autonomous one: there the owner's merge is required on top of both approvals.
+*(Corrected by the owner, 2026-10-07: it read "the owner's approval is required on
+top of both". The owner merges, so a separate owner approval adds nothing. See
+ADR-0004 as amended 2026-10-07.)*
+What survives: a reviewer that did not produce a review withholds the other's
+approval, two configured reviewers may not run one model, a single verdict per
+account, and a repository with one reviewer is unaffected.)*
+
+*(Amended by [ADR-0026](0026-any-runner-may-hold-any-position.md) §7, 2026-11-05: a
+repository whose reviewer seats are all the owner's has no agent review, and the
+owner's merge is its review. Every other critical repository is unchanged. This note was withdrawn by the owner, 2026-11-05, with ADR-0026 §7; nothing was built on it, and the text above binds as it did before.)*
+
+*(Amended by [ADR-0024](0024-no-review-requires-a-named-model.md), 2026-10-21. Both
+passages above that require different models are withdrawn: "run different models"
+and "A fallback may not put both on one model" in the ADR-0019 note, and "two
+configured reviewers may not run one model" in the 2026-10-06 note. `revbot`
+and `rev2bot` are the accounts of ordinals 1 and 2, and either may run any configured
+model, the same one included. What survives: each reviewer's own verdict under its
+own account, fresh sessions, and a reviewer that did not produce a review
+withholds.)*
 
 **5. A review names the runner and model that produced it.** The
 `Review-provenance:` line is written from the resolved runner, never from a

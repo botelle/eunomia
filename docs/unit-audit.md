@@ -32,7 +32,7 @@ see Boundaries.
 |---|---|---|
 | **shipped** | the repo's own `launchd/*.plist` | filename stem == label, by this repo's convention |
 | **enrolled** | this host's rows in `config/services.conf` | `primary=` label, for `supervisor=launchd` rows whose `host` matches |
-| **installed / loaded** | `~/Library/LaunchAgents/<label>.plist`, and `launchctl print gui/$UID` | a strict `plistlib` parse of the installed file; a label found in the domain's `services = {...}` block |
+| **installed / loaded** | `<label>.plist` in `~/Library/LaunchAgents` (or `/Library/LaunchDaemons` for an enrolled `domain=system` row), and `launchctl print gui/$UID` (or `launchctl print system` for that row) | a strict `plistlib` parse of the installed file; the label found in its own domain's `services = {...}` block — looked up by name, not through the `org.eunomia.*` filter, which decides only what the out-of-scope scan may report |
 
 Each is a **fact**, never inferred from another (§3 boundary) — every one of
 them was individually correct while mopsus sat undeployed for a day. A tool
@@ -44,9 +44,15 @@ Per unit, the report prints all four: `shipped=`, `enrolled=`, `installed=`,
 
 ## Scope, and what makes the exit status non-zero
 
-A unit is **in scope** if it is shipped by this repo, or enrolled in
-`config/services.conf` for this host. Only in-scope units can make the audit
-exit non-zero:
+A unit is **in scope** if it is enrolled in `config/services.conf` for this
+host, or shipped by this repo **for** this host. A shipped plist belongs to
+the host whose row enrols it; one enrolled nowhere belongs to opshost
+(`SHIPPED_UNITS_HOST` — every `launchd/*.plist` today is an opshost
+LaunchAgent; deliberately a constant, not an environment variable — an
+export in an operator's shell must not be able to move every unenrolled
+unit off opshost and turn the audit green). Without that rule, `audit` on cihost counted each opshost unit as
+shipped-but-not-installed and could never exit 0 there. Only in-scope units
+can make the audit exit non-zero:
 
 | condition | reported | exit non-zero |
 |---|---|---|
@@ -57,6 +63,7 @@ exit non-zero:
 | loaded `org.eunomia.*` this repo does not ship | yes | no — **including its own parse failures** |
 | `org.eunomia.fleet-orch.<lease>` (a dispatch in flight) | **not at all** | no |
 | `config/services.conf` rows for **another** host | yes, "not audited here" | no |
+| a shipped plist belonging to another host | yes, `shipped-for-other-host` with `loaded=` — never as out-of-scope `shipped-by-eunomia=no`; one enrolled elsewhere only when loaded here (otherwise its `other-host` line covers it) | no |
 
 Scope is decided before condition: an unshipped label's parse failure is
 still worth a line — the org.eunomia.lynceus case, measured live on opshost the

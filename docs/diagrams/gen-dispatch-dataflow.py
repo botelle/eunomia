@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan dispatch — processes and data, v1.0.
+"""Plan dispatch — processes and data, v1.1.
 
 The companion to plan-dispatch-flow.svg. That figure shows WHO decides; this one
 shows WHAT RUNS and WHAT IT WRITES at each step, so a reader can go from a step
@@ -90,7 +90,7 @@ e('''<style>
 e(f'<rect class="bg" x="0" y="0" width="{W}" height="{H}" fill="#ffffff"/>')
 
 label(950, 52, "Plan dispatch — the processes that run, and the data each one writes", "t", "middle")
-label(950, 76, "Version 1.0 — 2026-09-22 by Fleet Operator", "sub", "middle")
+label(950, 76, "Version 1.1 — 2026-09-27 by Fleet Operator", "sub", "middle")
 label(60, 46, "One plan, from a filed PR to a merged PR, as it actually runs on opshost.", "n")
 label(60, 62, "Bands are phases. Every box names the program; `writes` names what it leaves behind.", "n")
 label(60, 78, "The right rail lists every store, its writer and its readers.", "n")
@@ -117,7 +117,8 @@ y = 116
 start_band("1 · FILE", "#f7f5f0")
 y = place(y, "proc", "Plan PR opened", ["file-a-plan → forgejo-open-pr.sh, as implbot.", "Front matter: id, status: ready, paths (the lease),", "depends_on. No Plan: marker on a plan PR."],
           ["forge: pull request, branch plans/NNNN-slug"], "mech", "①")
-y = place(y, "agent", "Plan review", ["dispatch-review.py → a Fable session reads the", "plan against the checkout; HIGH blocks, else deferred."],
+y = place(y, "agent", "Plan review", ["dispatch-review.py → the repo's reviewer (default Fable),", "reads the plan against the checkout; HIGH blocks, else",
+          "deferred. Per-repo routing is a talos plan, not yet merged."],
           ["forge: review (APPROVE/COMMENT), review-ledger", "comment, follow-ups issue"], "agent", "②")
 y = place(y, "gate", "Merge the plan PR", ["Two approvals; the operator merges. Merge is ignition."],
           ["main: plans/NNNN-slug.md at status: ready"], "human", "③")
@@ -142,7 +143,8 @@ y = place(y, "proc", "Verify, then wait for CI", ["Finds the PR by marker; refus
 end_band(); y += 30
 start_band("4 · REVIEW", "#f1f4f7", "bounded: per-repo passes (review-bounds.conf), each round a fresh session")
 y += 18
-y = place(y, "agent", "Review round", ["CI red → a CI-fix session (check names only today; 0069", "adds the stored log). CI green → dispatch-review.py: a", "Fable session posts the verdict; MEDIUM/LOW → issue."],
+y = place(y, "agent", "Review round", ["CI red → a CI-fix session (check names only today; 0069", "adds the stored log). CI green → dispatch-review.py: the",
+          "repo's reviewer (default Fable) posts the verdict;", "additional reviewers annotate; MEDIUM/LOW → issue."],
           ["forge: review, review-ledger comment, follow-ups issue", "fleet.db review (via fleet-reviews)"], "agent", "⑩")
 y = place(y, "agent", "Fix round, or stop", ["HIGH → a fix session on the same branch, push, back", "to ⑩. Bound exhausted, or nothing pushed → stop."],
           ["forge: commits; run log: review-round, review-stopped", "events.jsonl: plan-failed (on stop)"], "agent", "⑪")

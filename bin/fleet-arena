@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""fleet-arena — one arena repository, many cells (plan 0062).
+
+A plan/implementer/reviewer model comparison runs as N cells against ONE
+repository (the "arena"), each cell a real dispatch of `bin/orchestrator`
+with the `implementer` position pinned to a chosen runner. Every cell's
+record carries the base commit and the resolved position->runner map it
+actually ran with, so a result is attributable from the record itself rather
+than by joining a start time against `repo_model_change`.
+
+  fleet-arena cell --repo <arena> --plan <repo-relative path> --base <full sha>
+             --assign implementer=<runner> [--round <name>]
+  fleet-arena list [--repo] [--round]
+  fleet-arena show <cell-id>
+
+`--assign` ACCEPTS ONLY `implementer`. `bin/orchestrator` has exactly one
+`resolve_repo` call site — `resolved_implementer_env`, with the literal
+string `"implementer"` — so every other position in `bin/fleet-models`'
+CHECK set is a vocabulary the table admits, not a wiring the orchestrator
+honours. `--assign <other position>=...` is refused before anything is
+written, naming that call site.
+
+`--base` IS AN ASSERTION, CHECKED, NEVER OBEYED. `bin/orchestrator` has no
+base input of its own: a fresh dispatch always branches from whatever the
+arena's `origin/main` is at dispatch time. So this file fetches the arena,
+resolves `origin/main` itself, and refuses when it differs from `--base` —
+before any row is written and before a lease is minted. `base_sha` is then
+the commit THIS file verified `origin/main` to be, which is the commit the
+orchestrator actually branches from; `plan_sha` is a content hash of
+`git show <base_sha>:<plan path>`, not a file the operator handed over.
+
+EVERY CELL GETS SEVEN `arena_cell_assignment` ROWS, not only the position
+`--assign` named. `implementer` is `source='assigned', effective=1`.
+`plan_reviewer`/`code_reviewer` are no longer pinned: ADR-0013 superseded
+plan 0065's Fable-only rule, and `~/agent/dispatch-review.py` resolves them
+from `repo_model`. They are recorded like the other four — from
+`bin/fleet-models`' `repo_model` table purely for the record, `effective=0`
+because `bin/orchestrator` does not read them (the review runs outside it, at
+review time, so the row is what the table said at dispatch, not a pin). So
+are `tester`, `mediator`, `impl_supervisor` and `test_supervisor` — `bin/orchestrator` reads none of
+them today, so every one of these rows is `effective=0`.
+
+THE ASSIGNMENT IS WRITTEN BEFORE DISPATCH, under one short `BEGIN IMMEDIATE`
+transaction, and the orchestrator is spawned only after it commits. There is
+no lock per arena and cells do not serialise: the one position the
+orchestrator reads is carried in `EUNOMIA_IMPL_RUNNER`, a per-process
+environment variable, so two cells on one arena share no state a lock would
+need to protect. A cell whose dispatch (lease mint or orchestrator spawn)
+fails afterward is marked `outcome='failed'` by an UPDATE — its row and its
+seven assignment rows are never deleted.
+
+THE LEASE AND BRANCH ARE MINTED HERE, one per cell, via `fleet-claim
+--assign` exactly as `bin/fleet-watch`'s own `spawn()` does — but naming
+`cell/<plan-slug>/<cell_id>` rather than `feat/<plan-slug>`, because
+`fleet-watch`'s branch name is one per PLAN and two cells on one plan need
+two branches. This is a second minting path beside `fleet-watch`'s; see
+`docs/arena.md` for the two side by side.
+
+FLEET-ARENA DOES NOT SCORE A CELL, MERGE ONE, OR FLIP A PLAN'S STATUS. See
+the plan's Boundaries section for why: the outcome metric is an
+independently authored test suite that never sees this file, and a merged
+cell would move the arena's `main` out from under every later cell in the
+round.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+
+def _load_sibling(name, mod_name):
+    loader = importlib.machinery.SourceFileLoader(mod_name, str(BIN / name))
+    spec = importlib.util.spec_from_loader(mod_name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+lib = _load_sibling("fleetlib.py", "fleetlib")
+fleetjob = _load_sibling("fleetjob.py", "fleetjob")
+models = _load_sibling("fleet-models", "_fleet_arena_models")
+
+
+# `lib.fleet_dir()`, not a hardcoded path — same reasoning as bin/fleet-models:
+# this file is invoked directly by an operator or a script, and a default that
+# ignored EUNOMIA_FLEET_DIR would let a test (or an alternate host
+# configuration) reach into the real production fleet.db.
+DB = os.path.expanduser(os.environ.get("FLEET_DB", str(lib.fleet_dir() / "fleet.db")))
+
+# The seven positions an arena cell records. This is not `models.POSITIONS`:
+# arena cells record bakeoff assignments, and `arena_cell_assignment`'s CHECK was
+# fixed when they were written. A position added to fleet-models later (such as
+# `style_reviewer`) would fail every new cell's insert here.
+ARENA_POSITIONS = ("implementer", "plan_reviewer", "code_reviewer", "tester",
+                   "mediator", "impl_supervisor", "test_supervisor")
+
+# The position `bin/orchestrator` actually reads (resolved_implementer_env,
+# with the literal "implementer") — the only one `--assign` accepts.
+EFFECTIVE_POSITIONS = frozenset({"implementer"})
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS arena_cell (
+  cell_id    TEXT    NOT NULL PRIMARY KEY,  -- ULID from the writer
+  ts         TEXT    NOT NULL,              -- ISO-8601 UTC, cell start
+  repo       TEXT    NOT NULL,              -- the arena, e.g. 'operator/arenarepo'
+  round      TEXT    NOT NULL,              -- 'build' | 'add-feature' | operator's own
+  plan_sha   TEXT    NOT NULL,              -- content hash of <base_sha>:<plan path>
+  base_sha   TEXT    NOT NULL,              -- origin/main as verified == --base; what the orchestrator branched from
+  branch     TEXT    NOT NULL,              -- per cell: cell/<plan-slug>/<cell_id>
+  pr         INTEGER,                       -- NULL until one is opened
+  lease      TEXT,                          -- joins dispatch/dispatch_phase
+  outcome    TEXT    NOT NULL DEFAULT 'running',
+  CHECK (outcome IN ('running','opened','failed','abandoned'))
+);
+
+CREATE TABLE IF NOT EXISTS arena_cell_assignment (
+  cell_id   TEXT    NOT NULL,
+  position  TEXT    NOT NULL,
+  ordinal   INTEGER NOT NULL DEFAULT 1,
+  runner    TEXT    NOT NULL,   -- a key in bin/orchestrator's RUNNERS, or
+                                 -- 'none' when no repo_model row (its own or
+                                 -- the shared default) resolves this position
+  source    TEXT    NOT NULL,   -- how this position got its runner
+  effective INTEGER NOT NULL,   -- 1 if bin/orchestrator reads this position
+  PRIMARY KEY (cell_id, position, ordinal),
+  CHECK (position IN ('implementer','plan_reviewer','code_reviewer',
+                      'tester','mediator','impl_supervisor','test_supervisor')),
+  CHECK (source IN ('assigned','repo_model','default','pinned')),
+  CHECK (effective IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS arena_cell_assignment_cell ON arena_cell_assignment(cell_id);
+CREATE INDEX IF NOT EXISTS arena_cell_repo_round ON arena_cell(repo, round);
+"""
+
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _ulid():
+    """A real ULID: 48-bit ms timestamp + 80-bit randomness, Crockford base32.
+    Same construction as bin/fleet-models' _ulid — the writer mints it, never
+    the DB, so two writers can never collide on a next integer."""
+    ts_ms = int(time.time() * 1000)
+    data = ts_ms.to_bytes(6, "big") + os.urandom(10)
+    bits = int.from_bytes(data, "big") << 2
+    return "".join(_CROCKFORD[(bits >> (130 - 5 * (i + 1))) & 0x1F] for i in range(26))
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def warn(msg):
+    print(f"fleet-arena: {msg}", file=sys.stderr)
+
+
+class Refused(Exception):
+    """A refusal before any row is written."""
+
+
+class DispatchFailed(Exception):
+    """A refusal AFTER the arena_cell row already exists — the caller marks
+    the row 'failed' rather than deleting it (plan 0062 D6)."""
+
+
+def _enable_wal(con):
+    """Same reasoning and same idiom as bin/fleet-models' _enable_wal: WAL is
+    what lets a reader (fleet-arena list/show, or the lynceus API later) read
+    fleet.db while another writer holds it."""
+    try:
+        mode = con.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    except sqlite3.OperationalError as e:
+        warn(f"could not switch to WAL ({e}) — continuing in the current journal mode")
+        return None
+    if mode not in ("wal", "memory"):
+        warn(f"journal_mode is {mode!r}, not 'wal'")
+    return mode
+
+
+def connect(db_path=None):
+    con = sqlite3.connect(db_path or DB)
+    _enable_wal(con)
+    con.executescript(SCHEMA)
+    return con
+
+
+# ------------------------------------------------------------------ --assign
+
+
+def _refuse_unspawnable(runner):
+    """A runner RUNNERS carries but this cell could never start: declared
+    `unwired`, or needing a credential kind other than the one
+    bin/orchestrator's resolve_credential gives the cell's child. The cell's
+    child inherits this process's environment (`_child_env`), so the kind is
+    read by calling that same function here — never a constant that drifts
+    when the orchestrator's rule changes (plan 0116 moved it from `local_cli`
+    to `oauth_token`). Either failure makes the orchestrator Stop at once, so
+    the cell would be recorded `running` for a run that never began."""
+    orch = models._load_orchestrator()
+    r = orch.RUNNERS[runner]
+    if r.unwired:
+        raise Refused(f"--assign implementer={runner} is refused: the runner "
+                      f"is declared but not wired ({r.unwired})")
+    try:
+        have = orch.resolve_credential().kind
+    except orch.Stop as e:
+        raise Refused(f"--assign implementer={runner} is refused: a cell "
+                      f"dispatched from here would Stop at once ({e})") from None
+    if r.needs and r.needs != have:
+        raise Refused(f"--assign implementer={runner} is refused: it needs a "
+                      f"{r.needs!r} credential and a cell dispatched from here "
+                      f"resolves {have!r} (bin/orchestrator "
+                      "resolve_credential)")
+
+
+def parse_assign(raw):
+    """'implementer=<runner>' -> {'implementer': runner}. Refuses (before any
+    row is written) any position bin/orchestrator does not read, any runner
+    name RUNNERS does not carry, a duplicate position, or a missing
+    implementer entry."""
+    pairs = {}
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise Refused(f"--assign {chunk!r} is not position=runner")
+        position, runner = (p.strip() for p in chunk.split("=", 1))
+        if not position or not runner:
+            raise Refused(f"--assign {chunk!r} is not position=runner")
+        if position not in EFFECTIVE_POSITIONS:
+            raise Refused(
+                f"--assign {position!r} is refused: bin/orchestrator has exactly "
+                "one resolve_repo call site, resolved_implementer_env, and it "
+                "names the literal 'implementer'. The other positions in "
+                "bin/fleet-models' CHECK set resolve from repo_model but nothing "
+                "in bin/orchestrator ever reads them — only "
+                "--assign implementer=<runner> can change what a cell runs")
+        try:
+            models.validate_runner(runner)
+        except models.UnknownRunner as e:
+            raise Refused(str(e)) from None
+        _refuse_unspawnable(runner)
+        if position in pairs:
+            raise Refused(f"--assign names {position!r} more than once")
+        pairs[position] = runner
+    if "implementer" not in pairs:
+        raise Refused("--assign must name implementer=<runner> — it is the one "
+                      "position bin/orchestrator reads")
+    return pairs
+
+
+# --------------------------------------------------------------------- --base
+
+
+_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def validate_base(value):
+    """Shape-only: full 40-char hex, refusing before any I/O. A short or
+    symbolic ref is ambiguous in a repo's future and the record outlives the
+    run — refused with the same message whichever it is."""
+    if not _FULL_SHA_RE.match(value or ""):
+        raise Refused(f"--base {value!r} is not a full 40-character SHA — short "
+                      "and symbolic refs are ambiguous in a repo's future and "
+                      "the record outlives the run")
+    return value.lower()
+
+
+_FM_RE = re.compile(rb"\A---\n(.*?)\n---\n", re.S)
+
+
+def parse_front_matter(raw_bytes):
+    """{key: value} from a plan's YAML-ish front matter block — the same
+    line-split parse bin/orchestrator's read_plan uses, over bytes already
+    read from git rather than a checked-out file."""
+    fm = {}
+    m = _FM_RE.match(raw_bytes)
+    if not m:
+        return fm
+    for line in m.group(1).decode("utf-8", "replace").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fm[k.strip()] = v.strip()
+    return fm
+
+
+def verify_base_and_read_plan(repo, base_sha, plan_path):
+    """Fetch the arena, refuse if its origin/main is not --base, then read the
+    plan at that exact commit. Returns (store path, plan bytes). Refuses
+    before any row is written — this is called before any DB write in
+    cmd_cell."""
+    try:
+        store = lib.ensure_store(repo)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+        raise Refused(f"could not fetch {repo}: {e.__class__.__name__}: {e}") from None
+    r = subprocess.run(["git", "rev-parse", "origin/main"], cwd=str(store),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise Refused(f"could not resolve {repo}'s origin/main: "
+                      f"{r.stderr.strip()[:200]}")
+    current = r.stdout.strip()
+    if current.lower() != base_sha:
+        raise Refused(
+            f"--base {base_sha} is not {repo}'s origin/main — it is currently "
+            f"{current}. fleet-arena checks --base, it does not obey it: reset "
+            "the arena's main to --base, or state a new base for this round")
+    r2 = subprocess.run(["git", "show", f"{base_sha}:{plan_path}"], cwd=str(store),
+                        capture_output=True, timeout=60)
+    if r2.returncode != 0:
+        detail = (r2.stderr or b"").decode("utf-8", "replace").strip()[:200]
+        raise Refused(f"{plan_path!r} unreadable at {base_sha} in {repo}: {detail}")
+    return store, r2.stdout
+
+
+# ------------------------------------------------------------- the assignment
+
+
+def _resolve_informational(repo, position):
+    """(runner, source) for a position bin/orchestrator does not read —
+    purely a record of what repo_model would have resolved, never consumed.
+    'none'/'default' when repo_model has not been adopted here, has no row
+    for this slot, or names a runner RUNNERS no longer carries."""
+    try:
+        runner, layer = models.resolve_repo(repo, position, db_path=DB)
+    except models.NotConfigured:
+        return "none", "default"
+    except models.UnknownRunner as e:
+        warn(f"repo_model names a stale runner for {position} ({e}) — recording 'none'")
+        return "none", "default"
+    if runner is None:
+        return "none", "default"
+    return runner, ("repo_model" if layer == "repo" else "default")
+
+
+def resolve_assignment(repo, assign_map):
+    """position -> (runner, source, effective), one entry per
+    ARENA_POSITIONS — every cell gets all seven, not only the one
+    --assign named (plan 0062 D2)."""
+    out = {}
+    for position in ARENA_POSITIONS:
+        if position == "implementer":
+            out[position] = (assign_map["implementer"], "assigned", 1)
+        else:
+            runner, source = _resolve_informational(repo, position)
+            out[position] = (runner, source, 0)
+    return out
+
+
+# --------------------------------------------------------- lease and dispatch
+
+
+_SLUG_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def slug_of(plan_id):
+    """Same construction as bin/fleet-watch's slug_of — kept as its own copy
+    per this file's self-contained-sibling convention, not an import, so a
+    change to fleet-watch's branch naming cannot silently change this file's."""
+    return _SLUG_RE.sub("-", plan_id.lower()).strip("-")[:40] or "plan"
+
+
+def _arena_sid():
+    """SPEC defines `actor` as a session id — use the caller's own if set
+    (the same convention bin/fleet-watch's _watch_sid follows), else a fixed
+    program identity distinct from any cell's own holder session."""
+    return os.environ.get("EUNOMIA_SESSION", "").strip() or "fleet-arena"
+
+
+def _child_env(sid=None):
+    """os.environ, minus the credential-recipe variables bin/fleet-watch's own
+    _child_env withholds from ITS children — a spawned fleet-claim or
+    orchestrator has no more business inheriting a token helper's recipe here
+    than it does there."""
+    env = dict(os.environ)
+    for k in ("FLEET_TOKEN_CMD", "FLEET_ADMIN_TOKEN_CMD", "FLEET_DIRECT_TOKEN_CMD"):
+        env.pop(k, None)
+    if sid is not None:
+        env["EUNOMIA_SESSION"] = sid
+    return env
+
+
+def mint_lease(repo, branch, cell_id, ttl_minutes, coordinator_sid, holder_sid):
+    """A branch lease on `branch`, via fleet-claim — the same call shape as
+    bin/fleet-watch's own spawn(), naming a per-cell branch instead of the
+    per-plan one (plan 0062 D4). Raises DispatchFailed, never writes to
+    arena_cell itself; the caller already holds that row."""
+    resource = json.dumps({"type": "branch", "repo": repo, "branch": branch},
+                          sort_keys=True)
+    r = subprocess.run(
+        [sys.executable, str(BIN / "fleet-claim"), "--assign", resource,
+         "--holder", holder_sid, "--note", f"arena:{cell_id}",
+         "--ttl", str(ttl_minutes)],
+        capture_output=True, text=True, env=_child_env(coordinator_sid), timeout=120)
+    lease_id = (r.stdout or "").strip().splitlines()[0] if (r.stdout or "").strip() else ""
+    if r.returncode != 0 or not lease_id:
+        raise DispatchFailed(f"lease assign failed for {branch}: "
+                             f"{(r.stderr or r.stdout).strip()[:200]}")
+    return lease_id
+
+
+# Same allowlist bin/fleet-watch's job_env applies: configuration, never a
+# credential, plus what git/ssh/claude need to run at all.
+_JOB_ENV_PREFIXES = ("FLEET_", "EUNOMIA_")
+_JOB_ENV_EXTRA = ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SSH_AUTH_SOCK")
+
+
+def spawn_mode():
+    """`launchd` (default) or `popen`, the same FLEET_SPAWN knob bin/fleet-watch
+    honours. A bare Popen from this process, which exits straight after, is
+    the orphaned shape fleet-watch documents as failing every LAN git fetch on
+    this fleet's macOS hosts, so the supervised job is the default."""
+    mode = (os.environ.get("FLEET_SPAWN") or "launchd").strip().lower()
+    if mode not in ("launchd", "popen"):
+        raise DispatchFailed(f"FLEET_SPAWN={mode!r} is not 'launchd' or 'popen'")
+    return mode
+
+
+def release_lease(lease_id):
+    """Best effort: a lease minted for a cell whose orchestrator never started
+    would otherwise orphan and page, as bin/fleet-watch's spawn failure path
+    avoids by retiring it."""
+    r = subprocess.run(
+        [sys.executable, str(BIN / "fleet-release"), lease_id, "--force"],
+        capture_output=True, text=True, env=_child_env(), timeout=120)
+    if r.returncode != 0:
+        warn(f"could not release lease {lease_id}: {(r.stderr or r.stdout).strip()[:200]}")
+
+
+def spawn_orchestrator(repo, plan_path, lease_id, holder_sid, plan_id, fm, runner):
+    """One detached orchestrator, holding the freshly minted lease — the
+    implementer position pinned via EUNOMIA_IMPL_RUNNER, which
+    resolved_implementer_env treats as the operator's own override and never
+    touches repo_model for."""
+    orch = os.environ.get("FLEET_ORCHESTRATOR", str(BIN / "orchestrator"))
+    env = _child_env(holder_sid)
+    env["EUNOMIA_PLAN_ID"] = plan_id
+    env["EUNOMIA_PLAN_ZONE"] = fm.get("zone", "")
+    env["EUNOMIA_PLAN_TIER"] = fm.get("tier", "")
+    env["EUNOMIA_IMPL_RUNNER"] = runner
+    argv = [orch, repo, plan_path, lease_id]
+    try:
+        if spawn_mode() == "launchd":
+            if not lib._ID_RE.match(lease_id or ""):
+                raise OSError(f"lease id {lease_id!r} is not label-safe")
+            job_env = {k: v for k, v in env.items()
+                       if k.startswith(_JOB_ENV_PREFIXES) or k in _JOB_ENV_EXTRA}
+            job_env["EUNOMIA_FLEET_DIR"] = str(lib.fleet_dir())
+            fleetjob.start(f"org.eunomia.fleet-orch.{lease_id}", argv, job_env)
+        else:
+            subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except (OSError, ValueError) as e:
+        raise DispatchFailed(f"orchestrator spawn failed for lease {lease_id}: "
+                             f"{e.__class__.__name__}: {e}") from None
+
+
+# --------------------------------------------------------------------- cell
+
+
+def cmd_cell(con, args):
+    try:
+        assign_map = parse_assign(args.assign)
+        base_sha = validate_base(args.base)
+    except Refused as e:
+        warn(str(e))
+        return 1
+
+    repo = args.repo
+    plan_path = args.plan
+    round_name = args.round or "default"
+
+    try:
+        _store, raw = verify_base_and_read_plan(repo, base_sha, plan_path)
+    except Refused as e:
+        warn(str(e))
+        return 1
+
+    plan_sha = hashlib.sha256(raw).hexdigest()
+    fm = parse_front_matter(raw)
+    plan_id = fm.get("id") or Path(plan_path).stem
+
+    try:
+        assignment = resolve_assignment(repo, assign_map)
+    except Refused as e:
+        warn(str(e))
+        return 1
+
+    cell_id = _ulid()
+    branch = f"cell/{slug_of(plan_id)}/{cell_id}"
+    holder_sid = f"arena-{slug_of(plan_id)}-{cell_id[-8:].lower()}"
+
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        con.execute(
+            "INSERT INTO arena_cell (cell_id, ts, repo, round, plan_sha, base_sha, "
+            "branch, pr, lease, outcome) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (cell_id, _now(), repo, round_name, plan_sha, base_sha, branch,
+             None, None, "running"))
+        con.executemany(
+            "INSERT INTO arena_cell_assignment (cell_id, position, ordinal, "
+            "runner, source, effective) VALUES (?,?,?,?,?,?)",
+            [(cell_id, position, 1, runner, source, effective)
+             for position, (runner, source, effective) in assignment.items()])
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+
+    lease_id = None
+    try:
+        lease_id = mint_lease(repo, branch, cell_id, lib.lease_ttl_minutes(),
+                              _arena_sid(), holder_sid)
+        con.execute("UPDATE arena_cell SET lease=? WHERE cell_id=?", (lease_id, cell_id))
+        con.commit()
+        spawn_orchestrator(repo, plan_path, lease_id, holder_sid, plan_id, fm,
+                           assignment["implementer"][0])
+    except DispatchFailed as e:
+        con.execute("UPDATE arena_cell SET outcome='failed' WHERE cell_id=?", (cell_id,))
+        con.commit()
+        if lease_id:
+            release_lease(lease_id)
+        warn(str(e))
+        return 1
+
+    print(cell_id)
+    warn(f"dispatched {repo} {plan_id} cell {cell_id} (branch {branch}, "
+        f"lease {lease_id}, round {round_name})")
+    return 0
+
+
+# --------------------------------------------------------------- list / show
+
+
+def cmd_list(con, args):
+    q = "SELECT cell_id, ts, repo, round, branch, outcome, pr FROM arena_cell WHERE 1=1"
+    params = []
+    if args.repo:
+        q += " AND repo=?"
+        params.append(args.repo)
+    if args.round:
+        q += " AND round=?"
+        params.append(args.round)
+    q += " ORDER BY ts"
+    rows = con.execute(q, params).fetchall()
+    if not rows:
+        print("no arena_cell rows")
+        return 0
+    for cell_id, ts, repo, round_name, branch, outcome, pr in rows:
+        print(f"{cell_id}  {ts}  {repo:28}  {round_name:12}  {outcome:8}  "
+             f"pr={pr or '-':<6}  {branch}")
+    return 0
+
+
+def cmd_show(con, args):
+    row = con.execute(
+        "SELECT cell_id, ts, repo, round, plan_sha, base_sha, branch, pr, lease, "
+        "outcome FROM arena_cell WHERE cell_id=?", (args.cell_id,)).fetchone()
+    if row is None:
+        warn(f"no such cell {args.cell_id!r}")
+        return 1
+    cell_id, ts, repo, round_name, plan_sha, base_sha, branch, pr, lease, outcome = row
+    print(f"cell_id:  {cell_id}")
+    print(f"ts:       {ts}")
+    print(f"repo:     {repo}")
+    print(f"round:    {round_name}")
+    print(f"plan_sha: {plan_sha}")
+    print(f"base_sha: {base_sha}")
+    print(f"branch:   {branch}")
+    print(f"pr:       {pr or '-'}")
+    print(f"lease:    {lease or '-'}")
+    print(f"outcome:  {outcome}")
+    print("assignment:")
+    for position, ordinal, runner, source, effective in con.execute(
+            "SELECT position, ordinal, runner, source, effective FROM "
+            "arena_cell_assignment WHERE cell_id=? ORDER BY position, ordinal",
+            (args.cell_id,)):
+        print(f"  {position:16} #{ordinal:<2} {runner:20} source={source:10} "
+             f"effective={effective}")
+    return 0
+
+
+# --------------------------------------------------------------------- CLI
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="fleet-arena")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("cell")
+    p.add_argument("--repo", required=True, help="the arena repository, owner/repo")
+    p.add_argument("--plan", required=True, metavar="PATH",
+                  help="repo-relative path to the plan file, read at --base")
+    p.add_argument("--base", required=True, metavar="SHA",
+                  help="full SHA the arena's origin/main must equal — checked, "
+                       "never obeyed")
+    p.add_argument("--assign", required=True, metavar="implementer=RUNNER",
+                  help="the only position bin/orchestrator reads")
+    p.add_argument("--round", default="default")
+    p.set_defaults(func=cmd_cell)
+
+    p = sub.add_parser("list")
+    p.add_argument("--repo")
+    p.add_argument("--round")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("show")
+    p.add_argument("cell_id")
+    p.set_defaults(func=cmd_show)
+
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    con = connect()
+    try:
+        return args.func(con, args)
+    finally:
+        con.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,4 +1,3 @@
-import pytest
 """Tests for `fleet-plan graph` (plan 0047).
 
 Two families, deliberately kept apart:
@@ -24,6 +23,7 @@ Two families, deliberately kept apart:
 plan 0047's Definition of done asks for it explicitly ("on `main`"); it checks
 only what cannot drift — node count and that every edge carries a form.
 """
+import pytest
 import importlib.machinery
 import importlib.util
 import json

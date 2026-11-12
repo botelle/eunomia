@@ -31,6 +31,11 @@ def _load(tmp_path, **env):
     spec = importlib.util.spec_from_loader("orch_freeze", loader)
     m = importlib.util.module_from_spec(spec)
     loader.exec_module(m)
+    # plan 0104: the steward asks fleet-meet each cycle; these tests are about the
+    # freeze, so the meeting step and the lane lines are inert (meeting_step reads
+    # head_sha, which some tests script call by call)
+    m.meeting_step = lambda *a, **k: None
+    m.refresh_test_lanes = lambda *a, **k: False
     return m
 
 
@@ -70,6 +75,16 @@ class Forge:
 
     def list_pulls(self, repo, state="all", page=1, limit=50, sort=None):
         return (200, self.pulls) if page == 1 else (200, [])
+
+    def get_pull_by_branch(self, repo, base, head):
+        for pr in self.pulls:
+            if (((pr.get("head") or {}).get("ref") or "") == head
+                    and ((pr.get("base") or {}).get("ref") or "") == base):
+                return 200, pr
+        return 404, None
+
+    def get_repo(self, repo):
+        return 200, {"full_name": repo}
 
     def create_issue_comment(self, repo, n, body):
         self.posted.append(body)
@@ -148,10 +163,15 @@ def test_a_followup_needs_the_follows_line_and_a_main_base(tmp_path):
     ok, why, _ = mod.verify_followup_pr("r", "fb", 7, "p",
                                         Forge(pulls=[dict(base, body="nothing")]), _ff())
     assert not ok and "Follows: #7" in why
+    # The real forge's by-branch read is keyed on base AND head (plan 0215
+    # D1, measured live) — a PR on this head targeting anything but main
+    # reads as no PR at all, never "found, wrong base". See
+    # verify_followup_pr's own docstring for why the base check stays in
+    # the function regardless.
     ok, why, _ = mod.verify_followup_pr(
         "r", "fb", 7, "p",
         Forge(pulls=[dict(base, base={"ref": "dev"}, body="Follows: #7")]), _ff())
-    assert not ok and "not main" in why
+    assert not ok and "no pull request with head" in why
 
 
 # ------------------------------------------------------------- the steward
@@ -397,7 +417,7 @@ def test_transcript_tags_do_not_collide_across_the_three_loops(tmp_path):
     forge = Forge(reviews=[{"id": 1, "state": "REQUEST_CHANGES", "commit_id": HEAD,
                             "stale": False, "dismissed": False,
                             "body": "```findings\nHIGH: broken\n```",
-                            "user": {"id": OWNER, "login": "operator"}}],
+                            "user": {"id": OWNER, "login": "revbot"}}],
                   heads=[HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2])
     mod._forge = lambda: (_ff(), forge)
     mod.dispatch_review = lambda *a, **k: (True, "")

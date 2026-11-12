@@ -32,14 +32,27 @@ def _write_plist(path, data):
     path.write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_XML))
 
 
-def _launchctl_stub(tmp_path, loaded_labels):
+def _launchctl_stub(tmp_path, loaded_labels, system_labels=None):
     """A stub `launchctl` whose `print <domain>` (no unit suffix) emits a
     `services = {...}` block naming each of `loaded_labels` — the exact
     shape `_domain_loaded_labels` parses, modeled on real
-    `launchctl print gui/$UID` output measured on opshost."""
+    `launchctl print gui/$UID` output measured on opshost. With
+    `system_labels`, `print system` answers with those instead (real
+    `launchctl print system` output, measured on cihost, has the same
+    shape); without it, both domains answer alike."""
     stub = tmp_path / "launchctl-stub.sh"
     body = "\n".join(f'echo "    0    0    {l}"' for l in loaded_labels)
+    sys_body = body if system_labels is None else \
+        "\n".join(f'echo "    0    0    {l}"' for l in system_labels)
     stub.write_text(f"""#!/bin/bash
+if [ "$1" = "print" ] && [ "$2" = "system" ]; then
+  echo "system = {{"
+  echo "  services = {{"
+{sys_body}
+  echo "  }}"
+  echo "}}"
+  exit 0
+fi
 if [ "$1" = "print" ]; then
   echo "gui/501 = {{"
   echo "  services = {{"
@@ -65,13 +78,14 @@ def _row(key, primary, also="-", config="-", supervisor="launchd", domain="gui")
            f"primary={primary} also={also} config={config}")
 
 
-def _wire(monkeypatch, tmp_path, *, launchd=None, agents=None, conf=None, loaded=()):
+def _wire(monkeypatch, tmp_path, *, launchd=None, agents=None, conf=None, loaded=(),
+          system_loaded=None):
     launchd_dir = launchd if launchd is not None else (tmp_path / "launchd")
     agents_dir = agents if agents is not None else (tmp_path / "LaunchAgents")
     launchd_dir.mkdir(parents=True, exist_ok=True)
     agents_dir.mkdir(parents=True, exist_ok=True)
     conf_path = conf if conf is not None else _services_conf(tmp_path, [])
-    stub = _launchctl_stub(tmp_path, loaded)
+    stub = _launchctl_stub(tmp_path, loaded, system_loaded)
     monkeypatch.setenv("FLEET_LAUNCHD_DIR", str(launchd_dir))
     monkeypatch.setenv("FLEET_LAUNCH_AGENTS_DIR", str(agents_dir))
     monkeypatch.setenv("FLEET_SERVICES_CONF", str(conf_path))
@@ -304,6 +318,205 @@ def test_other_host_services_conf_row_is_informational_only(mod, tmp_path, monke
     assert any("cihost:forgejo-runner" in l and "not audited here" in l for l in lines)
 
 
+# --- the installed copy is looked for where the row's domain puts it ---------
+
+
+def test_system_domain_row_is_audited_against_launch_daemons_not_launch_agents(
+        mod, tmp_path, monkeypatch):
+    """cihost:forgejo-runner is domain=system: its plist lives in
+    /Library/LaunchDaemons, and an audit that only read ~/Library/LaunchAgents
+    reported installed=no for it and exited non-zero on every run."""
+    daemons = tmp_path / "LaunchDaemons"
+    daemons.mkdir()
+    monkeypatch.setenv("FLEET_LAUNCH_DAEMONS_DIR", str(daemons))
+    launchd, agents, conf = _wire(
+        monkeypatch, tmp_path,
+        conf=_services_conf(tmp_path, [
+            _row("cihost:forgejo-runner", "org.eunomia.forgejo-runner", domain="system")]))
+    plist = {"Label": "org.eunomia.forgejo-runner", "ProgramArguments": ["/x/runner"]}
+
+    # Only in LaunchAgents: the wrong place for a system unit — not installed.
+    _write_plist(agents / "org.eunomia.forgejo-runner.plist", plist)
+    data = mod.audit_collect(host="cihost")
+    unit = data["units"][0]
+    assert unit["installed"] is False
+    assert unit["problem"] is True
+
+    # In LaunchDaemons: installed, and the audit is clean.
+    (agents / "org.eunomia.forgejo-runner.plist").unlink()
+    _write_plist(daemons / "org.eunomia.forgejo-runner.plist", plist)
+    data = mod.audit_collect(host="cihost")
+    unit = data["units"][0]
+    assert unit["installed"] is True
+    assert unit["installed_path"] == str(daemons / "org.eunomia.forgejo-runner.plist")
+    assert unit["problem"] is False
+    assert mod.audit_has_problem(data) is False
+
+
+def test_gui_domain_row_is_still_audited_against_launch_agents(mod, tmp_path, monkeypatch):
+    daemons = tmp_path / "LaunchDaemons"
+    daemons.mkdir()
+    monkeypatch.setenv("FLEET_LAUNCH_DAEMONS_DIR", str(daemons))
+    launchd, agents, conf = _wire(
+        monkeypatch, tmp_path,
+        conf=_services_conf(tmp_path, [_row("opshost:thing", "org.eunomia.thing")]))
+    plist = {"Label": "org.eunomia.thing", "ProgramArguments": ["/x/thing"]}
+
+    _write_plist(daemons / "org.eunomia.thing.plist", plist)
+    assert mod.audit_collect(host="opshost")["units"][0]["installed"] is False
+
+    _write_plist(agents / "org.eunomia.thing.plist", plist)
+    unit = mod.audit_collect(host="opshost")["units"][0]
+    assert unit["installed"] is True
+    assert unit["problem"] is False
+
+
+def test_system_domain_row_is_loaded_only_if_the_system_domain_lists_it(
+        mod, tmp_path, monkeypatch):
+    """The loaded query was fixed to gui/$UID and filtered to org.eunomia.*,
+    so org.eunomia.forgejo-runner read loaded=no whatever launchd said."""
+    daemons = tmp_path / "LaunchDaemons"
+    daemons.mkdir()
+    monkeypatch.setenv("FLEET_LAUNCH_DAEMONS_DIR", str(daemons))
+    row = _row("cihost:forgejo-runner", "org.eunomia.forgejo-runner", domain="system")
+    plist = {"Label": "org.eunomia.forgejo-runner", "ProgramArguments": ["/x/runner"]}
+
+    # Listed in the gui domain only: the wrong domain, so not loaded.
+    _wire(monkeypatch, tmp_path, conf=_services_conf(tmp_path, [row]),
+          loaded=["org.eunomia.forgejo-runner"], system_loaded=[])
+    _write_plist(daemons / "org.eunomia.forgejo-runner.plist", plist)
+    assert mod.audit_collect(host="cihost")["units"][0]["loaded"] is False
+
+    # Listed in the system domain: loaded.
+    _wire(monkeypatch, tmp_path, conf=_services_conf(tmp_path, [row]),
+          loaded=[], system_loaded=["org.eunomia.forgejo-runner"])
+    data = mod.audit_collect(host="cihost")
+    assert data["units"][0]["loaded"] is True
+    assert data["loaded_query_ok"] is True
+
+
+def test_enrolled_gui_label_outside_com_operator_is_seen_as_loaded(mod, tmp_path, monkeypatch):
+    """vaulthost:keyvault is gui and org.eunomia.* — the org.eunomia.* filter is
+    for the out-of-scope scan, never for a label enrolled by name."""
+    launchd, agents, conf = _wire(
+        monkeypatch, tmp_path,
+        conf=_services_conf(tmp_path, [_row("vaulthost:keyvault", "org.eunomia.keyvault")]),
+        loaded=["org.eunomia.keyvault"])
+    _write_plist(agents / "org.eunomia.keyvault.plist",
+                {"Label": "org.eunomia.keyvault", "ProgramArguments": ["/x/bao"]})
+    unit = mod.audit_collect(host="vaulthost")["units"][0]
+    assert unit["installed"] is True
+    assert unit["loaded"] is True
+
+
+def test_system_domain_query_failure_is_warned(mod, tmp_path, monkeypatch):
+    stub = tmp_path / "launchctl-sysfail.sh"
+    stub.write_text("""#!/bin/bash
+[ "$2" = "system" ] && exit 1
+echo "gui/501 = {"; echo "  services = {"; echo "  }"; echo "}"
+""")
+    stub.chmod(0o755)
+    _wire(monkeypatch, tmp_path, conf=_services_conf(tmp_path, [
+        _row("cihost:forgejo-runner", "org.eunomia.forgejo-runner", domain="system")]))
+    monkeypatch.setenv("FLEET_LAUNCHCTL", str(stub))
+    data = mod.audit_collect(host="cihost")
+    assert data["loaded_query_ok"] is False
+    assert any(l.startswith("WARN:") for l in mod.render_audit(data))
+
+
+@pytest.mark.parametrize("supervisor,domain", [
+    ("launchd", "sytem"), ("launchd", "user"), ("systemd", "gui")])
+def test_unknown_domain_is_refused_not_guessed(mod, tmp_path, monkeypatch, supervisor, domain):
+    """A mistyped launchd domain used to be audited against
+    /Library/LaunchDaemons as though it said system."""
+    _wire(monkeypatch, tmp_path, conf=_services_conf(tmp_path, [
+        _row("cihost:runner", "org.eunomia.runner", supervisor=supervisor, domain=domain)]))
+    with pytest.raises(SystemExit) as exc:
+        mod.audit_collect(host="cihost")
+    assert "domain" in str(exc.value) and repr(domain) in str(exc.value)
+
+
+# --- shipped plists are judged only on the host they belong to --------------
+
+
+def test_unenrolled_shipped_plists_are_not_judged_off_opshost(mod, tmp_path, monkeypatch):
+    """Every launchd/*.plist is an opshost LaunchAgent. On cihost each one read
+    as shipped-but-not-installed, so audit there could never exit 0."""
+    launchd, agents, conf = _wire(monkeypatch, tmp_path)
+    _write_plist(launchd / "org.eunomia.mopsus.plist",
+                {"Label": "org.eunomia.mopsus", "ProgramArguments": ["/x/mopsus"]})
+
+    data = mod.audit_collect(host="cihost")
+    assert data["units"] == []
+    assert mod.audit_has_problem(data) is False
+    assert data["shipped_elsewhere"] == [
+        {"label": "org.eunomia.mopsus", "host": "opshost", "loaded": False}]
+    lines = mod.render_audit(data)
+    assert any(l.startswith("shipped-for-other-host org.eunomia.mopsus host=opshost")
+               for l in lines)
+
+    # The same file on opshost is still the 2026-09-13 mopsus failure.
+    data = mod.audit_collect(host="opshost")
+    assert [u["label"] for u in data["units"]] == ["org.eunomia.mopsus"]
+    assert mod.audit_has_problem(data) is True
+
+
+def test_shipped_label_loaded_off_its_host_is_never_called_unshipped(
+        mod, tmp_path, monkeypatch):
+    """A second dispatcher on the wrong host: it was listed out-of-scope as
+    shipped-by-eunomia=no, contradicting its own shipped-for-other-host line."""
+    launchd, agents, conf = _wire(
+        monkeypatch, tmp_path,
+        conf=_services_conf(tmp_path, [_row("opshost:fleet-watch", "org.eunomia.fleet-watch")]),
+        loaded=["org.eunomia.mopsus", "org.eunomia.fleet-watch", "org.eunomia.other"])
+    for label in ("org.eunomia.mopsus", "org.eunomia.fleet-watch"):
+        _write_plist(launchd / f"{label}.plist",
+                    {"Label": label, "ProgramArguments": ["/x/y"]})
+
+    data = mod.audit_collect(host="cihost")
+    assert [o["label"] for o in data["out_of_scope"]] == ["org.eunomia.other"]
+    # Enrolled on opshost and loaded here: listed, although it is an other-host row too.
+    assert data["shipped_elsewhere"] == [
+        {"label": "org.eunomia.fleet-watch", "host": "opshost", "loaded": True},
+        {"label": "org.eunomia.mopsus", "host": "opshost", "loaded": True}]
+    assert mod.audit_has_problem(data) is False
+    lines = mod.render_audit(data)
+    assert not any("shipped-by-eunomia=no" in l and "mopsus" in l for l in lines)
+    assert any(l.startswith("shipped-for-other-host org.eunomia.mopsus host=opshost loaded=yes")
+               for l in lines)
+
+
+def test_there_is_no_environment_override_for_the_shipped_units_host(
+        mod, tmp_path, monkeypatch):
+    """An env var exported in an operator's shell must not be able to move
+    every unenrolled shipped unit off opshost and turn the audit green."""
+    launchd, agents, conf = _wire(monkeypatch, tmp_path)
+    _write_plist(launchd / "org.eunomia.mopsus.plist",
+                {"Label": "org.eunomia.mopsus", "ProgramArguments": ["/x/mopsus"]})
+    monkeypatch.setenv("FLEET_SHIPPED_UNITS_HOST", "elsewhere")
+    assert mod.audit_has_problem(mod.audit_collect(host="opshost")) is True
+
+
+def test_shipped_plist_enrolled_on_another_host_belongs_to_that_host(
+        mod, tmp_path, monkeypatch):
+    launchd, agents, conf = _wire(
+        monkeypatch, tmp_path,
+        conf=_services_conf(tmp_path, [_row("cihost:thing", "org.eunomia.thing")]))
+    _write_plist(launchd / "org.eunomia.thing.plist",
+                {"Label": "org.eunomia.thing", "ProgramArguments": ["/x/thing"]})
+
+    on_opshost = mod.audit_collect(host="opshost")
+    assert on_opshost["units"] == []
+    assert mod.audit_has_problem(on_opshost) is False
+    # Already an other-host line; not listed a second time.
+    assert on_opshost["shipped_elsewhere"] == []
+    assert [r["key"] for r in on_opshost["other_host_rows"]] == ["cihost:thing"]
+
+    on_cihost = mod.audit_collect(host="cihost")
+    assert [u["label"] for u in on_cihost["units"]] == ["org.eunomia.thing"]
+    assert on_cihost["units"][0]["problem"] is True
+
+
 # --- D4: shipped-but-not-enrolled is information, never a fault --------------
 
 
@@ -353,7 +566,9 @@ def test_no_secret_value_appears_anywhere_in_the_report(mod, tmp_path, monkeypat
 def test_cli_audit_exits_nonzero_on_a_problem(tmp_path, monkeypatch):
     launchd = tmp_path / "launchd"; launchd.mkdir()
     agents = tmp_path / "LaunchAgents"; agents.mkdir()
-    conf = _services_conf(tmp_path, [])
+    # Enrolled for whatever host runs this (a CI runner is not opshost), so the
+    # uninstalled plist is in scope here.
+    conf = _services_conf(tmp_path, [_row(f"{_load_mod()._host()}:thing", "org.eunomia.thing")])
     _write_plist(launchd / "org.eunomia.thing.plist",
                 {"Label": "org.eunomia.thing", "ProgramArguments": ["/bin/true"]})
     stub = _launchctl_stub(tmp_path, [])

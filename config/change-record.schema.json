@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Change record (ADR-0020; docs/change-management.md section 4)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "pr", "title", "base_ref", "head_sha", "merge_sha",
+               "merged_at", "merged_by", "author", "files", "plan", "reviews",
+               "statuses", "required_contexts", "autonomy", "recorded_at",
+               "recorder_rev", "source", "supersedes"],
+  "properties": {
+    "schema": {"const": 1},
+    "repo": {"type": "string", "minLength": 1},
+    "pr": {"type": ["integer", "null"]},
+    "title": {"type": "string"},
+    "base_ref": {"type": "string", "minLength": 1},
+    "head_sha": {"type": "string", "minLength": 1},
+    "merge_sha": {"type": "string", "minLength": 1},
+    "merged_at": {"type": "string", "minLength": 1},
+    "merged_by": {"type": "string", "minLength": 1},
+    "author": {"type": "string", "minLength": 1},
+    "files": {"type": "array", "items": {"type": "string"}},
+    "plan": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["id", "status_at_merge", "commit", "commit_merged_by"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "status_at_merge": {"type": ["string", "null"]},
+        "commit": {"type": ["string", "null"]},
+        "commit_merged_by": {"type": ["string", "null"]}
+      }
+    },
+    "reviews": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "account", "state", "commit_id", "submitted_at",
+                     "dismissed", "stale", "model", "session_uuid"],
+        "properties": {
+          "id": {"type": "integer"},
+          "account": {"type": "string"},
+          "state": {"type": "string"},
+          "commit_id": {"type": "string"},
+          "submitted_at": {"type": "string"},
+          "dismissed": {"type": "boolean"},
+          "stale": {"type": "boolean"},
+          "model": {"type": ["string", "null"]},
+          "session_uuid": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "statuses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["context", "state", "creator", "created_at"],
+        "properties": {
+          "context": {"type": "string"},
+          "state": {"type": "string"},
+          "creator": {"type": "string"},
+          "created_at": {"type": "string"}
+        }
+      }
+    },
+    "required_contexts": {"type": "array", "items": {"type": "string"}},
+    "autonomy": {"enum": ["autonomous", "critical"]},
+    "recorded_at": {"type": "string", "minLength": 1},
+    "recorder_rev": {"type": "string", "minLength": 1},
+    "source": {"enum": ["observed", "late", "backfill"]},
+    "supersedes": {"type": ["string", "null"]}
+  }
+}

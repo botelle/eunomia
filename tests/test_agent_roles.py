@@ -24,7 +24,8 @@ BIN = Path(__file__).resolve().parent.parent / "bin"
 _ENV = ("FLEET_AGENT_ACCOUNTS", "FLEET_IMPLEMENTER_LOGINS",
        "FLEET_IMPLEMENTER_UIDS", "FLEET_COMMIT_IDENTITY",
        "FLEET_AUTHOR_ACCOUNT", "FLEET_REVIEWER_ACCOUNT",
-       "FLEET_MERGER_ACCOUNT")
+       "FLEET_MERGER_ACCOUNT", "FLEET_SECOND_REVIEWER_ACCOUNT",
+       "FLEET_AGENT_MERGER_ACCOUNT")
 
 
 def _clean(monkeypatch):
@@ -70,6 +71,19 @@ def test_default_roles_are_this_fleets_own_accounts(monkeypatch):
     assert roles["author"].account == "implbot"
     assert roles["reviewer"].account == "revbot"
     assert roles["merger"].account == "operator"
+    assert roles["second_reviewer"].account == "rev2bot"
+    assert roles["agent_merger"].account == "mergebot"
+
+
+def test_the_new_roles_have_their_own_override_keys(monkeypatch):
+    mod = _fleetlib(monkeypatch)
+    monkeypatch.setenv("FLEET_SECOND_REVIEWER_ACCOUNT", "critic-3")
+    monkeypatch.setenv("FLEET_AGENT_MERGER_ACCOUNT", "queue-2")
+    roles = mod.agent_roles()
+    assert roles["second_reviewer"].account == "critic-3"
+    assert roles["agent_merger"].account == "queue-2"
+    assert roles["merger"].account == "operator"
+    assert {"critic-3", "queue-2"} <= mod.agent_accounts(roles)
 
 
 def test_each_role_account_is_configurable_independently(monkeypatch):
@@ -114,7 +128,7 @@ def test_the_constructed_table_never_omits_its_own_account(monkeypatch):
 # ---------------------------------------------- D4: defaults reproduce today's values
 def test_defaults_reproduce_fleet_watchs_agent_accounts(monkeypatch):
     mod = _fleet_watch(monkeypatch)
-    assert mod.AGENT_ACCOUNTS == {"implbot", "revbot"}
+    assert mod.AGENT_ACCOUNTS == {"implbot", "revbot", "rev2bot", "mergebot"}
 
 
 def test_defaults_reproduce_fleet_watchs_implementer_logins(monkeypatch):
@@ -124,7 +138,8 @@ def test_defaults_reproduce_fleet_watchs_implementer_logins(monkeypatch):
 
 def test_agent_accounts_still_extends_with_flag_agent_accounts(monkeypatch):
     mod = _fleet_watch(monkeypatch, FLEET_AGENT_ACCOUNTS="intakebot,queuebot")
-    assert mod.AGENT_ACCOUNTS == {"implbot", "revbot", "intakebot", "queuebot"}
+    assert mod.AGENT_ACCOUNTS == {"implbot", "revbot", "rev2bot", "mergebot",
+                                  "intakebot", "queuebot"}
 
 
 def test_agent_accounts_never_include_the_merger(monkeypatch):
@@ -174,9 +189,10 @@ def test_no_executable_in_bin_compares_against_a_literal_account_name():
 
 def test_fleetlibs_only_literal_account_names_are_the_documented_defaults():
     """fleetlib.py is where the role table's documented defaults legitimately
-    live (D1) plus the untouched `git_ssh_base` default (boundary: do not
-    change bin/fleetlib.py:686). Anywhere else in the file, a bare literal
-    account name would be exactly the comparison this plan removes."""
+    live (D1) plus the `git_ssh_base` function (plan 0075: its default names the
+    merger account, the key that exists on the dispatch host). Anywhere else
+    in the file, a bare literal account name would be exactly the comparison
+    this plan removes."""
     path = BIN / "fleetlib.py"
     tree = ast.parse(path.read_text(), filename=str(path))
     allowed_lines = set()
